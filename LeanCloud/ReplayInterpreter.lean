@@ -15,8 +15,10 @@ inductive Result where
   | suspended (children : Array (Option Exit))
   deriving Repr, BEq, ToJson, FromJson
 
+namespace Result
+
 /-- Parallel resumes once every child has a result, in the original array order. -/
-private def settle (children : Array (Option Exit)) : Result :=
+def settle (children : Array (Option Exit)) : Result :=
   match children.mapM id with
   | none => .suspended children
   | some outcomes =>
@@ -26,7 +28,7 @@ private def settle (children : Array (Option Exit)) : Result :=
     | .ok values => .completed (.success (Json.arr values))
     | .error outcome => .completed outcome
 
-private def recordChild (result : Result) (index : Nat) (outcome : Exit) : Except CloudError Result := do
+def recordChild (result : Result) (index : Nat) (outcome : Exit) : Except CloudError Result := do
   match result with
   | .completed _ => return result
   | .suspended children =>
@@ -36,25 +38,31 @@ private def recordChild (result : Result) (index : Nat) (outcome : Exit) : Excep
       throw ⟨.divergence, "Child completion changed during replay"⟩
     return settle (children.set! index (some outcome))
 
-private def load [Monad m] (storage : Storage σ m) (location : Location) :
+end Result
+
+open Result (settle recordChild)
+
+namespace ReplayInterpreter.Internal
+
+def load [Monad m] (storage : Storage σ m) (location : Location) :
     ExceptT CloudError (StateT σ m) (Option Result) := do
   let some value ← storage.get location.key | return none
   match fromJson? value with
   | .ok result => return some result
   | .error message => throw ⟨.codec, message⟩
 
-private def save [Monad m] (storage : Storage σ m) (location : Location) (result : Result) :
+def save [Monad m] (storage : Storage σ m) (location : Location) (result : Result) :
     ExceptT CloudError (StateT σ m) Unit := do
   unless ← storage.put location.key (toJson result) do
     throw ⟨.protocol, s!"Storage rejected result at {location.key}"⟩
 
-private def decode [Monad m] (codec : Codec α) (value : Json) : ExceptT CloudError m α :=
+def decode [Monad m] (codec : Codec α) (value : Json) : ExceptT CloudError m α :=
   match codec.decode value with
   | .ok value => pure value
   | .error message => throw ⟨.codec, message⟩
 
 /-- A completed value or the location of an unresolved parallel group. -/
-private inductive StepResult where
+inductive StepResult where
   | done (value : Json) (location : Location) (remainingFuel : Nat)
   | suspended (location : Location) (remainingFuel : Nat)
   deriving Repr
@@ -64,7 +72,7 @@ The loop uses encoded branch results so descending into a child can change its
 Lean result type without changing the loop's type. Parent code is rebuilt from root.
 Running the action returns `m (Except CloudError StepResult × σ)`, retaining storage
 updates even when stepping ends in an error. -/
-private def step {σ : Type} {m : Type → Type} [Monad m] (storage : Storage σ m)
+def step {σ : Type} {m : Type → Type} [Monad m] (storage : Storage σ m)
     (fuel : Nat) (root : Cloud m Json) (location : Location) :
     ExceptT CloudError (StateT σ m) StepResult := do
   if location.isEmpty || location[0]!.1 != 0 then
@@ -165,6 +173,10 @@ where
         | .choice .., _ => throw ⟨.unsupported, "Choice is not implemented yet"⟩
         | .sequential codec operation, continuation =>
           sequential operation codec (ArrsF.apply continuation)
+
+end ReplayInterpreter.Internal
+
+open ReplayInterpreter.Internal
 
 /-- Run a program to its final result, driving unfinished parallel children in array
 order. Suspension and replay locations stay internal. Running with an initial storage

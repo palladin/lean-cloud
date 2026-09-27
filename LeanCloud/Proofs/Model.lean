@@ -52,4 +52,41 @@ theorem modelStorage_put (blobs : BlobModel World) (key : String) (value : Json)
     (modelStorage blobs).put key value journal world =
       ((true, journal.write key value), world) := rfl
 
+/-- Primitive execution is independent of the replay journal and preserves it.
+The result and external-state transition can therefore be used as direct
+execution evidence even when replay already has committed records. -/
+theorem modelStorage_execute (blobs : BlobModel World) (operation : Operation (StateM World) α)
+    (journal : Journal) (world : World) :
+    ((modelStorage blobs).execute operation).run journal world =
+      let ((outcome, _), nextWorld) := ((modelStorage blobs).execute operation).run Journal.empty world
+      ((outcome, journal), nextWorld) := by
+  cases operation with
+  | exec label body =>
+    cases h : body () world with
+    | mk value nextWorld =>
+      simp [Storage.execute, ExceptT.run, ExceptT.mk, liftM, monadLift,
+        MonadLift.monadLift, ExceptT.lift, StateT.lift, Functor.map, StateT.map,
+        bind, pure, StateT.bind, StateT.pure, h]
+  | putBlob bytes => rfl
+  | readBlob ref => rfl
+  | resolveBlob name => rfl
+
+theorem modelStorage_execute_direct (blobs : BlobModel World)
+    (operation : Operation (StateM World) α) (journal : Journal) (world nextWorld : World)
+    (outcome : Except CloudError α)
+    (executed : ((modelStorage blobs).execute operation).run journal world =
+      ((outcome, journal), nextWorld)) :
+    ((modelStorage blobs).execute operation).run Journal.empty world =
+      ((outcome, Journal.empty), nextWorld) := by
+  have transferred := modelStorage_execute blobs operation journal world
+  rw [executed] at transferred
+  have emptyRun := modelStorage_execute blobs operation Journal.empty world
+  cases run : ((modelStorage blobs).execute operation).run Journal.empty world with
+  | mk pair finalWorld => cases pair with
+    | mk actual finalJournal =>
+      rw [run] at transferred emptyRun
+      dsimp only at transferred emptyRun
+      rcases transferred with ⟨⟨rfl, _⟩, rfl⟩
+      exact emptyRun
+
 end LeanCloud.Proofs

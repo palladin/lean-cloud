@@ -8,8 +8,11 @@ are used. Parallel evaluates all children in array order before selecting an err
 namespace LeanCloud.DirectInterpreter
 open LeanEff
 
+-- Stable internal names allow semantic proofs to live in a separate module.
+namespace Internal
+
 mutual
-  private def eval {σ α : Type} {m : Type → Type} [Monad m]
+  def eval {σ α : Type} {m : Type → Type} [Monad m]
       (storage : Storage σ m) (program : Cloud m α) : ExceptT CloudError (StateT σ m) α :=
     match program with
     | .pure value => pure value
@@ -18,7 +21,7 @@ mutual
       evalContinuation storage continuation value
   termination_by structural program
 
-  private def evalControl {σ α : Type} {m : Type → Type} [Monad m]
+  def evalControl {σ α : Type} {m : Type → Type} [Monad m]
       (storage : Storage σ m) (request : Control m α) : ExceptT CloudError (StateT σ m) α :=
     match request with
     | .delay => pure ()
@@ -33,7 +36,7 @@ mutual
       | .error error => throw error
   termination_by structural request
 
-  private def evalContinuation {σ α β : Type} {m : Type → Type} [Monad m]
+  def evalContinuation {σ α β : Type} {m : Type → Type} [Monad m]
       (storage : Storage σ m) (continuation : ArrsF (Control m) α β) (value : α) :
       ExceptT CloudError (StateT σ m) β :=
     match continuation with
@@ -44,10 +47,12 @@ mutual
   termination_by structural continuation
 end
 
+end Internal
+
 /-- Evaluate the original program directly, with no execution-step budget. -/
 def interpret {σ ι α : Type} {m : Type → Type} [Monad m]
     (storage : Storage σ m) (program : ι → Cloud m α) (input : ι) :
     ExceptT CloudError (StateT σ m) α :=
-  eval storage (program input)
+  Internal.eval storage (program input)
 
 end LeanCloud.DirectInterpreter

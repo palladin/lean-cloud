@@ -1,1 +1,1 @@
-import LeanCloud.Proofs.Equivalence
+import LeanCloud.Proofs.WholeRun
