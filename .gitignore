@@ -1,0 +1,11 @@
+# Lake dependencies and build output.
+.lake/
+
+# Lean output produced outside Lake's build directory.
+*.olean
+*.olean.private
+*.olean.server
+*.ilean
+
+# macOS metadata.
+.DS_Store
