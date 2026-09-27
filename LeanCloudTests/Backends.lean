@@ -15,14 +15,33 @@ def tick (ref : Ref) : Cloud IO Nat := Cloud.exec (fun _ => do
   appendEvent ref "exec:tick" (toJson n)
   return n)
 
-def idStorage : Storage (List (String × Json)) Id where
-  get key := return (← get).lookup key
+structure IdWorld where
+  records : List (String × Json) := []
+  pending : Array Location := #[Location.root]
+  completed : Option Exit := none
+
+def idStorage : Storage IdWorld Id where
+  get key := return (← get).records.lookup key
   put key value := do
-    modify fun entries => (key, value) :: entries.filter (fun entry => entry.1 != key)
+    modify fun world => { world with
+      records := (key, value) :: world.records.filter (fun entry => entry.1 != key) }
     return true
   putBlob _ := throw ⟨.unsupported, "This fixture has no blobs"⟩
   readBlob _ := throw ⟨.unsupported, "This fixture has no blobs"⟩
   resolveBlob _ := throw ⟨.unsupported, "This fixture has no blobs"⟩
+
+def idQueue : WorkQueue IdWorld Id where
+  next := do
+    let world ← get
+    if let some outcome := world.completed then return .completed outcome
+    match world.pending[0]? with
+    | some location => return .item location
+    | none => return .idle
+  complete location update := modify fun world =>
+    match update with
+    | .done outcome => { world with pending := #[], completed := some outcome }
+    | .runnable locations => { world with
+        pending := orderedLocations (world.pending.filter (· != location) ++ locations) }
 
 def backendCases : Array TestCase := #[
   expect "parallel/depth-32" (fun ref => deep ref 32) (.ok 32),
@@ -36,13 +55,13 @@ def backendCases : Array TestCase := #[
       let values ← Cloud.parallel #[pure value, pure (value + 1)]
       return values.foldl (· + ·) 0
     }
-    let (direct, unchanged) := (DirectInterpreter.interpret idStorage program 3).run []
-    let (replayed, records) := (interpret idStorage replayFuel program 3).run []
+    let (direct, unchanged) := (DirectInterpreter.interpret idStorage program 3).run {}
+    let (replayed, recorded) := (interpret idStorage idQueue replayFuel program 3).run {}
     assertOutcome direct (.ok 9)
     assertOutcome replayed direct
-    assertTrue unchanged.isEmpty "Direct Id interpretation changed the journal"
-    assertTrue (!records.isEmpty) "Replay Id interpretation lost its state"
-    let (again, _) := (interpret idStorage replayFuel program 3).run records
+    assertTrue unchanged.records.isEmpty "Direct Id interpretation changed the journal"
+    assertTrue (!recorded.records.isEmpty) "Replay Id interpretation lost its state"
+    let (again, _) := (interpret idStorage idQueue replayFuel program 3).run recorded
     assertOutcome again direct⟩,
   ⟨"backend/direct-never-accesses-journal", do
     let strict : Storage Ref IO := { storage with
@@ -57,7 +76,7 @@ def backendCases : Array TestCase := #[
       let program : Program Nat := fun ref => execValue ref "handle" 1
       let (result, returned) ← if direct then
         (DirectInterpreter.interpret storage program ref).run ref
-      else (interpret storage replayFuel program ref).run ref
+      else (interpret storage (workQueue) replayFuel program ref).run ref
       assertOutcome result (.ok 1)
       returned.modify fun world => { world with nextBlob := 777 }
       assertEq (← ref.get).nextBlob 777 "Interpreter returned a different IO handle"⟩,

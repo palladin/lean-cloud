@@ -42,9 +42,15 @@ during replay; an external action may run again if interrupted before its result
 is recorded.
 
 The current implementation provides direct and replay interpreters over abstract
-storage. Both currently execute parallel branches sequentially in array order.
-Distributed workers, on-premises and cloud adapters, choice, and cancellation are
-future work.
+storage. The direct interpreter is a simple, structurally recursive reference:
+it runs parallel children in array order and needs no fuel or scheduling policy.
+
+Replay takes work from an environment-provided [queue](LeanCloud/WorkQueue.lean).
+The environment retains pending locations and the final outcome across restarts;
+the interpreter executes each selected location without a discovery pass.
+Branches may interleave, while results retain their original array order.
+Execution currently uses one thread. Distributed workers, on-premises and cloud
+adapters, choice, and cancellation are future work.
 
 Build and run the tests with the pinned Lean toolchain:
 
@@ -54,5 +60,13 @@ lake test
 ```
 
 The [test suite](LeanCloudTests/README.md) compares the interpreters and checks
-recovery after interruption. The [formal equivalence statement](LeanCloud/Proofs/Equivalence.lean)
-is defined; its proof is still pending.
+recovery after interruption. The [equivalence proof](LeanCloud/Proofs/WholeRun.lean)
+establishes the same result or error and final external state for fresh runs in
+the ideal model, with lawful codecs, enough fuel, and a queue that preserves the
+direct interpreter's effect order. Arbitrary reordering of stateful effects can
+change results; restart correctness and concurrent workers are not covered by
+this theorem.
+
+[Queue fairness laws](LeanCloud/Proofs/WorkQueue.lean) separately prove that every
+pending location is eventually selected, assuming the environment satisfies the
+laws and workers keep polling.

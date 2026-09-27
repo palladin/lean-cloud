@@ -1,5 +1,5 @@
 import LeanCloud.Proofs.Assumptions
-import LeanCloud.ReplayInterpreter
+import LeanCloud.Result
 import Init.Data.Array.Monadic
 
 /-! Round-trip laws for the codecs and journal records used by replay. -/

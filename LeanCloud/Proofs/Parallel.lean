@@ -1,4 +1,4 @@
-import LeanCloud.ReplayInterpreter
+import LeanCloud.Result
 import Init.Data.Array.Monadic
 
 /-! Laws for the actual parallel-result bookkeeping used by replay.

@@ -1,48 +1,14 @@
 import LeanCloud.Core
-import LeanCloud.Location
 import LeanCloud.Storage
+import LeanCloud.WorkQueue
+import LeanCloud.Result
 
-/-! Location-directed replay interpreter.
-Each step reconstructs execution from recorded results at a location, then advances
-until suspension or completion. Continuations are rebuilt through replay. -/
+/-! Replay of locations supplied by the environment. Each step reconstructs its
+computation and advances one effect, fork, join, or completion. The environment
+retains pending work and the final outcome across restarts. -/
 
-namespace LeanCloud
+namespace LeanCloud.ReplayInterpreter.Internal
 open Lean LeanEff
-
-/-- Only outcomes and partial groups are stored; computations remain local. -/
-inductive Result where
-  | completed (outcome : Exit)
-  | suspended (children : Array (Option Exit))
-  deriving Repr, BEq, ToJson, FromJson
-
-namespace Result
-
-/-- Parallel resumes once every child has a result, in the original array order. -/
-def settle (children : Array (Option Exit)) : Result :=
-  match children.mapM id with
-  | none => .suspended children
-  | some outcomes =>
-    match outcomes.mapM (fun outcome => match outcome with
-      | .success value => Except.ok value
-      | outcome => Except.error outcome) with
-    | .ok values => .completed (.success (Json.arr values))
-    | .error outcome => .completed outcome
-
-def recordChild (result : Result) (index : Nat) (outcome : Exit) : Except CloudError Result := do
-  match result with
-  | .completed _ => return result
-  | .suspended children =>
-    if index ≥ children.size then throw ⟨.protocol, "Child is outside the suspended group"⟩
-    if let some existing := children[index]! then
-      if existing == outcome then return result
-      throw ⟨.divergence, "Child completion changed during replay"⟩
-    return settle (children.set! index (some outcome))
-
-end Result
-
-open Result (settle recordChild)
-
-namespace ReplayInterpreter.Internal
 
 def load [Monad m] (storage : Storage σ m) (location : Location) :
     ExceptT CloudError (StateT σ m) (Option Result) := do
@@ -61,148 +27,141 @@ def decode [Monad m] (codec : Codec α) (value : Json) : ExceptT CloudError m α
   | .ok value => pure value
   | .error message => throw ⟨.codec, message⟩
 
-/-- A completed value or the location of an unresolved parallel group. -/
-inductive StepResult where
-  | done (value : Json) (location : Location) (remainingFuel : Nat)
-  | suspended (location : Location) (remainingFuel : Nat)
-  deriving Repr
+def decodeGroup [Monad m] (codec : Codec α) (count : Nat) (value : Json) :
+    ExceptT CloudError m (Array α) := do
+  let _ : Codec α := codec
+  let values ← decode (inferInstance : Codec (Array α)) value
+  if values.size != count then throw ⟨.divergence, "Parallel child count changed"⟩
+  return values
 
-/-- Reconstruct the requested location, then run to the next unresolved group.
-The loop uses encoded branch results so descending into a child can change its
-Lean result type without changing the loop's type. Parent code is rebuilt from root.
-Running the action returns `m (Except CloudError StepResult × σ)`, retaining storage
-updates even when stepping ends in an error. -/
-def step {σ : Type} {m : Type → Type} [Monad m] (storage : Storage σ m)
-    (fuel : Nat) (root : Cloud m Json) (location : Location) :
+/-- Commit a terminal child and wake its parent only when all slots are filled.
+Updating the child before its parent permits recovery of either committed prefix. -/
+def finish [Monad m] (storage : Storage σ m) (current : Location) (outcome : Exit) :
     ExceptT CloudError (StateT σ m) StepResult := do
-  if location.isEmpty || location[0]!.1 != 0 then
-    throw ⟨.protocol, "A location must begin with the root branch 0"⟩
-  walk fuel root Location.root location
-where
-  walk (fuel : Nat) (program : Cloud m Json) (current target : Location) :
-      ExceptT CloudError (StateT σ m) StepResult :=
-    match fuel with
-    | 0 => throw ⟨.protocol, "Interpreter fuel exhausted"⟩
-    | fuel + 1 =>
-      let finish (outcome : Exit) (target : Location) : ExceptT CloudError (StateT σ m) StepResult := do
-        if current.before target then
-          throw (⟨.divergence, "Computation ended before the requested location"⟩ : CloudError)
-        match ← load storage current with
-        | none => save storage current (.completed outcome)
-        | some (.completed recorded) =>
-          if recorded != outcome then
-            throw ⟨.divergence, "Completion changed during replay"⟩
-        | some (.suspended ..) => throw ⟨.divergence, "Expected a completed computation"⟩
-        match current.parent? with
-        | none =>
-          match outcome with
-          | .success value => return StepResult.done value current fuel
-          | .failure error => throw error
-          | .cancelled _ => throw ⟨.unsupported, "Cancellation is not implemented yet"⟩
-        | some (parent, index) =>
-          let some group ← load storage parent | throw ⟨.protocol, "Missing parent suspension"⟩
-          let updated ← match recordChild group index outcome with
-            | .ok value => pure value
-            | .error error => throw error
-          save storage parent updated
-          match updated with
-          | .suspended _ => return StepResult.suspended parent fuel
-          | .completed _ =>
-            -- Rebuilding restores the parent's lexical environment and continuation.
-            walk fuel root Location.root parent
+  match ← load storage current with
+  | none => save storage current (.completed outcome)
+  | some (.completed recorded) =>
+    if recorded != outcome then throw ⟨.divergence, "Completion changed during replay"⟩
+  | some (.suspended _) => throw ⟨.divergence, "Expected a completed computation"⟩
+  match current.parent? with
+  | none => return .done outcome
+  | some (parent, index) =>
+    let some group ← load storage parent | throw ⟨.protocol, "Missing parent suspension"⟩
+    let updated ← match Result.recordChild group index outcome with
+      | .ok result => pure result
+      | .error error => throw error
+    save storage parent updated
+    match updated with
+    | .suspended _ => return .runnable #[]
+    | .completed _ => return .runnable #[parent]
 
-      let sequential {β : Type} (request : Operation m β) (codec : Codec β)
-          (resume : β → Cloud m Json) : ExceptT CloudError (StateT σ m) StepResult := do
+/-- Reconstruct a selected location. Recorded prefixes consume traversal fuel,
+but never call the chooser or repeat primitive effects. -/
+def walk [Monad m] (storage : Storage σ m) (fuel : Nat)
+    (program : Cloud m Json) (current target : Location) :
+    ExceptT CloudError (StateT σ m) StepResult :=
+  match fuel with
+  | 0 => throw ⟨.protocol, "Interpreter fuel exhausted"⟩
+  | fuel + 1 =>
+    match program with
+    | .pure value =>
+      if current == target then finish storage current (.success value)
+      else throw ⟨.divergence, "Computation ended before the requested location"⟩
+    | .impure request continuation =>
+      match request, continuation with
+      | .delay, continuation => walk storage fuel (ArrsF.apply continuation ()) current target
+      | .fail error, _ =>
+        if current == target then finish storage current (.failure error)
+        else throw ⟨.divergence, "Computation ended before the requested location"⟩
+      | .choice .., _ => throw ⟨.unsupported, "Choice is not implemented yet"⟩
+      | .sequential codec operation, continuation => do
         let outcome ← match ← load storage current with
           | some (.completed outcome) => pure outcome
-          | some (.suspended ..) => throw ⟨.divergence, "Expected a sequential result"⟩
+          | some (.suspended _) => throw ⟨.divergence, "Expected a sequential result"⟩
           | none => do
-            if current.before target then throw ⟨.divergence, "Missing replay result"⟩
+            if current != target then throw ⟨.divergence, "Missing replay result"⟩
             let outcome ← try
-              pure (.success (codec.encode (← storage.execute request)))
+              pure (.success (codec.encode (← storage.execute operation)))
             catch error => pure (.failure error)
             save storage current (.completed outcome)
             pure outcome
         match outcome with
         | .success value =>
           let value ← decode codec value
-          walk fuel (resume value) current.next target
-        | outcome => finish outcome target
-
-      let parallel {β : Type} (codec : Codec β) (count : Nat)
-          (branches : Fin count → Cloud m β) (resume : Array β → Cloud m Json) :
-          ExceptT CloudError (StateT σ m) StepResult := do
-        if current.entersChild target && target[current.size]!.1 ≥ count then
-          throw ⟨.protocol, "Child index is outside the group"⟩
-        let result ← match ← load storage current with
-          | some result => pure result
-          | none => do
-            if current.before target then throw ⟨.divergence, "Missing replay suspension"⟩
-            let result := settle (Array.replicate count none)
-            save storage current result
-            pure result
+          if current == target then return .runnable #[current.next]
+          else walk storage fuel (ArrsF.apply continuation value) current.next target
+        | outcome =>
+          if current == target then finish storage current outcome
+          else throw ⟨.divergence, "Computation ended before the requested location"⟩
+      | .parallel codec count branches, continuation => do
+        let existing ← load storage current
+        if current == target && existing.isNone then
+          save storage current (Result.settle (Array.replicate count none))
+          return .runnable (if count == 0 then #[current] else Array.ofFn fun i : Fin count => current.child i.val)
+        let some result := existing | throw ⟨.divergence, "Missing replay suspension"⟩
         match result with
         | .completed (.success value) =>
-          let _ : Codec β := codec
-          let value ← decode (inferInstance : Codec (Array β)) value
-          -- A completed ancestor group no longer needs its requested child resumed.
-          let target := if current.entersChild target then current.next else target
-          walk fuel (resume value) current.next target
+          let values ← decodeGroup codec count value
+          if current == target then return .runnable #[current.next]
+          else walk storage fuel (ArrsF.apply continuation values) current.next target
         | .completed outcome =>
-          finish outcome (if current.entersChild target then current else target)
+          if current == target then finish storage current outcome
+          else throw ⟨.divergence, "Computation ended before the requested location"⟩
         | .suspended children =>
-          if children.size != count then
-            throw ⟨.divergence, "Parallel child count changed"⟩
-          if current.entersChild target then
-            let index := target[current.size]!.1
-            if h : index < count then
-              walk fuel (codec.encode <$> branches ⟨index, h⟩) (current.child index) target
-            else throw ⟨.protocol, "Child index is outside the group"⟩
-          else if current.before target then
-            throw ⟨.divergence, "Earlier suspension has no complete result"⟩
-          else return StepResult.suspended current fuel
+          if children.size != count then throw ⟨.divergence, "Parallel child count changed"⟩
+          if current == target then
+            return .runnable ((Array.ofFn fun i : Fin count => i.val).filterMap fun i =>
+              if children[i]!.isNone then some (current.child i) else none)
+          if !current.entersChild target then throw ⟨.divergence, "Earlier suspension has no complete result"⟩
+          let index := target[current.size]!.1
+          if inside : index < count then
+            walk storage fuel (codec.encode <$> branches ⟨index, inside⟩) (current.child index) target
+          else throw ⟨.protocol, "Child index is outside the group"⟩
 
-      match program with
-      | .pure value => finish (.success value) target
-      | .impure request continuation =>
-        match request, continuation with
-        | .delay, continuation => walk fuel (ArrsF.apply continuation ()) current target
-        | .fail error, _ => finish (.failure error) target
-        | .parallel codec count branches, continuation =>
-          parallel codec count branches (ArrsF.apply continuation)
-        | .choice .., _ => throw ⟨.unsupported, "Choice is not implemented yet"⟩
-        | .sequential codec operation, continuation =>
-          sequential operation codec (ArrsF.apply continuation)
+def step [Monad m] (storage : Storage σ m) (fuel : Nat)
+    (root : Cloud m Json) (location : Location) : ExceptT CloudError (StateT σ m) StepResult := do
+  if location.isEmpty || location[0]!.1 != 0 then
+    throw ⟨.protocol, "A location must begin with the root branch 0"⟩
+  -- A crash can leave the last child queued after its parent result was saved.
+  -- Retry the queue update by publishing the parent's join, without descending
+  -- through a group whose result has already replaced its suspended children.
+  if let some (parent, _) := location.parent? then
+    if let some (.completed _) ← load storage parent then
+      return .runnable #[parent]
+  walk storage fuel root Location.root location
 
-end ReplayInterpreter.Internal
+def result [Monad m] [codec : Codec α] (outcome : Exit) : ExceptT CloudError m α :=
+  match outcome with
+  | .success value => decode codec value
+  | .failure error => throw error
+  | .cancelled _ => throw ⟨.unsupported, "Cancellation is not implemented yet"⟩
 
-open ReplayInterpreter.Internal
+def run [Monad m] [Codec α] (storage : Storage σ m) (queue : WorkQueue σ m) (fuel : Nat)
+    (root : Cloud m Json) : ExceptT CloudError (StateT σ m) α :=
+  match fuel with
+  | 0 => throw ⟨.protocol, "Interpreter fuel exhausted"⟩
+  | fuel + 1 => do
+    match ← queue.next with
+    | .completed outcome => result outcome
+    | .idle => run storage queue fuel root
+    | .item location =>
+      let update ← step storage (fuel + 1) root location
+      queue.complete location update
+      match update with
+      | .done outcome => result outcome
+      | .runnable _ => run storage queue fuel root
 
-/-- Run a program to its final result, driving unfinished parallel children in array
-order. Suspension and replay locations stay internal. Running with an initial storage
-state returns `m (Except CloudError α × σ)`, preserving writes even on failure. -/
+end LeanCloud.ReplayInterpreter.Internal
+
+namespace LeanCloud
+open Lean ReplayInterpreter.Internal
+
+/-- Run work supplied by the environment until the root completes. Fuel bounds
+queue polls and each reconstruction traversal. A new environment starts with the
+root item; a restart reuses the same queue, journal, program, and input. -/
 def interpret {σ ι α : Type} {m : Type → Type} [Monad m] [Codec α]
-    (storage : Storage σ m) (fuel : Nat) (program : ι → Cloud m α) (input : ι) :
-    ExceptT CloudError (StateT σ m) α :=
-  run fuel (Codec.encode <$> program input) Location.root
-where
-  run (fuel : Nat) (root : Cloud m Json) (location : Location) :
-      ExceptT CloudError (StateT σ m) α := do
-    match ← step storage fuel root location with
-    | .done value _ _ => decode (inferInstance : Codec α) value
-    | .suspended location remainingFuel =>
-      let nextLocation ← match ← load storage location with
-        | some (.suspended children) =>
-          let some index := children.findIdx? Option.isNone
-            | throw ⟨.protocol, "Suspended parallel has no unfinished child"⟩
-          pure (location.child index)
-        | some (.completed _) => pure location
-        | none => throw ⟨.protocol, "Missing parallel suspension"⟩
-      if _h : remainingFuel < fuel then
-        run remainingFuel root nextLocation
-      else
-        throw ⟨.protocol, "Step did not consume fuel"⟩
-  termination_by fuel
-  decreasing_by exact _h
+    (storage : Storage σ m) (queue : WorkQueue σ m) (fuel : Nat)
+    (program : ι → Cloud m α) (input : ι) : ExceptT CloudError (StateT σ m) α :=
+  run storage queue fuel (Codec.encode <$> program input)
 
 end LeanCloud

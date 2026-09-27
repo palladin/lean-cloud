@@ -2,8 +2,8 @@ import LeanCloud.Proofs.Parallel
 import LeanCloud.Proofs.Assumptions
 
 /-! Encoding an ordered prefix of child outcomes into the runtime's partial
-result array. The first missing slot determines the next child; a full array
-selects the same values or error as direct evaluation. -/
+result array. The ideal queue visits children in this order; a full array selects the same
+values or error as direct evaluation. -/
 
 namespace LeanCloud.Proofs
 open Lean
@@ -79,21 +79,6 @@ theorem parallelSlots_get_pending (codec : Codec α) (count : Nat)
   have size := parallelSlots_size codec count outcomes (by omega)
   rw [getElem!_pos (parallelSlots codec count outcomes) index (by omega)]
   simp [parallelSlots, Array.getElem_append, Nat.not_lt_of_ge pending]
-
-/-- The actual driver selects precisely the next child after the executed prefix. -/
-theorem parallelSlots_select (codec : Codec α) (count : Nat)
-    (outcomes : Array (Except CloudError α)) (inside : outcomes.size < count) :
-    (parallelSlots codec count outcomes).findIdx? Option.isNone = some outcomes.size := by
-  apply Array.findIdx?_eq_some_iff_getElem.mpr
-  have size := parallelSlots_size codec count outcomes (by omega)
-  refine ⟨by omega, ?_, ?_⟩
-  · have empty := parallelSlots_get_pending codec count outcomes outcomes.size (by omega) inside
-    rw [getElem!_pos _ _ (by omega)] at empty
-    simp [empty]
-  · intro index earlier
-    have filled := parallelSlots_get_finished codec count outcomes index earlier
-    rw [getElem!_pos _ _ (by omega)] at filled
-    simp [filled]
 
 /-- Filling the next slot extends exactly the ordered prefix. -/
 theorem parallelSlots_update (codec : Codec α) (count : Nat)

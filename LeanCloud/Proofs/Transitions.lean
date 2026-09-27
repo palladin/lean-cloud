@@ -3,7 +3,7 @@ import LeanCloud.Proofs.ReplayRoute
 /-! Build replay routes as execution advances through effects and descends into
 parallel branches. Routes depend on journal records, not external state. -/
 
-namespace LeanCloud.Proofs
+namespace LeanCloud.Proofs.ReplayModel
 open Lean LeanEff ReplayInterpreter.Internal
 
 namespace ReplayRoute
@@ -60,12 +60,12 @@ theorem advance_parallel {α : Type} {codec : Codec α} {count : Nat}
     {continuation : ArrsF (Control (StateM World)) (Array α) Json}
     (route : ReplayRoute journal program current
       (.impure (.parallel codec count branches) continuation) target steps)
-    (law : CodecLaw codec) (values : Array α)
+    (law : CodecLaw codec) (values : Array α) (size : values.size = count)
     (recorded : journal target.key =
       some (toJson (Result.completed (.success (Json.arr (values.map codec.encode)))))) :
     ReplayRoute journal program current (ArrsF.apply continuation values)
       target.next (steps + 1) := by
-  exact route.extend (.parallel law recorded .here)
+  exact route.extend (.parallel law size recorded .here)
 
 /-- Select the original child program within its enclosing replay route. -/
 theorem enter_child {α : Type} {codec : Codec α} {count : Nat}
@@ -93,4 +93,4 @@ theorem enter_child {α : Type} {codec : Codec α} {count : Nat}
         (Location.entersChild_child enters index.val) selected' descended)
 
 end ReplayRoute
-end LeanCloud.Proofs
+end LeanCloud.Proofs.ReplayModel

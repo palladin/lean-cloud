@@ -2,11 +2,9 @@ import LeanCloud.Proofs.ReplayPrefix
 
 /-! Reconstruction from the workflow root into nested branches. A route composes
 certified sequential prefixes with descent through recorded partial groups. The
-proofs apply to the existing `step` and `step.walk`, including their fuel budgets.
-`Proofs.Transitions` constructs these certificates for fresh effects, suspension,
-and child selection. `Proofs.WholeRun` establishes full fresh-run equivalence. -/
+proofs apply to the current `step` and `walk`, including their fuel budgets. -/
 
-namespace LeanCloud.Proofs
+namespace LeanCloud.Proofs.ReplayModel
 open Lean LeanEff ReplayInterpreter.Internal
 
 /-- A route to a computation reconstructed from recorded prefixes and partial
@@ -68,17 +66,16 @@ theorem root_branch (route : ReplayRoute journal program current remaining targe
     rw [segment.same_depth] at forkNonempty
     exact ih.trans ((Location.child_root_branch _ forkNonempty _).trans (segment.root_branch nonempty))
 
-/-- Reconstructing the complete route is identical to starting at the remaining
-computation with the remaining fuel, journal, and external world. -/
+/-- Root reconstruction and local reconstruction have identical observations. -/
 theorem reconstruct (route : ReplayRoute journal program current remaining target steps)
-    (root : Cloud (StateM World) Json) (fuel : Nat) (world : World) :
-    (step.walk (modelStorage blobs) root (fuel + steps) program current target).run journal world =
-    (step.walk (modelStorage blobs) root fuel remaining target target).run journal world := by
+    (fuel : Nat) (world : World) (pending : List Location) (completed : Option Exit) :
+    (walk (storage blobs) (fuel + steps) program current target).run ⟨journal, pending, completed⟩ world =
+      (walk (storage blobs) fuel remaining target target).run ⟨journal, pending, completed⟩ world := by
   induction route with
-  | leaf nonempty segment => exact segment.reconstruct root fuel world nonempty
+  | leaf nonempty segment => exact segment.reconstruct fuel world pending completed nonempty
   | child nonempty segment recorded size enters selected _ ih =>
-    have whole := (segment.reconstruct_towards root _ world _ (Or.inr enters) nonempty).trans
-      ((walk_parallel_child blobs root _ _ _ _ _ _ _ _ world _ size enters _ selected recorded).trans ih)
+    have whole := (segment.reconstruct_towards _ world pending completed _ (Or.inr enters) nonempty).trans
+      ((walk_parallel_child blobs _ _ _ _ _ _ _ ⟨journal, pending, completed⟩ world _ size enters _ selected recorded).trans ih)
     simpa only [Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using whole
 
 /-- Route reconstruction remains valid after changing completed-group records
@@ -96,22 +93,35 @@ theorem preserve {updated : Journal}
     have kept := ancestors _ forkNonempty (Location.entersChild_size enters)
     exact .child nonempty (segment.preserve completed) (kept.trans recorded) size enters selected (ih ancestors)
 
-/-- The actual `step` entry point accepts the route's target as a valid root-based
-location and reconstructs the requested nested computation. -/
+/-- The parent of the selected item is still waiting for its result. -/
+def ParentOpen (journal : Journal) (location : Location) : Prop :=
+  ∀ parent index, location.parent? = some (parent, index) →
+    ∃ children, journal parent.key = some (toJson (Result.suspended children))
+
+/-- The entry point validates the location and reconstructs the requested body.
+For fresh executions its parent remains suspended; the completed-parent retry
+shortcut is reserved for recovery and does not intervene here. -/
 theorem from_root {root : Cloud (StateM World) Json}
     (route : ReplayRoute journal root Location.root remaining target steps)
-    (fuel : Nat) (world : World) :
-    (step (modelStorage blobs) (fuel + steps) root target).run journal world =
-    (step.walk (modelStorage blobs) root fuel remaining target target).run journal world := by
-  have nonempty := route.depth_le
-  simp only [Location.size_root] at nonempty
+    (parentOpen : ParentOpen journal target)
+    (fuel : Nat) (world : World) (pending : List Location) :
+    (step (storage blobs) (fuel + steps) root target).run ⟨journal, pending, none⟩ world =
+      (walk (storage blobs) fuel remaining target target).run ⟨journal, pending, none⟩ world := by
+  have depth := route.depth_le
+  simp only [Location.size_root] at depth
   have notEmpty : target.isEmpty = false := by
     simp [Array.isEmpty, Nat.ne_of_gt (by omega : 0 < target.size)]
   have rootBranch : target[0]!.1 = 0 := route.root_branch
   rw [step]
-  simp only [notEmpty, rootBranch, bne_self_eq_false, Bool.false_or,
-    Bool.false_eq_true, ↓reduceIte]
-  exact route.reconstruct root fuel world
+  simp only [notEmpty, rootBranch, bne_self_eq_false, Bool.false_or, Bool.false_eq_true, ↓reduceIte]
+  cases parentEq : target.parent? with
+  | none =>
+    exact route.reconstruct fuel world pending none
+  | some pair =>
+    obtain ⟨parent, index⟩ := pair
+    obtain ⟨children, recorded⟩ := parentOpen parent index parentEq
+    simp only [run_bind, load_recorded blobs ⟨journal, pending, none⟩ world parent _ recorded]
+    exact route.reconstruct fuel world pending none
 
 end ReplayRoute
-end LeanCloud.Proofs
+end LeanCloud.Proofs.ReplayModel

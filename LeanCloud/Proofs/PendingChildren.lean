@@ -4,7 +4,7 @@ import LeanCloud.Proofs.Traversal
 supplies its traversal proof, retaining the original branch function and index.
 `ChildrenEvaluation.pending` builds the plan from direct evaluation. -/
 
-namespace LeanCloud.Proofs
+namespace LeanCloud.Proofs.ReplayModel
 open Lean LeanEff
 
 inductive PendingChildren {World α : Type} (blobs : BlobModel World) (codec : Codec α)
@@ -65,4 +65,4 @@ theorem ChildrenEvaluation.pending {World α : Type} {blobs : BlobModel World} (
     omega
 termination_by structural execution
 
-end LeanCloud.Proofs
+end LeanCloud.Proofs.ReplayModel

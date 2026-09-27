@@ -1,6 +1,6 @@
 import LeanCloud.Core
 
-/-! Assumptions for the first interpreter-equivalence theorem. These predicates
+/-! Codec laws and the supported program fragment. These predicates
 describe programs without changing the runtime effect algebra or codecs. -/
 
 namespace LeanCloud.Proofs
@@ -12,7 +12,7 @@ def CodecLaw (codec : Codec α) : Prop :=
   ∀ value, codec.decode (codec.encode value) = .ok value
 
 mutual
-  /-- The fragment covered by the first equivalence theorem. All embedded codecs
+  /-- The supported fragment used by the direct-evaluation proofs. All embedded codecs
   must round-trip, and choice is excluded. Continuations are checked for every
   possible argument, not just arguments reached in one particular execution. -/
   def Supported {m : Type → Type} {α : Type} (program : Cloud m α) : Prop :=

@@ -89,4 +89,19 @@ theorem modelStorage_execute_direct (blobs : BlobModel World)
       rcases transferred with ⟨⟨rfl, _⟩, rfl⟩
       exact emptyRun
 
+/-- Evaluate a monadic bind at concrete journal and world states. -/
+theorem run_bind_state {World α β : Type}
+    (action : ExceptT CloudError (StateT Journal (StateM World)) α)
+    (next : α → ExceptT CloudError (StateT Journal (StateM World)) β)
+    (journal : Journal) (world : World) :
+    (action >>= next).run journal world =
+      let ((outcome, journal'), world') := action.run journal world
+      match outcome with
+      | .ok value => (next value).run journal' world'
+      | .error error => ((.error error, journal'), world') := by
+  dsimp [ExceptT.run, bind, ExceptT.bind, ExceptT.bindCont, StateT.bind]
+  cases action journal world with
+  | mk pair world' => cases pair with
+    | mk outcome journal' => cases outcome <;> rfl
+
 end LeanCloud.Proofs

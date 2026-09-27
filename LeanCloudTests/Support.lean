@@ -36,6 +36,8 @@ structure World where
   rejectBlobPuts : Bool := false
   crashAfterPut : Option Nat := none
   crashBeforePut : Option Nat := none
+  pending : Array Location := #[Location.root]
+  completed : Option Exit := none
 
 abbrev Ref := IO.Ref World
 abbrev Program (α : Type) := Ref → Cloud IO α
@@ -111,13 +113,53 @@ def assertObservations (actual expected : World) : IO Unit := do
 
 def replayFuel : Nat := 200000
 
+/-- Test policies belong to the queue model, not either interpreter. -/
+abbrev Select := (pending : Array Location) → 0 < pending.size → IO (Fin pending.size)
+
+def selectFirst : Select := fun _ nonempty => pure ⟨0, nonempty⟩
+def selectLast : Select := fun pending nonempty => pure ⟨pending.size - 1, by omega⟩
+
+private def earlier : List (Nat × Nat) → List (Nat × Nat) → Bool
+  | [], [] => false
+  | [], _ :: _ => true
+  | _ :: _, [] => false
+  | (branch, command) :: rest, (otherBranch, otherCommand) :: other =>
+    if branch != otherBranch then branch < otherBranch
+    else if command != otherCommand then command < otherCommand
+    else earlier rest other
+
+def orderedLocations (locations : Array Location) : Array Location :=
+  let unique := locations.foldl (fun found location =>
+    if found.contains location then found else found.push location) #[]
+  unique.qsort fun a b => earlier a.toList b.toList
+
+def updateWork (world : World) (location : Location) (update : StepResult) : World :=
+  match update with
+  | .done outcome => { world with pending := #[], completed := some outcome }
+  | .runnable locations => { world with
+      pending := orderedLocations (world.pending.filter (· != location) ++ locations) }
+
+/-- The selected item remains pending until the interpreter publishes its update. -/
+def workQueue (select : Select := selectFirst) : WorkQueue Ref IO where
+  next ref := do
+    let world ← ref.get
+    if let some outcome := world.completed then return (.completed outcome, ref)
+    if nonempty : 0 < world.pending.size then
+      let index ← select world.pending nonempty
+      return (.item world.pending[index], ref)
+    else return (.idle, ref)
+  complete location update ref := do
+    ref.modify (fun world => updateWork world location update)
+    return ((), ref)
+
 def runDirect (program : Program α) (ref : Ref) : IO (Except CloudError α) := do
   let (result, _) ← (DirectInterpreter.interpret storage program ref).run ref
   return result
 
-def runReplay [Codec α] (program : Program α) (ref : Ref) (fuel : Nat := replayFuel) :
+def runReplay [Codec α] (program : Program α) (ref : Ref) (fuel : Nat := replayFuel)
+    (select : Select := selectFirst) :
     IO (Except CloudError α) := do
-  let (result, _) ← (interpret storage fuel program ref).run ref
+  let (result, _) ← (interpret storage (workQueue select) fuel program ref).run ref
   return result
 
 /-- Fresh-run comparison plus a second replay that must perform no new primitive effects. -/

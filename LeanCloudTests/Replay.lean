@@ -98,6 +98,9 @@ def replayCases : Array TestCase := #[
   ⟨"replay/changed-pure-completion", do
     let ref ← IO.mkRef initial
     assertOutcome (← runReplay (fun _ => pure (1 : Nat)) ref) (.ok 1)
+    -- Revisit the recorded location to check divergence, rather than asking the
+    -- environment for the already completed run's cached final outcome.
+    ref.modify fun world => { world with pending := #[Location.root], completed := none }
     assertError (← runReplay (fun _ => pure (2 : Nat)) ref) .divergence⟩,
   ⟨"replay/distinct-forks-have-distinct-keys", do
     let ref ← IO.mkRef initial

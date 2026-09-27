@@ -1,4 +1,5 @@
-import LeanCloud.Proofs.ReplayInterpreter
+import LeanCloud.Proofs.Model
+import LeanCloud.Proofs.DirectInterpreter
 
 /-! Direct evaluation never reads or changes the replay journal. This is proved
 for the actual evaluator, including all children of nested parallel groups. -/

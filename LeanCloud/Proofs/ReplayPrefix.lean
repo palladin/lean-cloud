@@ -1,11 +1,11 @@
-import LeanCloud.Proofs.ReplayInterpreter
+import LeanCloud.Proofs.ReplayStep
 import LeanCloud.Proofs.Storage
 
 /-! Replay a branch's recorded prefix without re-executing its effects.
 The certificate tracks recorded values and locations. `Evaluation` separately
 proves where those values and the external-state changes came from. -/
 
-namespace LeanCloud.Proofs
+namespace LeanCloud.Proofs.ReplayModel
 open Lean LeanEff ReplayInterpreter.Internal
 
 /-- A recorded prefix connects two computations and their locations.
@@ -32,7 +32,7 @@ inductive ReplayPrefix {World : Type} (journal : Journal) :
   | parallel {α : Type} {codec : Codec α} {count : Nat}
       {branches : Fin count → Cloud (StateM World) α}
       {continuation current remaining target steps values}
-      (law : CodecLaw codec)
+      (law : CodecLaw codec) (size : values.size = count)
       (recorded : journal current.key =
         some (toJson (Result.completed (.success (Json.arr (values.map codec.encode)))))) :
       ReplayPrefix journal (ArrsF.apply continuation values) current.next
@@ -61,9 +61,9 @@ theorem trans {middle : Cloud (StateM World) Json} {middleLocation : Location}
   | sequential law recorded _ ih =>
     simpa [Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using
       ReplayPrefix.sequential law recorded (ih second)
-  | parallel law recorded _ ih =>
+  | parallel law size recorded _ ih =>
     simpa [Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using
-      ReplayPrefix.parallel law recorded (ih second)
+      ReplayPrefix.parallel law size recorded (ih second)
 
 /-- Preserving completed records preserves the replay certificate. -/
 theorem preserve {updated : Journal}
@@ -76,8 +76,8 @@ theorem preserve {updated : Journal}
   | delay _ ih => exact .delay ih
   | sequential law recorded _ ih =>
     exact .sequential law (preserved _ _ recorded) ih
-  | parallel law recorded _ ih =>
-    exact .parallel law (preserved _ _ recorded) ih
+  | parallel law size recorded _ ih =>
+    exact .parallel law size (preserved _ _ recorded) ih
 
 theorem same_depth
     (certificate : ReplayPrefix journal program current
@@ -86,7 +86,7 @@ theorem same_depth
   | here => rfl
   | delay _ ih => exact ih
   | sequential _ _ _ ih => simpa only [Location.size_next] using ih
-  | parallel _ _ _ ih => simpa only [Location.size_next] using ih
+  | parallel _ _ _ _ ih => simpa only [Location.size_next] using ih
 
 theorem command_le
     (certificate : ReplayPrefix journal program current
@@ -95,7 +95,7 @@ theorem command_le
   induction certificate with
   | here => exact Nat.le_refl _
   | delay _ ih => exact ih nonempty
-  | sequential _ _ _ ih | parallel _ _ _ ih =>
+  | sequential _ _ _ ih | parallel _ _ _ _ ih =>
     have nextBound := ih (Location.next_nonempty _ nonempty)
     simp only [Location.size_next] at nextBound
     have advance := Location.next_command _ nonempty
@@ -109,7 +109,7 @@ theorem keeps_ancestor
   induction certificate with
   | here => exact enters
   | delay _ ih => exact ih enters
-  | sequential _ _ _ ih | parallel _ _ _ ih => exact ih (Location.entersChild_next enters)
+  | sequential _ _ _ ih | parallel _ _ _ _ ih => exact ih (Location.entersChild_next enters)
 
 theorem branch_at
     (certificate : ReplayPrefix journal program current
@@ -118,56 +118,65 @@ theorem branch_at
   induction certificate with
   | here => rfl
   | delay _ ih => exact ih inside
-  | sequential _ _ _ ih | parallel _ _ _ ih =>
+  | sequential _ _ _ ih | parallel _ _ _ _ ih =>
     exact (ih (by simpa using inside)).trans (Location.next_branch _ index inside)
 
 theorem root_branch (certificate : ReplayPrefix journal program current remaining target steps)
     (nonempty : 0 < current.size) : target[0]!.1 = current[0]!.1 :=
   certificate.branch_at 0 nonempty
 
-/-- A prefix can be reconstructed while targeting a descendant of its endpoint.
-Earlier completed groups cannot redirect replay into the wrong child. -/
+private theorem earlier_ne_requested {current target requested : Location}
+    (depth : current.size = target.size)
+    (earlier : current[current.size - 1]!.2 < target[target.size - 1]!.2)
+    (aligned : target = requested ∨ target.entersChild requested = true) : current ≠ requested := by
+  intro equal
+  rcases aligned with rfl | enters
+  · subst current
+    exact Nat.lt_irrefl _ earlier
+  · have deeper := Location.entersChild_size enters
+    rw [equal] at depth
+    omega
+
+/-- Recorded prefixes reconstruct the selected computation without executing
+any primitive effect or changing any part of the environment state. -/
 theorem reconstruct_towards
-    (certificate : ReplayPrefix journal program current
-      remaining target steps)
-    (root : Cloud (StateM World) Json) (fuel : Nat) (replayWorld : World)
+    (certificate : ReplayPrefix journal program current remaining target steps)
+    (fuel : Nat) (world : World) (pending : List Location) (completed : Option Exit)
     (requested : Location) (aligned : target = requested ∨ target.entersChild requested = true)
     (nonempty : 0 < current.size) :
-    (step.walk (modelStorage blobs) root (fuel + steps) program current requested).run
-      journal replayWorld =
-    (step.walk (modelStorage blobs) root fuel remaining target requested).run
-      journal replayWorld := by
+    (walk (storage blobs) (fuel + steps) program current requested).run ⟨journal, pending, completed⟩ world =
+      (walk (storage blobs) fuel remaining target requested).run ⟨journal, pending, completed⟩ world := by
   induction certificate with
   | here => rfl
   | delay _ ih =>
     rw [Nat.add_succ, walk_delay]
     exact ih aligned nonempty
-  | sequential law recorded _ ih =>
-    rw [Nat.add_succ, walk_recorded_sequential blobs root _ _ law _ _ _ _ _ _ _ recorded]
-    exact ih aligned (Location.next_nonempty _ nonempty)
-  | parallel law recorded tail ih =>
+  | sequential law recorded tail ih =>
     have depth := tail.same_depth
     simp only [Location.size_next] at depth
     have later := tail.command_le (Location.next_nonempty _ nonempty)
     simp only [Location.size_next] at later
     have advance := Location.next_command _ nonempty
-    have noChild := Location.earlier_not_enters depth (by omega) aligned
-    rw [Nat.add_succ, walk_recorded_parallel blobs root _ _ law _ _ _ _ _ _ _ _ noChild recorded]
+    have different := earlier_ne_requested depth (by omega) aligned
+    rw [Nat.add_succ, walk_recorded_sequential blobs _ _ law _ _ _ _ _ _ _ different recorded]
+    exact ih aligned (Location.next_nonempty _ nonempty)
+  | parallel law size recorded tail ih =>
+    have depth := tail.same_depth
+    simp only [Location.size_next] at depth
+    have later := tail.command_le (Location.next_nonempty _ nonempty)
+    simp only [Location.size_next] at later
+    have advance := Location.next_command _ nonempty
+    have different := earlier_ne_requested depth (by omega) aligned
+    rw [Nat.add_succ, walk_recorded_parallel blobs _ _ law _ _ _ _ _ _ _ _ size different recorded]
     exact ih aligned (Location.next_nonempty _ nonempty)
 
-/-- Replaying the certified prefix is exactly the same as starting at its
-remaining computation with the remaining fuel. This holds in ANY external world:
-none of the prefix's effects or parallel branches are re-executed. -/
 theorem reconstruct
-    (certificate : ReplayPrefix journal program current
-      remaining target steps)
-    (root : Cloud (StateM World) Json) (fuel : Nat) (replayWorld : World)
+    (certificate : ReplayPrefix journal program current remaining target steps)
+    (fuel : Nat) (world : World) (pending : List Location) (completed : Option Exit)
     (nonempty : 0 < current.size) :
-    (step.walk (modelStorage blobs) root (fuel + steps) program current target).run
-      journal replayWorld =
-    (step.walk (modelStorage blobs) root fuel remaining target target).run
-      journal replayWorld :=
-  certificate.reconstruct_towards root fuel replayWorld target (Or.inl rfl) nonempty
+    (walk (storage blobs) (fuel + steps) program current target).run ⟨journal, pending, completed⟩ world =
+      (walk (storage blobs) fuel remaining target target).run ⟨journal, pending, completed⟩ world :=
+  certificate.reconstruct_towards fuel world pending completed target (Or.inl rfl) nonempty
 
 end ReplayPrefix
-end LeanCloud.Proofs
+end LeanCloud.Proofs.ReplayModel
