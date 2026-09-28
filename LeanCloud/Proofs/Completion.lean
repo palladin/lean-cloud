@@ -1,6 +1,6 @@
 import LeanCloud.Proofs.Codecs
 import LeanCloud.Proofs.Parallel
-import LeanCloud.Proofs.Storage
+import LeanCloud.Proofs.Db
 
 /-! Algebraic laws for the two journal writes made by child completion. -/
 
@@ -55,15 +55,5 @@ theorem Journal.completeChild_other (journal : Journal) (current parent : Locati
     journal.completeChild current parent children index outcome key = journal key := by
   simp only [completeChild, read_write_other _ _ _ _ notParent,
     read_write_other _ _ _ _ notChild]
-
-/-- The child's two writes preserve every record above its parent. -/
-theorem Journal.completeChild_preserves_ancestors (journal : Journal)
-    (current parent : Location) (children : Array (Option Exit)) (index : Nat) (outcome : Exit)
-    (hasParent : current.parent? = some (parent, index)) :
-    journal.PreservesAncestors (journal.completeChild current parent children index outcome) parent := by
-  obtain ⟨parentNonempty, depth⟩ := Location.parent_size hasParent
-  exact (journal.write_preserves_shallower current parent _ (by omega) (by omega)).trans
-    ((journal.write current.key (toJson (Result.completed outcome))).write_preserves_shallower
-      parent parent _ parentNonempty (by omega))
 
 end LeanCloud.Proofs

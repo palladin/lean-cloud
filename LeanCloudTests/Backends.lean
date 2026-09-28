@@ -20,12 +20,14 @@ structure IdWorld where
   pending : Array Location := #[Location.root]
   completed : Option Exit := none
 
-def idStorage : Storage IdWorld Id where
+def idDb : Db IdWorld Id where
   get key := return (← get).records.lookup key
   put key value := do
     modify fun world => { world with
       records := (key, value) :: world.records.filter (fun entry => entry.1 != key) }
     return true
+
+def idBlobs : BlobStorage IdWorld Id where
   putBlob _ := throw ⟨.unsupported, "This fixture has no blobs"⟩
   readBlob _ := throw ⟨.unsupported, "This fixture has no blobs"⟩
   resolveBlob _ := throw ⟨.unsupported, "This fixture has no blobs"⟩
@@ -55,28 +57,25 @@ def backendCases : Array TestCase := #[
       let values ← Cloud.parallel #[pure value, pure (value + 1)]
       return values.foldl (· + ·) 0
     }
-    let (direct, unchanged) := (DirectInterpreter.interpret idStorage program 3).run {}
-    let (replayed, recorded) := (interpret idStorage idQueue replayFuel program 3).run {}
+    let (direct, unchanged) := (DirectInterpreter.interpret idBlobs program 3).run {}
+    let (replayed, recorded) := (interpret idDb idBlobs idQueue replayFuel program 3).run {}
     assertOutcome direct (.ok 9)
     assertOutcome replayed direct
     assertTrue unchanged.records.isEmpty "Direct Id interpretation changed the journal"
     assertTrue (!recorded.records.isEmpty) "Replay Id interpretation lost its state"
-    let (again, _) := (interpret idStorage idQueue replayFuel program 3).run recorded
+    let (again, _) := (interpret idDb idBlobs idQueue replayFuel program 3).run recorded
     assertOutcome again direct⟩,
   ⟨"backend/direct-never-accesses-journal", do
-    let strict : Storage Ref IO := { storage with
-      get := fun _ _ => throw (IO.userError "Unexpected journal read")
-      put := fun _ _ _ => throw (IO.userError "Unexpected journal write") }
     let ref ← IO.mkRef initial
-    let (result, _) ← (DirectInterpreter.interpret strict (fun ref => deep ref 8) ref).run ref
+    let (result, _) ← (DirectInterpreter.interpret blobStorage (fun ref => deep ref 8) ref).run ref
     assertOutcome result (.ok 8)⟩,
   ⟨"backend/returned-io-handle", do
     for direct in [true, false] do
       let ref ← IO.mkRef initial
       let program : Program Nat := fun ref => execValue ref "handle" 1
       let (result, returned) ← if direct then
-        (DirectInterpreter.interpret storage program ref).run ref
-      else (interpret storage (workQueue) replayFuel program ref).run ref
+        (DirectInterpreter.interpret blobStorage program ref).run ref
+      else (interpret db blobStorage (workQueue) replayFuel program ref).run ref
       assertOutcome result (.ok 1)
       returned.modify fun world => { world with nextBlob := 777 }
       assertEq (← ref.get).nextBlob 777 "Interpreter returned a different IO handle"⟩,

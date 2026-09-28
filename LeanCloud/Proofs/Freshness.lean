@@ -1,7 +1,7 @@
 import LeanCloud.Proofs.Completion
 import Init.Data.List.Lex
 
-/-! Fresh journal locations in the sequential reference scheduler. Lexicographic
+/-! Fresh journal locations. Lexicographic
 order follows branch indices, then command indices at each level. It places a
 group before its children and all its descendants before its next command. -/
 
@@ -60,13 +60,47 @@ theorem descendants_earlier_next (location suffix : Location) (nonempty : 0 < lo
   apply lex_append_common
   exact .rel (Or.inr ⟨rfl, by omega⟩)
 
+/-- Every descendant in one child precedes the next sibling's first command. -/
+theorem descendants_earlier_sibling (parent : Location) (index command nextIndex : Nat)
+    (suffix : Location) (later : index < nextIndex) :
+    Earlier (parent.push (index, command) ++ suffix) (parent.child nextIndex) := by
+  simp only [Earlier, child, Array.toList_push, Array.toList_append, List.append_assoc]
+  apply lex_append_common parent.toList
+  exact .rel (Or.inl later)
+
+theorem command_earlier_extension (parent : Location) (branch first last : Nat)
+    (suffix : Location) (later : first < last) :
+    Earlier (parent.push (branch, first)) (parent.push (branch, last) ++ suffix) := by
+  simp only [Earlier, Array.toList_push, Array.toList_append, List.append_assoc]
+  apply lex_append_common parent.toList
+  exact .rel (Or.inr ⟨rfl, later⟩)
+
+theorem command_earlier (parent : Location) (branch first last : Nat)
+    (later : first < last) :
+    Earlier (parent.push (branch, first)) (parent.push (branch, last)) := by
+  simpa using command_earlier_extension parent branch first last #[] later
+
+/-- A branch starts no later than any of its commands or nested descendants. -/
+theorem child_before_extension (parent : Location) (branch command : Nat) (suffix : Location) :
+    parent.child branch = parent.push (branch, command) ++ suffix ∨
+      Earlier (parent.child branch) (parent.push (branch, command) ++ suffix) := by
+  by_cases zero : command = 0
+  · subst command
+    by_cases empty : suffix = #[]
+    · exact Or.inl (by simp [empty, child])
+    · right
+      have notNil : suffix.toList ≠ [] := by simpa using empty
+      obtain ⟨head, tail, elements⟩ := List.exists_cons_of_ne_nil notNil
+      simp only [Earlier, child, Array.toList_push, Array.toList_append, elements,
+        List.append_assoc, List.singleton_append]
+      exact lex_append_common parent.toList (.cons .nil)
+  · exact Or.inr (command_earlier_extension parent branch 0 command suffix (by omega))
+
 /-- The terminal command of any child precedes the following sibling. -/
 theorem child_earlier_sibling (parent : Location) (index command nextIndex : Nat)
     (later : index < nextIndex) :
     Earlier (parent.push (index, command)) (parent.child nextIndex) := by
-  simp only [Earlier, child, Array.toList_push]
-  apply lex_append_common parent.toList
-  exact .rel (Or.inl later)
+  simpa using descendants_earlier_sibling parent index command nextIndex #[] later
 
 theorem shape_of_parent {current parent : Location} {index : Nat}
     (hasParent : current.parent? = some (parent, index)) :
@@ -82,17 +116,6 @@ theorem shape_of_parent {current parent : Location} {index : Nat}
   have equal := Option.some.inj hasParent
   obtain ⟨rfl, rfl⟩ := Prod.mk.inj equal
   exact ⟨command, rfl⟩
-
-theorem earlier_parent_next {current parent : Location} {index : Nat}
-    (hasParent : current.parent? = some (parent, index)) : current.Earlier parent.next := by
-  obtain ⟨command, rfl⟩ := shape_of_parent hasParent
-  have nonempty := (parent_size hasParent).1
-  simpa only [Array.push_eq_append] using descendants_earlier_next parent #[(index, command)] nonempty
-
-theorem earlier_next_sibling {current parent : Location} {index : Nat}
-    (hasParent : current.parent? = some (parent, index)) : current.Earlier (parent.child (index + 1)) := by
-  obtain ⟨command, rfl⟩ := shape_of_parent hasParent
-  exact child_earlier_sibling parent index command (index + 1) (by omega)
 
 theorem parent_earlier {current parent : Location} {index : Nat}
     (hasParent : current.parent? = some (parent, index)) : parent.Earlier current := by
@@ -119,61 +142,3 @@ theorem next_parent_eq (current : Location) : current.next.parent? = current.par
     · simp [parent?, small] at hasParent
 
 end LeanCloud.Location
-
-namespace LeanCloud.Proofs.Journal
-open Lean
-
-/-- All recorded locations are strictly earlier than the next fresh frontier.
-Records at ancestor groups may be updated without violating this property. -/
-def Fresh (journal : Journal) (frontier : Location) : Prop :=
-  ∀ location : Location, 0 < location.size → ¬location.Earlier frontier → journal location.key = none
-
-theorem Fresh.empty (frontier : Location) : Fresh Journal.empty frontier := by
-  intro location nonempty notEarlier
-  rfl
-
-theorem Fresh.missing {journal : Journal} {frontier : Location}
-    (fresh : Fresh journal frontier) (nonempty : 0 < frontier.size) : journal frontier.key = none :=
-  fresh frontier nonempty (Location.Earlier.irrefl frontier)
-
-theorem Fresh.advance {journal : Journal} {frontier next : Location}
-    (fresh : Fresh journal frontier) (later : frontier.Earlier next) : Fresh journal next := by
-  intro location nonempty notEarlier
-  exact fresh location nonempty (fun earlier => notEarlier (earlier.trans later))
-
-theorem Fresh.write_before {journal : Journal} {frontier written : Location}
-    (fresh : Fresh journal frontier) (nonempty : 0 < written.size)
-    (earlier : written.Earlier frontier) (value : Json) :
-    Fresh (journal.write written.key value) frontier := by
-  intro location locationNonempty notEarlier
-  rw [read_write_other]
-  · exact fresh location locationNonempty notEarlier
-  · intro sameKey
-    have equal := Location.key_injective locationNonempty nonempty sameKey
-    subst location
-    exact notEarlier earlier
-
-theorem Fresh.next {journal : Journal} {frontier : Location}
-    (fresh : Fresh journal frontier) (nonempty : 0 < frontier.size) (value : Json) :
-    Fresh (journal.write frontier.key value) frontier.next := by
-  have later := Location.earlier_next frontier nonempty
-  exact (fresh.advance later).write_before nonempty later value
-
-theorem Fresh.child {journal : Journal} {frontier : Location}
-    (fresh : Fresh journal frontier) (nonempty : 0 < frontier.size) (index : Nat) (value : Json) :
-    Fresh (journal.write frontier.key value) (frontier.child index) := by
-  have later := Location.earlier_child frontier index
-  exact (fresh.advance later).write_before nonempty later value
-
-/-- Child completion changes only locations before the next frontier, whether
-it is the next sibling or the parent's continuation. -/
-theorem Fresh.complete_child {journal : Journal} {current parent frontier : Location} {index : Nat}
-    (fresh : Fresh journal current.next) (hasParent : current.parent? = some (parent, index))
-    (later : current.next.Earlier frontier) (children : Array (Option Exit)) (outcome : Exit) :
-    Fresh (journal.completeChild current parent children index outcome) frontier := by
-  obtain ⟨parentNonempty, size⟩ := Location.parent_size hasParent
-  have ownEarlier := (Location.earlier_next current (by omega)).trans later
-  exact ((fresh.advance later).write_before (by omega) ownEarlier _).write_before parentNonempty
-    ((Location.parent_earlier hasParent).trans ownEarlier) _
-
-end LeanCloud.Proofs.Journal

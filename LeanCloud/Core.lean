@@ -37,6 +37,11 @@ def both [Codec α] [Codec β] (left : Cloud m α) (right : Cloud m β) : Cloud 
   | [.inl a, .inr b] => return (a, b)
   | _ => send (.fail ⟨.protocol, "Invalid parallel pair result"⟩)
 
+/-- Compute a pure value and record it for replay. Unlike the ordinary monadic
+`pure value`, this is a delayed computation with a persisted result. -/
+def pure [Pure m] [Codec α] (body : Unit → α) (label : String := "") : Cloud m α :=
+  exec (fun _ => Pure.pure (body ())) label
+
 end Cloud
 
 namespace CloudBlob

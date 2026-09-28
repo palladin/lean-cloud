@@ -1,5 +1,5 @@
 import LeanCloud.Core
-import LeanCloud.Storage
+import LeanCloud.BlobStorage
 
 /-! Direct sequential semantics, defined by mutual structural recursion over
 computations, control requests, and continuation queues. No replay or result codecs
@@ -13,37 +13,37 @@ namespace Internal
 
 mutual
   def eval {σ α : Type} {m : Type → Type} [Monad m]
-      (storage : Storage σ m) (program : Cloud m α) : ExceptT CloudError (StateT σ m) α :=
+      (blobs : BlobStorage σ m) (program : Cloud m α) : ExceptT CloudError (StateT σ m) α :=
     match program with
-    | .pure value => pure value
+    | EffF.pure value => pure value
     | .impure request continuation => do
-      let value ← evalControl storage request
-      evalContinuation storage continuation value
+      let value ← evalControl blobs request
+      evalContinuation blobs continuation value
   termination_by structural program
 
   def evalControl {σ α : Type} {m : Type → Type} [Monad m]
-      (storage : Storage σ m) (request : Control m α) : ExceptT CloudError (StateT σ m) α :=
+      (blobs : BlobStorage σ m) (request : Control m α) : ExceptT CloudError (StateT σ m) α :=
     match request with
     | .delay => pure ()
     | .fail error => throw error
-    | .sequential _ operation => storage.execute operation
+    | .sequential _ operation => blobs.execute operation
     | .choice .. => throw ⟨.unsupported, "Choice is not implemented yet"⟩
     | .parallel _ _ branches => do
       let outcomes ← liftM (m := StateT σ m)
-        (Array.ofFnM fun index => (eval storage (branches index)).run)
+        (Array.ofFnM fun index => (eval blobs (branches index)).run)
       match outcomes.mapM id with
       | .ok values => return values
       | .error error => throw error
   termination_by structural request
 
   def evalContinuation {σ α β : Type} {m : Type → Type} [Monad m]
-      (storage : Storage σ m) (continuation : ArrsF (Control m) α β) (value : α) :
+      (blobs : BlobStorage σ m) (continuation : ArrsF (Control m) α β) (value : α) :
       ExceptT CloudError (StateT σ m) β :=
     match continuation with
-    | .one k => eval storage (k value)
+    | .one k => eval blobs (k value)
     | .append first rest => do
-      let next ← evalContinuation storage first value
-      evalContinuation storage rest next
+      let next ← evalContinuation blobs first value
+      evalContinuation blobs rest next
   termination_by structural continuation
 end
 
@@ -51,8 +51,8 @@ end Internal
 
 /-- Evaluate the original program directly, with no execution-step budget. -/
 def interpret {σ ι α : Type} {m : Type → Type} [Monad m]
-    (storage : Storage σ m) (program : ι → Cloud m α) (input : ι) :
+    (blobs : BlobStorage σ m) (program : ι → Cloud m α) (input : ι) :
     ExceptT CloudError (StateT σ m) α :=
-  Internal.eval storage (program input)
+  Internal.eval blobs (program input)
 
 end LeanCloud.DirectInterpreter

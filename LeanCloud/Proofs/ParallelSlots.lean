@@ -1,9 +1,8 @@
 import LeanCloud.Proofs.Parallel
 import LeanCloud.Proofs.Assumptions
 
-/-! Encoding an ordered prefix of child outcomes into the runtime's partial
-result array. The ideal queue visits children in this order; a full array selects the same
-values or error as direct evaluation. -/
+/-! Encoding completed child outcomes preserves array order and selects the
+same values or error as direct evaluation, regardless of completion order. -/
 
 namespace LeanCloud.Proofs
 open Lean
@@ -12,6 +11,32 @@ open Lean
 def encodeOutcome (codec : Codec α) : Except CloudError α → Exit
   | .ok value => .success (codec.encode value)
   | .error error => .failure error
+
+private theorem collect_list_length (outcomes : List (Except CloudError α)) (values : List α)
+    (collected : outcomes.mapM id = .ok values) : values.length = outcomes.length := by
+  induction outcomes generalizing values with
+  | nil => change Except.ok [] = Except.ok values at collected; cases collected; rfl
+  | cons head tail ih =>
+    cases head with
+    | error error => simp [List.mapM_cons, bind, Except.bind] at collected
+    | ok value =>
+      simp only [List.mapM_cons] at collected
+      cases selected : tail.mapM id with
+      | error error => simp [selected, bind, Except.bind] at collected
+      | ok rest =>
+        simp [selected, bind, Except.bind, pure, Except.pure] at collected
+        subst values
+        simp [ih rest selected]
+
+theorem collect_outcomes_size (outcomes : Array (Except CloudError α)) (values : Array α)
+    (collected : outcomes.mapM id = .ok values) : values.size = outcomes.size := by
+  simp only [Array.mapM_eq_mapM_toList] at collected
+  cases selected : outcomes.toList.mapM id with
+  | error error => simp [selected, Functor.map, Except.map] at collected
+  | ok rest =>
+    simp [selected, Functor.map, Except.map] at collected
+    subst values
+    simpa using collect_list_length outcomes.toList rest selected
 
 private theorem collect_encoded_list (codec : Codec α) (outcomes : List (Except CloudError α)) :
     outcomes.mapM (fun outcome => match encodeOutcome codec outcome with
@@ -42,78 +67,5 @@ theorem settle_encoded (codec : Codec α) (outcomes : Array (Except CloudError �
   simp only [encodeOutcome] at collected ⊢
   erw [collected]
   cases collected : outcomes.toList.mapM id <;> simp [Functor.map, Except.map]
-
-/-- The runtime's partial array after an ordered prefix of children finished. -/
-def parallelSlots (codec : Codec α) (count : Nat) (outcomes : Array (Except CloudError α)) :
-    Array (Option Exit) :=
-  outcomes.map (fun outcome => some (encodeOutcome codec outcome)) ++
-    Array.replicate (count - outcomes.size) none
-
-@[simp] theorem parallelSlots_empty (codec : Codec α) (count : Nat) :
-    parallelSlots codec count #[] = Array.replicate count none := by
-  simp [parallelSlots]
-
-theorem parallelSlots_size (codec : Codec α) (count : Nat)
-    (outcomes : Array (Except CloudError α)) (bound : outcomes.size ≤ count) :
-    (parallelSlots codec count outcomes).size = count := by
-  simp only [parallelSlots, Array.size_append, Array.size_map, Array.size_replicate]
-  omega
-
-theorem parallelSlots_full (codec : Codec α) (outcomes : Array (Except CloudError α)) :
-    parallelSlots codec outcomes.size outcomes = (outcomes.map (encodeOutcome codec)).map some := by
-  simp [parallelSlots, Array.map_map, Function.comp_def]
-
-theorem parallelSlots_get_finished (codec : Codec α) (count : Nat)
-    (outcomes : Array (Except CloudError α)) (index : Nat) (inside : index < outcomes.size) :
-    (parallelSlots codec count outcomes)[index]! = some (encodeOutcome codec outcomes[index]) := by
-  have valid : index < (parallelSlots codec count outcomes).size := by
-    simp only [parallelSlots, Array.size_append, Array.size_map, Array.size_replicate]
-    omega
-  rw [getElem!_pos (parallelSlots codec count outcomes) index valid]
-  simp [parallelSlots, inside]
-
-theorem parallelSlots_get_pending (codec : Codec α) (count : Nat)
-    (outcomes : Array (Except CloudError α)) (index : Nat)
-    (pending : outcomes.size ≤ index) (inside : index < count) :
-    (parallelSlots codec count outcomes)[index]! = none := by
-  have size := parallelSlots_size codec count outcomes (by omega)
-  rw [getElem!_pos (parallelSlots codec count outcomes) index (by omega)]
-  simp [parallelSlots, Array.getElem_append, Nat.not_lt_of_ge pending]
-
-/-- Filling the next slot extends exactly the ordered prefix. -/
-theorem parallelSlots_update (codec : Codec α) (count : Nat)
-    (outcomes : Array (Except CloudError α)) (inside : outcomes.size < count)
-    (outcome : Except CloudError α) :
-    (parallelSlots codec count outcomes).set! outcomes.size (some (encodeOutcome codec outcome)) =
-      parallelSlots codec count (outcomes.push outcome) := by
-  have oldSize := parallelSlots_size codec count outcomes (by omega)
-  have newSize := parallelSlots_size codec count (outcomes.push outcome) (by simp; omega)
-  apply Array.ext (by simp [oldSize, newSize])
-  intro index leftInside rightInside
-  have valid : index < count := by simpa only [Array.size_set!, oldSize] using leftInside
-  rw [← getElem!_pos ((parallelSlots codec count outcomes).set! outcomes.size
-    (some (encodeOutcome codec outcome))) index leftInside,
-    ← getElem!_pos (parallelSlots codec count (outcomes.push outcome)) index rightInside]
-  by_cases same : outcomes.size = index
-  · subst index
-    rw [Array.getElem!_set!_self _ _ _ (by omega),
-      parallelSlots_get_finished codec count (outcomes.push outcome) outcomes.size (by simp)]
-    simp
-  · rw [Array.getElem!_set!_ne _ _ _ _ same]
-    by_cases earlier : index < outcomes.size
-    · rw [parallelSlots_get_finished codec count outcomes index earlier,
-        parallelSlots_get_finished codec count (outcomes.push outcome) index (by simp; omega)]
-      simp [Array.getElem_push_lt, earlier]
-    · rw [parallelSlots_get_pending codec count outcomes index (by omega) valid,
-        parallelSlots_get_pending codec count (outcomes.push outcome) index (by simp; omega) valid]
-
-theorem parallelSlots_waits (codec : Codec α) (count : Nat)
-    (outcomes : Array (Except CloudError α)) (inside : outcomes.size < count) :
-    Result.settle (parallelSlots codec count outcomes) = .suspended (parallelSlots codec count outcomes) := by
-  apply Result.settle_missing
-  have size := parallelSlots_size codec count outcomes (by omega)
-  have missing := parallelSlots_get_pending codec count outcomes outcomes.size (by omega) inside
-  rw [getElem!_pos (parallelSlots codec count outcomes) outcomes.size (by omega)] at missing
-  exact Array.mem_of_getElem missing
 
 end LeanCloud.Proofs

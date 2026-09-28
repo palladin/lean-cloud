@@ -6,7 +6,7 @@ Run everything from the repository root:
 lake test
 ```
 
-The suite currently contains 509 named cases. Some cases also iterate over values,
+The suite currently contains 515 named cases. Some cases also iterate over values,
 fuel budgets, journal writes, or queue updates. There are no additional test
 dependencies. Any failure prints its test name and exits with a nonzero status.
 
@@ -65,11 +65,12 @@ A completed environment must return its final outcome without selecting more wor
 
 | Module | Checks |
 | --- | --- |
+| [Pure.lean](Pure.lean) | Recorded pure calculations, captured inputs, dependent binds, parallel pairs, blob inputs, cached values, and the Id backend. |
 | [Differential.lean](Differential.lean) | Pure values, delays, mixed result types, captured values, data-dependent control flow, heterogeneous `\|\|`, empty/single/wide/nested/successive parallel groups, continuation chains, failure order, blob operations and errors. |
 | [Generated.lean](Generated.lean) | 256 reproducible generated programs combining binds, branches, delays, effects, blobs, failures, and parallel groups; all 32 ordered two-leaf compositions under bind and parallel. |
 | [Replay.lean](Replay.lean) | Restart after every journal write in selected workflows, fuel exhaustion, cached results and failures, rejected writes, malformed records, and selected divergence checks. |
 | [Codecs.lean](Codecs.lean) | Codec round trips, malformed input rejection, binary data, journal records, and an explicit broken-codec counterexample. |
-| [Backends.lean](Backends.lean) | Immutable `StateT` storage over `Id`, mutable storage over `IO`, returned backend handles, state-dependent effect results, native exceptions, deep parallel nesting, and location navigation. |
+| [Backends.lean](Backends.lean) | Separate Db and blob interfaces over `Id` and `IO`, returned backend handles, state-dependent effect results, native exceptions, deep parallel nesting, and location navigation. |
 | [WorkQueue.lean](WorkQueue.lean) | Scripted interleaving; state-dependent results; nested pending work; error and result ordering; heterogeneous pairs; empty groups; numeric location order; 128 generated programs under three policies; restart under a different schedule; interruptions around every queue update; temporary idle responses. |
 
 Generated failures print both the seed and the program tree. The generator uses
@@ -136,15 +137,17 @@ The direct interpreter does not serialize
 values, so a broken codec can make replay fail while direct execution succeeds;
 the suite demonstrates that distinction.
 
-The separate [equivalence theorem](../LeanCloud/Proofs/WholeRun.lean) proves equal
-results/errors and final external state for fresh runs of supported programs in
-the ideal `StateM` model, with lawful codecs and enough fuel. Its stack queue
-preserves the direct interpreter's effect order. It applies to the actual public
-interpreters; it does not prove restart correctness, arbitrary schedule
-independence, concurrent workers, or correctness of an `IO`/database adapter.
+The separate [equivalence theorem](../LeanCloud/Proofs/QueueContract.lean) proves
+equal results/errors for pure `Cloud Id` programs containing ordinary pure values,
+delay, failure, and parallel. It uses an ideal Db and a lawful fair queue, permits
+arbitrary pending-item selection, and derives sufficient fuel. It has no external
+user state or effect-order assumptions.
+
+The theorem covers fresh runs with serialized worker steps. Exec (including the
+recorded `Cloud.pure` helper), blobs, restart correctness, simultaneous workers,
+and real adapters are outside its scope. The tests above still exercise these
+runtime effects and modeled recovery scenarios.
 
 [Queue laws](../LeanCloud/Proofs/WorkQueue.lean) specify valid selection, retention,
-completion only when no work remains, and weak fairness. Assuming those laws and
-continued polling, the proofs establish eventual selection of each pending
-location and finite snapshots of pending work. These are environment obligations;
-finite tests do not prove fairness of a backend or successful workflow completion.
+completion reporting, and weak fairness. Finite tests check representative
+schedules; they do not prove backend fairness.

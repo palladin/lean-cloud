@@ -63,58 +63,15 @@ theorem key_injective {left right : Location} (leftNonempty : 0 < left.size)
   rw [decodeKey_key left leftNonempty, decodeKey_key right rightNonempty] at decoded
   exact Array.toList_inj.mp decoded
 
-@[simp] theorem size_root : root.size = 1 := rfl
-
 @[simp] theorem size_child (location : Location) (index : Nat) :
     (location.child index).size = location.size + 1 := by simp [child]
 
 @[simp] theorem size_next (location : Location) : location.next.size = location.size := by
   simp [next]
 
-theorem child_nonempty (location : Location) (index : Nat) :
-    0 < (location.child index).size := by simp
-
-theorem next_nonempty (location : Location) (nonempty : 0 < location.size) :
-    0 < location.next.size := by simpa using nonempty
-
 theorem parent_child (location : Location) (nonempty : 0 < location.size) (index : Nat) :
     (location.child index).parent? = some (location, index) := by
   simp [parent?, child, show ¬location.size + 1 ≤ 1 by omega]
-
-theorem enters_child (location : Location) (index : Nat) :
-    location.entersChild (location.child index) = true := by
-  simp [entersChild, child]
-
-theorem child_injective {left right : Location} {i j : Nat}
-    (equal : left.child i = right.child j) : left = right ∧ i = j := by
-  have parts := Array.push_eq_push.mp equal
-  exact ⟨parts.2, congrArg Prod.fst parts.1⟩
-
-theorem next_command (location : Location) (nonempty : 0 < location.size) :
-    location.next[location.size - 1]!.2 = location[location.size - 1]!.2 + 1 := by
-  unfold next
-  rw [Array.getElem!_set!_self _ _ _ (by omega)]
-
-theorem before_next (location : Location) (nonempty : 0 < location.size) :
-    location.before location.next = true := by
-  simp [before, next_command location nonempty]
-
-theorem next_ne (location : Location) (nonempty : 0 < location.size) : location.next ≠ location := by
-  intro equal
-  have changed := next_command location nonempty
-  rw [equal] at changed
-  omega
-
-theorem next_key_ne (location : Location) (nonempty : 0 < location.size) :
-    location.next.key ≠ location.key := by
-  intro equal
-  exact next_ne location nonempty (key_injective (next_nonempty location nonempty) nonempty equal)
-
-theorem child_keys_distinct (location : Location) {i j : Nat} (different : i ≠ j) :
-    (location.child i).key ≠ (location.child j).key := by
-  intro equal
-  exact different (child_injective (key_injective (child_nonempty location i)
-    (child_nonempty location j) equal)).2
 
 /-- A child's current command may have advanced since entry; its parent still
 has exactly one fewer location level. -/
@@ -144,77 +101,23 @@ theorem entersChild_size {current target : Location}
   simp only [entersChild, Bool.and_eq_true, decide_eq_true_eq] at enters
   exact enters.1
 
-/-- At each depth, a target has only one ancestor location. -/
-theorem entersChild_unique {left right target : Location}
-    (size : left.size = right.size)
-    (leftEnters : left.entersChild target = true)
-    (rightEnters : right.entersChild target = true) : left = right := by
-  simp only [entersChild, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq] at leftEnters rightEnters
-  rw [size] at leftEnters
-  exact leftEnters.2.trans rightEnters.2.symm
+/-- Every position of an ancestor is preserved in a descendant's location. -/
+theorem entersChild_position {ancestor target : Location}
+    (enters : ancestor.entersChild target = true) (index : Nat)
+    (inside : index < ancestor.size) : target[index]! = ancestor[index]! := by
+  simp only [entersChild, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq] at enters
+  have same := congrArg (fun location : Location => location[index]!) enters.2
+  simpa [getElem!_pos, inside, show index < target.size by omega,
+    show index < min ancestor.size target.size by omega] using same.symm
 
-/-- A completed group earlier in the branch cannot be an ancestor of the
-requested location: the ancestor fork has a later command index. -/
-theorem earlier_not_enters {current endpoint target : Location}
-    (size : current.size = endpoint.size)
-    (earlier : current[current.size - 1]!.2 < endpoint[endpoint.size - 1]!.2)
-    (aligned : endpoint = target ∨ endpoint.entersChild target = true) :
-    current.entersChild target = false := by
-  rcases aligned with rfl | enters
-  · simp [entersChild, size]
-  · cases currentEnters : current.entersChild target with
-    | false => rfl
-    | true =>
-      have equal := entersChild_unique size currentEnters enters
-      subst current
-      omega
-
-theorem next_root_branch (location : Location) (nonempty : 0 < location.size) :
-    location.next[0]!.1 = location[0]!.1 := by
-  by_cases singleton : location.size = 1
-  · simp [next, singleton]
-  · unfold next
-    rw [Array.getElem!_set!_ne _ _ _ _ (by omega)]
-
-theorem child_root_branch (location : Location) (nonempty : 0 < location.size) (index : Nat) :
-    (location.child index)[0]!.1 = location[0]!.1 := by
-  simp [child, nonempty, Array.getElem_push_lt nonempty]
-
-theorem next_branch (location : Location) (index : Nat) (inside : index < location.size) :
-    location.next[index]!.1 = location[index]!.1 := by
-  unfold next
-  by_cases last : location.size - 1 = index
-  · rw [last, Array.getElem!_set!_self _ _ _ inside]
-  · rw [Array.getElem!_set!_ne _ _ _ _ last]
-
-theorem next_extract (location : Location) (count : Nat) (shallower : count < location.size) :
-    location.next.extract 0 count = location.extract 0 count := by
-  simp only [next, Array.set!, Array.setIfInBounds,
-    show location.size - 1 < location.size by omega, ↓reduceDIte]
-  rw [Array.extract_set]
-  simp [show ¬location.size - 1 < min count location.size by omega]
-
-/-- Advancing the command in a child leaves its ancestor forks unchanged. -/
-theorem entersChild_next {ancestor target : Location}
-    (enters : ancestor.entersChild target = true) : ancestor.entersChild target.next = true := by
-  have depth := entersChild_size enters
-  simpa only [entersChild, size_next, next_extract target ancestor.size depth] using enters
-
-/-- Descending one more level retains every existing ancestor fork. -/
-theorem entersChild_child {ancestor target : Location}
-    (enters : ancestor.entersChild target = true) (index : Nat) :
-    ancestor.entersChild (target.child index) = true := by
-  have depth := entersChild_size enters
-  simp only [entersChild, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq] at enters ⊢
-  constructor
-  · simp only [size_child]; omega
-  · simpa only [child, Array.extract_push_of_le (Nat.le_of_lt depth)] using enters.2
-
-theorem child_branch (location : Location) (index childIndex : Nat) (inside : index < location.size) :
-    (location.child childIndex)[index]!.1 = location[index]!.1 := by
-  have pushedInside : index < (location.push (childIndex, 0)).size := by
-    simp only [Array.size_push]; omega
-  simp only [child, getElem!_pos (location.push (childIndex, 0)) index pushedInside,
-    getElem!_pos location index inside, Array.getElem_push_lt inside]
+/-- Descending through nested groups retains the outer ancestor. -/
+theorem entersChild_trans {ancestor middle target : Location}
+    (first : ancestor.entersChild middle = true) (second : middle.entersChild target = true) :
+    ancestor.entersChild target = true := by
+  simp only [entersChild, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq] at first second ⊢
+  refine ⟨by omega, ?_⟩
+  have same := congrArg (fun location : Location => location.extract 0 ancestor.size) second.2
+  simp only [Array.extract_extract, Nat.zero_add, Nat.min_eq_left (Nat.le_of_lt first.1)] at same
+  exact first.2.trans same
 
 end LeanCloud.Location

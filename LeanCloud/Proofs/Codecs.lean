@@ -80,7 +80,7 @@ theorem codec_bytes : CodecLaw (inferInstance : Codec ByteArray) := by
     let bytes ← (data.map UInt8.toNat).mapM (fun n =>
       if n < 256 then (Except.ok n.toUInt8 : Except String UInt8)
       else .error "Byte outside 0..255")
-    pure ({ data := bytes } : ByteArray)) = .ok { data := data }
+    pure ({data := bytes} : ByteArray)) = .ok {data := data}
   rw [Array.mapM_map]
   have byte_decode : (fun byte : UInt8 =>
       if byte.toNat < 256 then (Except.ok byte.toNat.toUInt8 : Except String UInt8)

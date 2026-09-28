@@ -7,50 +7,32 @@ import LeanCloud.Proofs.Location
 namespace LeanCloud.Proofs.ReplayModel
 open Lean LeanEff ReplayInterpreter.Internal
 
-variable {World α : Type}
+variable {α : Type}
 
-theorem run_pure (value : α) (state : State) (world : World) :
-    (pure value : ExceptT CloudError (StateT State (StateM World)) α).run state world =
-      ((.ok value, state), world) := rfl
+theorem run_pure (value : α) (state : State) :
+    (pure value : ExceptT CloudError (StateT State Id) α).run state =
+      ((.ok value, state)) := rfl
 
-theorem run_catch
-    (action : ExceptT CloudError (StateT State (StateM World)) α)
-    (handle : CloudError → ExceptT CloudError (StateT State (StateM World)) α)
-    (state : State) (world : World) :
-    (tryCatch action handle).run state world =
-      let ((outcome, state'), world') := action.run state world
-      match outcome with
-      | .ok value => ((.ok value, state'), world')
-      | .error error => (handle error).run state' world' := by
-  dsimp [tryCatch, tryCatchThe, MonadExceptOf.tryCatch, ExceptT.tryCatch,
-    ExceptT.run, bind, StateT.bind]
-  cases action state world with
-  | mk pair world' => cases pair with
-    | mk outcome state' => cases outcome <;> rfl
-
-theorem load_recorded (blobs : BlobModel World) (state : State) (world : World)
-    (location : Location) (result : Result)
+theorem load_recorded (state : State) (location : Location) (result : Result)
     (recorded : state.journal location.key = some (toJson result)) :
-    (load (storage blobs) location).run state world = ((.ok (some result), state), world) := by
-  dsimp [load, storage, ExceptT.run, bind, pure, liftM, monadLift,
+    (load db location).run state = ((.ok (some result), state)) := by
+  dsimp [load, db, ExceptT.run, bind, pure, liftM, monadLift,
     MonadLift.monadLift, ExceptT.lift, ExceptT.mk, ExceptT.bind, ExceptT.bindCont,
     ExceptT.pure, StateT.bind, StateT.pure, Functor.map, StateT.map]
   simp only [recorded, result_roundtrip]
   rfl
 
-theorem load_missing (blobs : BlobModel World) (state : State) (world : World)
-    (location : Location) (missing : state.journal location.key = none) :
-    (load (storage blobs) location).run state world = ((.ok none, state), world) := by
-  dsimp [load, storage, ExceptT.run, bind, pure, liftM, monadLift,
+theorem load_missing (state : State) (location : Location) (missing : state.journal location.key = none) :
+    (load db location).run state = ((.ok none, state)) := by
+  dsimp [load, db, ExceptT.run, bind, pure, liftM, monadLift,
     MonadLift.monadLift, ExceptT.lift, ExceptT.mk, ExceptT.bind, ExceptT.bindCont,
     ExceptT.pure, StateT.bind, StateT.pure, Functor.map, StateT.map]
   rw [missing]
   rfl
 
-theorem save_result (blobs : BlobModel World) (state : State) (world : World)
-    (location : Location) (result : Result) :
-    (save (storage blobs) location result).run state world =
-      ((.ok (), { state with journal := state.journal.write location.key (toJson result) }), world) := rfl
+theorem save_result (state : State) (location : Location) (result : Result) :
+    (save db location result).run state =
+      ((.ok (), {state with journal := state.journal.write location.key (toJson result)})) := rfl
 
 theorem decode_encoded {m : Type → Type} [Monad m] (codec : Codec α)
     (law : CodecLaw codec) (value : α) :
@@ -65,83 +47,96 @@ theorem decode_group_encoded {m : Type → Type} [Monad m] [LawfulMonad m] (code
   change decode (m := m) (inferInstance : Codec (Array α)) (Json.arr (values.map codec.encode)) = pure values at decoded
   simp [decodeGroup, decoded]
 
-theorem walk_recorded_sequential (blobs : BlobModel World) (fuel : Nat)
-    (codec : Codec α) (law : CodecLaw codec) (operation : Operation (StateM World) α)
-    (continuation : ArrsF (Control (StateM World)) α Json) (value : α)
-    (current target : Location) (state : State) (world : World)
-    (different : current ≠ target)
-    (recorded : state.journal current.key = some (toJson (Result.completed (.success (codec.encode value))))) :
-    (walk (storage blobs) (fuel + 1) (.impure (.sequential codec operation) continuation) current target).run state world =
-      (walk (storage blobs) fuel (ArrsF.apply continuation value) current.next target).run state world := by
-  rw [walk]
-  simp only [run_bind, load_recorded blobs state world current _ recorded, run_pure,
-    decode_encoded codec law value, beq_eq_false_iff_ne.mpr different, Bool.false_eq_true, ↓reduceIte]
-
-theorem walk_fresh_sequential (blobs : BlobModel World) (fuel : Nat)
-    (codec : Codec α) (law : CodecLaw codec) (operation : Operation (StateM World) α)
-    (continuation : ArrsF (Control (StateM World)) α Json) (value : α)
-    (current : Location) (state : State) (world nextWorld : World)
-    (missing : state.journal current.key = none)
-    (executed : ((storage blobs).execute operation).run state world = ((.ok value, state), nextWorld)) :
-    (walk (storage blobs) (fuel + 1) (.impure (.sequential codec operation) continuation) current current).run state world =
-      ((.ok (.runnable #[current.next]),
-        { state with journal := state.journal.write current.key (toJson (Result.completed (.success (codec.encode value)))) }),
-        nextWorld) := by
-  rw [walk]
-  simp only [run_bind, load_missing blobs state world current missing, bne_self_eq_false,
-    Bool.false_eq_true, ↓reduceIte, run_catch, executed, run_pure, save_result,
-    decode_encoded codec law value, beq_self_eq_true, ↓reduceIte]
-
-theorem finish_fresh_root (blobs : BlobModel World) (current : Location) (outcome : Exit)
-    (state : State) (world : World) (missing : state.journal current.key = none)
+theorem finish_fresh_root (current : Location) (outcome : Exit)
+    (state : State) (missing : state.journal current.key = none)
     (noParent : current.parent? = none) :
-    (finish (storage blobs) current outcome).run state world =
-      ((.ok (.done outcome), { state with journal := state.journal.write current.key (toJson (Result.completed outcome)) }), world) := by
+    (finish db current outcome).run state =
+      ((.ok (.done outcome), {state with journal := state.journal.write current.key (toJson (Result.completed outcome))})) := by
   rw [finish]
-  simp only [run_bind, load_missing blobs state world current missing, save_result, noParent, run_pure]
+  simp only [run_bind, load_missing state current missing, save_result, noParent, run_pure]
 
-theorem step_root (blobs : BlobModel World) (fuel : Nat) (root : Cloud (StateM World) Json) :
-    step (storage blobs) fuel root Location.root =
-      walk (storage blobs) fuel root Location.root Location.root := by
-  simp [step, Location.root, Location.parent?]
-
-theorem walk_recorded_parallel (blobs : BlobModel World) (fuel : Nat)
+theorem walk_recorded_parallel (fuel : Nat)
     (codec : Codec α) (law : CodecLaw codec) (count : Nat)
-    (branches : Fin count → Cloud (StateM World) α)
-    (continuation : ArrsF (Control (StateM World)) (Array α) Json) (values : Array α)
-    (current target : Location) (state : State) (world : World)
-    (size : values.size = count) (different : current ≠ target)
+    (branches : Fin count → Cloud Id α)
+    (continuation : ArrsF (Control Id) (Array α) Json) (values : Array α)
+    (current target : Location) (state : State) (size : values.size = count) (different : current ≠ target)
     (recorded : state.journal current.key =
       some (toJson (Result.completed (.success (Json.arr (values.map codec.encode)))))) :
-    (walk (storage blobs) (fuel + 1) (.impure (.parallel codec count branches) continuation) current target).run state world =
-      (walk (storage blobs) fuel (ArrsF.apply continuation values) current.next target).run state world := by
+    (walk db noBlobs (fuel + 1) (.impure (.parallel codec count branches) continuation) current target).run state =
+      (walk db noBlobs fuel (ArrsF.apply continuation values) current.next target).run state := by
   rw [walk]
-  simp only [run_bind, load_recorded blobs state world current _ recorded,
+  simp only [run_bind, load_recorded state current _ recorded,
     beq_eq_false_iff_ne.mpr different, Bool.false_and, Bool.false_eq_true, ↓reduceIte,
     run_pure, ← size, decode_group_encoded codec law values]
 
-theorem walk_parallel_child (blobs : BlobModel World) (fuel : Nat)
-    (codec : Codec α) (count : Nat) (branches : Fin count → Cloud (StateM World) α)
-    (continuation : ArrsF (Control (StateM World)) (Array α) Json)
-    (current target : Location) (state : State) (world : World)
-    (children : Array (Option Exit)) (size : children.size = count)
+theorem walk_parallel_child (fuel : Nat)
+    (codec : Codec α) (count : Nat) (branches : Fin count → Cloud Id α)
+    (continuation : ArrsF (Control Id) (Array α) Json)
+    (current target : Location) (state : State) (children : Array (Option Exit)) (size : children.size = count)
     (enters : current.entersChild target = true) (index : Fin count)
     (selected : target[current.size]!.1 = index.val)
     (recorded : state.journal current.key = some (toJson (Result.suspended children))) :
-    (walk (storage blobs) (fuel + 1) (.impure (.parallel codec count branches) continuation) current target).run state world =
-      (walk (storage blobs) fuel (codec.encode <$> branches index) (current.child index.val) target).run state world := by
+    (walk db noBlobs (fuel + 1) (.impure (.parallel codec count branches) continuation) current target).run state =
+      (walk db noBlobs fuel (codec.encode <$> branches index) (current.child index.val) target).run state := by
   have different : current ≠ target := by
     intro same
     subst target
     simp [Location.entersChild] at enters
   rw [walk]
-  simp only [run_bind, load_recorded blobs state world current _ recorded,
+  simp only [run_bind, load_recorded state current _ recorded,
     beq_eq_false_iff_ne.mpr different, Bool.false_and, Bool.false_eq_true, ↓reduceIte,
     size, bne_self_eq_false, enters, Bool.not_true, selected, index.isLt, ↓reduceDIte]
 
-theorem walk_delay (blobs : BlobModel World) (fuel : Nat)
-    (continuation : ArrsF (Control (StateM World)) Unit Json) (current target : Location) :
-    walk (storage blobs) (fuel + 1) (.impure .delay continuation) current target =
-      walk (storage blobs) fuel (ArrsF.apply continuation ()) current target := rfl
+theorem walk_delay (fuel : Nat)
+    (continuation : ArrsF (Control Id) Unit Json) (current target : Location) :
+    walk db noBlobs (fuel + 1) (.impure .delay continuation) current target =
+      walk db noBlobs fuel (ArrsF.apply continuation ()) current target := rfl
+
+theorem walk_fresh_parallel (fuel : Nat) (codec : Codec α)
+    (count : Nat) (branches : Fin count → Cloud Id α)
+    (continuation : ArrsF (Control Id) (Array α) Json)
+    (current : Location) (state : State) (missing : state.journal current.key = none) :
+    (walk db noBlobs (fuel + 1) (.impure (.parallel codec count branches) continuation) current current).run state =
+      ((.ok (.runnable (if count == 0 then #[current] else Array.ofFn fun i : Fin count => current.child i.val)),
+        {state with journal := state.journal.write current.key (toJson (Result.settle (Array.replicate count none)))})) := by
+  rw [walk]
+  simp only [run_bind, load_missing state current missing, beq_self_eq_true,
+    Option.isNone_none, Bool.and_true, ↓reduceIte, save_result, run_pure]
+
+theorem walk_join_parallel (fuel : Nat)
+    (codec : Codec α) (law : CodecLaw codec) (count : Nat)
+    (branches : Fin count → Cloud Id α)
+    (continuation : ArrsF (Control Id) (Array α) Json) (values : Array α)
+    (current : Location) (state : State) (size : values.size = count)
+    (recorded : state.journal current.key =
+      some (toJson (Result.completed (.success (Json.arr (values.map codec.encode)))))) :
+    (walk db noBlobs (fuel + 1) (.impure (.parallel codec count branches) continuation) current current).run state =
+      ((.ok (.runnable #[current.next]), state)) := by
+  rw [walk]
+  simp only [run_bind, load_recorded state current _ recorded, beq_self_eq_true,
+    Option.isNone_some, Bool.and_false, Bool.false_eq_true, ↓reduceIte,
+    ← size, decode_group_encoded codec law values, run_pure]
+
+/-- The parent of a pending item is still waiting for its result. -/
+def ParentOpen (journal : Journal) (location : Location) : Prop :=
+  ∀ parent index, location.parent? = some (parent, index) →
+    ∃ children, journal parent.key = some (toJson (Result.suspended children))
+
+/-- Valid pending locations pass the worker entry point's guards. -/
+theorem step_eq_walk {journal : Journal} {root : Cloud Id Json} {target : Location}
+    (nonempty : 0 < target.size) (rootBranch : target[0]!.1 = 0)
+    (parentOpen : ParentOpen journal target) (fuel : Nat) (pending : List Location) :
+    (step db noBlobs fuel root target).run ⟨journal, pending, none⟩ =
+      (walk db noBlobs fuel root Location.root target).run ⟨journal, pending, none⟩ := by
+  have notEmpty : target.isEmpty = false := by
+    simp [Array.isEmpty, Nat.ne_of_gt nonempty]
+  rw [step]
+  simp only [notEmpty, rootBranch, bne_self_eq_false, Bool.false_or, Bool.false_eq_true, ↓reduceIte]
+  cases parentEq : target.parent? with
+  | none => rfl
+  | some pair =>
+    obtain ⟨parent, index⟩ := pair
+    obtain ⟨children, recorded⟩ := parentOpen parent index parentEq
+    simp only [run_bind, load_recorded ⟨journal, pending, none⟩ parent _ recorded]
 
 end LeanCloud.Proofs.ReplayModel

@@ -36,13 +36,15 @@ The three files are split into two batches: one contains the first two files and
 the other contains the third. `Cloud.parallel` returns one count per batch. The
 workflow sums the counts, saves the report, and returns its `BlobRef`.
 
-`||` combines the results of two computations into a pair. `Cloud.exec` records
-the results of actions such as `IO` computations. Recorded results are reused
+`||` combines the results of two computations into a pair. Use
+`Cloud.pure (fun _ => analyze input)` to record the result of a delayed pure
+calculation. Ordinary `pure value` and `return value` retain their usual meaning.
+`Cloud.exec` records the results of actions such as `IO` computations. Recorded results are reused
 during replay; an external action may run again if interrupted before its result
 is recorded.
 
-The current implementation provides direct and replay interpreters over abstract
-storage. The direct interpreter is a simple, structurally recursive reference:
+The interpreters use separate interfaces: [Db](LeanCloud/Db.lean) stores execution
+records; [BlobStorage](LeanCloud/BlobStorage.lean) handles user blobs. The direct interpreter is a simple, structurally recursive reference:
 it runs parallel children in array order and needs no fuel or scheduling policy.
 
 Replay takes work from an environment-provided [queue](LeanCloud/WorkQueue.lean).
@@ -60,13 +62,12 @@ lake test
 ```
 
 The [test suite](LeanCloudTests/README.md) compares the interpreters and checks
-recovery after interruption. The [equivalence proof](LeanCloud/Proofs/WholeRun.lean)
-establishes the same result or error and final external state for fresh runs in
-the ideal model, with lawful codecs, enough fuel, and a queue that preserves the
-direct interpreter's effect order. Arbitrary reordering of stateful effects can
-change results; restart correctness and concurrent workers are not covered by
-this theorem.
+recovery after interruption. The [equivalence proof](LeanCloud/Proofs/QueueContract.lean)
+shows that pure workflows return the same value or error under direct evaluation
+and replay with a lawful, fair queue and sufficient fuel. Branches may be selected
+in any order.
 
-[Queue fairness laws](LeanCloud/Proofs/WorkQueue.lean) separately prove that every
-pending location is eventually selected, assuming the environment satisfies the
-laws and workers keep polling.
+The [proof model](LeanCloud/Proofs/README.md) covers ordinary pure values, delay,
+failure, and parallel control flow. Runtime exec and blob operations remain
+available outside that theorem. The proof covers fresh runs with serialized
+worker steps; recovery and concurrent workers remain future proof work.

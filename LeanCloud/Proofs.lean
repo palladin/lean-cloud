@@ -1,2 +1,1 @@
-import LeanCloud.Proofs.WholeRun
-import LeanCloud.Proofs.WorkQueue
+import LeanCloud.Proofs.QueueContract

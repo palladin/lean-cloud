@@ -12,30 +12,30 @@ def CodecLaw (codec : Codec α) : Prop :=
   ∀ value, codec.decode (codec.encode value) = .ok value
 
 mutual
-  /-- The supported fragment used by the direct-evaluation proofs. All embedded codecs
-  must round-trip, and choice is excluded. Continuations are checked for every
+  /-- The supported fragment used by the direct-evaluation proofs. Parallel codecs must round-trip.
+  Choice and user operations (exec and blobs) are excluded. Continuations are checked for every
   possible argument, not just arguments reached in one particular execution. -/
-  def Supported {m : Type → Type} {α : Type} (program : Cloud m α) : Prop :=
+  def PureProgram {m : Type → Type} {α : Type} (program : Cloud m α) : Prop :=
     match program with
-    | .pure _ => True
+    | EffF.pure _ => True
     | .impure request continuation =>
-      SupportedControl request ∧ SupportedContinuation continuation
+      PureControl request ∧ PureContinuation continuation
   termination_by structural program
 
-  def SupportedControl {m : Type → Type} {α : Type} (request : Control m α) : Prop :=
+  def PureControl {m : Type → Type} {α : Type} (request : Control m α) : Prop :=
     match request with
     | .delay => True
     | .fail _ => True
-    | .sequential codec _ => CodecLaw codec
-    | .parallel codec _ branches => CodecLaw codec ∧ ∀ index, Supported (branches index)
+    | .sequential .. => False
+    | .parallel codec _ branches => CodecLaw codec ∧ ∀ index, PureProgram (branches index)
     | .choice .. => False
   termination_by structural request
 
-  def SupportedContinuation {m : Type → Type} {α β : Type}
+  def PureContinuation {m : Type → Type} {α β : Type}
       (continuation : ArrsF (Control m) α β) : Prop :=
     match continuation with
-    | .one k => ∀ value, Supported (k value)
-    | .append first rest => SupportedContinuation first ∧ SupportedContinuation rest
+    | .one k => ∀ value, PureProgram (k value)
+    | .append first rest => PureContinuation first ∧ PureContinuation rest
   termination_by structural continuation
 end
 

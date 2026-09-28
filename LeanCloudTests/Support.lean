@@ -52,8 +52,7 @@ def initial : World :=
 def appendEvent (ref : Ref) (name : String) (payload : Json) : IO Unit :=
   ref.modify fun world => { world with trace := world.trace.push (name, payload) }
 
-/-- Unique blob keys deliberately expose duplicate effects during replay. -/
-def storage : Storage Ref IO where
+def db : Db Ref IO where
   get key ref := do
     ref.modify fun world => { world with recordGets := world.recordGets + 1 }
     return ((← ref.get).records.lookup key, ref)
@@ -71,6 +70,9 @@ def storage : Storage Ref IO where
       ref.modify fun world => { world with crashAfterPut := none }
       throw (IO.userError "injected crash after journal commit")
     return (true, ref)
+
+/-- Unique blob keys deliberately expose duplicate effects during replay. -/
+def blobStorage : BlobStorage Ref IO where
   putBlob bytes ref := do
     appendEvent ref "putBlob" (encodeBytes bytes)
     let world ← ref.get
@@ -153,13 +155,13 @@ def workQueue (select : Select := selectFirst) : WorkQueue Ref IO where
     return ((), ref)
 
 def runDirect (program : Program α) (ref : Ref) : IO (Except CloudError α) := do
-  let (result, _) ← (DirectInterpreter.interpret storage program ref).run ref
+  let (result, _) ← (DirectInterpreter.interpret blobStorage program ref).run ref
   return result
 
 def runReplay [Codec α] (program : Program α) (ref : Ref) (fuel : Nat := replayFuel)
     (select : Select := selectFirst) :
     IO (Except CloudError α) := do
-  let (result, _) ← (interpret storage (workQueue select) fuel program ref).run ref
+  let (result, _) ← (interpret db blobStorage (workQueue select) fuel program ref).run ref
   return result
 
 /-- Fresh-run comparison plus a second replay that must perform no new primitive effects. -/

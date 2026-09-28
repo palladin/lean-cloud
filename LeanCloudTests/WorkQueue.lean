@@ -124,7 +124,7 @@ def queueUpdateSweep [Codec α] [BEq α] [Repr α] (program : Program α) : IO U
             if n == cut && after then throw (IO.userError "queue interrupted")
             return result }
         let crashed ← try
-          let _ ← (interpret storage queue replayFuel program ref).run ref
+          let _ ← (interpret db blobStorage queue replayFuel program ref).run ref
           pure false
         catch error => do
           assertEq error.toString "queue interrupted"
@@ -216,7 +216,7 @@ def cases : Array TestCase := #[
         idle.set false
         return (.idle, state)
       base.next state }
-    let (outcome, _) ← (interpret storage queue 20 (fun _ : Unit => pure (7 : Nat)) ()).run ref
+    let (outcome, _) ← (interpret db blobStorage queue 20 (fun _ : Unit => pure (7 : Nat)) ()).run ref
     assertOutcome outcome (.ok 7)⟩,
   ⟨"queue/empty-is-not-completed-or-reseeded", do
     let ref ← IO.mkRef { initial with pending := #[] }
