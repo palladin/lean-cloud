@@ -35,8 +35,10 @@ def decodeGroup [Monad m] (codec : Codec α) (count : Nat) (value : Json) :
   if values.size != count then throw ⟨.divergence, "Parallel child count changed"⟩
   return values
 
-/-- Commit a terminal child and wake its parent only when all slots are filled.
-Updating the child before its parent permits recovery of either committed prefix. -/
+/-- Publish the child slot before caching a completed group. With `JournalDb`,
+each present slot is a separate immutable record. Reread after publication:
+another child may have completed concurrently, even if our earlier view was
+partial. The worker that observes all slots filled wakes the parent. -/
 def finish [Monad m] (db : Db σ m) (current : Location) (outcome : Exit) :
     ExceptT CloudError (StateT σ m) StepResult := do
   match ← load db current with
@@ -48,13 +50,18 @@ def finish [Monad m] (db : Db σ m) (current : Location) (outcome : Exit) :
   | none => return .done outcome
   | some (parent, index) =>
     let some group ← load db parent | throw ⟨.protocol, "Missing parent suspension"⟩
-    let updated ← match Result.recordChild group index outcome with
-      | .ok result => pure result
-      | .error error => throw error
-    save db parent updated
-    match updated with
-    | .suspended _ => return .runnable #[]
+    match group with
     | .completed _ => return .runnable #[parent]
+    | .suspended children =>
+      let updated ← match Result.recordChild group index outcome with
+        | .ok result => pure result
+        | .error error => throw error
+      save db parent (.suspended (children.set! index (some outcome)))
+      if let .completed _ := updated then save db parent updated
+      let some latest ← load db parent | throw ⟨.protocol, "Missing parent suspension"⟩
+      match latest with
+      | .suspended _ => return .runnable #[]
+      | .completed _ => return .runnable #[parent]
 
 /-- Reconstruct a selected location. Recorded prefixes consume traversal fuel,
 but never call the chooser or repeat primitive effects. -/

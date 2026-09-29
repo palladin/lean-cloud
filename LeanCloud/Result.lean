@@ -3,7 +3,8 @@ import LeanCloud.Core
 namespace LeanCloud
 open Lean
 
-/-- Only outcomes and partial groups are stored; computations remain local. -/
+/-- Logical execution state. `JournalDb` assembles partial groups from separate
+immutable records; the ideal reference Db stores this view directly. -/
 inductive Result where
   | completed (outcome : Exit)
   | suspended (children : Array (Option Exit))
@@ -28,7 +29,7 @@ def recordChild (result : Result) (index : Nat) (outcome : Exit) : Except CloudE
   | .suspended children =>
     if index ≥ children.size then throw ⟨.protocol, "Child is outside the suspended group"⟩
     if let some existing := children[index]! then
-      if existing == outcome then return result
+      if existing == outcome then return settle children
       throw ⟨.divergence, "Child completion changed during replay"⟩
     return settle (children.set! index (some outcome))
 

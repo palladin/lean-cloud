@@ -8,10 +8,10 @@ work. Intermediate pure values in a bind are not worker completion reports. -/
 namespace LeanCloud.Proofs
 open LeanEff
 
-variable {delayCost : Nat}
+variable {m : Type → Type} {delayCost : Nat}
 
 theorem ChildrenEvaluation.size {α : Type} {count : Nat}
-    {branches : Fin count → Cloud Id α} {outcomes}
+    {branches : Fin count → Cloud m α} {outcomes}
     (evaluation : ChildrenEvaluation branches outcomes) : outcomes.size = count := by
   match evaluation with
   | .empty _ => rfl
@@ -19,7 +19,7 @@ theorem ChildrenEvaluation.size {α : Type} {count : Nat}
 termination_by structural evaluation
 
 theorem ProgramWork.bind_cases {α β : Type}
-    (program : Cloud Id α) (next : α → Cloud Id β)
+    (program : Cloud m α) (next : α → Cloud m β)
     {outcome : Except CloudError β} {work}
     {evaluation : Evaluation (EffF.bind program next) outcome}
     (cost : ProgramWork delayCost evaluation work) :
@@ -41,7 +41,7 @@ theorem ProgramWork.bind_cases {α β : Type}
       | failure _ first => exact .inr ⟨_, _, .success head first, rfl⟩
     | failure _ head => exact .inr ⟨_, _, .failure continuation head, rfl⟩
 
-theorem ProgramWork.map_cases {α β : Type} (program : Cloud Id α)
+theorem ProgramWork.map_cases {α β : Type} (program : Cloud m α)
     (f : α → β) {outcome : Except CloudError β} {work}
     {evaluation : Evaluation (f <$> program) outcome} (cost : ProgramWork delayCost evaluation work) :
     ∃ original, ∃ (head : Evaluation program original),
@@ -55,7 +55,7 @@ theorem ProgramWork.map_cases {α β : Type} (program : Cloud Id α)
   · obtain ⟨error, head, headCost, rfl⟩ := failure
     exact ⟨.error error, head, headCost, rfl⟩
 
-theorem Evaluation.map_cases {α β : Type} (program : Cloud Id α)
+theorem Evaluation.map_cases {α β : Type} (program : Cloud m α)
     (f : α → β) {outcome : Except CloudError β}
     (evaluation : Evaluation (f <$> program) outcome) :
     ∃ original, Evaluation program original ∧ outcome = original.map f := by
@@ -64,7 +64,7 @@ theorem Evaluation.map_cases {α β : Type} (program : Cloud Id α)
   exact ⟨original, head, same⟩
 
 theorem ProgramWork.of_encoded {α : Type} (codec : Codec α) (law : CodecLaw codec)
-    (program : Cloud Id α) {outcome : Except CloudError α} {work}
+    (program : Cloud m α) {outcome : Except CloudError α} {work}
     {evaluation : Evaluation (codec.encode <$> program) (outcome.map codec.encode)}
     (cost : ProgramWork delayCost evaluation work) :
     ∃ result : Evaluation program outcome, ProgramWork delayCost result work := by
@@ -83,8 +83,8 @@ theorem ProgramWork.of_encoded {α : Type} (codec : Codec α) (law : CodecLaw co
       exact ⟨_, originalCost⟩
 
 private theorem ContinuationWork.associate_left {α β γ δ : Type}
-    {first : ArrsF (Control Id) α β} {second : ArrsF (Control Id) β γ}
-    {rest : ArrsF (Control Id) γ δ} {value : α}
+    {first : ArrsF (Control m) α β} {second : ArrsF (Control m) β γ}
+    {rest : ArrsF (Control m) γ δ} {value : α}
     {outcome : Except CloudError δ} {work}
     {evaluation : ContinuationEvaluation (.append first (.append second rest)) value outcome}
     (cost : ContinuationWork delayCost evaluation work) :
@@ -101,7 +101,7 @@ private theorem ContinuationWork.associate_left {α β γ δ : Type}
   | failure _ head => exact ⟨_, .failure rest (.failure second head)⟩
 
 private theorem ContinuationWork.of_viewLAppend {α β γ : Type}
-    (first : ArrsF (Control Id) α β) (rest : ArrsF (Control Id) β γ)
+    (first : ArrsF (Control m) α β) (rest : ArrsF (Control m) β γ)
     (value : α) {outcome : Except CloudError γ} {work}
     (cost : match ArrsF.viewLAppend first rest with
       | .one k => ∃ evaluation : Evaluation (k value) outcome, ProgramWork delayCost evaluation work
@@ -116,7 +116,7 @@ private theorem ContinuationWork.of_viewLAppend {α β γ : Type}
 termination_by sizeOf first
 
 private theorem ContinuationWork.of_viewL {α β : Type}
-    (continuation : ArrsF (Control Id) α β) (value : α)
+    (continuation : ArrsF (Control m) α β) (value : α)
     {outcome : Except CloudError β} {work}
     (cost : match ArrsF.viewL continuation with
       | .one k => ∃ evaluation : Evaluation (k value) outcome, ProgramWork delayCost evaluation work
@@ -128,7 +128,7 @@ private theorem ContinuationWork.of_viewL {α β : Type}
   | append first rest => exact ContinuationWork.of_viewLAppend first rest value cost
 
 theorem ContinuationWork.of_apply {α β : Type}
-    (continuation : ArrsF (Control Id) α β) (value : α)
+    (continuation : ArrsF (Control m) α β) (value : α)
     {outcome : Except CloudError β} {work}
     {evaluation : Evaluation (ArrsF.apply continuation value) outcome}
     (cost : ProgramWork delayCost evaluation work) :
@@ -155,7 +155,7 @@ decreasing_by simpa [view] using ArrsF.viewL_rest_lt continuation
 /-- A continuation can also be rebuilt in the forward direction. Its work is
 fixed by the existing inverse theorem and uniqueness, so no second queue
 normalization proof is needed. -/
-theorem ContinuationWork.apply {continuation : ArrsF (Control Id) α β} {value outcome work}
+theorem ContinuationWork.apply {continuation : ArrsF (Control m) α β} {value outcome work}
     {evaluation : ContinuationEvaluation continuation value outcome}
     (cost : ContinuationWork delayCost evaluation work) (supported : PureContinuation continuation) :
     ∃ result : Evaluation (ArrsF.apply continuation value) outcome, ProgramWork delayCost result work := by
@@ -167,5 +167,23 @@ theorem ContinuationWork.apply {continuation : ArrsF (Control Id) α β} {value 
 
 theorem returnWork_map (outcome : Except CloudError α) (f : α → β) :
     returnWork (outcome.map f) = returnWork outcome := by cases outcome <;> rfl
+
+/-- Encoding a branch result changes its returned value but adds no work. -/
+theorem ProgramWork.map {program : Cloud m α} {outcome work}
+    {evaluation : Evaluation program outcome} (cost : ProgramWork delayCost evaluation work)
+    (supported : PureProgram program) (f : α → β) :
+    ∃ result : Evaluation (f <$> program) (outcome.map f), ProgramWork delayCost result work := by
+  obtain ⟨_, evaluation⟩ := Evaluation.exists (f <$> program) (supported.map f)
+  obtain ⟨_, mappedCost⟩ := evaluation.work_exists delayCost
+  obtain ⟨original, source, sourceCost, same⟩ := mappedCost.map_cases program f
+  obtain ⟨rfl, rfl⟩ := sourceCost.unique cost
+  subst same
+  exact ⟨evaluation, mappedCost⟩
+
+theorem ContinuationEvaluation.of_apply {continuation : ArrsF (Control m) α β} {value outcome}
+    (evaluation : Evaluation (ArrsF.apply continuation value) outcome) :
+    ContinuationEvaluation continuation value outcome := by
+  obtain ⟨_, cost⟩ := evaluation.work_exists
+  exact (ContinuationWork.of_apply continuation value cost).choose
 
 end LeanCloud.Proofs

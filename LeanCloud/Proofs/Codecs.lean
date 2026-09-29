@@ -13,6 +13,14 @@ theorem codec_encode_injective (codec : Codec α) (law : CodecLaw codec)
   rw [law a, law b] at decoded
   exact Except.ok.inj decoded
 
+/-- Round-trip decoding makes serialized records unambiguous. -/
+theorem toJson_injective {α : Type} [ToJson α] [FromJson α]
+    (law : ∀ value : α, fromJson? (toJson value) = .ok value)
+    {left right : α} (same : toJson left = toJson right) : left = right := by
+  have decoded := congrArg (fromJson? (α := α)) same
+  rw [law left, law right] at decoded
+  exact Except.ok.inj decoded
+
 theorem codec_json : CodecLaw (inferInstance : Codec Json) := fun _ => rfl
 theorem codec_nat : CodecLaw (inferInstance : Codec Nat) := fun _ => rfl
 theorem codec_string : CodecLaw (inferInstance : Codec String) := fun _ => rfl

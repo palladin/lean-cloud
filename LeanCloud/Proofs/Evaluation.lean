@@ -8,44 +8,44 @@ namespace LeanCloud.Proofs
 open LeanEff DirectInterpreter.Internal
 
 mutual
-  inductive Evaluation :
-      {α : Type} → Cloud Id α → Except CloudError α → Prop where
+  inductive Evaluation {m : Type → Type} :
+      {α : Type} → Cloud m α → Except CloudError α → Prop where
     | pure (value : α) : Evaluation (EffF.pure value) (.ok value)
-    | success {request : Control Id β} {continuation : ArrsF (Control Id) β α}
+    | success {request : Control m β} {continuation : ArrsF (Control m) β α}
         {value outcome}
         (head : ControlEvaluation request (.ok value))
         (tail : ContinuationEvaluation continuation value outcome) :
         Evaluation (.impure request continuation) outcome
-    | failure {request : Control Id β} (continuation : ArrsF (Control Id) β α)
+    | failure {request : Control m β} (continuation : ArrsF (Control m) β α)
         {error} (head : ControlEvaluation request (.error error)) :
         Evaluation (.impure request continuation) (.error error)
 
-  inductive ControlEvaluation :
-      {α : Type} → Control Id α → Except CloudError α → Prop where
+  inductive ControlEvaluation {m : Type → Type} :
+      {α : Type} → Control m α → Except CloudError α → Prop where
     | delay : ControlEvaluation .delay (.ok ())
     | fail (error : CloudError) : ControlEvaluation (Control.fail (α := α) error) (.error error)
-    | parallel {codec : Codec α} {count} {branches : Fin count → Cloud Id α} {outcomes}
+    | parallel {codec : Codec α} {count} {branches : Fin count → Cloud m α} {outcomes}
         (children : ChildrenEvaluation branches outcomes) :
         ControlEvaluation (.parallel codec count branches) (outcomes.mapM id)
 
-  inductive ContinuationEvaluation : {α β : Type} →
-      ArrsF (Control Id) α β → α → Except CloudError β → Prop where
-    | one {next : α → Cloud Id β} {value outcome}
+  inductive ContinuationEvaluation {m : Type → Type} : {α β : Type} →
+      ArrsF (Control m) α β → α → Except CloudError β → Prop where
+    | one {next : α → Cloud m β} {value outcome}
         (program : Evaluation (next value) outcome) :
         ContinuationEvaluation (.one next) value outcome
-    | success {first : ArrsF (Control Id) α β} {rest : ArrsF (Control Id) β γ}
+    | success {first : ArrsF (Control m) α β} {rest : ArrsF (Control m) β γ}
         {value next outcome}
         (head : ContinuationEvaluation first value (.ok next))
         (tail : ContinuationEvaluation rest next outcome) :
         ContinuationEvaluation (.append first rest) value outcome
-    | failure {first : ArrsF (Control Id) α β} (rest : ArrsF (Control Id) β γ)
+    | failure {first : ArrsF (Control m) α β} (rest : ArrsF (Control m) β γ)
         {value error} (head : ContinuationEvaluation first value (.error error)) :
         ContinuationEvaluation (.append first rest) value (.error error)
 
-  inductive ChildrenEvaluation : {α : Type} → {count : Nat} →
-      (Fin count → Cloud Id α) → Array (Except CloudError α) → Prop where
-    | empty (branches : Fin 0 → Cloud Id α) : ChildrenEvaluation branches #[]
-    | cons {count : Nat} {branches : Fin (count + 1) → Cloud Id α}
+  inductive ChildrenEvaluation {m : Type → Type} : {α : Type} → {count : Nat} →
+      (Fin count → Cloud m α) → Array (Except CloudError α) → Prop where
+    | empty (branches : Fin 0 → Cloud m α) : ChildrenEvaluation branches #[]
+    | cons {count : Nat} {branches : Fin (count + 1) → Cloud m α}
         {outcome outcomes}
         (head : Evaluation (branches 0) outcome)
         (tail : ChildrenEvaluation (fun index => branches index.succ) outcomes)
@@ -53,60 +53,73 @@ mutual
         ChildrenEvaluation branches (#[outcome] ++ outcomes)
 end
 
-/- Pure evaluation agrees with the actual direct interpreter and preserves its
-backend handle. No property of blob operations is needed: none is called. -/
+variable {m : Type → Type}
+
+/- Pure evaluation executes no operations in the underlying monad. This applies
+also to the crash monad: the direct semantics has no crash boundaries or storage. -/
 mutual
-  theorem Evaluation.sound {program : Cloud Id α} {outcome}
-      (evaluation : Evaluation program outcome) (blobs : BlobStorage σ Id) (state : σ) :
-      (eval blobs program).run state = (outcome, state) := by
+  theorem Evaluation.effect_free [Monad m] [LawfulMonad m] {program : Cloud m α} {outcome}
+      (evaluation : Evaluation program outcome) (blobs : BlobStorage σ m) :
+      (eval blobs program).run = pure outcome := by
     match evaluation with
     | .pure _ => rfl
-    | .success head tail => rw [eval, run_bind_state, head.sound blobs state]; exact tail.sound blobs state
-    | .failure _ head => rw [eval, run_bind_state, head.sound blobs state]
+    | .success head tail =>
+      rw [eval, ExceptT.run_bind, head.effect_free blobs]
+      simpa only [pure_bind] using tail.effect_free blobs
+    | .failure _ head =>
+      rw [eval, ExceptT.run_bind, head.effect_free blobs]
+      simp only [pure_bind]
   termination_by structural evaluation
 
-  theorem ControlEvaluation.sound {request : Control Id α} {outcome}
-      (evaluation : ControlEvaluation request outcome) (blobs : BlobStorage σ Id) (state : σ) :
-      (evalControl blobs request).run state = (outcome, state) := by
+  theorem ControlEvaluation.effect_free [Monad m] [LawfulMonad m] {request : Control m α} {outcome}
+      (evaluation : ControlEvaluation request outcome) (blobs : BlobStorage σ m) :
+      (evalControl blobs request).run = pure outcome := by
     match evaluation with
     | .delay | .fail _ => rfl
-    | .parallel (branches := branches) (outcomes := outcomes) children =>
-      rw [evalControl, run_bind_state]
-      have executed := children.sound blobs state
-      dsimp [liftM, monadLift, MonadLift.monadLift, ExceptT.lift, ExceptT.mk,
-        ExceptT.run, Functor.map, StateT.map]
-      dsimp only [ExceptT.run] at executed
-      simp only [bind, pure, executed]
+    | .parallel (outcomes := outcomes) children =>
+      rw [evalControl, ExceptT.run_bind]
+      have executed := children.effect_free blobs
+      change ((Except.ok <$> (Array.ofFnM fun index => (eval blobs _).run)) >>= _) = _
+      rw [executed]
+      simp only [map_pure, pure_bind]
       cases outcomes.mapM id <;> rfl
   termination_by structural evaluation
 
-  theorem ContinuationEvaluation.sound {continuation : ArrsF (Control Id) α β} {value outcome}
-      (evaluation : ContinuationEvaluation continuation value outcome) (blobs : BlobStorage σ Id) (state : σ) :
-      (evalContinuation blobs continuation value).run state = (outcome, state) := by
+  theorem ContinuationEvaluation.effect_free [Monad m] [LawfulMonad m]
+      {continuation : ArrsF (Control m) α β} {value outcome}
+      (evaluation : ContinuationEvaluation continuation value outcome) (blobs : BlobStorage σ m) :
+      (evalContinuation blobs continuation value).run = pure outcome := by
     match evaluation with
-    | .one program => exact program.sound blobs state
-    | .success head tail => rw [evalContinuation, run_bind_state, head.sound blobs state]; exact tail.sound blobs state
-    | .failure _ head => rw [evalContinuation, run_bind_state, head.sound blobs state]
+    | .one program => exact program.effect_free blobs
+    | .success head tail =>
+      rw [evalContinuation, ExceptT.run_bind, head.effect_free blobs]
+      simpa only [pure_bind] using tail.effect_free blobs
+    | .failure _ head =>
+      rw [evalContinuation, ExceptT.run_bind, head.effect_free blobs]
+      simp only [pure_bind]
   termination_by structural evaluation
 
-  theorem ChildrenEvaluation.sound {count : Nat} {branches : Fin count → Cloud Id α} {outcomes}
-      (evaluation : ChildrenEvaluation branches outcomes) (blobs : BlobStorage σ Id) (state : σ) :
-      (Array.ofFnM fun index => (eval blobs (branches index)).run) state = (outcomes, state) := by
+  theorem ChildrenEvaluation.effect_free [Monad m] [LawfulMonad m]
+      {count : Nat} {branches : Fin count → Cloud m α} {outcomes}
+      (evaluation : ChildrenEvaluation branches outcomes) (blobs : BlobStorage σ m) :
+      (Array.ofFnM fun index => (eval blobs (branches index)).run) = pure outcomes := by
     match evaluation with
-    | .empty _ => simp [Array.ofFnM_zero]; rfl
+    | .empty _ => simp [Array.ofFnM_zero]
     | .cons head tail =>
-      rw [Array.ofFnM_succ']
-      change (let (value, next) := (eval blobs (branches 0)).run state
-        let (rest, last) := (Array.ofFnM fun index => (eval blobs (branches index.succ)).run) next
-        (#[value] ++ rest, last)) = _
-      rw [head.sound]
-      dsimp only
-      rw [tail.sound]
+      rw [Array.ofFnM_succ', head.effect_free blobs]
+      simp only [pure_bind]
+      rw [tail.effect_free blobs]
+      simp only [pure_bind]
   termination_by structural evaluation
 end
 
+/-- Specialization used by the ideal replay proof: the backend handle is unchanged. -/
+theorem Evaluation.sound {program : Cloud Id α} {outcome}
+    (evaluation : Evaluation program outcome) (blobs : BlobStorage σ Id) (state : σ) :
+    (eval blobs program).run state = (outcome, state) := by rw [evaluation.effect_free blobs]; rfl
+
 /-- Combine the finite evaluations of the children. -/
-theorem ChildrenEvaluation.exists_of_children {count : Nat} (branches : Fin count → Cloud Id α)
+theorem ChildrenEvaluation.exists_of_children {count : Nat} (branches : Fin count → Cloud m α)
     (children : ∀ index, ∃ outcome, Evaluation (branches index) outcome) :
     ∃ outcomes, ChildrenEvaluation branches outcomes := by
   induction count with
@@ -117,7 +130,7 @@ theorem ChildrenEvaluation.exists_of_children {count : Nat} (branches : Fin coun
     exact ⟨_, .cons head tail⟩
 
 mutual
-  theorem Evaluation.exists (program : Cloud Id α) (supported : PureProgram program) :
+  theorem Evaluation.exists (program : Cloud m α) (supported : PureProgram program) :
       ∃ outcome, Evaluation program outcome := by
     match program with
     | EffF.pure value => exact ⟨.ok value, .pure value⟩
@@ -130,7 +143,7 @@ mutual
         exact ⟨outcome, .success head tail⟩
   termination_by structural program
 
-  theorem ControlEvaluation.exists (request : Control Id α) (supported : PureControl request) :
+  theorem ControlEvaluation.exists (request : Control m α) (supported : PureControl request) :
       ∃ outcome, ControlEvaluation request outcome := by
     match request with
     | .delay => exact ⟨_, .delay⟩
@@ -141,7 +154,7 @@ mutual
       exact ⟨outcomes.mapM id, .parallel children⟩
   termination_by structural request
 
-  theorem ContinuationEvaluation.exists (continuation : ArrsF (Control Id) α β)
+  theorem ContinuationEvaluation.exists (continuation : ArrsF (Control m) α β)
       (supported : PureContinuation continuation) (value : α) :
       ∃ outcome, ContinuationEvaluation continuation value outcome := by
     match continuation with
@@ -165,5 +178,16 @@ def direct (program : Cloud Id α) : Except CloudError α :=
 
 theorem Evaluation.result {program : Cloud Id α} {outcome} (evaluation : Evaluation program outcome) :
     direct program = outcome := congrArg Prod.fst (evaluation.sound noBlobs ())
+
+/-- The direct interpreter of a pure workflow returns a fixed ordinary outcome
+without calling the underlying monad or any blob backend. In particular, using
+the crash monad introduces no crash boundary on the direct side. -/
+theorem PureProgram.direct_effect_free [Monad m] [LawfulMonad m]
+    (program : ι → Cloud m α) (input : ι) (supported : PureProgram (program input)) :
+    ∃ outcome, Evaluation (program input) outcome ∧
+      ∀ {σ : Type} (blobs : BlobStorage σ m),
+        (DirectInterpreter.interpret blobs program input).run = pure outcome := by
+  obtain ⟨outcome, evaluation⟩ := Evaluation.exists (program input) supported
+  exact ⟨outcome, evaluation, fun _ => evaluation.effect_free _⟩
 
 end LeanCloud.Proofs

@@ -15,45 +15,45 @@ def returnWork : Except CloudError α → Nat
   | .error _ => 0
 
 mutual
-  inductive ProgramWork (delayCost : Nat) : {α : Type} → {program : Cloud Id α} →
+  inductive ProgramWork {m : Type → Type} (delayCost : Nat) : {α : Type} → {program : Cloud m α} →
       {outcome : Except CloudError α} → Evaluation program outcome → Nat → Prop where
     | pure (value : α) : ProgramWork delayCost (Evaluation.pure value) 0
-    | success {request : Control Id β} {continuation : ArrsF (Control Id) β α}
+    | success {request : Control m β} {continuation : ArrsF (Control m) β α}
         {value outcome controlWork restWork}
         {head : ControlEvaluation request (.ok value)} {tail : ContinuationEvaluation continuation value outcome}
         (control : ControlWork delayCost head controlWork) (remaining : ContinuationWork delayCost tail restWork) :
         ProgramWork delayCost (.success head tail) (controlWork + restWork)
-    | failure {request : Control Id β} (continuation : ArrsF (Control Id) β α)
+    | failure {request : Control m β} (continuation : ArrsF (Control m) β α)
         {error work} {head : ControlEvaluation request (.error error)}
         (control : ControlWork delayCost head work) : ProgramWork delayCost (.failure continuation head) work
 
-  inductive ControlWork (delayCost : Nat) : {α : Type} → {request : Control Id α} →
+  inductive ControlWork {m : Type → Type} (delayCost : Nat) : {α : Type} → {request : Control m α} →
       {outcome : Except CloudError α} → ControlEvaluation request outcome → Nat → Prop where
     | delay : ControlWork delayCost (ControlEvaluation.delay) delayCost
     | fail (error : CloudError) : ControlWork delayCost (ControlEvaluation.fail (α := α) error) 1
-    | parallel {codec : Codec α} {count : Nat} {branches : Fin count → Cloud Id α}
+    | parallel {codec : Codec α} {count : Nat} {branches : Fin count → Cloud m α}
         {outcomes work} {children : ChildrenEvaluation branches outcomes}
         (cost : ChildrenWork delayCost children work) : ControlWork delayCost (.parallel (codec := codec) children) (work + 2)
 
-  inductive ContinuationWork (delayCost : Nat) : {α β : Type} → {continuation : ArrsF (Control Id) α β} →
+  inductive ContinuationWork {m : Type → Type} (delayCost : Nat) : {α β : Type} → {continuation : ArrsF (Control m) α β} →
       {value : α} → {outcome : Except CloudError β} →
         ContinuationEvaluation continuation value outcome → Nat → Prop where
-    | one {k : α → Cloud Id β} {value outcome work} {evaluation : Evaluation (k value) outcome}
+    | one {k : α → Cloud m β} {value outcome work} {evaluation : Evaluation (k value) outcome}
         (cost : ProgramWork delayCost evaluation work) : ContinuationWork delayCost (.one evaluation) work
-    | success {first : ArrsF (Control Id) α β} {rest : ArrsF (Control Id) β γ}
+    | success {first : ArrsF (Control m) α β} {rest : ArrsF (Control m) β γ}
         {value next outcome firstWork restWork}
         {head : ContinuationEvaluation first value (.ok next)} {tail : ContinuationEvaluation rest next outcome}
         (first : ContinuationWork delayCost head firstWork) (rest : ContinuationWork delayCost tail restWork) :
         ContinuationWork delayCost (.success head tail) (firstWork + restWork)
-    | failure {first : ArrsF (Control Id) α β} (rest : ArrsF (Control Id) β γ)
+    | failure {first : ArrsF (Control m) α β} (rest : ArrsF (Control m) β γ)
         {value error work} {head : ContinuationEvaluation first value (.error error)}
         (cost : ContinuationWork delayCost head work) : ContinuationWork delayCost (.failure rest head) work
 
-  inductive ChildrenWork (delayCost : Nat) : {α : Type} → {count : Nat} → {branches : Fin count → Cloud Id α} →
+  inductive ChildrenWork {m : Type → Type} (delayCost : Nat) : {α : Type} → {count : Nat} → {branches : Fin count → Cloud m α} →
       {outcomes : Array (Except CloudError α)} →
         ChildrenEvaluation branches outcomes → Nat → Prop where
-    | empty (branches : Fin 0 → Cloud Id α) : ChildrenWork delayCost (.empty branches) 0
-    | cons {count : Nat} {branches : Fin (count + 1) → Cloud Id α}
+    | empty (branches : Fin 0 → Cloud m α) : ChildrenWork delayCost (.empty branches) 0
+    | cons {count : Nat} {branches : Fin (count + 1) → Cloud m α}
         {outcome outcomes firstWork restWork}
         {head : Evaluation (branches 0) outcome}
         {tail : ChildrenEvaluation (fun index => branches index.succ) outcomes}
@@ -62,10 +62,10 @@ mutual
         ChildrenWork delayCost (.cons head tail) (firstWork + returnWork outcome + restWork)
 end
 
-variable {delayCost : Nat}
+variable {m : Type → Type} {delayCost : Nat}
 
 mutual
-  theorem Evaluation.work_exists {program : Cloud Id α} {outcome}
+  theorem Evaluation.work_exists {program : Cloud m α} {outcome}
       (evaluation : Evaluation program outcome) (delayCost : Nat := 0) : ∃ work, ProgramWork delayCost evaluation work := by
     match evaluation with
     | .pure value => exact ⟨0, .pure value⟩
@@ -78,7 +78,7 @@ mutual
       exact ⟨work, .failure continuation cost⟩
   termination_by structural evaluation
 
-  theorem ControlEvaluation.work_exists {request : Control Id α} {outcome}
+  theorem ControlEvaluation.work_exists {request : Control m α} {outcome}
       (evaluation : ControlEvaluation request outcome) (delayCost : Nat := 0) : ∃ work, ControlWork delayCost evaluation work := by
     match evaluation with
     | .delay => exact ⟨delayCost, .delay⟩
@@ -88,7 +88,7 @@ mutual
       exact ⟨work + 2, .parallel cost⟩
   termination_by structural evaluation
 
-  theorem ContinuationEvaluation.work_exists {continuation : ArrsF (Control Id) α β}
+  theorem ContinuationEvaluation.work_exists {continuation : ArrsF (Control m) α β}
       {value outcome} (evaluation : ContinuationEvaluation continuation value outcome) (delayCost : Nat := 0) :
       ∃ work, ContinuationWork delayCost evaluation work := by
     match evaluation with
@@ -104,7 +104,7 @@ mutual
       exact ⟨work, .failure rest cost⟩
   termination_by structural evaluation
 
-  theorem ChildrenEvaluation.work_exists {count : Nat} {branches : Fin count → Cloud Id α}
+  theorem ChildrenEvaluation.work_exists {count : Nat} {branches : Fin count → Cloud m α}
       {outcomes} (evaluation : ChildrenEvaluation branches outcomes) (delayCost : Nat := 0) : ∃ work, ChildrenWork delayCost evaluation work := by
     match evaluation with
     | .empty branches => exact ⟨0, .empty branches⟩
@@ -116,7 +116,7 @@ mutual
 end
 
 mutual
-  theorem ProgramWork.total_positive {α : Type} {program : Cloud Id α}
+  theorem ProgramWork.total_positive {α : Type} {program : Cloud m α}
       {outcome work} {evaluation : Evaluation program outcome} (cost : ProgramWork delayCost evaluation work) :
       0 < work + returnWork outcome := by
     match cost with
@@ -125,7 +125,7 @@ mutual
     | .failure continuation head => exact head.total_positive
   termination_by structural cost
 
-  theorem ControlWork.total_positive {α : Type} {request : Control Id α}
+  theorem ControlWork.total_positive {α : Type} {request : Control m α}
       {outcome work} {evaluation : ControlEvaluation request outcome} (cost : ControlWork delayCost evaluation work) :
       0 < work + returnWork outcome := by
     match cost with
@@ -133,7 +133,7 @@ mutual
     | .fail _ => simp [returnWork]
     | .parallel .. => omega
 
-  theorem ContinuationWork.total_positive {α β : Type} {continuation : ArrsF (Control Id) α β}
+  theorem ContinuationWork.total_positive {α β : Type} {continuation : ArrsF (Control m) α β}
       {value outcome work} {evaluation : ContinuationEvaluation continuation value outcome}
       (cost : ContinuationWork delayCost evaluation work) : 0 < work + returnWork outcome := by
     match cost with
@@ -143,21 +143,21 @@ mutual
   termination_by structural cost
 end
 
-theorem ControlWork.positive {request : Control Id α} {outcome work}
+theorem ControlWork.positive {request : Control m α} {outcome work}
     {evaluation : ControlEvaluation request outcome} (cost : ControlWork 1 evaluation work) :
     0 < work := by
   cases cost <;> omega
 
 /-- Retyping the collected result preserves a group's work count. -/
 theorem ChildrenWork.control {α : Type} (codec : Codec α) {count : Nat}
-    {branches : Fin count → Cloud Id α} {outcomes work outcome}
+    {branches : Fin count → Cloud m α} {outcomes work outcome}
     {evaluation : ChildrenEvaluation branches outcomes} (cost : ChildrenWork delayCost evaluation work)
     (collected : outcomes.mapM id = outcome) :
     ∃ head : ControlEvaluation (.parallel codec count branches) outcome, ControlWork delayCost head (work + 2) := by
   subst outcome
   exact ⟨_, .parallel cost⟩
 
-private theorem ControlWork.shape {request : Control Id α} {outcome work}
+private theorem ControlWork.shape {request : Control m α} {outcome work}
     {evaluation : ControlEvaluation request outcome} (cost : ControlWork delayCost evaluation work) :
     match request with
     | .delay => outcome = .ok () ∧ work = delayCost
@@ -173,7 +173,7 @@ private theorem ControlWork.shape {request : Control Id α} {outcome work}
 /- The amount of pure work is determined by the program, independently of
 which parallel child the queue selects first. -/
 mutual
-  theorem ProgramWork.unique {program : Cloud Id α} {outcome work}
+  theorem ProgramWork.unique {program : Cloud m α} {outcome work}
       {evaluation : Evaluation program outcome} (cost : ProgramWork delayCost evaluation work) :
       ∀ {otherOutcome otherWork} {other : Evaluation program otherOutcome},
       ProgramWork delayCost other otherWork → outcome = otherOutcome ∧ work = otherWork := by
@@ -196,7 +196,7 @@ mutual
         exact ⟨congrArg Except.error (Except.error.inj same), work⟩
   termination_by structural cost
 
-  theorem ControlWork.unique {request : Control Id α} {outcome work}
+  theorem ControlWork.unique {request : Control m α} {outcome work}
       {evaluation : ControlEvaluation request outcome} (cost : ControlWork delayCost evaluation work) :
       ∀ {otherOutcome otherWork} {other : ControlEvaluation request otherOutcome},
       ControlWork delayCost other otherWork → outcome = otherOutcome ∧ work = otherWork := by
@@ -214,7 +214,7 @@ mutual
       exact ⟨(congrArg (fun outcomes => outcomes.mapM id) same).trans sameOutcome.symm, by omega⟩
   termination_by structural cost
 
-  theorem ContinuationWork.unique {continuation : ArrsF (Control Id) α β} {value outcome work}
+  theorem ContinuationWork.unique {continuation : ArrsF (Control m) α β} {value outcome work}
       {evaluation : ContinuationEvaluation continuation value outcome} (cost : ContinuationWork delayCost evaluation work) :
       ∀ {otherOutcome otherWork} {other : ContinuationEvaluation continuation value otherOutcome},
       ContinuationWork delayCost other otherWork → outcome = otherOutcome ∧ work = otherWork := by
@@ -237,7 +237,7 @@ mutual
         exact ⟨congrArg Except.error (Except.error.inj same), work⟩
   termination_by structural cost
 
-  theorem ChildrenWork.unique {count : Nat} {branches : Fin count → Cloud Id α} {outcomes work}
+  theorem ChildrenWork.unique {count : Nat} {branches : Fin count → Cloud m α} {outcomes work}
       {evaluation : ChildrenEvaluation branches outcomes} (cost : ChildrenWork delayCost evaluation work) :
       ∀ {otherOutcomes otherWork} {other : ChildrenEvaluation branches otherOutcomes},
       ChildrenWork delayCost other otherWork → outcomes = otherOutcomes ∧ work = otherWork := by
@@ -253,5 +253,19 @@ mutual
         exact ⟨by rw [sameResults], by omega⟩
   termination_by structural cost
 end
+
+/-- The pure result is determined by the program, without assumptions on the
+underlying monad or its external actions. -/
+theorem Evaluation.unique {program : Cloud m α} {left right : Except CloudError α}
+    (first : Evaluation program left) (second : Evaluation program right) : left = right := by
+  obtain ⟨_, a⟩ := first.work_exists
+  obtain ⟨_, b⟩ := second.work_exists
+  exact (a.unique b).1
+
+theorem ChildrenEvaluation.unique {count : Nat} {branches : Fin count → Cloud m α} {left right}
+    (first : ChildrenEvaluation branches left) (second : ChildrenEvaluation branches right) : left = right := by
+  obtain ⟨_, a⟩ := first.work_exists
+  obtain ⟨_, b⟩ := second.work_exists
+  exact (a.unique b).1
 
 end LeanCloud.Proofs

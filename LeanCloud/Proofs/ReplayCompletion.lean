@@ -68,7 +68,13 @@ theorem finish_missing (parent : Parent) (location : Location) (outcome : Exit)
       save_result, linked, load_recorded ⟨journal.write location.key (toJson (Result.completed outcome)), pending, none⟩ parent _ parentKept,
       Result.recordChild_missing children index outcome inside missingSlot, run_pure,
       Parent.record, Parent.result, Journal.completeChild]
-    cases settled : Result.settle (children.set! index (some outcome)) <;> rfl
+    cases settled : Result.settle (children.set! index (some outcome)) with
+    | completed exit =>
+      simp only [run_bind, save_result, Journal.write_write, load_written, run_pure]
+    | suspended slots =>
+      have same := Result.settle_suspended settled
+      subst slots
+      simp only [run_bind, load_written, run_pure]
 
 theorem finish_existing_failure (parent : Parent) (location : Location) (error : CloudError)
     (journal : Journal) (pending : List Location) (recorded : journal location.key = some (toJson (Result.completed (.failure error))))
@@ -91,7 +97,13 @@ theorem finish_existing_failure (parent : Parent) (location : Location) (error :
       load_recorded ⟨journal, pending, none⟩ parent _ parentRecorded,
       Result.recordChild_missing children index _ inside missingSlot, save_result,
       Parent.record, Parent.result, Journal.completeChild, journal.write_existing _ _ recorded]
-    cases settled : Result.settle (children.set! index (some (.failure error))) <;> rfl
+    cases settled : Result.settle (children.set! index (some (.failure error))) with
+    | completed exit =>
+      simp only [run_bind, save_result, Journal.write_write, load_written, run_pure]
+    | suspended slots =>
+      have same := Result.settle_suspended settled
+      subst slots
+      simp only [run_bind, load_written, run_pure]
 
 theorem Parent.records_current {parent : Parent} {journal : Journal} {location : Location}
     (valid : parent.Valid location journal) (outcome : Exit) :

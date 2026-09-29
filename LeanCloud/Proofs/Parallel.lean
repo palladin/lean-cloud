@@ -2,9 +2,9 @@ import LeanCloud.Result
 import Init.Data.Array.Monadic
 
 /-! Laws for the actual parallel-result bookkeeping used by replay.
-These cover fresh child slots. Idempotence of repeated successful completions is
-not proved here: the existing equality check delegates to Lean's partial JSON
-comparison. Recovery proofs will need a separate treatment of that comparison. -/
+Repeated child completion requires explicit reflexivity of the outcome's
+equality check, because the existing comparator delegates to partial JSON
+comparison. -/
 
 namespace LeanCloud.Result
 open Lean
@@ -45,5 +45,33 @@ theorem recordChild_missing (children : Array (Option Exit)) (index : Nat) (outc
       .ok (settle (children.set! index (some outcome))) := by
   simp [recordChild, Nat.not_le_of_lt inside, missing]
   rfl
+
+theorem recordChild_existing (children : Array (Option Exit)) (index : Nat) (outcome : Exit)
+    (inside : index < children.size) (recorded : children[index]! = some outcome)
+    (reflexive : (outcome == outcome) = true) :
+    recordChild (.suspended children) index outcome = .ok (settle children) := by
+  simp [recordChild, Nat.not_le_of_lt inside, recorded, reflexive]
+  rfl
+
+theorem settle_suspended {children slots : Array (Option Exit)}
+    (settled : settle children = .suspended slots) : children = slots := by
+  unfold settle at settled
+  split at settled
+  · cases settled; rfl
+  · split at settled <;> cases settled
+
+/-- A completed group has an outcome at every array position. -/
+theorem settle_filled {children : Array (Option Exit)} {outcome : Exit}
+    (settled : settle children = .completed outcome) (index : Nat) (inside : index < children.size) :
+    ∃ value, children[index]! = some value := by
+  cases slot : children[index]! with
+  | some value => exact ⟨value, rfl⟩
+  | none =>
+    have missing : none ∈ children := by
+      have same : children[index] = none := by simpa only [getElem!_pos children index inside] using slot
+      rw [← same]
+      exact Array.getElem_mem inside
+    rw [settle_missing children missing] at settled
+    cases settled
 
 end LeanCloud.Result

@@ -34,6 +34,12 @@ theorem save_result (state : State) (location : Location) (result : Result) :
     (save db location result).run state =
       ((.ok (), {state with journal := state.journal.write location.key (toJson result)})) := rfl
 
+theorem load_written (journal : Journal) (pending : List Location) (completed : Option Exit)
+    (location : Location) (result : Result) :
+    (load db location).run ⟨journal.write location.key (toJson result), pending, completed⟩ =
+      (.ok (some result), ⟨journal.write location.key (toJson result), pending, completed⟩) :=
+  load_recorded _ location result (journal.read_write _ _)
+
 theorem decode_encoded {m : Type → Type} [Monad m] (codec : Codec α)
     (law : CodecLaw codec) (value : α) :
     decode (m := m) codec (codec.encode value) = pure value := by

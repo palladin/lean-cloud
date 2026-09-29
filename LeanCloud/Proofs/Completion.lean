@@ -2,19 +2,19 @@ import LeanCloud.Proofs.Codecs
 import LeanCloud.Proofs.Parallel
 import LeanCloud.Proofs.Db
 
-/-! Algebraic laws for the two journal writes made by child completion. -/
+/-! Algebraic laws for child completion's net update to the logical journal. -/
 
 namespace LeanCloud.Proofs
 open Lean
 
-/-- The two writes made when a child finishes. This names the journal expression
-in the proof statements; the runtime continues to use its existing storage calls. -/
+/-- The net update after a child finishes in the ideal logical Db. Intermediate
+slot publication and the completed-group cache reduce to this final state. -/
 def Journal.completeChild (journal : Journal) (current parent : Location)
     (children : Array (Option Exit)) (index : Nat) (outcome : Exit) : Journal :=
   (journal.write current.key (toJson (Result.completed outcome))).write parent.key
     (toJson (Result.settle (children.set! index (some outcome))))
 
-/-- Both completion writes preserve the results of all previously finished work. -/
+/-- Completion preserves the results of all previously finished work. -/
 theorem Journal.completeChild_preserves (journal : Journal) (current parent : Location)
     (children : Array (Option Exit)) (index : Nat) (outcome : Exit)
     (hasParent : current.parent? = some (parent, index))

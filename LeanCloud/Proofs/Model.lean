@@ -13,7 +13,7 @@ def write (journal : Journal) (key : String) (value : Json) : Journal :=
 end Journal
 
 /-- Unreachable for the pure fragment; supplied only to instantiate the runtime. -/
-def noBlobs : BlobStorage σ Id where
+def noBlobs {m : Type → Type} [Monad m] : BlobStorage σ m where
   putBlob _ := throw ⟨.unsupported, "Blob operations are outside the pure fragment"⟩
   readBlob _ := throw ⟨.unsupported, "Blob operations are outside the pure fragment"⟩
   resolveBlob _ := throw ⟨.unsupported, "Blob operations are outside the pure fragment"⟩

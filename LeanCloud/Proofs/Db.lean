@@ -22,6 +22,11 @@ theorem write_existing (journal : Journal) (key : String) (value : Json)
   · subst queried; simp [recorded]
   · exact read_write_other _ _ _ _ same
 
+@[simp] theorem write_write (journal : Journal) (key : String) (first last : Json) :
+    (journal.write key first).write key last = journal.write key last := by
+  funext queried
+  by_cases same : queried = key <;> simp [write, same]
+
 /-- Every previously completed result is still recorded with the same outcome.
 Partial groups may change as more children complete. -/
 def PreservesCompleted (before after : Journal) : Prop :=
