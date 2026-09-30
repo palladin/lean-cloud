@@ -1,12 +1,14 @@
 import LeanCloud.Control
 
+universe u
+
 namespace LeanCloud
 open Lean LeanEff
 
 /-- The cloud monad uses lean-eff's shared core with one higher-order effect family. -/
-abbrev Cloud (m : Type → Type) := EffF (Control m)
+abbrev Cloud (m : Type → Type u) := EffF (Control m)
 
-variable {m : Type → Type}
+variable {m : Type → Type u}
 
 namespace Cloud
 

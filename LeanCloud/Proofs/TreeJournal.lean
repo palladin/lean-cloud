@@ -134,9 +134,11 @@ private theorem node_field_mem {tree node : ExecutionTree} {root location : Loca
   · intro own
     exact ExecutionTree.ownRecords_subset member own
 
-private theorem node_field_read {tree node : ExecutionTree} {root location : Location}
+/-- A command's physical fields are exactly those prescribed by its own node. -/
+theorem ExecutionTree.node_field_read {tree node : ExecutionTree} {root location : Location}
     (nonempty : 0 < root.size) (member : (location, node) ∈ tree.nodes root)
-    {key} (field : FieldAt location key) :
+    {key} (field : key = resultKey location.key ∨ key = forkKey location.key ∨
+      ∃ index, key = childKey location.key index) :
     tree.journal root key = (node.ownRecords location).lookup key := by
   cases stored : (node.ownRecords location).lookup key with
   | some value =>

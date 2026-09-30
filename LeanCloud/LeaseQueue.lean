@@ -2,6 +2,8 @@ import LeanCloud.WorkQueue
 import LeanCloud.Db
 import LeanCloud.BlobStorage
 
+universe u
+
 namespace LeanCloud
 
 /-- The transport primitives needed by a replay worker. Receipts belong to
@@ -10,7 +12,7 @@ Successful enqueue must be durable before returning. Dequeue retains work until
 acknowledgement, and unacknowledged leases must permit eventual redelivery.
 Backend failures escape through `m`; a rejected receipt returns `false`.
 Lease duration, renewal, waiting, and time belong to the backend environment. -/
-structure LeaseQueue (σ : Type) (m : Type → Type) (ρ : Type) where
+structure LeaseQueue (σ : Type) (m : Type → Type u) (ρ : Type) where
   enqueue : Location → StateT σ m Unit
   dequeue : StateT σ m (Option (Location × ρ))
   acknowledge : ρ → StateT σ m Bool

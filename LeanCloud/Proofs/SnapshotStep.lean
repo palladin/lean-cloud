@@ -94,7 +94,9 @@ mutual
         simpa only [Nat.add_assoc] using combined
       · intro fuel queueItems
         rw [← Nat.add_assoc, walk_recorded_parallel _ _ supported.1.1 _ _ _ _ _ _ _
-          ((collect_outcomes_size _ _ collected).trans childrenEvaluation.size) (next_target_ne rest.source selected) recorded,
+          ((collect_outcomes_size _ _ collected).trans childrenEvaluation.size) (next_target_ne rest.source selected)
+          (Location.not_entersChild_of_next (by simp [commandLocation])
+            (by simpa only [commandLocation_next] using rest.source.at_or_after selected)) recorded,
           commandLocation_next]
         exact executed fuel queueItems
     | .parallel (codec := codec) (continuation := continuation) (work := childrenSpent)

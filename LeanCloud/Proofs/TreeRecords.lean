@@ -6,6 +6,8 @@ import LeanCloud.Location
 /-! Expected physical records extracted from the pure control tree. This finite
 list describes admitted values; it does not prepopulate storage or run replay. -/
 
+universe u
+
 namespace LeanCloud.Proofs
 open Lean JournalDb
 
@@ -29,7 +31,7 @@ def ExecutionTree.ownRecords (tree : ExecutionTree) (location : Location) : List
 def ExecutionTree.records (tree : ExecutionTree) (location : Location) : List (String × Json) :=
   (tree.nodes location).flatMap fun (address, node) => node.ownRecords address
 
-variable {m : Type → Type}
+variable {m : Type → Type u}
 
 theorem ChildrenExpansion.slots {codec : Codec α} {count : Nat} {branches : Fin count → Cloud m α}
     {trees outcomes} (expansion : ChildrenExpansion codec branches trees)

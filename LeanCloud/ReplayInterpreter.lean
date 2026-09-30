@@ -8,6 +8,8 @@ import LeanCloud.Result
 computation and advances one effect, fork, join, or completion. The environment
 retains pending work and the final outcome across restarts. -/
 
+universe u
+
 namespace LeanCloud.ReplayInterpreter.Internal
 open Lean LeanEff
 
@@ -35,6 +37,11 @@ def decodeGroup [Monad m] (codec : Codec α) (count : Nat) (value : Json) :
   if values.size != count then throw ⟨.divergence, "Parallel child count changed"⟩
   return values
 
+/-- A completed join makes its parent runnable; a partial join still waits. -/
+def joinResponse (parent : Location) : Result → StepResult
+  | .suspended _ => .runnable #[]
+  | .completed _ => .runnable #[parent]
+
 /-- Publish the child slot before caching a completed group. With `JournalDb`,
 each present slot is a separate immutable record. Reread after publication:
 another child may have completed concurrently, even if our earlier view was
@@ -59,9 +66,7 @@ def finish [Monad m] (db : Db σ m) (current : Location) (outcome : Exit) :
       save db parent (.suspended (children.set! index (some outcome)))
       if let .completed _ := updated then save db parent updated
       let some latest ← load db parent | throw ⟨.protocol, "Missing parent suspension"⟩
-      match latest with
-      | .suspended _ => return .runnable #[]
-      | .completed _ => return .runnable #[parent]
+      return joinResponse parent latest
 
 /-- Reconstruct a selected location. Recorded prefixes consume traversal fuel,
 but never call the chooser or repeat primitive effects. -/
@@ -111,9 +116,13 @@ def walk [Monad m] (db : Db σ m) (blobs : BlobStorage σ m) (fuel : Nat)
         | .completed (.success value) =>
           let values ← decodeGroup codec count value
           if current == target then return .runnable #[current.next]
+          -- Another worker can complete this ancestor after step's parent
+          -- check. The old child delivery now republishes the ancestor's work.
+          else if current.entersChild target then return .runnable #[current]
           else walk db blobs fuel (ArrsF.apply continuation values) current.next target
         | .completed outcome =>
           if current == target then finish db current outcome
+          else if current.entersChild target then return .runnable #[current]
           else throw ⟨.divergence, "Computation ended before the requested location"⟩
         | .suspended children =>
           if children.size != count then throw ⟨.divergence, "Parallel child count changed"⟩
@@ -167,7 +176,7 @@ open Lean ReplayInterpreter.Internal
 /-- Run work supplied by the environment until the root completes. Fuel bounds
 queue polls and each reconstruction traversal. A new environment starts with the
 root item; a restart reuses the same queue, journal, program, and input. -/
-def interpret {σ ι α : Type} {m : Type → Type} [Monad m] [Codec α]
+def interpret {σ ι α : Type} {m : Type → Type u} [Monad m] [Codec α]
     (db : Db σ m) (blobs : BlobStorage σ m) (queue : WorkQueue σ m) (fuel : Nat)
     (program : ι → Cloud m α) (input : ι) : ExceptT CloudError (StateT σ m) α :=
   run db blobs queue fuel (Codec.encode <$> program input)

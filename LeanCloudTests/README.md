@@ -6,7 +6,7 @@ Run everything from the repository root:
 lake test
 ```
 
-The suite currently contains 610 named cases. Some cases also iterate over values,
+The suite lists its named cases with `lake test -- --list`. Some cases also iterate over values,
 fuel budgets, journal writes, or queue updates. There are no additional test
 dependencies. Any failure prints its test name and exits with a nonzero status.
 
@@ -18,10 +18,11 @@ lake test -- differential/parallel/
 lake test -- generated/seed/42
 lake test -- replay/checkpoints/ replay/fuel/
 lake test -- queue/
-lake test -- crash/
+lake test -- recovery/
 lake test -- lease/
 lake test -- leased-replay/
 lake test -- journal/
+lake test -- simulation/
 ```
 
 Filters are test-name prefixes; multiple filters select their union. A filter that
@@ -76,10 +77,15 @@ A completed environment must return its final outcome without selecting more wor
 | [Codecs.lean](Codecs.lean) | Codec round trips, malformed input rejection, binary data, journal records, and an explicit broken-codec counterexample. |
 | [Backends.lean](Backends.lean) | Separate Db and blob interfaces over `Id` and `IO`, returned backend handles, state-dependent effect results, native exceptions, deep parallel nesting, and location navigation. |
 | [WorkQueue.lean](WorkQueue.lean) | Scripted interleaving; state-dependent results; nested pending work; error and result ordering; heterogeneous pairs; empty groups; numeric location order; 128 generated programs under three policies; restart under a different schedule; interruptions around every queue update; temporary idle responses. |
-| [Crash.lean](Crash.lean) | Pure crash model; interruptions before/after every Db and queue primitive in selected fixtures and 32 generated pure programs; automatic retry and changed scheduling; repeated crashes; retained durable state; discarded worker-local state; separate crash, workflow-error, and fuel-exhaustion outcomes. |
+| [Recovery.lean](Recovery.lean) | Single-worker SimM recovery; interruptions before commit and before reply at every boundary of selected fixtures and 32 generated pure programs; repeated crashes, pauses, retained durable state, and distinct workflow-error and fuel-exhaustion outcomes. |
 | [LeaseQueue.lean](LeaseQueue.lean) | Primitive enqueue/dequeue/renew/ack; expiry and redelivery; stale receipts; duplicate payloads; repeated expiry; crashes and lost replies around dequeue, enqueue, renewal, and acknowledgement. |
-| [LeasedReplay.lean](LeasedReplay.lean) | The actual replay interpreter over leased transport; interruptions before/after individual Db operations, enqueues, acknowledgement, and final-result publication; duplicate deliveries; repeated crashes; 16 generated workflows; backend handles and receipts. |
+| [LeasedReplay.lean](LeasedReplay.lean) | The actual replay interpreter over leased transport; interruptions before/after individual Db operations, enqueues, acknowledgement, and final-result publication; duplicate deliveries; explicit lease-time advancement; backend handles and receipts. |
 | [JournalDb.lean](JournalDb.lean) | Independent child records; interleaved sibling completions; late fork initialization; duplicate completion; observed conflicts; malformed physical records. |
+| [Simulation.lean](Simulation.lean) | Two workers running the actual interpreter; independent commits and response delivery; local state discarded on restart; delayed reads; lease expiry and stale receipts; concurrent sibling completion; completed-ancestor race regression; interruption at every boundary of selected runs; all 256 eight-event scheduling prefixes of a fixture; 96 reproducible workflow/schedule/crash combinations compared with direct evaluation. |
+| [ConcurrentJournal.lean](ConcurrentJournal.lean) | Actual `putSame` and full `put` calls; delayed absent-key responses; complementary partial arrays; all 256 eight-event scheduling prefixes; crashes at every boundary of a three-record publication; 16 repeated-crash schedules; late initialization after completed publication; empty groups, duplicate completion, malformed inputs, and a same-key disagreement counterexample. |
+| [ConcurrentRead.lean](ConcurrentRead.lean) | Actual readers overlapping actual publishers; delayed cached and missing replies; a mixed view that never existed as an atomic snapshot; retention of pre-existing slots; crashes at all ten boundaries of a three-child read; all 256 eight-event scheduling prefixes; empty groups; 32 reproducible schedules with and without repeated crashes. |
+| [ConcurrentJoin.lean](ConcurrentJoin.lean) | Two actual `finish` calls; sibling success and failure priority; nested parents and duplicate completion; crashes at every first-worker boundary while the other finishes; root completion and reuse of a completed child group without its own cache; a lost last-slot reply without a result cache; all 1,024 ten-event scheduling prefixes; 32 reproducible schedules with and without repeated crashes. |
+| [ConcurrentPublication.lean](ConcurrentPublication.lean) | Actual queue publication requests; overlapping and duplicate requests, stale receipts, partial and empty successor lists, final-result publication; coverage checked at each scheduled boundary; all enabled scheduling prefixes up to ten events; crashes at every first-publisher boundary; a conflicting-plan counterexample; full interpreter recovery before/after parent enqueue, child acknowledgement, and final-result publication; delayed empty replies after parent consumption; changed replies on retry. |
 
 Generated failures print both the seed and the program tree. The generator uses
 fixed seeds, so the same test can be rerun with a prefix such as
@@ -116,41 +122,31 @@ claim exactly-once external effects across that boundary.
 Native `IO` exceptions escape both interpreters and stop the current execution.
 They differ from typed cloud failures, whose outcomes are collected and recorded.
 
-## Explicit crash model
+## External crash and restart
 
-[Crash.lean](Crash.lean) also runs the existing interpreter in
-`CrashM`, an exception layer over durable state. Unlike the IO injection tests,
-this is a pure, inspectable model. The fault script is separate harness bookkeeping;
-each primitive consumes one entry and either crashes before committing, crashes
-after committing, or returns normally. Neither crashes nor retries reset the
-script or durable state.
+[Recovery.lean](Recovery.lean) runs the actual interpreter over
+[`SimulationBackend`](../LeanCloud/SimulationBackend.lean). Recovery and concurrent
+execution share `SimM`; crashes are external scheduling events.
 
-The outer runner takes a fresh worker-local state on every attempt:
+A worker first waits to commit an atomic operation, then waits to receive its
+saved response. The boundary sweep enumerates both states for every operation of
+an uninterrupted run. At each boundary it crashes the worker, checks that durable
+state is unchanged, explicitly advances lease time, and restarts a fresh attempt.
+The returned result and durable completion record must match direct evaluation.
+This includes individual journal reads/writes, enqueues, and acknowledgements.
 
-```lean
-let attempt := Prod.fst <$> (interpret db blobs queue fuel program input).run ()
-let (result, state) := (CrashM.restart 3 attempt).run initial
-```
-
-Here `3` permits three retries after the first attempt. The result has type
-`Except Crash (Except CloudError α)`: retry exhaustion remains a crash; workflow
-errors and interpreter fuel exhaustion return normally through the inner layer.
-The caller initializes the Db and root item once, outside the runner.
-
-Boundary sweeps compare direct evaluation with both automatic retry and explicit
-restart under the opposite queue policy. They use ordinary pure values, delay,
-failure, and parallel; a separate exec test checks that a crash bypasses the
-interpreter's CloudError handler without being journaled as a failure.
-
-The tests above retain selected work until an atomic `complete` operation. The
-leased replay tests below separate successor publication and acknowledgement;
-they do not assume that stronger atomic queue contract.
+[SimulationSupport.lean](SimulationSupport.lean) supplies the one-worker test
+driver. [Simulation.lean](Simulation.lean) supplies two-worker scheduling and
+interleaving tests. Both use the same external events. A finite event list can
+leave a worker paused; a test driver's event budget is separate from interpreter
+fuel and from workflow errors. Tests also cover lost replies from exec without
+turning the crash into a journaled `CloudError`.
 
 ## Lease primitives
 
 [LeaseQueue.lean](LeaseQueue.lean) tests the pure
 [lease model](../LeanCloud/LeaseQueueModel.lean), including operations wrapped with
-`CrashModel.atomic` and retried by the outer runner. Each enqueued message has its
+`SimM.atomic` and interrupted by explicit simulation events. Each enqueued message has its
 own slot, even when the payload is an identical `Location`. Dequeue retains the
 message and returns a receipt; acknowledgement uses the receipt, not the payload.
 
@@ -179,7 +175,7 @@ concurrent replay must account for the service's guarantees.
 [LeasedReplay.lean](LeasedReplay.lean) supplies the existing interpreter with
 [LeaseQueue.toWorkQueue](../LeanCloud/LeaseQueue.lean). The adapter keeps the
 current receipt in worker-local state, while Db records, messages, and the final
-outcome survive in the crash model's durable state. Db and blob wrappers thread
+outcome survive in the simulator's durable state. Db and blob wrappers thread
 the backend handle without disturbing the receipt. The Db wrapper uses
 [JournalDb](../LeanCloud/JournalDb.lean), so the boundary sweeps include its
 individual physical reads and writes.
@@ -191,25 +187,29 @@ and persist that result. A restart can therefore return an already saved outcome
 even if the final message was never acknowledged; draining such leftover messages
 is separate cleanup work.
 
-The test environment explicitly advances time by one unit before each transport
-poll, so a crashed worker's three-unit lease can expire during later polls.
-Catching the crash itself does not release the lease. Boundary sweeps interrupt
-every primitive in selected workflows and 16 generated programs, restart with a
-fresh worker, and compare against direct evaluation. Other cases insert duplicate
-messages, interrupt between two successor enqueues, and reject a stale receipt
-without removing the newer delivery.
+The recovery sweeps explicitly advance time after interruption so the old lease
+expires before the worker resumes. Crash and restart themselves leave the clock
+unchanged. The distinct 32 generated pure workflows are swept once through this
+shared backend. Additional leased tests insert duplicate publications, interrupt
+between successor enqueues and between final-result publication and acknowledgement,
+and reject stale receipts without removing newer deliveries.
 
-[LeasePublication.lean](../LeanCloud/Proofs/LeasePublication.lean) also proves the
-adapter's publication ordering with separately atomic primitives: either the
-incoming delivery survives, or its successors (or final result) are durable.
-The proofs include stale receipts, invalid completion calls, and reading an
-already saved final result without dequeuing leftover work.
+[ConcurrentHandoff.lean](../LeanCloud/Proofs/ConcurrentHandoff.lean) and
+[ConcurrentAudit.lean](../LeanCloud/Proofs/ConcurrentAudit.lean) prove publication
+before acknowledgement, including overlapping processing and stale receipts.
+The main [concurrent equivalence theorem](../LeanCloud/Proofs/ConcurrentEquivalence.lean)
+proves both returned and durable outcomes under its explicit fairness conditions.
 
-These recovery runs serialize worker attempts. The journal tests below separately
-exercise controlled overlapping completions. The existing `same_output` theorem
-still assumes the ideal logical Db and atomic queue contract; equivalence across
-physical storage, leased delivery, concurrent workers, and crashes remains to be
-proved.
+The concurrent publication tests check that every incoming item remains queued
+until its supplied replacement work is durable. The corresponding batch proof
+assumes agreement between requests sharing a slot and leaves new successors for
+later consumers. A deliberately conflicting pair of requests demonstrates why
+the agreement premise matters. Separate full-interpreter tests restart with a
+fresh receipt after crashes on both sides of the three handoff boundaries above;
+these exercise recovery beyond the current batch theorem. Additional regressions
+let another worker consume the parent before an old empty reply acknowledges,
+and crash a child whose retry now enqueues the completed parent instead of
+returning no work. The changed reply is interrupted before and after its enqueue.
 
 ## Independent child records
 
@@ -241,12 +241,31 @@ observed disagreements, but its read/check/write is not compare-and-set and cann
 resolve simultaneous conflicting values. These tests do not establish exactly-once
 external effects or full concurrent replay correctness.
 
-The [storage proofs](../LeanCloud/Proofs/README.md) now establish read
-reconstruction and preservation of compatible records across interrupted
-publication. They also derive eventual publication with enough retries for any
-finite fault script. These proofs cover serialized attempts and explicitly state
-the agreement and JSON comparison assumptions; the interleaving tests exercise
-behavior beyond that proof scope.
+The [storage proofs](../LeanCloud/Proofs/README.md) establish reconstruction and
+preservation of compatible records under arbitrary legal simulation schedules,
+including partial publication, delayed replies, crashes, and retries. Concurrent
+read observations are bounded by the journal before and after the read; they need
+not be a simultaneous snapshot. Agreement and comparison laws remain explicit.
+These properties support the full pure-workflow equivalence theorem.
+
+A mixed-read regression pauses a reader after observing child 0 absent. The writer
+then commits child 0 and child 1 in order. When resumed, the reader sees child 1
+present and returns a partial array that never existed as a simultaneous storage
+state. A fresh read sees both results and completes. Tests also restart a reader
+at every physical read/reply boundary after allowing the publisher to finish;
+the restarted read must include all the newly durable children.
+
+Join tests run the actual child-completion code and require both durable child
+records, the expected group result, and at least one parent wakeup request.
+They also check recovery after committing the last slot but losing its reply:
+the retry recognizes completion from child records alone, without a cached group
+result. These focused tests stop at the wakeup request; they do not enqueue it.
+The concurrent completion proof now covers the full `finish` call under its
+explicit storage assumptions, including arbitrary finite crash/restart schedules.
+The [wakeup theorem](../LeanCloud/Proofs/ConcurrentWakeup.lean) additionally proves
+that returned attempts for all children of a nonempty group cannot all omit the
+parent notification. The simulated raw Db retains a write log to order reread
+points; clients continue to use the same atomic key/value interface.
 
 ## Adding a case
 
@@ -268,8 +287,9 @@ included in `allCases` in [LeanCloudTests.lean](../LeanCloudTests.lean).
 
 These tests exercise simulated interleaving on one thread and ideal in-memory
 storage. Lease primitives and replay cover redelivery and duplicate messages
-with serialized attempts. Concurrent leased workers, database adapters, cloud
-deployments, and cancellation are not tested.
+with serialized attempts and with interleaved simulated workers. Real concurrent
+execution against database adapters, cloud deployments, and cancellation are not
+tested.
 Choice has only an explicit unsupported-operation check.
 
 Differential comparison assumes the queue selects the sequential reference order,
@@ -286,8 +306,8 @@ user state or effect-order assumptions.
 
 The theorem covers fresh runs with serialized worker steps. Exec (including the
 recorded `Cloud.pure` helper), blobs, restart correctness, simultaneous workers,
-and real adapters are outside its scope. The tests above still exercise these
-runtime effects and modeled recovery scenarios.
+and real adapters are outside its scope. The concurrent equivalence theorem separately covers pure workflows with
+crashes and interleaved workers. The tests also exercise runtime effects.
 
 [Queue laws](../LeanCloud/Proofs/WorkQueue.lean) specify valid selection, retention,
 completion reporting, and weak fairness. Finite tests check representative

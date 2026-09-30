@@ -67,6 +67,11 @@ theorem TreeRoute.next_ne {tree current target node} (route : TreeRoute tree cur
   · exact (same ▸ first).ne
   · exact (first.trans later).ne
 
+theorem TreeRoute.next_not_child {tree node : ExecutionTree} {current target : Location} (route : TreeRoute tree current.next target node)
+    (nonempty : 0 < current.size) : current.entersChild target = false :=
+  Location.not_entersChild_of_next nonempty
+    (ExecutionTree.node_at_or_after (by simpa using nonempty) route.member)
+
 theorem TreeRoute.child_path {tree node : ExecutionTree} {current target : Location} {index : Nat}
     (route : TreeRoute tree (current.child index) target node) :
     current.entersChild target = true ∧ target[current.size]!.1 = index :=

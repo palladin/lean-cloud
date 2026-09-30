@@ -3,11 +3,13 @@ import LeanCloud.ReplayInterpreter
 /-! Backend-independent proof factors of the existing completion code. The
 runtime interpreter is unchanged; recovery and backend mapping share these terms. -/
 
+universe u
+
 namespace LeanCloud.Proofs.ReplayRecovery
 open Lean ReplayInterpreter.Internal
 
 /-- The common prefix of root and child completion in the actual worker. -/
-def recordResult {m : Type → Type} [Monad m] (db : Db σ m) (current : Location) (outcome : Exit) :
+def recordResult {m : Type → Type u} [Monad m] (db : Db σ m) (current : Location) (outcome : Exit) :
     ExceptT CloudError (StateT σ m) Unit := do
   match ← load db current with
   | none => save db current (.completed outcome)
@@ -15,21 +17,19 @@ def recordResult {m : Type → Type} [Monad m] (db : Db σ m) (current : Locatio
     if recorded != outcome then throw ⟨.divergence, "Completion changed during replay"⟩
   | some (.suspended _) => throw ⟨.divergence, "Expected a completed computation"⟩
 
-def readParent {m : Type → Type} [Monad m] (db : Db σ m) (parent : Location) :
+def readParent {m : Type → Type u} [Monad m] (db : Db σ m) (parent : Location) :
     ExceptT CloudError (StateT σ m) StepResult := do
   let some latest ← load db parent | throw ⟨.protocol, "Missing parent suspension"⟩
-  match latest with
-  | .suspended _ => return .runnable #[]
-  | .completed _ => return .runnable #[parent]
+  return joinResponse parent latest
 
-def publishParent {m : Type → Type} [Monad m] (db : Db σ m) (parent : Location)
+def publishParent {m : Type → Type u} [Monad m] (db : Db σ m) (parent : Location)
     (slots : Array (Option Exit)) (updated : Result) : ExceptT CloudError (StateT σ m) StepResult := do
   save db parent (.suspended slots)
   if let .completed _ := updated then save db parent updated
   readParent db parent
 
 /-- Publication of a child's result to its parent. -/
-def notifyParent {m : Type → Type} [Monad m] (db : Db σ m) (parent : Location) (index : Nat) (outcome : Exit) : ExceptT CloudError (StateT σ m) StepResult := do
+def notifyParent {m : Type → Type u} [Monad m] (db : Db σ m) (parent : Location) (index : Nat) (outcome : Exit) : ExceptT CloudError (StateT σ m) StepResult := do
   let some group ← load db parent | throw ⟨.protocol, "Missing parent suspension"⟩
   match group with
   | .completed _ => return .runnable #[parent]
@@ -39,7 +39,7 @@ def notifyParent {m : Type → Type} [Monad m] (db : Db σ m) (parent : Location
       | .error error => throw error
     publishParent db parent (children.set! index (some outcome)) updated
 
-theorem finish_eq {m : Type → Type} [Monad m] [LawfulMonad m] (db : Db σ m)
+theorem finish_eq {m : Type → Type u} [Monad m] [LawfulMonad m] (db : Db σ m)
     (current : Location) (outcome : Exit) :
     finish db current outcome = (do
       recordResult db current outcome
@@ -59,7 +59,7 @@ theorem finish_eq {m : Type → Type} [Monad m] [LawfulMonad m] (db : Db σ m)
         simp only [different, Bool.false_eq_true, ↓reduceIte, ExceptT.bind_throw, pure_bind]
       congr 1
 
-theorem finish_child_eq {m : Type → Type} [Monad m] [LawfulMonad m] (db : Db σ m)
+theorem finish_child_eq {m : Type → Type u} [Monad m] [LawfulMonad m] (db : Db σ m)
     (current parent : Location) (index : Nat) (outcome : Exit)
     (linked : current.parent? = some (parent, index)) :
     finish db current outcome = (do

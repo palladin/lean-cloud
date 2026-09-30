@@ -4,6 +4,8 @@ import LeanCloud.Proofs.CompletionView
 /-! Database safety stated against the program's own execution tree. Missing
 records are allowed; every present record must have its program-defined value. -/
 
+universe u
+
 namespace LeanCloud.Proofs
 open Lean JournalDb JournalAdapter ReplayRecovery
 
@@ -29,7 +31,7 @@ theorem ExecutionTree.PartialSlots.empty (children : List ExecutionTree) :
 
 /-- Settling a valid partial array either retains that partial array or yields
 exactly the pure fork result, including the original array-order failure. -/
-theorem Expansion.settle_admitted {m : Type → Type} {program : Cloud m Json} {children result next slots}
+theorem Expansion.settle_admitted {m : Type → Type u} {program : Cloud m Json} {children result next slots}
     (expansion : Expansion program (.fork children result next))
     (valid : ExecutionTree.PartialSlots children slots) :
     (ExecutionTree.fork children result next).Admits (Result.settle slots) := by
@@ -96,20 +98,6 @@ theorem ExecutionTree.admitted_agrees {tree node : ExecutionTree} {root location
     (ExecutionTree.ownRecords_subset member (admitted.records location published))
   exact ⟨recorded, comparable _ _ recorded⟩
 
-/-- The actual interpreter save preserves the program-derived Db bound across
-every raw read/write crash boundary. On return its requested fields are durable. -/
-theorem ExecutionTree.save_admitted {tree node : ExecutionTree} {root location : Location} {record}
-    (nonempty : 0 < root.size) (member : (location, node) ∈ tree.nodes root)
-    (admitted : node.Admits record) (comparable : Comparable (tree.journal root)) (initial : Journal) :
-    Spec (Between initial (tree.journal root))
-      (ReplayInterpreter.Internal.save ReplayRecovery.db location record)
-      (fun _ journal => Between initial (tree.journal root) journal ∧
-        Published (JournalAdapter.records location.key record) journal)
-      (Between initial (tree.journal root)) := by
-  exact (save_spec (tree.journal root) initial location record
-    (tree.admitted_agrees nonempty member admitted comparable)).weaken
-      (fun _ h => h) (fun _ _ h => ⟨⟨h.1, h.2.1⟩, h.2.2⟩) (fun _ h => h)
-
 /-- Proof description of the currently present slots. Their values come from
 the program; the durable journal determines only which ones are present. -/
 def ExecutionTree.observedSlots (children : List ExecutionTree) (journal : Journal) (location : Location) :
@@ -141,7 +129,7 @@ theorem ExecutionTree.observedSlots_spec {tree : ExecutionTree} {root location :
 
 /-- Reading any sparse, compatible fork journal yields a valid partial group
 or the program's completed fork result. No successful replay is assumed. -/
-theorem Expansion.fork_view {m : Type → Type} {program : Cloud m Json} {tree : ExecutionTree}
+theorem Expansion.fork_view {m : Type → Type u} {program : Cloud m Json} {tree : ExecutionTree}
     (expansion : Expansion program tree) {root location : Location} {children result next}
     (nonempty : 0 < root.size) (member : (location, .fork children result next) ∈ tree.nodes root)
     (journal : Journal) (bounded : Extends journal (tree.journal root)) :

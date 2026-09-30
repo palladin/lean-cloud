@@ -4,6 +4,8 @@ import LeanCloud.Proofs.EvaluationContinuation
 This is proof data, not an interpreter or a runtime scheduling policy. Children
 retain their original array order; completed successful forks have a continuation. -/
 
+universe u
+
 namespace LeanCloud.Proofs
 open Lean LeanEff
 
@@ -20,7 +22,7 @@ def ExecutionTree.outcome : ExecutionTree → Except CloudError Json
   | .fork _ _ (some next) => next.outcome
 
 mutual
-  inductive Expansion {m : Type → Type} : Cloud m Json → ExecutionTree → Prop where
+  inductive Expansion {m : Type → Type u} : Cloud m Json → ExecutionTree → Prop where
     | pure (value : Json) : Expansion (EffF.pure value) (.terminal (.ok value))
     | fail (error : CloudError) (continuation : ArrsF (Control m) α Json) :
         Expansion (.impure (.fail error) continuation) (.terminal (.error error))
@@ -43,7 +45,7 @@ mutual
         Expansion (.impure (.parallel codec count branches) continuation)
           (.fork trees (.error error) none)
 
-  inductive ChildrenExpansion {m : Type → Type} : {α : Type} → Codec α → {count : Nat} →
+  inductive ChildrenExpansion {m : Type → Type u} : {α : Type} → Codec α → {count : Nat} →
       (Fin count → Cloud m α) → List ExecutionTree → Prop where
     | empty (codec : Codec α) (branches : Fin 0 → Cloud m α) : ChildrenExpansion codec branches []
     | cons {codec : Codec α} {count : Nat} {branches : Fin (count + 1) → Cloud m α} {tree trees}
@@ -52,7 +54,7 @@ mutual
         ChildrenExpansion codec branches (tree :: trees)
 end
 
-variable {m : Type → Type}
+variable {m : Type → Type u}
 
 /-- The tree records the existing pure semantics, including array-order failure
 selection. It cannot invent an outcome for a program. -/

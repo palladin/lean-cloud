@@ -110,7 +110,7 @@ theorem Coverage.grow {before after pending tree current done done'}
 
 /-- An initialized fork is either still waiting on a missing slot or has a
 durable completion witness. A completed cache is optional. -/
-theorem Expansion.fork_coverage_cases {m : Type → Type} {program : Cloud m Json} {tree root location children result next}
+theorem Expansion.fork_coverage_cases {m : Type → Type u} {program : Cloud m Json} {tree root location children result next}
     (expansion : Expansion program tree) (nonempty : 0 < root.size)
     (member : (location, ExecutionTree.fork children result next) ∈ tree.nodes root)
     (journal : Journal) (bounded : Extends journal (tree.journal root))
@@ -144,7 +144,7 @@ theorem Expansion.fork_coverage_cases {m : Type → Type} {program : Cloud m Jso
 
 /-- The worker only needs to account for joins newly made readable by its
 journal writes. Still-partial groups retain coverage of their children. -/
-theorem Coverage.grow_of_woken {m : Type → Type} {program : Cloud m Json}
+theorem Coverage.grow_of_woken {m : Type → Type u} {program : Cloud m Json}
     {tree current before after pending done done'}
     (expansion : Expansion program tree) (nonempty : 0 < current.size)
     (covered : Coverage before pending tree current done) (growth : Extends before after)

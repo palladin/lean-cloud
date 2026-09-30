@@ -1,6 +1,6 @@
 import LeanCloud.Proofs.TreeCausality
-import LeanCloud.Proofs.TreeRootRecovery
-import LeanCloud.Proofs.TreeChildRecovery
+import LeanCloud.Proofs.TreeCompletion
+import LeanCloud.Proofs.TreeSnapshot
 
 /-! Durable prerequisites for an issued location. Unlike a suspended read,
 activation survives later completions. Causality then shows that the delivery

@@ -54,18 +54,16 @@ Branches may interleave, while results retain their original array order.
 Execution currently uses one thread. Distributed workers, on-premises and cloud
 adapters, choice, and cancellation are future work.
 
-The [crash model](LeanCloud/CrashModel.lean) can interrupt atomic backend operations
-before or after they commit. An outer [restart runner](LeanCloud/Crash.lean) retries
-the interpreter with retained Db and queue state and fresh worker-local state.
-Crashes are separate from workflow errors. The [lease adapter](LeanCloud/LeaseQueue.lean)
-connects replay to dequeue, enqueue, and acknowledgement primitives. It publishes
-successors individually before acknowledging the delivery; the tests cover
-crashes between those operations and duplicate deliveries with serialized workers.
-
 [JournalDb](LeanCloud/JournalDb.lean) stores each child's outcome separately, so
-sibling completions cannot overwrite each other. It reconstructs the group's
-partial result when read. Tests also interleave sibling completions and delayed
-fork initialization; a full concurrent-worker proof remains future work.
+sibling completions cannot overwrite each other. The
+[lease adapter](LeanCloud/LeaseQueue.lean) publishes successors or the final result
+before acknowledging a delivery.
+
+The [worker simulation](LeanCloud/Simulation.md) runs the same interpreter over
+`SimM`. An external driver interleaves atomic backend operations, delays replies,
+crashes workers, restarts them with fresh local state, and advances lease time.
+Durable records and queued work survive. Single-worker recovery and concurrent
+execution use this same model.
 
 Build and run the tests with the pinned Lean toolchain:
 
@@ -81,9 +79,10 @@ and replay with a lawful, fair queue and sufficient fuel. Branches may be select
 in any order.
 
 The [proof model](LeanCloud/Proofs/README.md) covers ordinary pure values, delay,
-failure, and parallel control flow. Runtime exec and blob operations remain
-available outside that theorem. The equivalence proof covers fresh runs with
-serialized worker steps. [Recovery equivalence](LeanCloud/Proofs/RecoveryEquivalence.lean)
-extends this to finite crashes and restarts with the physical journal and leased
-queue, under the stated time, delivery, and comparison laws. Concurrent workers
-remain future proof work.
+failure, and parallel control flow. The main
+[`ConcurrentRecovery.same_output`](LeanCloud/Proofs/ConcurrentEquivalence.lean)
+theorem proves that concurrent replay returns the direct interpreter's outcome
+and stores its encoding in the durable completion record. Fair scheduling and
+delivery after crashes stop supply a completing prefix and sufficient finite fuel.
+Runtime exec and blob operations remain available outside this theorem; real
+storage and cloud adapters still need implementation and validation.

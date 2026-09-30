@@ -132,12 +132,18 @@ mutual
   termination_by sizeOf trees
 end
 
+/-- The original location order is independent of worker scheduling. -/
+theorem ExecutionTree.locations_order (tree : ExecutionTree) (location : Location)
+    (nonempty : 0 < location.size) :
+    ((tree.nodes location).map Prod.fst).Pairwise Location.Earlier := by
+  obtain ⟨parent, ⟨branch, command⟩, rfl⟩ := Array.exists_push_of_size_pos nonempty
+  rw [List.pairwise_map]
+  exact (tree.nodes_order parent branch command).1
+
 /-- Different storage-bearing tree positions have different runtime locations. -/
 theorem ExecutionTree.locations_nodup (tree : ExecutionTree) (location : Location)
-    (nonempty : 0 < location.size) : ((tree.nodes location).map Prod.fst).Nodup := by
-  obtain ⟨parent, ⟨branch, command⟩, rfl⟩ := Array.exists_push_of_size_pos nonempty
-  rw [List.nodup_iff_pairwise_ne, List.pairwise_map]
-  exact (tree.nodes_order parent branch command).1.imp (fun earlier => earlier.ne)
+    (nonempty : 0 < location.size) : ((tree.nodes location).map Prod.fst).Nodup :=
+  (tree.locations_order location nonempty).imp (fun earlier => earlier.ne)
 
 theorem ExecutionTree.node_nonempty {tree : ExecutionTree} {location : Location}
     (nonempty : 0 < location.size) {node} (member : node ∈ tree.nodes location) : 0 < node.1.size := by

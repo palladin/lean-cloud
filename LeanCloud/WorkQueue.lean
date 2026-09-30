@@ -1,6 +1,8 @@
 import LeanCloud.Location
 import LeanCloud.Protocol
 
+universe u
+
 namespace LeanCloud
 
 /-- What the environment currently offers to a worker. Idle is not completion. -/
@@ -30,7 +32,7 @@ obligations; they are not implied by this interface or satisfied automatically
 by leased transport. The ideal logical Db assumes serialized workers; `JournalDb`
 provides separate physical child records, with its own same-value writer
 assumption. Full concurrent-worker correctness is a separate proof obligation. -/
-structure WorkQueue (σ : Type) (m : Type → Type) where
+structure WorkQueue (σ : Type) (m : Type → Type u) where
   next : StateT σ m Work
   complete : Location → StepResult → StateT σ m Unit
 

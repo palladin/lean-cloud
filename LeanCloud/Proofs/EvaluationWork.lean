@@ -7,6 +7,8 @@ one final report, while failures report during their failing command.
 The delay cost is zero for queue progress and one for reconstruction
 termination. Both measures use the same evaluation and continuation laws. -/
 
+universe u
+
 namespace LeanCloud.Proofs
 open LeanEff
 
@@ -15,7 +17,7 @@ def returnWork : Except CloudError α → Nat
   | .error _ => 0
 
 mutual
-  inductive ProgramWork {m : Type → Type} (delayCost : Nat) : {α : Type} → {program : Cloud m α} →
+  inductive ProgramWork {m : Type → Type u} (delayCost : Nat) : {α : Type} → {program : Cloud m α} →
       {outcome : Except CloudError α} → Evaluation program outcome → Nat → Prop where
     | pure (value : α) : ProgramWork delayCost (Evaluation.pure value) 0
     | success {request : Control m β} {continuation : ArrsF (Control m) β α}
@@ -27,7 +29,7 @@ mutual
         {error work} {head : ControlEvaluation request (.error error)}
         (control : ControlWork delayCost head work) : ProgramWork delayCost (.failure continuation head) work
 
-  inductive ControlWork {m : Type → Type} (delayCost : Nat) : {α : Type} → {request : Control m α} →
+  inductive ControlWork {m : Type → Type u} (delayCost : Nat) : {α : Type} → {request : Control m α} →
       {outcome : Except CloudError α} → ControlEvaluation request outcome → Nat → Prop where
     | delay : ControlWork delayCost (ControlEvaluation.delay) delayCost
     | fail (error : CloudError) : ControlWork delayCost (ControlEvaluation.fail (α := α) error) 1
@@ -35,7 +37,7 @@ mutual
         {outcomes work} {children : ChildrenEvaluation branches outcomes}
         (cost : ChildrenWork delayCost children work) : ControlWork delayCost (.parallel (codec := codec) children) (work + 2)
 
-  inductive ContinuationWork {m : Type → Type} (delayCost : Nat) : {α β : Type} → {continuation : ArrsF (Control m) α β} →
+  inductive ContinuationWork {m : Type → Type u} (delayCost : Nat) : {α β : Type} → {continuation : ArrsF (Control m) α β} →
       {value : α} → {outcome : Except CloudError β} →
         ContinuationEvaluation continuation value outcome → Nat → Prop where
     | one {k : α → Cloud m β} {value outcome work} {evaluation : Evaluation (k value) outcome}
@@ -49,7 +51,7 @@ mutual
         {value error work} {head : ContinuationEvaluation first value (.error error)}
         (cost : ContinuationWork delayCost head work) : ContinuationWork delayCost (.failure rest head) work
 
-  inductive ChildrenWork {m : Type → Type} (delayCost : Nat) : {α : Type} → {count : Nat} → {branches : Fin count → Cloud m α} →
+  inductive ChildrenWork {m : Type → Type u} (delayCost : Nat) : {α : Type} → {count : Nat} → {branches : Fin count → Cloud m α} →
       {outcomes : Array (Except CloudError α)} →
         ChildrenEvaluation branches outcomes → Nat → Prop where
     | empty (branches : Fin 0 → Cloud m α) : ChildrenWork delayCost (.empty branches) 0
@@ -62,7 +64,7 @@ mutual
         ChildrenWork delayCost (.cons head tail) (firstWork + returnWork outcome + restWork)
 end
 
-variable {m : Type → Type} {delayCost : Nat}
+variable {m : Type → Type u} {delayCost : Nat}
 
 mutual
   theorem Evaluation.work_exists {program : Cloud m α} {outcome}

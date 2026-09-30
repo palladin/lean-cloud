@@ -5,6 +5,8 @@ import LeanCloud.BlobStorage
 computations, control requests, and continuation queues. No replay or result codecs
 are used. Parallel evaluates all children in array order before selecting an error. -/
 
+universe u
+
 namespace LeanCloud.DirectInterpreter
 open LeanEff
 
@@ -12,7 +14,7 @@ open LeanEff
 namespace Internal
 
 mutual
-  def eval {σ α : Type} {m : Type → Type} [Monad m]
+  def eval {σ α : Type} {m : Type → Type u} [Monad m]
       (blobs : BlobStorage σ m) (program : Cloud m α) : ExceptT CloudError (StateT σ m) α :=
     match program with
     | EffF.pure value => pure value
@@ -21,7 +23,7 @@ mutual
       evalContinuation blobs continuation value
   termination_by structural program
 
-  def evalControl {σ α : Type} {m : Type → Type} [Monad m]
+  def evalControl {σ α : Type} {m : Type → Type u} [Monad m]
       (blobs : BlobStorage σ m) (request : Control m α) : ExceptT CloudError (StateT σ m) α :=
     match request with
     | .delay => pure ()
@@ -36,7 +38,7 @@ mutual
       | .error error => throw error
   termination_by structural request
 
-  def evalContinuation {σ α β : Type} {m : Type → Type} [Monad m]
+  def evalContinuation {σ α β : Type} {m : Type → Type u} [Monad m]
       (blobs : BlobStorage σ m) (continuation : ArrsF (Control m) α β) (value : α) :
       ExceptT CloudError (StateT σ m) β :=
     match continuation with
@@ -50,7 +52,7 @@ end
 end Internal
 
 /-- Evaluate the original program directly, with no execution-step budget. -/
-def interpret {σ ι α : Type} {m : Type → Type} [Monad m]
+def interpret {σ ι α : Type} {m : Type → Type u} [Monad m]
     (blobs : BlobStorage σ m) (program : ι → Cloud m α) (input : ι) :
     ExceptT CloudError (StateT σ m) α :=
   Internal.eval blobs (program input)

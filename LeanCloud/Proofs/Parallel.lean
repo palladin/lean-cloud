@@ -60,6 +60,32 @@ theorem settle_suspended {children slots : Array (Option Exit)}
   · cases settled; rfl
   · split at settled <;> cases settled
 
+/-- A suspended result really has an unfilled position. This is about the
+returned array, independently of later publications to the physical journal. -/
+theorem settle_suspended_missing {children slots : Array (Option Exit)}
+    (settled : settle children = .suspended slots) : none ∈ slots := by
+  have same := settle_suspended settled
+  subst slots
+  classical
+  by_cases missing : none ∈ children
+  · exact missing
+  have collect (values : List (Option Exit)) (filled : none ∉ values) :
+      ∃ outcomes, values.mapM id = some outcomes := by
+    induction values with
+    | nil => exact ⟨[], rfl⟩
+    | cons value rest ih =>
+      cases value with
+      | none => exact False.elim (filled (by simp))
+      | some value =>
+        obtain ⟨outcomes, collected⟩ := ih (fun present => filled (by simp [present]))
+        exact ⟨value :: outcomes, by simp [List.mapM_cons, collected]⟩
+  obtain ⟨outcomes, collected⟩ := collect children.toList (by simpa using missing)
+  have complete : children.mapM id = some outcomes.toArray := by
+    rw [Array.mapM_eq_mapM_toList, collected]
+    rfl
+  simp only [settle, complete] at settled
+  split at settled <;> cases settled
+
 /-- A completed group has an outcome at every array position. -/
 theorem settle_filled {children : Array (Option Exit)} {outcome : Exit}
     (settled : settle children = .completed outcome) (index : Nat) (inside : index < children.size) :

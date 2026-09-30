@@ -5,10 +5,12 @@ import LeanCloud.Proofs.PureContinuation
 /-! Rebuilding continuations and encoding branch results do not add processing
 work. Intermediate pure values in a bind are not worker completion reports. -/
 
+universe u
+
 namespace LeanCloud.Proofs
 open LeanEff
 
-variable {m : Type → Type} {delayCost : Nat}
+variable {m : Type → Type u} {delayCost : Nat}
 
 theorem ChildrenEvaluation.size {α : Type} {count : Nat}
     {branches : Fin count → Cloud m α} {outcomes}

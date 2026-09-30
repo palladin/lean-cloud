@@ -1,6 +1,5 @@
 import LeanCloud.Proofs.JournalDb
 import LeanCloud.Proofs.ParallelSlots
-import LeanCloud.Proofs.Crash
 import Init.Data.Range.Lemmas
 
 /-! Specifications of the actual journal adapter. The list of records below is

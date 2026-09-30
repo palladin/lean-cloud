@@ -66,6 +66,7 @@ theorem walk_recorded_parallel (fuel : Nat)
     (branches : Fin count → Cloud Id α)
     (continuation : ArrsF (Control Id) (Array α) Json) (values : Array α)
     (current target : Location) (state : State) (size : values.size = count) (different : current ≠ target)
+    (outside : current.entersChild target = false)
     (recorded : state.journal current.key =
       some (toJson (Result.completed (.success (Json.arr (values.map codec.encode)))))) :
     (walk db noBlobs (fuel + 1) (.impure (.parallel codec count branches) continuation) current target).run state =
@@ -73,7 +74,7 @@ theorem walk_recorded_parallel (fuel : Nat)
   rw [walk]
   simp only [run_bind, load_recorded state current _ recorded,
     beq_eq_false_iff_ne.mpr different, Bool.false_and, Bool.false_eq_true, ↓reduceIte,
-    run_pure, ← size, decode_group_encoded codec law values]
+    run_pure, ← size, decode_group_encoded codec law values, outside]
 
 theorem walk_parallel_child (fuel : Nat)
     (codec : Codec α) (count : Nat) (branches : Fin count → Cloud Id α)

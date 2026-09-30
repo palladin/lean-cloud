@@ -1,4 +1,4 @@
-import LeanCloud.Proofs.ReplayRecovery
+import LeanCloud.Proofs.JournalRecovery
 import LeanCloud.Proofs.CompletionCode
 
 /-! Physical records that justify retrying a completion. These are predicates
@@ -140,32 +140,6 @@ theorem CompletionSource.view {initial expected : Journal} {key : String} {outco
     have present := recorded.grow valid.1
     exact ⟨some (.completed outcome), present.view valid.2 intended, Or.inr ⟨rfl, present⟩⟩
 
-/-- Saving a missing result and accepting an existing result establish the
-same durable fact. Clients supply only the invariant preserved by their save. -/
-theorem recordResult_spec {initial expected : Journal} {current : Location} {outcome : Exit}
-    (source : CompletionSource initial expected current.key outcome)
-    (intended : expected (resultKey current.key) = some (toJson outcome))
-    (sameExit : (outcome == outcome) = true)
-    {invariant stopped : Journal → Prop}
-    (bounded : ∀ journal, invariant journal → Between initial expected journal)
-    (safe : ∀ journal, invariant journal → stopped journal)
-    (saved : Spec invariant (ReplayInterpreter.Internal.save db current (.completed outcome))
-      (fun _ journal => invariant journal ∧ CompletedAt journal current.key outcome) stopped) :
-    Spec invariant (recordResult db current outcome)
-      (fun _ journal => invariant journal ∧ CompletedAt journal current.key outcome) stopped := by
-  unfold recordResult
-  apply Spec.bind ((load_spec current invariant
-    (fun record journal => invariant journal ∧
-      (record = none ∨ record = some (.completed outcome) ∧ CompletedAt journal current.key outcome))
-    (fun journal kept => by
-      obtain ⟨record, view, allowed⟩ := source.view intended journal (bounded journal kept)
-      exact ⟨record, view, kept, allowed⟩)).weaken (fun _ h => h) (fun _ _ h => h) safe)
-  intro record start h
-  rcases h with ⟨kept, absent | ⟨rfl, recorded⟩⟩
-  · subst record; exact saved start kept
-  · simp only [bne, sameExit, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
-    exact ⟨Nat.le_refl _, (), rfl, kept, recorded⟩
-
 /-- The local completion's fixed records. The parent descriptor and other slots
 are already durable; only this child slot and a possible result cache can be
 added. Values at unrelated locations are unrestricted. -/
@@ -199,10 +173,7 @@ theorem ChildLayout.rebase {initial expected journal : Journal} {current parent 
   have fixed := layout.others i inside different
   exact ⟨(valid.fixed _ (fixed.2.trans fixed.1.symm)).trans fixed.1, fixed.2⟩
 
-def completionResponse (parent : Location) (result : Result) : StepResult :=
-  match result with
-  | .suspended _ => .runnable #[]
-  | .completed _ => .runnable #[parent]
+abbrev completionResponse := ReplayInterpreter.Internal.joinResponse
 
 /-- The parent's logical view is either the original partial group or exactly
 the settled group after publishing this child. A cache can only contain that
@@ -279,7 +250,7 @@ theorem agrees_of_published {entries : List Record} {expected : Journal}
     (recorded : Published entries expected) (comparable : Comparable expected) : Agrees entries expected :=
   fun entry member => ⟨recorded entry member, comparable _ _ (recorded entry member)⟩
 
-private theorem published_suspended (key : String) (children : Array (Option Exit)) (journal : Journal)
+theorem published_suspended (key : String) (children : Array (Option Exit)) (journal : Journal)
     (fork : journal (forkKey key) = some (toJson children.size))
     (slots : ∀ i, i < children.size → ∀ outcome, children[i]! = some outcome →
       journal (childKey key i) = some (toJson outcome)) :

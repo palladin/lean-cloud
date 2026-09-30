@@ -4,11 +4,13 @@ import LeanCloud.Proofs.Model
 
 /-! Pure evaluation: values, delay, failure, and parallel. No external state or
 primitive-effect histories participate in this relation. -/
+universe u
+
 namespace LeanCloud.Proofs
 open LeanEff DirectInterpreter.Internal
 
 mutual
-  inductive Evaluation {m : Type → Type} :
+  inductive Evaluation {m : Type → Type u} :
       {α : Type} → Cloud m α → Except CloudError α → Prop where
     | pure (value : α) : Evaluation (EffF.pure value) (.ok value)
     | success {request : Control m β} {continuation : ArrsF (Control m) β α}
@@ -20,7 +22,7 @@ mutual
         {error} (head : ControlEvaluation request (.error error)) :
         Evaluation (.impure request continuation) (.error error)
 
-  inductive ControlEvaluation {m : Type → Type} :
+  inductive ControlEvaluation {m : Type → Type u} :
       {α : Type} → Control m α → Except CloudError α → Prop where
     | delay : ControlEvaluation .delay (.ok ())
     | fail (error : CloudError) : ControlEvaluation (Control.fail (α := α) error) (.error error)
@@ -28,7 +30,7 @@ mutual
         (children : ChildrenEvaluation branches outcomes) :
         ControlEvaluation (.parallel codec count branches) (outcomes.mapM id)
 
-  inductive ContinuationEvaluation {m : Type → Type} : {α β : Type} →
+  inductive ContinuationEvaluation {m : Type → Type u} : {α β : Type} →
       ArrsF (Control m) α β → α → Except CloudError β → Prop where
     | one {next : α → Cloud m β} {value outcome}
         (program : Evaluation (next value) outcome) :
@@ -42,7 +44,7 @@ mutual
         {value error} (head : ContinuationEvaluation first value (.error error)) :
         ContinuationEvaluation (.append first rest) value (.error error)
 
-  inductive ChildrenEvaluation {m : Type → Type} : {α : Type} → {count : Nat} →
+  inductive ChildrenEvaluation {m : Type → Type u} : {α : Type} → {count : Nat} →
       (Fin count → Cloud m α) → Array (Except CloudError α) → Prop where
     | empty (branches : Fin 0 → Cloud m α) : ChildrenEvaluation branches #[]
     | cons {count : Nat} {branches : Fin (count + 1) → Cloud m α}
@@ -53,7 +55,7 @@ mutual
         ChildrenEvaluation branches (#[outcome] ++ outcomes)
 end
 
-variable {m : Type → Type}
+variable {m : Type → Type u}
 
 /- Pure evaluation executes no operations in the underlying monad. This applies
 also to the crash monad: the direct semantics has no crash boundaries or storage. -/

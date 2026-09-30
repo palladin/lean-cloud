@@ -60,6 +60,27 @@ theorem descendants_earlier_next (location suffix : Location) (nonempty : 0 < lo
   apply lex_append_common
   exact .rel (Or.inr ⟨rfl, by omega⟩)
 
+/-- A target in a group's continuation cannot also belong to that group's children. -/
+theorem not_entersChild_of_next {current target : Location} (nonempty : 0 < current.size)
+    (later : current.next = target ∨ current.next.Earlier target) :
+    current.entersChild target = false := by
+  cases enters : current.entersChild target with
+  | false => rfl
+  | true =>
+    simp only [entersChild, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq] at enters
+    have split : current ++ target.extract current.size target.size = target := by
+      calc
+        _ = target.extract 0 current.size ++ target.extract current.size target.size :=
+          congrArg (fun base => base ++ target.extract current.size target.size) enters.2
+        _ = target := by
+          rw [Array.extract_append_extract]
+          simp [Nat.max_eq_right (Nat.le_of_lt enters.1)]
+    have before := descendants_earlier_next current (target.extract current.size target.size) nonempty
+    rw [split] at before
+    rcases later with same | later
+    · exact False.elim (before.ne same.symm)
+    · exact False.elim (Earlier.irrefl _ (before.trans later))
+
 /-- Every descendant in one child precedes the next sibling's first command. -/
 theorem descendants_earlier_sibling (parent : Location) (index command nextIndex : Nat)
     (suffix : Location) (later : index < nextIndex) :

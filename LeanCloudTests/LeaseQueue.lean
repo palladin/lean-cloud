@@ -1,4 +1,4 @@
-import LeanCloudTests.Support
+import LeanCloudTests.SimulationSupport
 
 namespace LeanCloudTests.Leases
 open LeanCloud LeanCloud.LeaseQueueModel
@@ -7,14 +7,6 @@ def required (value : Option α) : IO α :=
   match value with
   | some value => pure value
   | none => throw (IO.userError "Expected a delivery")
-
-def success (value : Except Crash α) : IO α :=
-  match value with
-  | .ok value => pure value
-  | .error _ => throw (IO.userError "Unexpected crash")
-
-def crashed (value : Except Crash α) : IO Unit :=
-  assertTrue (match value with | .error .stopped => true | _ => false) "Expected a crash"
 
 def seed : State Location := (enqueue Location.root {}).2
 
@@ -98,43 +90,49 @@ def cases : Array TestCase := #[
     assertTrue (newId != delivery.receipt.message) "Deleted message id was reused"
     assertEq (acknowledge delivery.receipt state) (false, state)⟩,
   ⟨"lease/crash-before-dequeue", do
-    let start : CrashModel.State (State Location) := ⟨seed, ⟨[some .before], 0⟩⟩
-    let (result, state) := (CrashModel.atomic (dequeue 5)).run start
-    crashed result
+    let action := SimM.atomic (dequeue (α := Location) 5)
+    let .ok state := SimTest.events action advance [.crash 0] (SimTest.initial action seed)
+      | throw (IO.userError "Simulation schedule did not finish")
+    assertEq (state.workers 0).phase .stopped
     assertEq state.durable seed⟩,
   ⟨"lease/crash-after-dequeue-does-not-release", do
-    let start : CrashModel.State (State Location) := ⟨seed, ⟨[some .after], 0⟩⟩
-    let action := CrashModel.atomic (dequeue 5)
-    let (result, state) := (CrashM.restart 1 action).run start
-    assertEq (← success result) none "Restart released the crashed worker's lease"
+    let action := SimM.atomic (dequeue (α := Location) 5)
+    let .ok state := SimTest.events action advance
+      [.commit 0, .crash 0, .restart 0, .commit 0, .resume 0] (SimTest.initial action seed)
+      | throw (IO.userError "Simulation schedule did not finish")
+    assertEq (← SimTest.value state) none "Restart released the crashed worker's lease"
     assertEq state.durable.now 0 "Restart secretly advanced time"
-    let state := { state with durable := advance 5 state.durable }
-    let (result, _) := (CrashM.restart 0 action).run state
-    let delivery ← required (← success result)
+    let (result, _) ← SimTest.finish action (advance 5 state.durable)
+    let delivery ← required result
     assertEq delivery.value Location.root
     assertEq delivery.receipt.generation 2⟩,
   ⟨"lease/crash-around-ack", do
     let (delivery, leased) := dequeue 5 seed
     let delivery ← required delivery
-    for boundary in [CrashModel.Boundary.before, .after] do
-      let start : CrashModel.State (State Location) := ⟨leased, ⟨[some boundary], 0⟩⟩
-      let (result, state) := (CrashModel.atomic (acknowledge delivery.receipt)).run start
-      crashed result
+    let action := SimM.atomic (acknowledge (α := Location) delivery.receipt)
+    for committed in [false, true] do
+      let schedule := (if committed then [Simulation.Event.commit 0] else []) ++ [.crash 0]
+      let .ok state := SimTest.events action advance schedule (SimTest.initial action leased)
+        | throw (IO.userError "Simulation schedule did not finish")
+      assertEq (state.workers 0).phase .stopped
       let (redelivery, _) := dequeue 5 (advance 5 state.durable)
-      assertEq redelivery.isSome (boundary == .before)
+      assertEq redelivery.isSome (!committed)
         "Ack crash retained or removed the wrong message"⟩,
   ⟨"lease/lost-enqueue-reply-can-duplicate", do
-    let start : CrashModel.State (State Location) := ⟨{}, ⟨[some .after], 0⟩⟩
-    let (result, state) := (CrashM.restart 1 (CrashModel.atomic (enqueue Location.root))).run start
-    assertEq (← success result) 1
+    let action := SimM.atomic (enqueue Location.root)
+    let .ok state := SimTest.events action advance
+      [.commit 0, .crash 0, .restart 0, .commit 0, .resume 0] (SimTest.initial action {})
+      | throw (IO.userError "Simulation schedule did not finish")
+    assertEq (← SimTest.value state) 1
     assertEq state.durable.messages.size 2 "Retry hid a duplicate enqueue"⟩,
   ⟨"lease/lost-renewal-reply", do
     let (delivery, state) := dequeue 5 seed
     let delivery ← required delivery
-    let start : CrashModel.State (State Location) :=
-      ⟨advance 2 state, ⟨[some .after], 0⟩⟩
-    let (result, state) := (CrashModel.atomic (renew delivery.receipt 10)).run start
-    crashed result
+    let action := SimM.atomic (renew (α := Location) delivery.receipt 10)
+    let .ok state := SimTest.events action advance [.commit 0, .crash 0]
+      (SimTest.initial action (advance 2 state))
+      | throw (IO.userError "Simulation schedule did not finish")
+    assertEq (state.workers 0).phase .stopped
     assertEq (acknowledge delivery.receipt state.durable).1 false
     assertEq (dequeue 5 (advance 3 state.durable)).1 none
     assertTrue (dequeue 5 (advance 10 state.durable)).1.isSome "Lost renewal made work unrecoverable"⟩,

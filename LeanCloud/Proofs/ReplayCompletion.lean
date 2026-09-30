@@ -70,11 +70,11 @@ theorem finish_missing (parent : Parent) (location : Location) (outcome : Exit)
       Parent.record, Parent.result, Journal.completeChild]
     cases settled : Result.settle (children.set! index (some outcome)) with
     | completed exit =>
-      simp only [run_bind, save_result, Journal.write_write, load_written, run_pure]
+      simp only [run_bind, save_result, Journal.write_write, load_written, run_pure, joinResponse]
     | suspended slots =>
       have same := Result.settle_suspended settled
       subst slots
-      simp only [run_bind, load_written, run_pure]
+      simp only [run_bind, load_written, run_pure, joinResponse]
 
 theorem finish_existing_failure (parent : Parent) (location : Location) (error : CloudError)
     (journal : Journal) (pending : List Location) (recorded : journal location.key = some (toJson (Result.completed (.failure error))))
@@ -99,11 +99,11 @@ theorem finish_existing_failure (parent : Parent) (location : Location) (error :
       Parent.record, Parent.result, Journal.completeChild, journal.write_existing _ _ recorded]
     cases settled : Result.settle (children.set! index (some (.failure error))) with
     | completed exit =>
-      simp only [run_bind, save_result, Journal.write_write, load_written, run_pure]
+      simp only [run_bind, save_result, Journal.write_write, load_written, run_pure, joinResponse]
     | suspended slots =>
       have same := Result.settle_suspended settled
       subst slots
-      simp only [run_bind, load_written, run_pure]
+      simp only [run_bind, load_written, run_pure, joinResponse]
 
 theorem Parent.records_current {parent : Parent} {journal : Journal} {location : Location}
     (valid : parent.Valid location journal) (outcome : Exit) :

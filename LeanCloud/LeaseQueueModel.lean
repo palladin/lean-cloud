@@ -1,7 +1,7 @@
 import Lean
 
 /-! An ideal queue with explicit time and receipt-based acknowledgement.
-Each operation is one pure state transition, suitable for `CrashModel.atomic`.
+Each operation is one pure state transition, suitable for `SimM.atomic`.
 `LeaseQueue.toWorkQueue` connects these primitives to replay, separating
 successor publication from acknowledgement.
 
