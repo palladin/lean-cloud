@@ -1,0 +1,5 @@
+{
+  "files": ["demo/log-0.txt", "demo/log-1.txt", "demo/log-2.txt", "demo/log-3.txt"],
+  "batchSize": 2,
+  "pauseMs": 3000
+}

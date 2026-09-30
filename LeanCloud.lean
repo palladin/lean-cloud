@@ -9,4 +9,5 @@ import LeanCloud.ReplayInterpreter
 import LeanCloud.LeaseQueueModel
 import LeanCloud.LeaseQueue
 import LeanCloud.SimulationBackend
+import LeanCloud.Worker
 import LeanCloud.Proofs

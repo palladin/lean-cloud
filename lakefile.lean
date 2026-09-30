@@ -15,3 +15,9 @@ lean_lib LeanCloudTests
 @[test_driver]
 lean_exe lean_cloud_tests where
   root := `LeanCloudTests.Main
+
+lean_exe cloud_chaos where
+  root := `LeanCloudTests.Chaos
+
+lean_exe cloud_runtime_tests where
+  root := `LeanCloudTests.Runtime

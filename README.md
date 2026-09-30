@@ -36,6 +36,25 @@ The three files are split into two batches: one contains the first two files and
 the other contains the third. `Cloud.parallel` returns one count per batch. The
 workflow sums the counts, saves the report, and returns its `BlobRef`.
 
+Run the [complete example](runtime/LeanCloudRuntime/Demo.lean) with three worker
+containers, PostgreSQL, RabbitMQ, and shared S3 blob storage:
+
+```sh
+docker compose up --build -d --scale worker=3
+docker compose logs -f worker
+```
+
+Once the workers finish, read the saved report:
+
+```sh
+docker compose run --rm --no-deps worker result /etc/lean-cloud/config.json demo
+# files=16, errors=24
+```
+
+The [deployment guide](LeanCloud/Deployment.md) explains configuration, submission,
+restarts, and integration tests. `docker compose down` stops the stack while
+preserving its data.
+
 `||` combines the results of two computations into a pair. Use
 `Cloud.pure (fun _ => analyze input)` to record the result of a delayed pure
 calculation. Ordinary `pure value` and `return value` retain their usual meaning.
@@ -51,8 +70,9 @@ Replay takes work from an environment-provided [queue](LeanCloud/WorkQueue.lean)
 The environment retains pending locations and the final outcome across restarts;
 the interpreter executes each selected location without a discovery pass.
 Branches may interleave, while results retain their original array order.
-Execution currently uses one thread. Distributed workers, on-premises and cloud
-adapters, choice, and cancellation are future work.
+Each worker runs the same interpreter in its own process. The container runtime
+connects it to PostgreSQL through lean-linq, RabbitMQ, and S3-compatible storage.
+Choice, cancellation, and native Azure/AWS queue adapters remain future work.
 
 [JournalDb](LeanCloud/JournalDb.lean) stores each child's outcome separately, so
 sibling completions cannot overwrite each other. The
@@ -85,4 +105,6 @@ theorem proves that concurrent replay returns the direct interpreter's outcome
 and stores its encoding in the durable completion record. Fair scheduling and
 delivery after crashes stop supply a completing prefix and sufficient finite fuel.
 Runtime exec and blob operations remain available outside this theorem; real
-storage and cloud adapters still need implementation and validation.
+adapters are checked separately by integration tests. Run those with
+`lake exe cloud_runtime_tests`, or inject random worker crashes with
+`lake exe cloud_chaos --seed 1`.

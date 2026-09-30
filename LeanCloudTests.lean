@@ -14,6 +14,7 @@ import LeanCloudTests.ConcurrentJournal
 import LeanCloudTests.ConcurrentRead
 import LeanCloudTests.ConcurrentJoin
 import LeanCloudTests.ConcurrentPublication
+import LeanCloudTests.Worker
 
 namespace LeanCloudTests
 
@@ -22,6 +23,6 @@ def allCases : Array TestCase :=
   Queue.cases ++ Queue.generatedCases ++ RecoveryTests.cases ++ RecoveryTests.generatedCases ++ Leases.cases ++
   LeasedReplay.cases ++ ImmutableJournal.cases ++
   Simulated.cases ++ Simulated.generatedCases ++ ConcurrentJournal.cases ++ ConcurrentRead.cases ++ ConcurrentJoin.cases ++
-  ConcurrentPublication.cases
+  ConcurrentPublication.cases ++ WorkerTests.cases ++ WorkerTests.generatedCases
 
 end LeanCloudTests

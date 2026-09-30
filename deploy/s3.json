@@ -1,0 +1,7 @@
+{
+  "identities": [{
+    "name": "local-cloud",
+    "credentials": [{"accessKey": "local-cloud", "secretKey": "local-cloud-secret"}],
+    "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+  }]
+}

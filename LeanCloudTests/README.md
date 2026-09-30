@@ -23,10 +23,25 @@ lake test -- lease/
 lake test -- leased-replay/
 lake test -- journal/
 lake test -- simulation/
+lake test -- worker/
 ```
 
 Filters are test-name prefixes; multiple filters select their union. A filter that
 matches nothing fails rather than silently succeeding.
+
+`worker/` checks typed configuration, connection cleanup, durable completion,
+restart after acknowledgement failure, and blob connection wiring. Generated
+pure programs also compare direct + SimM, replay + SimM, and the IO worker startup
+path using the same simulated primitives. These tests do not connect to real
+services. The separate [runtime integration suite](../runtime/Integration.lean)
+checks generated PostgreSQL tables and database/queue/blob adapters. It also
+compares 32 generated pure programs with direct evaluation and simulated replay. Run it together with the
+multi-process recovery checks using `lake exe cloud_runtime_tests`.
+
+`lake exe cloud_chaos --seed 1` randomly kills and restarts real workers
+running the file example, then requires the correct durable result after crashes
+stop. It retains its seeded fault plan and logs. See the
+[deployment guide](../LeanCloud/Deployment.md) for scope and options.
 
 ## What the comparison checks
 
@@ -285,11 +300,11 @@ included in `allCases` in [LeanCloudTests.lean](../LeanCloudTests.lean).
 
 ## Scope
 
-These tests exercise simulated interleaving on one thread and ideal in-memory
+The core suite exercises simulated interleaving on one thread and ideal in-memory
 storage. Lease primitives and replay cover redelivery and duplicate messages
-with serialized attempts and with interleaved simulated workers. Real concurrent
-execution against database adapters, cloud deployments, and cancellation are not
-tested.
+with serialized attempts and with interleaved simulated workers. The separate
+container suite tests real concurrent workers and service adapters. Hosted cloud
+deployments and cancellation are not tested.
 Choice has only an explicit unsupported-operation check.
 
 Differential comparison assumes the queue selects the sequential reference order,

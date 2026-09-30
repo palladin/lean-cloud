@@ -1,0 +1,11 @@
+{
+  "db": {"connection": "host=db port=5432 dbname=lean_cloud user=cloud password=local-cloud connect_timeout=10"},
+  "queue": {"host": "queue", "port": 5672, "vhost": "/", "user": "cloud", "password": "local-cloud", "queuePrefix": "lean-cloud."},
+  "blobs": {
+    "endpoint": "http://blobs:8333",
+    "bucket": "lean-cloud",
+    "region": "us-east-1",
+    "accessKey": "local-cloud",
+    "secretKey": "local-cloud-secret"
+  }
+}

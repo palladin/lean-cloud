@@ -1,0 +1,84 @@
+name: lean-cloud
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: lean_cloud
+      POSTGRES_USER: cloud
+      POSTGRES_PASSWORD: local-cloud
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cloud -d lean_cloud"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  queue:
+    image: rabbitmq:4.3-management
+    hostname: queue
+    environment:
+      RABBITMQ_DEFAULT_USER: cloud
+      RABBITMQ_DEFAULT_PASS: local-cloud
+    volumes:
+      - queue-data:/var/lib/rabbitmq
+      - ./deploy/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+
+  blobs:
+    image: chrislusf/seaweedfs:4.48
+    command: ["server", "-ip=blobs", "-ip.bind=0.0.0.0", "-dir=/data", "-volume.max=20", "-master.volumeSizeLimitMB=100", "-filer", "-s3", "-s3.config=/etc/seaweedfs/s3.json"]
+    volumes:
+      - blob-data:/data
+      - ./deploy/s3.json:/etc/seaweedfs/s3.json:ro
+      - ./deploy/filer.toml:/etc/seaweedfs/filer.toml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -S -O /dev/null http://localhost:8333/ 2>&1 | grep -q 'HTTP/1.1 403'"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  submit:
+    build: .
+    image: lean-cloud-worker:dev
+    restart: on-failure
+    command: ["submit", "/etc/lean-cloud/config.json", "${RUN_ID:-demo}"]
+    volumes:
+      - ./deploy/config.json:/etc/lean-cloud/config.json:ro
+    depends_on:
+      db: {condition: service_healthy}
+      queue: {condition: service_healthy}
+      blobs: {condition: service_healthy}
+
+  worker:
+    build: .
+    image: lean-cloud-worker:dev
+    command: ["worker", "/etc/lean-cloud/config.json", "${RUN_ID:-demo}"]
+    restart: on-failure
+    volumes:
+      - ./deploy/config.json:/etc/lean-cloud/config.json:ro
+    depends_on:
+      submit: {condition: service_completed_successfully}
+
+  checks:
+    profiles: ["test"]
+    build:
+      context: .
+      target: integration
+    image: lean-cloud-integration:dev
+    volumes:
+      - ./deploy/config.json:/etc/lean-cloud/config.json:ro
+    depends_on:
+      db: {condition: service_healthy}
+      queue: {condition: service_healthy}
+      blobs: {condition: service_healthy}
+
+volumes:
+  db-data:
+  queue-data:
+  blob-data:
