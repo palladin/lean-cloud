@@ -15,6 +15,7 @@ Use `--` to pass arguments through Lake to the test runner:
 ```sh
 lake test -- --list
 lake test -- differential/parallel/
+lake test -- pure-replay/
 lake test -- generated/seed/42
 lake test -- replay/checkpoints/ replay/fuel/
 lake test -- queue/
@@ -24,10 +25,18 @@ lake test -- leased-replay/
 lake test -- journal/
 lake test -- simulation/
 lake test -- worker/
+lake test -- backend-contract/
 ```
 
 Filters are test-name prefixes; multiple filters select their union. A filter that
 matches nothing fails rather than silently succeeding.
+
+`pure-replay/` runs the concrete pure backend against direct evaluation. It checks
+nested and empty parallel groups, captured inputs, dependent continuations,
+failure order, persisted completion, and the exact saved locations after a fork
+and child completion. A fuel sweep resumes the nested workflow from each saved
+state and requires the same final value. The corresponding proof is
+[`pure_replay_matches_direct`](../LeanCloud/Proofs/MainTheorems.lean).
 
 `worker/` checks typed configuration, connection cleanup, durable completion,
 restart after acknowledgement failure, and blob connection wiring. Generated
@@ -35,8 +44,21 @@ pure programs also compare direct + SimM, replay + SimM, and the IO worker start
 path using the same simulated primitives. These tests do not connect to real
 services. The separate [runtime integration suite](../runtime/Integration.lean)
 checks generated PostgreSQL tables and database/queue/blob adapters. It also
-compares 32 generated pure programs with direct evaluation and simulated replay. Run it together with the
+checks primitive observations against the shared backend model and compares 32
+generated pure programs across direct evaluation, both simulation models, and
+three concurrent real workers. Run it together with the
 multi-process recovery checks using `lake exe cloud_runtime_tests`.
+
+`backend-contract/` checks the [shared service contract](../LeanCloud/Backend.md).
+It includes 48 generated pure workflows on three simulated workers, with
+unordered and repeated deliveries, crashes, delayed replies, and late commits
+from replaced attempts. It waits for every worker, checks their equal outcomes
+and cleared receipts, and compares the persisted completion record with direct
+evaluation. Targeted cases reject invented deliveries and
+stale reads, retain ambiguous publication identities, and isolate old replies
+from replacement workers. `BackendAdapterLaws.run` accepts any real Db and leased
+queue; its current primitive-history checker is sequential. Concurrent workflow
+tests compare outcomes but do not establish linearizability of arbitrary histories.
 
 `lake exe cloud_chaos --seed 1` randomly kills and restarts real workers
 running the file example, then requires the correct durable result after crashes
@@ -212,7 +234,7 @@ and reject stale receipts without removing newer deliveries.
 [ConcurrentHandoff.lean](../LeanCloud/Proofs/ConcurrentHandoff.lean) and
 [ConcurrentAudit.lean](../LeanCloud/Proofs/ConcurrentAudit.lean) prove publication
 before acknowledgement, including overlapping processing and stale receipts.
-The main [concurrent equivalence theorem](../LeanCloud/Proofs/ConcurrentEquivalence.lean)
+The main [concurrent equivalence theorem](../LeanCloud/Proofs/MainTheorems.lean)
 proves both returned and durable outcomes under its explicit fairness conditions.
 
 The concurrent publication tests check that every incoming item remains queued
@@ -313,7 +335,7 @@ The direct interpreter does not serialize
 values, so a broken codec can make replay fail while direct execution succeeds;
 the suite demonstrates that distinction.
 
-The separate [equivalence theorem](../LeanCloud/Proofs/QueueContract.lean) proves
+The separate [equivalence theorem](../LeanCloud/Proofs/MainTheorems.lean) proves
 equal results/errors for pure `Cloud Id` programs containing ordinary pure values,
 delay, failure, and parallel. It uses an ideal Db and a lawful fair queue, permits
 arbitrary pending-item selection, and derives sufficient fuel. It has no external

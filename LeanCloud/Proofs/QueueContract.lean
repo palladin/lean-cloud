@@ -65,18 +65,4 @@ theorem QueueContract.trace_exists {queue : LeanCloud.WorkQueue State Id}
   let sequence : Nat → Live := fun n => Nat.rec start (fun _ live => next live) n
   exact ⟨⟨fun n => (sequence n).val, fun n => response (sequence n), fun n => observation (sequence n)⟩, rfl⟩
 
-/-- A pure workflow has the same value or CloudError under direct evaluation
-and replay with a lawful fair queue. The fuel bound may depend on the schedule.
-Only the interpreter's Db and pending locations occur in the model. -/
-theorem same_output [codec : Codec α]
-    (queue : LeanCloud.WorkQueue State Id) (program : ι → Cloud Id α) (input : ι)
-    (law : CodecLaw codec) (supported : PureProgram (program input))
-    (contract : QueueContract queue)
-    (fair : ∀ trace : DriverTrace queue (codec.encode <$> program input),
-      trace.states 0 = initial → WorkQueue.Fair trace.queueTrace) :
-    ∃ bound, ∀ fuel, bound ≤ fuel →
-      ((LeanCloud.interpret db noBlobs queue fuel program input).run initial).1 = direct (program input) := by
-  obtain ⟨trace, start⟩ := contract.trace_exists (supported.map codec.encode)
-  exact fair_queue_same_output queue program input law supported trace start (fair trace start)
-
 end LeanCloud.Proofs

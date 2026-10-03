@@ -93,18 +93,22 @@ lake test
 ```
 
 The [test suite](LeanCloudTests/README.md) compares the interpreters and checks
-recovery after interruption. The [equivalence proof](LeanCloud/Proofs/QueueContract.lean)
-shows that pure workflows return the same value or error under direct evaluation
-and replay with a lawful, fair queue and sufficient fuel. Branches may be selected
-in any order.
+recovery after interruption. The [main theorems](LeanCloud/Proofs/MainTheorems.lean)
+start with `pure_replay_matches_direct`: an entirely pure Db and deterministic
+work list give the same value or error as direct evaluation, with sufficient
+fuel. The next theorem generalizes this to a lawful, fair queue that may select
+branches in any order.
 
 The [proof model](LeanCloud/Proofs/README.md) covers ordinary pure values, delay,
 failure, and parallel control flow. The main
-[`ConcurrentRecovery.same_output`](LeanCloud/Proofs/ConcurrentEquivalence.lean)
+[`ConcurrentRecovery.concurrent_replay_matches_direct`](LeanCloud/Proofs/MainTheorems.lean)
 theorem proves that concurrent replay returns the direct interpreter's outcome
 and stores its encoding in the durable completion record. Fair scheduling and
 delivery after crashes stop supply a completing prefix and sufficient finite fuel.
 Runtime exec and blob operations remain available outside this theorem; real
-adapters are checked separately by integration tests. Run those with
+adapters are checked separately by integration tests. The theorem uses
+[shared service contracts](LeanCloud/Backend.md), allowing unordered delivery,
+duplicates, stale acknowledgements, and requests that commit after a worker crashes.
+Run integration tests with
 `lake exe cloud_runtime_tests`, or inject random worker crashes with
 `lake exe cloud_chaos --seed 1`.

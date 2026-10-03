@@ -2,6 +2,7 @@ import LeanCloud.WorkerConfig
 import LeanCloud.ReplayInterpreter
 import LeanCloud.JournalDb
 import LeanCloud.LeaseQueue
+import LeanCloud.CompletionStore
 
 /-! Connection setup for a worker assigned to an existing workflow run.
 Adapters locate the services; the existing interpreter executes the workflow.
@@ -39,17 +40,13 @@ structure Connectors (dbConfig queueConfig blobConfig receipt : Type) where
 
 /-- Reserved physical key, distinct from location/result, fork, and child keys.
 It shares the raw Db's run namespace and survives worker restarts. -/
-def completionKey : String := "completed"
+abbrev completionKey : String := CompletionStore.key
 
-private def readCompleted (db : Db Unit IO) : StateT Unit IO (Option Exit) := do
-  let some value ← db.get completionKey | return none
-  match fromJson? value with
-  | .ok outcome => return some outcome
-  | .error _ => throw (IO.userError "Invalid workflow completion record")
+private def readCompleted (db : Db Unit IO) : StateT Unit IO (Option Exit) :=
+  CompletionStore.read db (fun message => throw (IO.userError message))
 
-private def writeCompleted (db : Db Unit IO) (outcome : Exit) : StateT Unit IO Unit := do
-  unless ← JournalDb.putSame db completionKey (toJson outcome) do
-    throw (IO.userError "Db rejected workflow completion record")
+private def writeCompleted (db : Db Unit IO) (outcome : Exit) : StateT Unit IO Unit :=
+  CompletionStore.write db (fun message => throw (IO.userError message)) outcome
 
 /-- Connect to the configured services, run the existing interpreter, and close
 all connections. `program` and `input` must be the same on every worker assigned

@@ -10,4 +10,5 @@ import LeanCloud.LeaseQueueModel
 import LeanCloud.LeaseQueue
 import LeanCloud.SimulationBackend
 import LeanCloud.Worker
+import LeanCloud.Backend
 import LeanCloud.Proofs

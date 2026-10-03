@@ -1,4 +1,4 @@
-import LeanCloud.ReplayInterpreter
+import LeanCloud.Proofs.PureModel
 import LeanCloud.Proofs.Model
 import LeanCloud.Proofs.Db
 
@@ -7,10 +7,8 @@ import LeanCloud.Proofs.Db
 namespace LeanCloud.Proofs.ReplayModel
 open Lean
 
-structure State where
-  journal : Journal := Journal.empty
-  pending : List Location := [Location.root]
-  completed : Option Exit := none
+/-- The concrete pure backend and the abstract queue proofs share one state. -/
+abbrev State := Pure.State
 
 def db : Db State Id where
   get key state := (state.journal key, state)
