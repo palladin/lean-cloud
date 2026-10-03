@@ -54,14 +54,18 @@ from empty storage satisfies the completion theorem's processing-window premise.
 Its scheduler updates its private database while the worker is between replay
 operations, so the witness also checks interference inside a processing window.
 
-Real adapter properties compare 16 generated programs using RabbitMQ, SQLite, and S3 with
+Real adapter properties compare 16 generated programs using independent RabbitMQ
+brokers, SQLite, and S3 with
 direct evaluation. Concurrent blob writers must receive the same canonical record;
 invalid blob references, missing names, and invalid UTF-8 must be rejected. Mailbox tests
-close consumers without acknowledging and verify 24 successive redeliveries.
+close consumers without acknowledging and verify 24 successive redeliveries on
+every broker. Identically named queues on different brokers must retain different
+payloads; unknown worker routes and duplicate configured identities are rejected.
 After acknowledgement, a new consumer must receive the next confirmed message
 instead of the old delivery; an empty poll on the original consumer is insufficient.
-A broker SIGKILL immediately after creating
+A SIGKILL of each broker immediately after creating
 a mailbox and confirming its first publication must preserve that message.
+While that broker is down, another must still accept and deliver messages.
 Container tests exercise actual mailbox transport, multiple worker processes, and
 restarts. Chaos plans are generated before execution and recorded with logs; the
 seed reproduces the plan, not OS timing.

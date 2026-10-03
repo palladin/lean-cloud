@@ -1,20 +1,54 @@
 name: lean-cloud
 
+x-broker: &broker
+  image: rabbitmq:4.3
+  restart: unless-stopped
+  environment:
+    RABBITMQ_DEFAULT_USER: cloud
+    RABBITMQ_DEFAULT_PASS: local-cloud
+    RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "+S 2:2 +sbwt none +sbwtdcpu none +sbwtdio none"
+  healthcheck:
+    test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+    interval: 3s
+    timeout: 5s
+    retries: 30
+
+x-worker: &worker
+  build: .
+  image: lean-cloud-worker:dev
+  command: ["worker", "/etc/lean-cloud/config.json", "${RUN_ID:-demo}"]
+  restart: on-failure
+  volumes:
+    - ./deploy/config.json:/etc/lean-cloud/config.json:ro
+
 services:
-  broker:
-    image: rabbitmq:4.3-management
-    hostname: broker
-    environment:
-      RABBITMQ_DEFAULT_USER: cloud
-      RABBITMQ_DEFAULT_PASS: local-cloud
+  scheduler-mailbox:
+    <<: *broker
+    hostname: scheduler-mailbox
     volumes:
-      - broker-data:/var/lib/rabbitmq
+      - scheduler-mailbox-data:/var/lib/rabbitmq
       - ./deploy/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
-    healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
-      interval: 3s
-      timeout: 5s
-      retries: 30
+
+  worker1-mailbox:
+    <<: *broker
+    hostname: worker1-mailbox
+    volumes:
+      - worker1-mailbox-data:/var/lib/rabbitmq
+      - ./deploy/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+
+  worker2-mailbox:
+    <<: *broker
+    hostname: worker2-mailbox
+    volumes:
+      - worker2-mailbox-data:/var/lib/rabbitmq
+      - ./deploy/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+
+  worker3-mailbox:
+    <<: *broker
+    hostname: worker3-mailbox
+    volumes:
+      - worker3-mailbox-data:/var/lib/rabbitmq
+      - ./deploy/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
 
   blobs:
     image: chrislusf/seaweedfs:4.48
@@ -30,42 +64,49 @@ services:
       retries: 30
 
   submit:
-    build: .
-    image: lean-cloud-worker:dev
-    restart: on-failure
+    <<: *worker
     command: ["submit", "/etc/lean-cloud/config.json", "${RUN_ID:-demo}"]
-    volumes:
-      - ./deploy/config.json:/etc/lean-cloud/config.json:ro
     depends_on:
       blobs: {condition: service_healthy}
 
   scheduler:
-    build: .
-    image: lean-cloud-worker:dev
+    <<: *worker
     command: ["scheduler", "/etc/lean-cloud/config.json", "${RUN_ID:-demo}"]
-    restart: on-failure
     volumes:
       - ./deploy/config.json:/etc/lean-cloud/config.json:ro
       - scheduler-data:/data
     depends_on:
       submit: {condition: service_completed_successfully}
-      broker: {condition: service_healthy}
+      scheduler-mailbox: {condition: service_healthy}
     healthcheck:
       test: ["CMD", "cloud-demo", "status", "/etc/lean-cloud/config.json", "${RUN_ID:-demo}"]
-      interval: 2s
-      timeout: 5s
+      interval: 3s
+      timeout: 10s
       retries: 30
 
   worker:
-    build: .
-    image: lean-cloud-worker:dev
-    command: ["worker", "/etc/lean-cloud/config.json", "${RUN_ID:-demo}"]
-    restart: on-failure
-    volumes:
-      - ./deploy/config.json:/etc/lean-cloud/config.json:ro
+    <<: *worker
+    environment:
+      CLOUD_WORKER_ID: worker1
     depends_on:
       scheduler: {condition: service_healthy}
-      broker: {condition: service_healthy}
+      worker1-mailbox: {condition: service_healthy}
+
+  worker2:
+    <<: *worker
+    environment:
+      CLOUD_WORKER_ID: worker2
+    depends_on:
+      scheduler: {condition: service_healthy}
+      worker2-mailbox: {condition: service_healthy}
+
+  worker3:
+    <<: *worker
+    environment:
+      CLOUD_WORKER_ID: worker3
+    depends_on:
+      scheduler: {condition: service_healthy}
+      worker3-mailbox: {condition: service_healthy}
 
   checks:
     profiles: ["test"]
@@ -77,9 +118,15 @@ services:
       - ./deploy/config.json:/etc/lean-cloud/config.json:ro
     depends_on:
       blobs: {condition: service_healthy}
-      broker: {condition: service_healthy}
+      scheduler-mailbox: {condition: service_healthy}
+      worker1-mailbox: {condition: service_healthy}
+      worker2-mailbox: {condition: service_healthy}
+      worker3-mailbox: {condition: service_healthy}
 
 volumes:
   scheduler-data:
-  broker-data:
+  scheduler-mailbox-data:
+  worker1-mailbox-data:
+  worker2-mailbox-data:
+  worker3-mailbox-data:
   blob-data:

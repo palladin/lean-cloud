@@ -10,12 +10,49 @@
     "accessKey": "local-cloud",
     "secretKey": "local-cloud-secret"
   },
-  "broker": {
-    "host": "broker",
-    "port": 5672,
-    "vhost": "/",
-    "user": "cloud",
-    "password": "local-cloud",
-    "queuePrefix": "lean-cloud.mailbox."
+  "mailboxes": {
+    "scheduler": {
+      "host": "scheduler-mailbox",
+      "port": 5672,
+      "vhost": "/",
+      "user": "cloud",
+      "password": "local-cloud",
+      "queuePrefix": "lean-cloud.mailbox."
+    },
+    "workers": [
+      {
+        "worker": "worker1",
+        "broker": {
+          "host": "worker1-mailbox",
+          "port": 5672,
+          "vhost": "/",
+          "user": "cloud",
+          "password": "local-cloud",
+          "queuePrefix": "lean-cloud.mailbox."
+        }
+      },
+      {
+        "worker": "worker2",
+        "broker": {
+          "host": "worker2-mailbox",
+          "port": 5672,
+          "vhost": "/",
+          "user": "cloud",
+          "password": "local-cloud",
+          "queuePrefix": "lean-cloud.mailbox."
+        }
+      },
+      {
+        "worker": "worker3",
+        "broker": {
+          "host": "worker3-mailbox",
+          "port": 5672,
+          "vhost": "/",
+          "user": "cloud",
+          "password": "local-cloud",
+          "queuePrefix": "lean-cloud.mailbox."
+        }
+      }
+    ]
   }
 }

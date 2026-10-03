@@ -13,6 +13,8 @@ structure Context where
   artifacts : System.FilePath
   project : String
   workers : IO.Ref (Array String)
+  nextWorker : IO.Ref Nat
+  workerCount : Nat
   started : Nat
 
 def say (message : String) : IO Unit := do
@@ -68,7 +70,43 @@ def Context.docker (ctx : Context) (args : Array String) (check := true)
 
 def Context.compose (ctx : Context) (args : Array String) (check := true)
     (timeout := 60) : IO IO.Process.Output :=
-  ctx.docker (#["compose", "-p", ctx.project] ++ args) check timeout
+  ctx.docker (#["compose", "-p", ctx.project, "-f", (ctx.root / "compose.yaml").toString,
+    "-f", (ctx.artifacts / "compose.json").toString] ++ args) check timeout
+
+def Context.brokers (ctx : Context) : Array String :=
+  #["scheduler-mailbox"] ++ (Array.range ctx.workerCount).map (fun i => s!"worker{i + 1}-mailbox")
+
+def Context.startServices (ctx : Context) : IO Unit := do
+  discard <| ctx.compose (#["up", "-d", "--wait", "blobs"] ++ ctx.brokers) (timeout := 240)
+
+/-- Extend the ordinary deployment with one independent broker per test worker,
+including a fresh worker after completion. All resources belong to this project. -/
+private def Context.prepare (ctx : Context) : IO Unit := do
+  let config ← IO.ofExcept (Json.parse (← IO.FS.readFile (ctx.root / "deploy/config.json")))
+  let mailboxes ← IO.ofExcept (config.getObjVal? "mailboxes")
+  let broker ← IO.ofExcept (mailboxes.getObjVal? "scheduler")
+  let workers := (Array.range ctx.workerCount).map fun i => Json.mkObj [
+    ("worker", toJson s!"worker{i + 1}"),
+    ("broker", broker.setObjVal! "host" (toJson s!"worker{i + 1}-mailbox"))]
+  let config := config.setObjVal! "mailboxes" (mailboxes.setObjVal! "workers" (toJson workers))
+  IO.FS.writeFile (ctx.artifacts / "config.json") config.pretty
+  -- Use the actual Compose broker definition, including its image and settings.
+  let base ← ctx.docker #["compose", "-f", (ctx.root / "compose.yaml").toString, "config", "--format", "json"]
+  let base ← IO.ofExcept (Json.parse base.stdout)
+  let template ← IO.ofExcept ((base.getObjVal? "services") >>= (·.getObjVal? "worker1-mailbox"))
+  let configVolume := toJson #[s!"{ctx.artifacts / "config.json"}:{configPath}:ro"]
+  let mut services := ["worker", "worker2", "worker3", "submit", "scheduler", "checks"].map fun name =>
+    (name, Json.mkObj [("volumes", configVolume)])
+  let mut volumes := []
+  for i in [3:ctx.workerCount] do
+    let name := s!"worker{i + 1}-mailbox"
+    let volume := name ++ "-data"
+    let node := (template.setObjVal! "hostname" (toJson name)).setObjVal! "volumes" (toJson #[
+      s!"{volume}:/var/lib/rabbitmq", s!"{ctx.root / "deploy/rabbitmq.conf"}:/etc/rabbitmq/rabbitmq.conf:ro"])
+    services := services ++ [(name, node)]
+    volumes := volumes ++ [(volume, Json.mkObj [])]
+  IO.FS.writeFile (ctx.artifacts / "compose.json") (Json.mkObj [
+    ("services", Json.mkObj services), ("volumes", Json.mkObj volumes)]).pretty
 
 structure Status where
   running : Bool
@@ -89,10 +127,14 @@ def checkExit (worker : String) (status : Status) : IO Unit :=
     s!"Unplanned worker failure: {worker} exited {status.exitCode}"
 
 def Context.createWorker (ctx : Context) (name run : String) : IO String := do
+  let index ← ctx.nextWorker.get
+  require (index < ctx.workerCount) "No independent broker reserved for this worker"
+  ctx.nextWorker.set (index + 1)
   let worker := ctx.project ++ "-" ++ name
   ctx.workers.modify (·.push worker)
   discard <| ctx.docker #["create", "--network", ctx.project ++ "_default", "--name", worker,
-    "-v", s!"{ctx.root / "deploy/config.json"}:{configPath}:ro",
+    "-e", s!"CLOUD_WORKER_ID=worker{index + 1}",
+    "-v", s!"{ctx.artifacts / "config.json"}:{configPath}:ro",
     "lean-cloud-worker:dev", "worker", configPath, run]
   return worker
 
@@ -100,7 +142,7 @@ def Context.createScheduler (ctx : Context) (name run : String) : IO String := d
   let scheduler := ctx.project ++ "-" ++ name
   ctx.workers.modify (·.push scheduler)
   discard <| ctx.docker #["create", "--network", ctx.project ++ "_default", "--network-alias", "scheduler",
-    "--name", scheduler, "-v", s!"{ctx.root / "deploy/config.json"}:{configPath}:ro",
+    "--name", scheduler, "-v", s!"{ctx.artifacts / "config.json"}:{configPath}:ro",
     "-v", ctx.project ++ "_scheduler-data:/data", "lean-cloud-worker:dev", "scheduler", configPath, run]
   discard <| ctx.docker #["start", scheduler]
   let deadline := (← IO.monoMsNow) + 30000
@@ -183,7 +225,7 @@ private def Context.cleanup (ctx : Context) : IO Unit := do
     discard <| ctx.docker #["volume", "rm", ctx.project ++ "_scheduler-data"] (check := false)
   say s!"Test artifacts retained: {ctx.artifacts}"
 
-def withContext (name : String) (body : Context → IO Unit) : IO Unit := do
+def withContext (name : String) (body : Context → IO Unit) (workers : Nat := 3) : IO Unit := do
   let root ← IO.Process.getCurrentDir
   require (← (root / "compose.yaml").pathExists) "Run from the lean-cloud repository root"
   let started ← IO.monoMsNow
@@ -192,8 +234,11 @@ def withContext (name : String) (body : Context → IO Unit) : IO Unit := do
     artifacts := ← IO.FS.createTempDir
     project := s!"lean-cloud-{name}-{← IO.Process.getPID}-{started}"
     workers := ← IO.mkRef #[]
+    nextWorker := ← IO.mkRef 0
+    workerCount := max 3 (workers + 1)
     started }
   say s!"Test project: {ctx.project}; artifacts: {ctx.artifacts}"
+  ctx.prepare
   try body ctx finally ctx.cleanup
 
 end LeanCloudTests.Containers

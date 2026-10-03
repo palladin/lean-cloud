@@ -6,7 +6,7 @@ open Containers
 def run (build : Bool) : IO Unit := withContext "test" fun ctx => do
   if build then
     discard <| ctx.compose #["build", "worker", "checks"] (timeout := 1800)
-  discard <| ctx.compose #["up", "-d", "--wait", "broker", "blobs"] (timeout := 180)
+  ctx.startServices
   let checks ← ctx.compose #["run", "--rm", "--no-deps", "checks", configPath] (timeout := 300)
   say ((checks.stdout.trimAscii.toString.splitOn "\n").getLast!)
   discard <| ctx.compose #["run", "--rm", "--no-deps", "submit", "submit", configPath, "normal"]
@@ -22,11 +22,20 @@ def run (build : Bool) : IO Unit := withContext "test" fun ctx => do
   require (participants ≥ 2) s!"Expected multiple workers; observed {participants}"
   say s!"Parallel demo: {participants} worker containers processed locations."
   require (← ctx.crash scheduler) "Scheduler was not running"
-  discard <| ctx.compose #["run", "--rm", "--no-deps", "checks", configPath, "mailbox-seed", "persistence"]
-  discard <| ctx.compose #["kill", "-s", "SIGKILL", "broker"]
+  for index in [:ctx.brokers.size] do
+    let node := ctx.brokers[index]!
+    let run := s!"persistence-{index}"
+    discard <| ctx.compose #["run", "--rm", "--no-deps", "checks", configPath, "mailbox-seed", run, toString index]
+    discard <| ctx.compose #["kill", "-s", "SIGKILL", node]
+    -- A different actor's broker must still accept and deliver confirmed mail.
+    let other := (index + 1) % ctx.brokers.size
+    discard <| ctx.compose #["run", "--rm", "--no-deps", "checks", configPath, "mailbox-seed", run, toString other]
+    discard <| ctx.compose #["run", "--rm", "--no-deps", "checks", configPath, "mailbox-check", run, toString other]
+    discard <| ctx.compose #["up", "-d", "--wait", node] (timeout := 120)
+    discard <| ctx.compose #["run", "--rm", "--no-deps", "checks", configPath, "mailbox-check", run, toString index]
+    say s!"Persistence and isolation: {node} recovered confirmed mail after SIGKILL."
   discard <| ctx.compose #["restart", "blobs"]
-  discard <| ctx.compose #["up", "-d", "--wait", "broker", "blobs"] (timeout := 180)
-  discard <| ctx.compose #["run", "--rm", "--no-deps", "checks", configPath, "mailbox-check", "persistence"]
+  discard <| ctx.compose #["up", "-d", "--wait", "blobs"] (timeout := 180)
   ctx.start #[scheduler]
   ctx.checkReport "normal" "files=16, errors=24" (restartTimeout := 60)
   let fresh ← ctx.createWorker "fresh" "normal"
@@ -36,7 +45,7 @@ def run (build : Bool) : IO Unit := withContext "test" fun ctx => do
   require (lines.contains "completed normal" &&
     !lines.any (fun line => (line.splitOn " location=").length > 1))
     "A fresh worker must confirm completion without processing new work"
-  say "Persistence: confirmed mail survived broker SIGKILL; scheduler state and blob results survived restart."
+  say "Persistence: scheduler state and blob results survived restart; fresh worker used its own broker."
   say "All real runtime checks passed."
 
 end LeanCloudTests.Runtime

@@ -37,11 +37,11 @@ the other contains the third. `Cloud.parallel` returns one count per batch. The
 workflow sums the counts, saves the report, and returns its `BlobRef`.
 
 Run the [complete example](runtime/LeanCloudRuntime/Demo.lean) with three worker
-containers, one scheduler, RabbitMQ mailboxes, and shared S3 blob storage:
+containers, one scheduler, a RabbitMQ broker per actor, and shared S3 blob storage:
 
 ```sh
-docker compose up --build -d --scale worker=3
-docker compose logs -f scheduler worker
+docker compose up --build -d
+docker compose logs -f scheduler worker worker2 worker3
 ```
 
 Once the workers finish, read the saved report:
@@ -62,10 +62,11 @@ calculation. Ordinary `pure value` and `return value` retain their usual meaning
 during replay; an external action may run again if interrupted before its result
 is recorded.
 
-One scheduler organizes assignments and parallel joins through durable RabbitMQ mailbox
-messages. Workers execute the workflow and write immutable replay records directly
+One scheduler organizes assignments and parallel joins through durable mailbox
+messages. Each worker and the scheduler has its own independent RabbitMQ broker
+and persistent mailbox volume. Workers execute the workflow and write immutable replay records directly
 to shared blob storage. The scheduler keeps only coordination metadata in its own
-local SQLite database. Each actor has its own queue; there is no shared work queue or shared execution database.
+local SQLite database. Global blob storage holds replay values and user files.
 
 The [direct interpreter](LeanCloud/DirectInterpreter.lean) remains the simple
 sequential reference. [Sim](LeanCloud/Simulation.md) runs the same scheduler,

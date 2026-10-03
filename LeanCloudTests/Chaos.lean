@@ -45,7 +45,7 @@ def plan (options : Options) : Array Fault := Id.run do
     faults := faults.push ⟨worker, 100 + (seed / 65536) % 601⟩
   return faults
 
-def run (options : Options) : IO Unit := withContext s!"chaos-{options.seed}" fun ctx => do
+def run (options : Options) : IO Unit := withContext s!"chaos-{options.seed}" (workers := options.workers) fun ctx => do
   let faults := plan options
   IO.FS.writeFile (ctx.artifacts / "plan.json") (Json.mkObj [
     ("generator", toJson "lcg32/v1"), ("options", toJson options), ("plan", toJson faults)]).pretty
@@ -56,7 +56,7 @@ def run (options : Options) : IO Unit := withContext s!"chaos-{options.seed}" fu
   IO.FS.writeFile inputFile input.compress
   if options.build then
     discard <| ctx.compose #["build", "worker"] (timeout := 1800)
-  discard <| ctx.compose #["up", "-d", "--wait", "broker", "blobs"] (timeout := 180)
+  ctx.startServices
   -- Seed global blobs through the ordinary application submission command.
   discard <| ctx.compose #["run", "--rm", "--no-deps", "submit", "submit", configPath, "seed-files"]
   discard <| ctx.compose #["run", "--rm", "--no-deps", "-v", s!"{inputFile}:/input.json:ro",
@@ -81,9 +81,12 @@ def run (options : Options) : IO Unit := withContext s!"chaos-{options.seed}" fu
   ctx.event "faults_stopped" [("crashes", toJson killed)]
   ctx.waitAll workers options.timeout
   ctx.checkReport "chaos" "files=16, errors=24"
-  let fresh ← ctx.compose #["run", "--rm", "--no-deps", "worker", "worker", configPath, "chaos"]
-  require ((fresh.stdout.splitOn "\n").contains "completed chaos" &&
-    !(fresh.stdout.splitOn "\n").any (fun line => (line.splitOn " location=").length > 1))
+  let fresh ← ctx.createWorker "fresh" "chaos"
+  ctx.start #[fresh]
+  ctx.waitAll #[fresh]
+  let lines := (← ctx.logs fresh).splitOn "\n"
+  require (lines.contains "completed chaos" &&
+    !lines.any (fun line => (line.splitOn " location=").length > 1))
     "A fresh worker must read the saved outcome without processing new work"
   ctx.event "passed" [("crashes", toJson killed), ("report", toJson "files=16, errors=24")]
 

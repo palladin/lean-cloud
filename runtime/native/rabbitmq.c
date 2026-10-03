@@ -67,7 +67,7 @@ LEAN_EXPORT lean_obj_res lc_queue_open(b_lean_obj_arg host, uint32_t port,
     amqp_table_entry_t entries[2] = {0};
     entries[0].key = amqp_cstring_bytes("x-queue-type");
     entries[0].value.kind = AMQP_FIELD_KIND_UTF8;
-    /* The reference deployment is a single persistent broker. Classic queues
+    /* Each actor has an independent persistent broker. Classic queues
        have no finite redelivery limit; clustered quorum deployment is separate. */
     entries[0].value.value.bytes = amqp_cstring_bytes("classic");
     entries[1].key = amqp_cstring_bytes("x-single-active-consumer");

@@ -12,15 +12,14 @@ structure SchedulerConfig where
   deriving FromJson, ToJson
 
 structure Config where
-  broker : RabbitMQ.Config
+  mailboxes : RabbitMQ.Mailboxes
   scheduler : SchedulerConfig
   blobs : S3.Config
   deriving FromJson, ToJson
 
 def Config.load (path : System.FilePath) : IO Config := do
   let config ← IO.ofExcept (Json.parse (← IO.FS.readFile path) >>= fromJson? (α := Config))
-  unless 0 < config.broker.port && config.broker.port ≤ 65535 do
-    throw (IO.userError "RabbitMQ port must be between 1 and 65535")
+  IO.ofExcept config.mailboxes.validate
   unless config.scheduler.assignmentMs > 0 do throw (IO.userError "Assignment timeout must be positive")
   return config
 
@@ -63,7 +62,7 @@ def runScheduler (config : Config) (run : String) : IO Unit := do
     let conn ← LeanLinq.Sqlite.connect config.scheduler.database
     try
       LocalDb.initializeSchema conn
-      let handle ← RabbitMQ.openMailbox config.broker run "scheduler"
+      let handle ← RabbitMQ.openMailbox config.mailboxes.scheduler run "scheduler"
       try
         let store := LocalDb.store conn run
         let inbox : Mailbox IO SchedulerMessage := RabbitMQ.inbox handle
@@ -82,7 +81,7 @@ def runScheduler (config : Config) (run : String) : IO Unit := do
                 if let .tick _ := delivery.message then throw (IO.userError "Invalid external timer message")
               return delivery
             acknowledge := fun receipt => if receipt == 0 then pure () else inbox.acknowledge receipt }
-          send := fun delivery => RabbitMQ.send config.broker run ("worker." ++ delivery.worker) delivery.message }
+          send := config.mailboxes.sendWorker run }
         Scheduler.recover store
         IO.println s!"scheduler ready for {run} using RabbitMQ"
         (← IO.getStdout).flush
@@ -125,7 +124,8 @@ assignments independently of either actor's process lifetime. -/
 def runWorker [Codec α] (config : Config) (run : String)
     (program : ι → Cloud IO α) (input : ι) : IO Unit := do
   let id ← workerId
-  let handle ← RabbitMQ.openMailbox config.broker run ("worker." ++ id)
+  let broker ← IO.ofExcept (config.mailboxes.worker id)
+  let handle ← RabbitMQ.openMailbox broker run ("worker." ++ id)
   try
     let inbox : Mailbox IO WorkerMessage := RabbitMQ.inbox handle
     let failure ← IO.mkRef (none : Option CloudError)
@@ -143,7 +143,7 @@ def runWorker [Codec α] (config : Config) (run : String)
             | _ => pure ()
           return delivery
         acknowledge := inbox.acknowledge }
-      send := fun message => RabbitMQ.send config.broker run "scheduler" message
+      send := fun message => RabbitMQ.send config.mailboxes.scheduler run "scheduler" message
       observe := ← observe (S3.records config.blobs run)
       blobs := S3.storage config.blobs }
     IO.println s!"worker {id} joined {run} via RabbitMQ"
@@ -161,10 +161,10 @@ def status (config : Config) (run : String) : IO Scheduler.State := do
   let random ← IO.Process.output { cmd := "openssl", args := #["rand", "-hex", "16"] }
   unless random.exitCode == 0 do throw (IO.userError "Cannot allocate status reply address")
   let id := "status-" ++ random.stdout.trimAscii.toString
-  let handle ← RabbitMQ.openMailbox config.broker run ("worker." ++ id)
+  let handle ← RabbitMQ.openMailbox config.mailboxes.scheduler run ("worker." ++ id)
   try
     let inbox : Mailbox IO WorkerMessage := RabbitMQ.inbox handle
-    RabbitMQ.send config.broker run "scheduler" (SchedulerMessage.inspect id)
+    RabbitMQ.send config.mailboxes.scheduler run "scheduler" (SchedulerMessage.inspect id)
     let deadline := (← IO.monoMsNow) + 5000
     repeat
       if (← IO.monoMsNow) > deadline then throw (IO.userError "Scheduler status timed out")
