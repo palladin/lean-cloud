@@ -8,7 +8,8 @@ require lean_eff from git
   "https://github.com/palladin/lean-eff.git" @ "2ad33d532b3de9008a5b80f9b29732364209643c"
 
 @[default_target]
-lean_lib LeanCloud
+lean_lib LeanCloud where
+  globs := #[.one `LeanCloud, .one `LeanCloud.Proofs]
 
 lean_lib LeanCloudTests
 

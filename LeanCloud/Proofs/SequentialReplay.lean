@@ -19,7 +19,8 @@ theorem Verified.replace {expected branch outcome action replacement before}
     (same : ∃ offset, ∀ fuel, (replacement (offset + fuel)).run before = (action fuel).run before) :
     Verified blobs source expected branch outcome replacement before := by
   obtain ⟨after, grows, consistent, returned, execution⟩ := verified
-  exact ⟨after, grows, consistent, returned, execution.replace same⟩
+  obtain ⟨offset, same⟩ := same
+  exact ⟨after, grows, consistent, returned, execution.replace ⟨offset, 0, fun fuel _ => same fuel⟩⟩
 
 theorem Verified.extend_before {expected branch outcome action before middle}
     (verified : Verified blobs source expected branch outcome action middle)
@@ -27,17 +28,7 @@ theorem Verified.extend_before {expected branch outcome action before middle}
     (same : ∃ offset minimum, ∀ fuel, minimum ≤ fuel → (replacement (offset + fuel)).run before = (action fuel).run middle) :
     Verified blobs source expected branch outcome replacement before := by
   obtain ⟨after, extension, consistent, returned, execution⟩ := verified
-  obtain ⟨offset, minimum, same⟩ := same
-  have transfer : ∀ progress journal, Returns action middle progress journal → Returns replacement before progress journal := by
-    rintro progress journal ⟨bound, enough⟩
-    refine ⟨offset + (bound + minimum), fun fuel large => ?_⟩
-    obtain ⟨spare, rfl⟩ := Nat.exists_eq_add_of_le large
-    rw [Nat.add_assoc, same _ (by omega)]
-    exact enough _ (by omega)
-  refine ⟨after, grows.trans extension, consistent, returned, ?_⟩
-  cases execution with
-  | done finished => exact .done (transfer _ _ finished)
-  | fork stopped children resumed => exact .fork (transfer _ _ stopped) children resumed
+  exact ⟨after, grows.trans extension, consistent, returned, execution.replace same⟩
 
 theorem Verified.step {expected journal current} {encode : β → Json} {remaining : Cloud M β}
     (cursor : Cursor blobs source journal current encode remaining) (assignment : Assignment)
@@ -175,32 +166,6 @@ private theorem parallel_runs (expected journal : Journal) (assignment : Assignm
           apply List.ext_getElem <;> simp [List.finRange]
         simpa only [same] using batch
 
-private theorem exec_records (expected journal : Journal) (assignment : Assignment)
-    (current : Location) (encode : β → Json) (codec : Codec γ) (label : String) (body : Unit → γ)
-    (next : ArrsF (Control M) γ β) (consistent : Extends journal expected)
-    (roundtrip : codec.decode (codec.encode (body ())) = .ok (body ()))
-    (known : expected.lookup (ReplayStore.valueKey current) =
-      some ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → M γ)), .success (codec.encode (body ()))⟩) :
-    ∃ after, Extends journal after ∧ Extends after expected ∧
-      after.lookup (ReplayStore.valueKey current) =
-        some ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → M γ)), .success (codec.encode (body ()))⟩ ∧
-      ∀ fuel, (walk store blobs assignment (fuel + 1) encode
-        (.impure (.sequential codec (.exec label (fun _ => pure (body ())))) next) current true).run journal =
-        (walk store blobs assignment fuel encode (next.apply (body ())) current.next true).run after := by
-  have accepted := create_within journal expected _ _ consistent known
-  refine ⟨_, create_extends journal _ _, accepted.2,
-    (create_visible journal _ _).trans (congrArg some accepted.1), ?_⟩
-  intro fuel
-  cases found : journal.lookup (ReplayStore.valueKey current) with
-  | none =>
-    simpa [store, StateT.run, found] using
-      Recording.exec_missing encode journal blobs assignment current fuel codec label body next found roundtrip
-  | some record =>
-    have same := Option.some.inj ((consistent _ _ found).symm.trans known)
-    subst record
-    simpa [store, StateT.run, found] using
-      Recording.exec_present encode journal blobs assignment current fuel codec label body next found roundtrip
-
 private theorem finish_verified (expected journal : Journal) (branch : Location) (outcome : Exit)
     (consistent : Extends journal expected)
     (known : expected.lookup (ReplayStore.returnKey branch) = some ⟨ReplayStore.returnRequest, outcome⟩) :
@@ -234,7 +199,7 @@ theorem complete_runs {expected current} {program : Cloud M β} {outcome}
     exact ⟨1, fun fuel => by simp [Nat.add_comm 1 fuel, walk]⟩
   | exec codec label body next roundtrip present rest ih =>
     intro encode journal assignment consistent cursor known ready
-    obtain ⟨after, grows, compatible, recorded, executes⟩ := exec_records blobs expected journal assignment _ encode codec label body next consistent roundtrip present
+    obtain ⟨after, grows, compatible, recorded, executes⟩ := Recording.exec_within encode journal expected blobs assignment _ codec label body next roundtrip consistent present
     have continues := ih encode after assignment compatible
       ((cursor.extend blobs source grows).exec blobs source codec label body next recorded roundtrip) known
       (fun joining => (ready joining).extend grows)

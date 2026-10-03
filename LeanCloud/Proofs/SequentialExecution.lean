@@ -26,16 +26,19 @@ mutual
         (rest : Batch step assignments middle after) : Batch step (assignment :: assignments) before after
 end
 
-theorem Execution.replace {step branch action replacement before after}
-    (execution : Execution step branch action before after)
-    (same : ∃ offset, ∀ fuel, (replacement (offset + fuel)).run before = (action fuel).run before) :
+/-- Replace the first segment by one with the same eventual result. This also
+covers replaying a prefix or recording an effect before the segment starts. -/
+theorem Execution.replace {step branch action replacement before middle after}
+    (execution : Execution step branch action middle after)
+    (same : ∃ offset minimum, ∀ fuel, minimum ≤ fuel →
+      (replacement (offset + fuel)).run before = (action fuel).run middle) :
     Execution step branch replacement before after := by
-  obtain ⟨offset, same⟩ := same
-  have transfer : ∀ progress journal, Returns action before progress journal → Returns replacement before progress journal := by
+  obtain ⟨offset, minimum, same⟩ := same
+  have transfer : ∀ progress journal, Returns action middle progress journal → Returns replacement before progress journal := by
     rintro progress journal ⟨bound, enough⟩
-    refine ⟨offset + bound, fun fuel large => ?_⟩
+    refine ⟨offset + (bound + minimum), fun fuel large => ?_⟩
     obtain ⟨spare, rfl⟩ := Nat.exists_eq_add_of_le large
-    rw [Nat.add_assoc, same]
+    rw [Nat.add_assoc, same _ (by omega)]
     exact enough _ (by omega)
   cases execution with
   | done returned => exact .done (transfer _ _ returned)

@@ -388,38 +388,4 @@ theorem entry [codec : Codec α] (expected : Journal) (worker : WorkerId) (fuel 
       simp only [Option.isSome_none, Bool.false_eq_true, ite_false]
       exact traversal.weaken _ (fun _ _ holds => holds.2)
 
-/-- The actual root entry point starts with no assumed cached prefix. Existing
-and new returns obey the same specification, including across delayed replies. -/
-theorem root [codec : Codec α] (expected : Journal) (worker : WorkerId) (fuel : Nat)
-    (program : ι → Cloud (SimM World) α) (input : ι) {outcome}
-    (meaning : Specification.Complete expected Location.root (program input) outcome)
-    (known : expected.lookup (ReplayStore.returnKey Location.root) =
-      some ⟨ReplayStore.returnRequest, Parallel.recorded codec.encode outcome⟩) :
-    (ReplayContracts.rules expected).Program (fun _ => True)
-      (Result expected Location.root (Parallel.recorded codec.encode outcome) codec.encode (program input) Location.root)
-      (step (observed worker).records blobs fuel program input ⟨0, Location.root, Location.root, false⟩).run := by
-  apply entry expected worker fuel program input ⟨0, Location.root, Location.root, false⟩ _ known rfl
-    (fun _ => True) (fun _ _ _ _ _ _ => trivial) _
-    (fun _ _ _ present => ⟨present, by intro location count impossible; cases impossible⟩)
-  rw [Reconstruction.walk_at_assignment]
-  obtain ⟨_, bounded⟩ := active_bounded expected meaning (by decide)
-  apply Rules.Program.weaken _ ((bounded worker ⟨0, Location.root, Location.root, false⟩ codec.encode
-    (by simp) known fuel).weaken_post _ _ (fun _ _ _ holds => holds.1))
-  exact fun _ _ _ => by simp [Ready]
-
-/-- A supported pure source program supplies its own specification. The same
-root step used by workers is certified from any compatible store, including
-empty storage, without assuming its intermediate results already exist. -/
-theorem pure_root [codec : Codec α] (program : ι → Cloud (SimM World) α) (input : ι) {outcome}
-    (evaluation : Pure.Evaluation (program input) outcome) :
-    ∃ expected,
-      Specification.Complete expected Location.root (program input) outcome ∧
-      expected.lookup (ReplayStore.returnKey Location.root) =
-        some ⟨ReplayStore.returnRequest, Parallel.recorded codec.encode outcome⟩ ∧
-      ∀ worker fuel, (ReplayContracts.rules expected).Program (fun _ => True)
-        (Result expected Location.root (Parallel.recorded codec.encode outcome) codec.encode (program input) Location.root)
-        (step (observed worker).records blobs fuel program input ⟨0, Location.root, Location.root, false⟩).run := by
-  obtain ⟨expected, complete, known⟩ := Specification.workflow_journal_exists evaluation codec.encode
-  exact ⟨expected, complete, known, fun worker fuel => root expected worker fuel program input complete known⟩
-
 end LeanCloud.Proofs.ExecutionContracts

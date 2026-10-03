@@ -20,14 +20,6 @@ def next (location : Location) : Location :=
 
 def child (location : Location) (index : Nat) : Location := location.push (index, 0)
 
-def parent? (location : Location) : Option (Location × Nat) :=
-  if location.size ≤ 1 then none
-  else some (location.extract 0 (location.size - 1), location[location.size - 1]!.1)
-
-/-- An earlier position that must be reconstructed using accepted results. -/
-def before (current target : Location) : Bool :=
-  current.size < target.size || current[current.size - 1]!.2 < target[current.size - 1]!.2
-
 def entersChild (current target : Location) : Bool :=
   current.size < target.size && current == target.extract 0 current.size
 

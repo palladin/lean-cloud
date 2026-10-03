@@ -4,10 +4,11 @@ import LeanCloudTests.Codecs
 import LeanCloudTests.ProofExamples
 import LeanCloudTests.ProgressWitness
 import LeanCloudTests.SequentialReplay
+import LeanCloudTests.Replay
 
 namespace LeanCloudTests
 
 def allCases : Array TestCase := codecCases ++ mailboxCases ++ coordinationCases ++ simulationBoundaryCases ++
-  crashBoundaryCases ++ generatedCases ++ compositionCases ++ sequentialReplayCases
+  crashBoundaryCases ++ generatedCases ++ compositionCases ++ blobFailureCases ++ sequentialReplayCases ++ replayCases
 
 end LeanCloudTests

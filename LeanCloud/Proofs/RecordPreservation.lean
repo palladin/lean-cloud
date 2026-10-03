@@ -1,9 +1,8 @@
-import LeanCloud.Proofs.Reconstruction
-import LeanCloud.Proofs.CachedReplay
+import LeanCloud.Proofs.ReplayModel
 import LeanCloud.SimulationBackend
 
 namespace LeanCloud.Proofs
-open ReplayModel Reconstruction SimulationBackend
+open ReplayModel SimulationBackend
 
 /-- Sim's global record creation preserves every previously committed record. -/
 theorem simulated_create_extends (world : World) (key : String) (proposed : ReplayRecord) :
@@ -23,23 +22,6 @@ theorem simulated_create_within (world : World) (expected : Journal) (key : Stri
   have accepted := create_within world.records expected key proposed consistent known
   cases found : world.records.lookup key <;>
     simpa [create, store, StateT.run, found] using accepted
-
-/-- A write by any worker, including a late write from a crashed attempt, cannot
-invalidate a prefix already available to another worker running the same program. -/
-theorem simulated_write_preserves_prefix (world : World) (key : String) (proposed : ReplayRecord)
-    {target current steps} {encode : α → Lean.Json} {program : Cloud (SimM World) α}
-    {remainingEncode : β → Lean.Json} {remaining : Cloud (SimM World) β}
-    (witness : Prefix world.records target encode program current steps remainingEncode remaining) :
-    Prefix (create key proposed world).2.records target encode program current steps remainingEncode remaining :=
-  witness.extend (simulated_create_extends world key proposed)
-
-/-- A concurrent or late write also preserves a branch's cached intermediate
-results, including the successful values needed by its continuation. -/
-theorem simulated_write_preserves_cached_branch (world : World) (key : String) (proposed : ReplayRecord)
-    {current steps outcome} {program : Cloud (SimM World) α}
-    (cached : CachedReplay.Cached world.records current program outcome steps) :
-    CachedReplay.Cached (create key proposed world).2.records current program outcome steps :=
-  cached.extend (simulated_create_extends world key proposed)
 
 /-- Retrying a record creation cannot replace a committed outcome. -/
 theorem create_preserves_existing (world : World) (key : String)

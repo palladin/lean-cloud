@@ -29,6 +29,7 @@ def exec [Codec α] (body : Unit → m α) (label : String := "") : Cloud m α :
 def parallel [Codec α] (branches : Array (Cloud m α)) : Cloud m (Array α) :=
   send (.parallel inferInstance branches.size (fun index => branches[index]))
 
+/-- Reserved for choice semantics; both current interpreters return `unsupported`. -/
 def choice [Codec α] (branches : Array (Cloud m (Option α))) : Cloud m (Option α) :=
   send (.choice inferInstance branches.size (fun index => branches[index]))
 

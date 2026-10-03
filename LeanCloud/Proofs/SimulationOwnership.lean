@@ -13,12 +13,6 @@ def Allowed (owner : Bool) : Atomic δ β → Prop
   | .step remote _ operation =>
       remote = true ∨ owner = false → ∀ world, field (operation world).2 = field world
 
-abbrev ActorValid (owner : Bool) := SimulationEvolution.ActorValid (Allowed field owner) (α := α)
-
-theorem ofProgram (owner : Bool) {program : SimM δ α}
-    (valid : Effects.Program (Allowed field owner) program) :
-    ActorValid field owner (Actor.ofProgram program) := SimulationEvolution.ofProgram _ valid
-
 abbrev Valid (owner : Fin count) (state : State δ α count) : Prop :=
   SimulationEvolution.Valid (fun actor => Allowed field (actor == owner))
     (fun before after => field after = field before) state

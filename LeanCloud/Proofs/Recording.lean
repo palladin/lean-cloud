@@ -1,4 +1,5 @@
 import LeanCloud.Proofs.Specification
+import LeanCloud.Proofs.Worker
 
 namespace LeanCloud.Proofs.Recording
 open Lean LeanEff ReplayModel ReplayInterpreter
@@ -131,7 +132,7 @@ theorem exec_present (journal : Journal) (blobs : BlobStorage M) (assignment : A
 /-- A pure computation either creates its specified record or reuses it. In
 both cases its continuation sees the computed value and the journal stays valid. -/
 theorem exec_within (journal expected : Journal) (blobs : BlobStorage M) (assignment : Assignment)
-    (current : Location) (fuel : Nat) (codec : Codec α) (label : String) (body : Unit → α)
+    (current : Location) (codec : Codec α) (label : String) (body : Unit → α)
     (next : ArrsF (Control M) α β)
     (roundtrip : codec.decode (codec.encode (body ())) = .ok (body ()))
     (consistent : Extends journal expected)
@@ -142,7 +143,7 @@ theorem exec_within (journal expected : Journal) (blobs : BlobStorage M) (assign
     let record : ReplayRecord := ⟨Internal.request codec operation, .success (codec.encode (body ()))⟩
     ∃ after, Extends journal after ∧ Extends after expected ∧
       after.lookup (ReplayStore.valueKey current) = some record ∧
-      (walk store blobs assignment (fuel + 1) encode (.impure (.sequential codec operation) next) current true).run journal =
+      ∀ fuel, (walk store blobs assignment (fuel + 1) encode (.impure (.sequential codec operation) next) current true).run journal =
         (walk store blobs assignment fuel encode (next.apply (body ())) current.next true).run after := by
   dsimp only
   have accepted := create_within journal expected _ _ consistent known
@@ -151,7 +152,8 @@ theorem exec_within (journal expected : Journal) (blobs : BlobStorage M) (assign
       ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → M α)),
         .success (codec.encode (body ()))⟩
     exact visible.trans (congrArg some accepted.1)
-  · cases found : journal.lookup (ReplayStore.valueKey current) with
+  · intro fuel
+    cases found : journal.lookup (ReplayStore.valueKey current) with
     | none =>
       simpa [store, StateT.run, found] using
         exec_missing (encode := encode) journal blobs assignment current fuel codec label body next found roundtrip
@@ -188,45 +190,6 @@ theorem join_missing_is_cached (journal : Journal) (blobs : BlobStorage M) (assi
   simp [store, StateT.run, Internal.check]
   erw [lift_bind_run]
   simp [StateT.run, missing]
-
-/-- A group either suspends without writing, or obtains its correct immutable
-join record. The equality covers the rest of the actual worker execution. -/
-theorem group_record_or_suspend (journal expected : Journal) (blobs : BlobStorage M)
-    (assignment : Assignment) (current : Location) (fuel : Nat) (codec : Codec α) (count : Nat)
-    (branches : Fin count → Cloud M α) (next : ArrsF (Control M) (Array α) β) (outcome : Exit)
-    (consistent : Extends journal expected)
-    (known : expected.lookup (ReplayStore.valueKey current) =
-      some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, outcome⟩)
-    (ready : assignment.joining = true → JoinReady expected journal assignment.location) :
-    let record : ReplayRecord := ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, outcome⟩
-    let execute := walk store blobs assignment (fuel + 1) encode (.impure (.parallel codec count branches) next) current true
-    execute.run journal = (.ok (.fork current count), journal) ∨
-      ∃ after, Extends journal after ∧ Extends after expected ∧
-        after.lookup (ReplayStore.valueKey current) = some record ∧ execute.run journal = execute.run after := by
-  dsimp only
-  cases found : journal.lookup (ReplayStore.valueKey current) with
-  | some record =>
-    have same := Option.some.inj ((consistent _ _ found).symm.trans known)
-    subst record
-    exact .inr ⟨journal, .refl _, consistent, found, rfl⟩
-  | none =>
-    by_cases authorized : current = assignment.location ∧ assignment.joining = true
-    · obtain ⟨atLocation, joining⟩ := authorized
-      subst current
-      obtain ⟨children, completed, collected⟩ := ready joining codec.schema count outcome known
-      have accepted := create_within journal expected _ _ consistent known
-      right
-      refine ⟨_, create_extends journal _ _, accepted.2, ?_, ?_⟩
-      · exact (create_visible journal _ _).trans (congrArg some accepted.1)
-      · simpa [collected, store, StateT.run, found] using
-          join_missing_is_cached (encode := encode) journal blobs assignment fuel codec count branches next children joining found completed
-    · left
-      rw [walk]
-      simp only [Bool.true_or]
-      erw [read_then]
-      have suspend : (current != assignment.location || !assignment.joining) = true := by
-        cases joining : assignment.joining <;> simp_all
-      simp [found, suspend]
 
 theorem group_success (journal : Journal) (blobs : BlobStorage M) (assignment : Assignment)
     (current : Location) (fuel : Nat) (codec : Codec α) (count : Nat) (branches : Fin count → Cloud M α)

@@ -23,6 +23,29 @@ private def typedWorkflow (_ : Unit) : Cloud (SimM SimulationBackend.World) (Nat
 }
 
 def coordinationCases : Array TestCase := #[
+  ⟨"replay/child-does-not-read-ancestor-joins", do
+    let program (input : Nat) : Cloud IO (Array (Array Nat)) :=
+      Cloud.parallel #[Cloud.parallel #[cloud { return input + 1 }, cloud { return input + 2 }]]
+    let branch := Location.root.child 0 |>.child 1
+    let key := ReplayStore.returnKey branch
+    let saved ← IO.mkRef (none : Option ReplayRecord)
+    let records : ReplayStore IO := {
+      read := fun requested => do
+        unless requested == key do
+          throw (IO.userError s!"Child depends on an unrelated record: {requested}")
+        saved.get
+      create := fun requested proposed => do
+        assertEq requested key
+        saved.modifyGet fun existing =>
+          let accepted := existing.getD proposed
+          (accepted, some accepted) }
+    let blobs : BlobStorage IO := {
+      putBlob := fun _ => throw ⟨.unsupported, "Unexpected blob operation"⟩
+      readBlob := fun _ => throw ⟨.unsupported, "Unexpected blob operation"⟩
+      resolveBlob := fun _ => throw ⟨.unsupported, "Unexpected blob operation"⟩ }
+    let result ← (ReplayInterpreter.step records blobs 100 program 7 ⟨0, branch, branch, false⟩).run
+    assertOutcome result (.ok .done)
+    assertEq (← saved.get) (some (rootRecord 9))⟩,
   ⟨"replay/typed-root-and-nested-child-codecs", do
     for chaos in [false, true] do
       let world ← differential typedWorkflow 71 chaos
@@ -77,20 +100,31 @@ def coordinationCases : Array TestCase := #[
     let (_, resumed) := Scheduler.handle 10 state (.ready "a")
     assertTrue (← assigned resumed).joining "Empty group remained suspended"⟩,
   ⟨"records/first-successful-create-wins", do
-    let (first, world) := SimulationBackend.create "key" (rootRecord 7) {}
-    let (second, world) := SimulationBackend.create "key" (rootRecord 99) world
-    assertEq first second
-    assertEq world.writes 1
-    assertEq world.records.length 1⟩,
+    let old : Fin 2 := ⟨0, by decide⟩
+    let fresh : Fin 2 := ⟨1, by decide⟩
+    let start : Simulation.Start SimulationBackend.World ReplayRecord 2 := fun actor _ =>
+      SimulationBackend.records.create "key" (rootRecord (if actor == old then 99 else 7))
+    -- The old request survives its crash. A fresh writer finishes first;
+    -- then the old request arrives, and that writer retries after restart.
+    let result := Simulation.run start
+      [.crash old, .commit fresh, .resume fresh, .commitOrphan 0,
+        .restart old, .commit old, .resume old]
+      (Simulation.State.initial {} start)
+    let (records, writes, returned) ← unwrap (result.map (fun state =>
+      (state.world.records, state.world.writes, (Array.finRange 2).map fun actor =>
+        match state.actors actor with | .finished record => some record | _ => none)) |>.mapError reprStr)
+    assertEq records [("key", rootRecord 7)]
+    assertEq writes 1
+    assertEq returned #[some (rootRecord 7), some (rootRecord 7)]⟩,
   ⟨"protocol/json-roundtrip", do
     let report : Report := ⟨"worker/3", 17, .ok (.fork #[(0, 2), (1, 5)] 3), #["x", "y"]⟩
     let state : Scheduler.State := { workers := #[⟨"worker/3", #["x", "y"]⟩], nextAttempt := 18 }
-    let decoded ← unwrap (fromJson? (toJson state) : Except String Scheduler.State)
+    let decoded ← unwrap (Json.parse (toJson state).compress >>= fromJson? (α := Scheduler.State))
     assertEq decoded state
-    let decoded ← unwrap (fromJson? (toJson report) : Except String Report)
+    let decoded ← unwrap (Json.parse (toJson report).compress >>= fromJson? (α := Report))
     assertEq (toJson decoded) (toJson report)
     let error : Report := ⟨"worker/3", 17, .error ⟨.divergence, "changed"⟩, #[]⟩
-    let decoded ← unwrap (fromJson? (toJson error) : Except String Report)
+    let decoded ← unwrap (Json.parse (toJson error).compress >>= fromJson? (α := Report))
     assertEq (toJson decoded) (toJson error)⟩
 ]
 
@@ -107,7 +141,7 @@ private def workflow (_ : Unit) : Cloud (SimM SimulationBackend.World) Nat := cl
 
 /-- Find a real execution boundary in a running group, then kill that actor.
 The remaining execution includes late orphan commits and fresh process ids. -/
-private def crashAt (label : String) (afterCommit : Bool) : Except String Machine := do
+private def crashAt (label : String) (afterCommit : Bool) (loseRequest := false) : Except String Machine := do
   let start := SimulationBackend.start (workers := 3) 100000 10000 1000 workflow ()
   let mut state := Simulation.State.initial {} start
   for _ in [:20000] do
@@ -117,22 +151,29 @@ private def crashAt (label : String) (afterCommit : Bool) : Except String Machin
       | .waiting _ waitingLabel _ _ =>
         if waitingLabel.startsWith label && state.world.writes > 0 then
           if afterCommit then state ← event start (.commit actor) state
+          let pending := state.orphans.size
           state ← event start (.crash actor) state
+          if loseRequest then
+            unless state.orphans.size == pending + 1 do throw "Crash did not leave an uncommitted remote request"
+            state ← event start (.discardOrphan pending) state
           let finished ← runSystem start state 0 false
           return finished
       | _ => pure PUnit.unit
       state ← tick start actor state
   throw s!"Boundary not reached: {label}"
 
-def crashBoundaryCases : Array TestCase := #[
-    "record.create:0:0/return", "record.read", "worker.observe", "worker.confirmed",
-    "worker.send", "worker.acknowledge", "scheduler.receive", "scheduler.load", "scheduler.save", "scheduler.send", "scheduler.acknowledge"
-  ].flatMap fun label => #[false, true].map fun afterCommit =>
-    ⟨s!"crash/{label}/{if afterCommit then "after" else "before"}", do
-      let world ← unwrap ((crashAt label afterCommit).map (·.world))
+def crashBoundaryCases : Array TestCase :=
+  let remote := #["record.create:0:0/return", "record.read", "worker.receive",
+    "worker.send", "worker.acknowledge", "scheduler.receive", "scheduler.send", "scheduler.acknowledge"]
+  let localOps := #["worker.observe", "worker.confirmed", "scheduler.load", "scheduler.save"]
+  let check (label : String) (afterCommit loseRequest : Bool) : TestCase :=
+    ⟨s!"crash/{label}/{if loseRequest then "before-lost" else if afterCommit then "after" else "before"}", do
+      let world ← unwrap ((crashAt label afterCommit loseRequest).map (·.world))
       let some record := world.records.lookup (ReplayStore.returnKey Location.root)
         | throw (IO.userError "No final durable record")
       assertEq record.outcome (.success (toJson (38 : Nat)))⟩
+  ((remote ++ localOps).flatMap fun label => #[check label false false, check label true false]) ++
+    (remote.map fun label => check label false true)
 
 def mailboxCases : Array TestCase := #[
   ⟨"mailbox/unacknowledged-delivery-survives-crash", do

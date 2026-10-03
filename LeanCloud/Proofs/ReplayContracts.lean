@@ -1,6 +1,5 @@
-import LeanCloud.Proofs.SimulationBackendSafety
+import LeanCloud.Proofs.SimulationLogic
 import LeanCloud.Proofs.RecordPreservation
-import LeanCloud.Proofs.ReplayEvolution
 
 /-! Semantic contracts for the actual simulated replay store. The expected
 journal is a pure specification, never a prefilled runtime store. Replies retain
@@ -94,15 +93,6 @@ theorem read_preserving (expected : Journal) (key : String) (record : ReplayReco
   · intro world invariant holds
     exact ⟨invariant, ⟨Extends.refl _, ⟨rfl, rfl, rfl, rfl⟩⟩, present world invariant holds,
       stable _ _ invariant invariant (Extends.refl _) holds⟩
-
-/-- A previously established record cannot disappear between issuing a read,
-committing it, and delivering the reply. -/
-theorem read_known (expected : Journal) (key : String) (record : ReplayRecord) :
-    (rules expected).Program (fun world => world.records.lookup key = some record)
-      (fun result world => result = some record ∧ world.records.lookup key = some record)
-      (records.read key) :=
-  read_preserving expected key record _ (fun _ _ _ _ grows present => grows key record present)
-    (fun _ _ present => present)
 
 /-- Retain a committed record while a certified computation continues. Fork
 paths use this fact to reconstruct earlier effects after later suspension. -/
@@ -225,47 +215,6 @@ theorem observed_create (expected : Journal) (worker : WorkerId) (key : String) 
   intro _
   exact fun _ _ holds => holds
 
-/-- Checking an existing record uses agreement with the pure specification.
-The reply's presence assertion remains valid even after a delayed read. -/
-theorem check_existing (expected : Journal) (key : String) (proposed actual : ReplayRecord)
-    (known : expected.lookup key = some proposed) (pre : World → Prop)
-    (present : ∀ world, (rules expected).invariant world → pre world → world.records.lookup key = some actual) :
-    (rules expected).Program pre
-      (fun result world => result = Except.ok proposed.outcome ∧ pre world ∧ world.records.lookup key = some proposed)
-      (ReplayInterpreter.Internal.check proposed.request actual).run := by
-  unfold ReplayInterpreter.Internal.check
-  split
-  · intro world invariant holds
-    have found := present world invariant holds
-    have same := Option.some.inj ((invariant _ _ found).symm.trans known)
-    exact ⟨by rw [same], holds, found.trans (congrArg some same)⟩
-  · intro world invariant holds
-    have found := present world invariant holds
-    have same := congrArg ReplayRecord.request (Option.some.inj ((invariant _ _ found).symm.trans known))
-    simp_all
-
-/-- Creating and checking a specified record establishes a durable result while
-retaining the caller's stable facts. Retries return the same canonical value. -/
-theorem create_checked (expected : Journal) (worker : WorkerId) (key : String) (proposed : ReplayRecord)
-    (known : expected.lookup key = some proposed) (pre : World → Prop)
-    (stable : (rules expected).Stable (rules expected).interference pre) :
-    (rules expected).Program pre
-      (fun result world => result = Except.ok proposed.outcome ∧ pre world ∧ world.records.lookup key = some proposed)
-      ((do
-        let accepted ← (observed worker).records.create key proposed
-        ReplayInterpreter.Internal.check proposed.request accepted : ExceptT CloudError (SimM World) Exit).run) := by
-  apply Rules.except_bind (middle := fun accepted world => Created key proposed accepted world ∧ pre world)
-  · apply Rules.except_lift _ (preserving expected (observed_create expected worker key proposed known) stable)
-    exact fun _ _ _ holds => holds
-  · intro accepted
-    unfold ReplayInterpreter.Internal.check
-    split
-    · intro world invariant holds
-      exact ⟨by rw [holds.1.1], holds.2, holds.1.2⟩
-    · intro world invariant holds
-      have same := congrArg ReplayRecord.request holds.1.1
-      simp_all
-
 /-- The existing completion helper reports done only after its specified
 return record is durable. Each intermediate reply may be delayed. -/
 theorem finish (expected : Journal) (worker : WorkerId) (branch : Location) (outcome : Exit)
@@ -288,62 +237,5 @@ theorem finish (expected : Journal) (worker : WorkerId) (branch : Location) (out
         simp_all
   · intro _
     exact fun _ _ present => ⟨rfl, present⟩
-
-/-- Correct immutable record operations all obey the same interference law.
-The simulator soundness theorem can therefore compose different workers. -/
-def system (expected : Journal) (count : Nat) : SimulationSafety.System World count where
-  invariant := (rules expected).invariant
-  evolution := (rules expected).interference
-  rely _ := (rules expected).interference
-  guarantee _ := (rules expected).guarantee
-  reflexive world := Extends.refl world.records
-  transitive := fun {_ _ _} first second => first.trans second
-  compatible _ _ _ _ _ _ grows := ⟨grows.1, fun _ _ => grows.1⟩
-
-private theorem unchanged_world (expected : Journal)
-    {post : Fin count → α → World → Prop} {state : Simulation.State World α count} {world : World}
-    (valid : (system expected count).Valid post state)
-    (postStable : ∀ actor value, (rules expected).Stable (rules expected).interference (post actor value))
-    (same : world.records = state.world.records) :
-    (system expected count).Valid post { state with world } ∧
-      (system expected count).evolution state.world world := by
-  have invariant : (system expected count).invariant world := by
-    change Extends world.records expected
-    rw [same]
-    exact valid.invariant
-  have grows : (system expected count).evolution state.world world := by
-    change Extends state.world.records world.records
-    rw [same]
-    exact Extends.refl _
-  exact ⟨valid.advance _ postStable invariant grows (fun _ => grows), grows⟩
-
-/-- The backend's broker disconnect hook preserves semantic assertions as well
-as immutable records. The underlying event is the actual Simulation.step. -/
-theorem step_preserves (expected : Journal) (start : Simulation.Start World α count)
-    (post : Fin count → α → World → Prop)
-    (postStable : ∀ actor value, (rules expected).Stable (rules expected).interference (post actor value))
-    (starts : ∀ actor generation, (rules expected).Program (fun _ => True) (post actor) (start actor generation))
-    (state after : Simulation.State World α count) (event : Simulation.Event count)
-    (valid : (system expected count).Valid post state)
-    (executed : SimulationBackend.step start event state = .ok after) :
-    (system expected count).Valid post after :=
-  ((system expected count).backend_step_preserves start post postStable starts
-    (fun _ _ _ safe => unchanged_world expected safe postStable (ReplayEvolution.disconnect _ _ _))
-    state after event valid executed).1
-
-/-- Stable reply assertions follow every actual actor/network interleaving.
-Atomic and startup contracts remain the obligations to discharge for each actor;
-correctness of a trace is obtained here, not assumed as a premise. -/
-theorem trace_preserves (expected : Journal) (start : Simulation.Start World α count)
-    (post : Fin count → α → World → Prop)
-    (postStable : ∀ actor value, (rules expected).Stable (rules expected).interference (post actor value))
-    (starts : ∀ actor generation, (rules expected).Program (fun _ => True) (post actor) (start actor generation))
-    {allowed : Simulation.Event count → Prop} {before after : Simulation.State World α count}
-    (valid : (system expected count).Valid post before)
-    (history : SchedulerOwnership.Trace start allowed before after) :
-    (system expected count).Valid post after :=
-  ((system expected count).backend_trace_preserves start post postStable starts
-    (fun _ _ _ safe => unchanged_world expected safe postStable (ReplayEvolution.disconnect _ _ _))
-    (fun _ event safe => unchanged_world expected safe postStable (ReplayEvolution.network event _)) valid history).1
 
 end LeanCloud.Proofs.ReplayContracts

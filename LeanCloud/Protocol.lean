@@ -89,10 +89,6 @@ inductive Exit where
   | cancelled (reason : String)
   deriving Repr, BEq, ToJson, FromJson
 
-def Exit.isSuccess : Exit → Bool
-  | .success _ => true
-  | _ => false
-
 structure Request where
   kind : String
   schema : String
@@ -123,9 +119,5 @@ structure BlobRef where
   deriving Repr, BEq, DecidableEq, ToJson, FromJson
 
 instance : Codec BlobRef := jsonCodec BlobRef "blob-ref/model-v1"
-
-inductive GroupKind where
-  | parallel | choice
-  deriving Repr, BEq, DecidableEq, ToJson, FromJson
 
 end LeanCloud

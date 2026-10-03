@@ -32,7 +32,8 @@ mutual
     | .branch even odd => if input % 2 == 0 then lower even input else lower odd input
     | .parallel children => do
       let values ← Cloud.parallel (lowerChildren children input).toArray
-      Cloud.pure (fun _ => values.foldl (· + ·) input) "generated/join"
+      -- An order-sensitive result exposes reordered children; summing hid them.
+      Cloud.pure (fun _ => values.foldl (fun acc value => acc * 31 + value + 1) input) "generated/join"
   termination_by structural tree
 
   def lowerChildren [Pure m] (children : List Tree) (input : Nat) : List (Cloud m Nat) :=
@@ -93,5 +94,22 @@ def compositionCases : Array TestCase := Id.run do
           let _ ← differential (fun _ => lower tree 1) (i * 4 + j) true
           pure ()⟩
   return cases
+
+/-- Blob failures must be durable workflow outcomes, unlike base-monad IO errors. -/
+def blobFailureCases : Array TestCase :=
+  let programs : Array (String × Cloud (SimM SimulationBackend.World) String × ErrorKind) := #[
+    ("missing-name", CloudBlob.readTextByName "missing", .missingBlob),
+    ("integrity", (do
+      let ref ← CloudBlob.putText "content"
+      CloudBlob.readText { ref with checksum := ref.checksum + 1 }), .integrity),
+    ("invalid-utf8", (do
+      let ref ← CloudBlob.putBytes (ByteArray.mk #[255])
+      CloudBlob.readText ref), .invalidUtf8)]
+  programs.flatMap fun (name, source, kind) => #[false, true].map fun chaos =>
+    ⟨s!"blobs/{name}/{if chaos then "chaos" else "clean"}", do
+      let world ← differential (fun _ => source) 71 chaos
+      let some record := world.records.lookup (ReplayStore.returnKey Location.root)
+        | throw (IO.userError "Missing durable blob failure")
+      assertError (ReplayInterpreter.result (m := Id) (α := String) record.outcome).run kind⟩
 
 end LeanCloudTests

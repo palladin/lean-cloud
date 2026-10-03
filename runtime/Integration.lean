@@ -23,53 +23,60 @@ private def checkAdapters (config : Config) (runPrefix : String) : IO Unit := do
   let .ok actual ← (S3.readBytes config.blobs ref).run
     | throw (IO.userError "Cannot read test blob")
   assertEq actual.data bytes.data
+  for invalid in #[{ ref with size := ref.size + 1 }, { ref with checksum := ref.checksum + 1 }] do
+    assertError (← (S3.readBytes config.blobs invalid).run) .integrity
+  assertError (← (S3.resolve config.blobs (runPrefix ++ "/missing")).run) .missingBlob
+  let invalidText ← S3.putBytes config.blobs (ByteArray.mk #[255])
+  assertError (← (DirectInterpreter.interpret (S3.storage config.blobs)
+    (fun _ : Unit => CloudBlob.readText invalidText) ()).run) .invalidUtf8
   IO.FS.withTempFile fun _ path => do
     let conn ← LeanLinq.Sqlite.connect path.toString
-    LocalDb.initializeSchema conn
     let state := (Scheduler.handle 10 {} (.ready "adapter-worker")).1
-    LocalDb.save conn runPrefix state
-    conn.close
+    try
+      LocalDb.initializeSchema conn
+      LocalDb.save conn runPrefix state
+    finally conn.close
     let reopened ← LeanLinq.Sqlite.connect path.toString
     try assertEq (← LocalDb.load reopened runPrefix) state "Scheduler state did not survive reopen"
     finally reopened.close
 
+/-- A confirmed publication can still take time to reach a consumer. Require
+the expected payload within a bounded wait instead of assuming immediate delivery. -/
+private def receiveAcknowledged (handle : RabbitMQ.Handle) (expected : Nat) : IO Nat := do
+  let inbox : Mailbox IO WorkerMessage := RabbitMQ.inbox handle
+  for _ in [:40] do
+    if let some delivery ← inbox.receive then
+      assertEq (toJson delivery.message) (toJson (WorkerMessage.acknowledged expected))
+        "Unexpected mailbox payload"
+      return delivery.receipt
+  throw (IO.userError s!"Missing confirmed message {expected}")
+
 private def checkMailboxes (config : Config) (run : String) : IO Unit := do
   let first ← RabbitMQ.openMailbox config.broker run "durability"
-  first.send (WorkerMessage.acknowledged 42)
-  let inbox : Mailbox IO WorkerMessage := RabbitMQ.inbox first
-  let some delivery ← inbox.receive | throw (IO.userError "Missing confirmed publication")
-  match delivery.message with
-  | .acknowledged 42 => pure ()
-  | _ => throw (IO.userError "Wrong mailbox payload")
+  try
+    first.send (WorkerMessage.acknowledged 42)
+    discard <| receiveAcknowledged first 42
+  finally first.close
   -- Closing without ack must retain the delivery through repeated crashes.
   -- The reference classic queues have no finite delivery limit.
-  first.close
   for _ in [:24] do
     let handle ← RabbitMQ.openMailbox config.broker run "durability"
-    try
-      let inbox : Mailbox IO WorkerMessage := RabbitMQ.inbox handle
-      let mut found := false
-      for _ in [:40] do
-        if let some delivery ← inbox.receive then
-          match delivery.message with
-          | .acknowledged 42 => found := true
-          | _ => throw (IO.userError "Redelivery changed payload")
-          break
-      assertTrue found "Unacknowledged message did not survive consumer restart"
+    try discard <| receiveAcknowledged handle 42
     finally handle.close
   let handle ← RabbitMQ.openMailbox config.broker run "durability"
   try
     let inbox : Mailbox IO WorkerMessage := RabbitMQ.inbox handle
-    let mut acknowledged := false
-    for _ in [:40] do
-      if let some delivery ← inbox.receive then
-        inbox.acknowledge delivery.receipt
-        acknowledged := true
-        break
-    assertTrue acknowledged "Cannot acknowledge redelivered message"
-    assertTrue (← inbox.receive).isNone "Acknowledged message was retained"
-    handle.delete
+    inbox.acknowledge (← receiveAcknowledged handle 42)
   finally handle.close
+  -- A receive on the old consumer can time out while 42 is still in flight.
+  -- Reopen it and require the next confirmed message, rather than an empty poll.
+  let reopened ← RabbitMQ.openMailbox config.broker run "durability"
+  try
+    reopened.send (WorkerMessage.acknowledged 99)
+    let inbox : Mailbox IO WorkerMessage := RabbitMQ.inbox reopened
+    inbox.acknowledge (← receiveAcknowledged reopened 99)
+    reopened.delete
+  finally reopened.close
 
 /-- Real RabbitMQ, SQLite, and S3 ports run the same actor turns as Sim. -/
 private def compareProgram (config : Config) (run : String) (tree : Tree) (input : Nat) : IO Unit := do
@@ -122,15 +129,7 @@ private def stagedMailbox (config : Config) (run : String) (publish : Bool) : IO
     if publish then handle.send (WorkerMessage.acknowledged 73)
     else
       let inbox : Mailbox IO WorkerMessage := RabbitMQ.inbox handle
-      let mut found := false
-      for _ in [:40] do
-        if let some delivery ← inbox.receive then
-          match delivery.message with
-          | .acknowledged 73 => found := true
-          | _ => throw (IO.userError "Wrong message after broker restart")
-          inbox.acknowledge delivery.receipt
-          break
-      assertTrue found "Confirmed message did not survive broker restart"
+      inbox.acknowledge (← receiveAcknowledged handle 73)
       handle.delete
   finally handle.close
 
@@ -148,7 +147,8 @@ def main (args : List String) : IO UInt32 := do
     checkMailboxes config runPrefix
     for seed in [:16] do
       let tree := (generate 3 seed).1
-      compareProgram config s!"{runPrefix}-{seed}" tree (seed % 7)
+      try compareProgram config s!"{runPrefix}-{seed}" tree (seed % 7)
+      catch error => throw (IO.userError s!"seed={seed}, program={reprStr tree}\n{error}")
     IO.println "Real adapters: durable RabbitMQ redelivery, immutable writes, concurrent creation, blob integrity, SQLite recovery, and 16 differential programs passed."
     return 0
   catch error => IO.eprintln error.toString; return 1

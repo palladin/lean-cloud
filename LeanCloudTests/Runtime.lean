@@ -32,8 +32,10 @@ def run (build : Bool) : IO Unit := withContext "test" fun ctx => do
   let fresh ← ctx.createWorker "fresh" "normal"
   ctx.start #[fresh]
   ctx.waitAll #[fresh]
-  require (!((← ctx.logs fresh).splitOn "\n").any (fun line => (line.splitOn " location=").length > 1))
-    "A fresh worker executed work for a completed run"
+  let lines := (← ctx.logs fresh).splitOn "\n"
+  require (lines.contains "completed normal" &&
+    !lines.any (fun line => (line.splitOn " location=").length > 1))
+    "A fresh worker must confirm completion without processing new work"
   say "Persistence: confirmed mail survived broker SIGKILL; scheduler state and blob results survived restart."
   say "All real runtime checks passed."
 

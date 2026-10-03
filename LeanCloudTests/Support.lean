@@ -68,13 +68,15 @@ def event (start : Start) (event : Simulation.Event 4) (state : Machine) : Excep
 def nextSeed (seed : Nat) : Nat := (1664525 * seed + 1013904223) % 4294967296
 
 /-- Finite chaos followed by fair delivery and actor scheduling. Includes crashes
-of the scheduler, orphan commits, delayed/duplicate messages, redelivery, and expiry. -/
+of the scheduler, lost or late remote requests, duplicate messages, redelivery, and expiry.
+Only uncommitted orphan requests may be discarded, never confirmed messages. -/
 def runSystem (start : Start) (initial : Machine) (seed : Nat) (chaos : Bool) : Except String Machine := do
   let mut state := initial
   let mut random := seed
   for step in [:if chaos then 1500 else 0] do
     random := nextSeed random
-    let actor : Fin 4 := ⟨random % 4, Nat.mod_lt _ (by decide)⟩
+    -- The low two bits of this LCG cycle through the same four actors.
+    let actor : Fin 4 := ⟨random / 65536 % 4, Nat.mod_lt _ (by decide)⟩
     let index := random / 16 % max 1 state.world.network.size
     let networkEvent := match random / 256 % 13 with
       | 0 => .hold
@@ -87,7 +89,10 @@ def runSystem (start : Start) (initial : Machine) (seed : Nat) (chaos : Bool) : 
       | _ => state ← tick start actor state
     else state ← tick start actor state
     if !state.orphans.isEmpty && random / 1048576 % 7 == 0 then
-      state ← event start (.commitOrphan 0) state
+      let orphan := random / 4096 % state.orphans.size
+      let action := if random / 8388608 % 2 == 0 then
+        Simulation.Event.commitOrphan orphan else .discardOrphan orphan
+      state ← event start action state
     if step % 97 == 0 then
       state := { state with world := SimulationBackend.networkStep (.tick 500) state.world }
   -- Expire abandoned assignments after faults stop. Retrying messages repairs
@@ -96,7 +101,13 @@ def runSystem (start : Start) (initial : Machine) (seed : Nat) (chaos : Bool) : 
   for round in [:200000] do
     if let some error := state.world.scheduler.error then
       throw s!"Scheduler error: {reprStr error}"
-    if state.world.scheduler.finished then return state
+    if state.world.scheduler.finished then
+      -- Completion must remain valid when old remote requests arrive later.
+      let completed := state.world.records
+      while !state.orphans.isEmpty do state ← event start (.commitOrphan 0) state
+      unless completed.all (fun (key, record) => state.world.records.lookup key == some record) do
+        throw "Late request changed a committed record"
+      return state
     if !state.orphans.isEmpty then state ← event start (.commitOrphan 0) state
     if round % 5000 == 0 then
       state := { state with world := SimulationBackend.networkStep (.tick 1000) state.world }
@@ -123,6 +134,7 @@ def differential [Codec α] [BEq α] [Repr α]
   assertOutcome actual expected
   -- Reconstructing any completed branch must reuse its result without writes.
   for job in finished.scheduler.jobs do
+    assertEq job.status .done "Scheduler finished with unfinished branches"
     let assignment : Assignment := ⟨9999999, job.branch, job.location, job.joining⟩
     let (repeated, after) ← unwrap (evaluate 100000
       (ReplayInterpreter.step SimulationBackend.records SimulationBackend.blobs 10000 program () assignment).run
@@ -131,6 +143,7 @@ def differential [Codec α] [BEq α] [Repr α]
     | .ok .done => pure ()
     | other => throw (IO.userError s!"Completed branch failed warm replay: {reprStr other}")
     assertEq after.writes finished.writes "Warm replay wrote a record"
+    assertEq after.records finished.records "Warm replay changed recorded outcomes"
   return finished
 
 end LeanCloudTests

@@ -110,7 +110,6 @@ def walk [Monad m] (store : ReplayStore m) (blobs : BlobStorage m) (assignment :
           finish store assignment.branch outcome
       | .parallel codec count branches, continuation => do
         let expected : Request := ⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩
-        let existing ← store.read (ReplayStore.valueKey current)
         -- Descending into a child requires no mutable suspension record.
         if !active && current.entersChild assignment.location then
           let index := assignment.location[current.size]!.1
@@ -119,6 +118,7 @@ def walk [Monad m] (store : ReplayStore m) (blobs : BlobStorage m) (assignment :
               (current.child index)
           else throw ⟨.divergence, "Child index is outside the group"⟩
         else
+          let existing ← store.read (ReplayStore.valueKey current)
           if existing.isNone && (current != assignment.location || !assignment.joining) then
             unless active do throw ⟨.divergence, "Missing joined result in replay prefix"⟩
             return .fork current count

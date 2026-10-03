@@ -1,6 +1,8 @@
 # Interpreter equivalence proofs
 
-Start with [MainTheorems.lean](MainTheorems.lean).
+Start with [MainTheorems.lean](MainTheorems.lean). Import `LeanCloud.Proofs`
+for the theorem library; `LeanCloud` exposes runtime modules. The default
+`lake build` checks both.
 
 `sequential_replay_matches_direct` is the basic equivalence theorem:
 
@@ -177,16 +179,10 @@ than duplicating the interpreter proof.
 
 ## Smaller results for review
 
-- [CachedReplay.lean](CachedReplay.lean): `cached_replay_matches_direct` checks
-  location-based replay against direct evaluation using the small pure journal
-  in [ReplayModel.lean](ReplayModel.lean). Cached intermediate results and
-  sufficient fuel are explicit premises. `resumed_branch_matches_direct` also
-  covers reconstruction to a nested assignment. The public sequential theorem
-  above removes the cache premise by executing and recording the children.
 - [Parallel.lean](Parallel.lean), [ParallelContracts.lean](ParallelContracts.lean):
   joins preserve source order and the first error in that order, including empty
   groups. Actual interleaved reads retain the required child-record facts.
-- [Segment.lean](Segment.lean), [Recording.lean](Recording.lean): a worker segment
+- [Recording.lean](Recording.lean): sequential execution
   may create new records from empty compatible storage; it need not start with
   all intermediate results cached. Completion is stored before `done` is reported.
 - [ReplayEvolution.lean](ReplayEvolution.lean),
@@ -202,6 +198,3 @@ than duplicating the interpreter proof.
 - [Location.lean](Location.lean), [JournalRegion.lean](JournalRegion.lean): location
   encodings are injective and separate command, return, sibling, and descendant
   record regions.
-
-The old shared-queue and JournalDb proofs were retired with that implementation.
-Git history retains them; they are not claims about this architecture.

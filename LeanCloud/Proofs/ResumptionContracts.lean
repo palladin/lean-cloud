@@ -85,12 +85,7 @@ theorem replay (expected journal : Journal) (worker : WorkerId) (assignment : As
     | succ fuel =>
       simp only [walk, Bool.false_or, beq_eq_false_iff_ne.mpr before, Bool.not_false, Bool.true_and, enters, ite_true,
         selected, index.isLt, dite_true]
-      apply Rules.except_bind (middle := fun _ => pre)
-      · apply Rules.except_lift _ (ReplayContracts.preserving expected
-          (ReplayContracts.observed_read expected worker _) stable)
-        exact fun _ _ _ holds => holds.2
-      · intro _
-        exact ih fuel (fun smaller => exhausted (by omega)) (fun remainingFuel same => continued remainingFuel (by omega))
+      exact ih fuel (fun smaller => exhausted (by omega)) (fun remainingFuel same => continued remainingFuel (by omega))
 
 /-- Compose a certified active continuation with its actual recorded prefix.
 The budget is the prefix length plus the supplied continuation bound. -/

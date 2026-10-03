@@ -14,14 +14,6 @@ def ReportResult (expected : Journal) (worker : WorkerId) (assignment : Assignme
     ExecutionContracts.Result expected assignment.branch outcome encode program Location.root report.progress world ∧
     ExecutionContracts.ForksAfter assignment assignment.location report.progress
 
-theorem report_stable (expected : Journal) (worker : WorkerId) (assignment : Assignment) (outcome : Exit)
-    (encode : α → Json) (program : Cloud (SimM World) α) (report : Report) :
-    (ReplayContracts.rules expected).Stable (ReplayContracts.rules expected).interference
-      (ReportResult expected worker assignment outcome encode program report) :=
-  fun before after first last grows holds => ⟨holds.1, holds.2.1,
-    ExecutionContracts.result_stable expected assignment.branch outcome encode program Location.root report.progress
-      before after first last grows holds.2.2.1, holds.2.2.2⟩
-
 /-- Reading observation keys preserves any stable interpreter postcondition,
 including semantic results, replay paths, and fuel guarantees. -/
 theorem execute [codec : Codec α] (expected : Journal) (worker : WorkerId) (assignment : Assignment)

@@ -1,8 +1,10 @@
-import LeanCloud.Proofs.CachedReplay
+import LeanCloud.Proofs.Pure
+import LeanCloud.Proofs.Parallel
+import LeanCloud.Proofs.Reconstruction
 import LeanCloud.Proofs.JournalRegion
 
 namespace LeanCloud.Proofs.Specification
-open Lean LeanEff ReplayModel CachedReplay JournalRegion
+open Lean LeanEff ReplayModel JournalRegion
 
 /-- A real parallel group in the pure specification: its children have known
 returns, and their ordered reduction is the expected group result. -/
@@ -56,30 +58,21 @@ inductive Complete {m : Type → Type u} [Monad m] (journal : Journal) :
         some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, .failure error⟩) :
       Complete journal current (.impure (.parallel codec count branches) next) (.error error)
 
-theorem Complete.cached {m : Type → Type u} [Monad m] {α : Type}
+/-- Forget recorded values to recover the original pure source meaning. -/
+theorem Complete.evaluation {m : Type → Type u} [Monad m] {α : Type}
     {journal current} {program : Cloud m α} {outcome}
     (complete : Complete journal current program outcome) :
-    ∃ steps, Cached journal current program outcome steps := by
+    Pure.Evaluation program outcome := by
   induction complete with
-  | pure value => exact ⟨1, .pure value⟩
-  | fail error next => exact ⟨1, .fail error next⟩
-  | delay next rest ih =>
-    obtain ⟨steps, cached⟩ := ih
-    exact ⟨steps + 1, .delay next cached⟩
+  | pure value => exact .pure value
+  | fail error next => exact .fail error next
+  | delay next rest ih => exact .delay next ih
   | exec codec label body next roundtrip present rest ih =>
-    obtain ⟨steps, cached⟩ := ih
-    exact ⟨steps + 1, .exec codec label body next roundtrip present cached⟩
+    exact .exec codec label body next roundtrip ih
   | parallelOk codec count branches next outcomes roundtrip children returned collected present rest ihChildren ih =>
-    obtain ⟨steps, cached⟩ := ih
-    refine ⟨steps + 1, .parallelOk codec count branches next outcomes roundtrip ?_ collected present cached⟩
-    intro index
-    obtain ⟨_, child⟩ := ihChildren index
-    exact child.evaluation
+    exact .parallelOk codec count branches next outcomes roundtrip ihChildren collected ih
   | parallelError codec count branches next outcomes roundtrip children returned collected present ihChildren =>
-    refine ⟨1, .parallelError codec count branches next outcomes roundtrip ?_ collected present⟩
-    intro index
-    obtain ⟨_, child⟩ := ihChildren index
-    exact child.evaluation
+    exact .parallelError codec count branches next outcomes roundtrip ihChildren collected
 
 theorem Complete.extend {m : Type → Type u} [Monad m] {α : Type}
     {before after current} {program : Cloud m α} {outcome}

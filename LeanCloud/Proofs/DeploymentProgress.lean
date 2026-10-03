@@ -82,11 +82,10 @@ theorem window_productive [codec : Codec α] (expected : ReplayModel.Journal)
     committed, stored, finish⟩ := window
   have safe := ConcurrentSafety.invariant expected workers turns fuel duration program input meaning known (history.trans approach)
   have ready := Traffic.inbox_valid safe.messages worker (.execute assignment) queued
-  obtain ⟨_, cached⟩ := meaning.cached
   have successful := execution.post (ReplayContracts.rules expected) _
     (fun _ reached => (ConcurrentSafety.invariant expected workers turns fuel duration program input meaning known reached).records)
     (fun _ _ reached continued =>
-      (ConcurrentSafety.trace_advances workers turns fuel duration program input cached.evaluation reached continued).records)
+      (ConcurrentSafety.trace_advances workers turns fuel duration program input meaning.evaluation reached continued).records)
     (budget worker assignment) (history.trans approach) ready.2
   exact ⟨delivered, saved, (approach.trans execution.trace).trans transported, committed,
     ⟨report, received, job, member, deadline, running, successful, stored⟩, finish⟩

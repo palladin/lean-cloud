@@ -6,7 +6,7 @@ open Lean LeanCloud
 def roundTrips [Codec α] [BEq α] [Repr α] (name : String) (values : Array α) : TestCase :=
   ⟨s!"codec/roundtrip/{name}", do
     for value in values do
-      match (Codec.decode (Codec.encode value) : Except String α) with
+      match (Json.parse (Codec.encode value).compress >>= Codec.decode : Except String α) with
       | .ok decoded => assertEq decoded value
       | .error error => throw (IO.userError error)⟩
 
@@ -35,12 +35,12 @@ def codecCases : Array TestCase := #[
   rejects ByteArray "bytes" #[toJson (#[256] : Array Nat), Json.str "bytes"],
   ⟨"codec/roundtrip/bytes", do
     for bytes in #[ByteArray.empty, ByteArray.mk ((List.range 256).toArray.map Nat.toUInt8)] do
-      match decodeBytes (encodeBytes bytes) with
+      match Json.parse (encodeBytes bytes).compress >>= decodeBytes with
       | .ok decoded => assertEq decoded.data bytes.data
       | .error error => throw (IO.userError error)⟩,
   ⟨"codec/roundtrip/replay-record", do
     let record : ReplayRecord := ⟨ReplayStore.returnRequest, .success (toJson (7 : Nat))⟩
-    let decoded ← unwrap (fromJson? (toJson record) : Except String ReplayRecord)
+    let decoded ← unwrap (Json.parse (toJson record).compress >>= fromJson? (α := ReplayRecord))
     assertEq decoded record⟩,
   ⟨"protocol/request-check-survives-persistence", do
     -- These are every payload shape emitted by replay's request signatures.

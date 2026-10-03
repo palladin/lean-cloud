@@ -25,7 +25,6 @@ structure World where
   observations : List (WorkerId × Array String) := []
   writes : Nat := 0
   reads : Nat := 0
-  clock : Nat := 0
 
 private def setEntry [BEq κ] (entries : List (κ × ν)) (key : κ) (value : ν) : List (κ × ν) :=
   (key, value) :: entries.filter (fun entry => entry.1 != key)
@@ -165,7 +164,7 @@ def networkStep (event : NetworkEvent) (world : World) : World := Id.run do
   match event with
   | .tick elapsed =>
     let inbox := MailboxModel.publish (.tick elapsed) world.schedulerInbox
-    return { world with clock := world.clock + elapsed, schedulerInbox := inbox }
+    return { world with schedulerInbox := inbox }
   | .hold => return world
   | .duplicate index =>
     let some envelope := world.network[index]? | return world

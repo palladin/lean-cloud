@@ -157,7 +157,7 @@ theorem replay_reaches_continuation (journal : Journal) (blobs : BlobStorage M)
     exact ih
   | child codec count branches next index before enters selected rest ih =>
     rw [Nat.add_right_comm _ 1 fuel, walk]
-    simp [beq_eq_false_iff_ne.mpr before, enters, read_then, selected, index.isLt]
+    simp [beq_eq_false_iff_ne.mpr before, enters, selected, index.isLt]
     exact ih
 
 /-- The worker entry point resumes the continuation certified by the recorded

@@ -138,13 +138,13 @@ theorem walk_preserves (ports : Ports allowed store blobs) (assignment : Assignm
             current.next (active || current == assignment.location))
           (decodeGroup codec count) (fun decoded => ih encode _ _ _ (CloudEffects.apply _ next continuation decoded))
         simp only [walk]
-        apply Effects.except_bind _ (Effects.except_lift _ (ports.read _))
-        intro record
         split
         · split
           · exact ih codec.encode _ _ _ (request _)
           · trivial
-        · split
+        · apply Effects.except_bind _ (Effects.except_lift _ (ports.read _))
+          intro record
+          split
           · split <;> trivial
           · cases record with
             | some record => exact Effects.except_bind _ (check _ _) (resumed _)

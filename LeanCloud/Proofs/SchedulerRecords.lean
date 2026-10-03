@@ -1,8 +1,6 @@
 import LeanCloud.Proofs.Scheduler
 import LeanCloud.Proofs.SchedulerAssignments
-import LeanCloud.Proofs.Recording
-import LeanCloud.Proofs.Segment
-import LeanCloud.Worker
+import LeanCloud.Proofs.Specification
 
 namespace LeanCloud.Proofs.SchedulerRecords
 open LeanCloud.Scheduler Internal ReplayModel
@@ -61,38 +59,6 @@ theorem ForkBacked.advance {expected before after report} (backed : ForkBacked e
   intro job member deadline location count running forked
   exact backed job (forward.2 job member report.worker report.attempt deadline running old)
     deadline location count running forked
-
-/-- The actual worker reporting code produces `done` only after the step has
-persisted its result. Reading observation keys may not alter replay records.
-Fork reports identify a specified group in the assigned branch. Assignment
-identity comes from issuance and survives subsequent transitions. -/
-theorem execute_report_backed [Codec α] (expected journal : Journal) (state : State)
-    (worker : WorkerId) (assignment : Assignment) (blobs : BlobStorage M) (fuel : Nat)
-    (program : ι → Cloud M α) (input : ι) (outcome : Exit)
-    (confirmed : M (Array String)) (readOnly : ∀ records, (confirmed.run records).2 = records)
-    (safe : Segment.Safe expected assignment.branch outcome journal
-      ((ReplayInterpreter.step store blobs fuel program input assignment).run journal))
-    (identity : SchedulerAssignments.Identifies state worker assignment) :
-    let observed : LeanCloud.Worker.ObservedStore M := ⟨store, confirmed⟩
-    let (report, after) := (LeanCloud.Worker.execute worker observed blobs fuel program input assignment).run journal
-    report.attempt < state.nextAttempt ∧ ReportBacked after state report ∧ ForkBacked expected state report := by
-  let execution := (ReplayInterpreter.step store blobs fuel program input assignment).run journal
-  change assignment.attempt < state.nextAttempt ∧ ReportBacked (confirmed.run execution.2).2 state
-    ⟨worker, assignment.attempt, execution.1, (confirmed.run execution.2).1⟩ ∧
-    ForkBacked expected state ⟨worker, assignment.attempt, execution.1, (confirmed.run execution.2).1⟩
-  rw [readOnly]
-  refine ⟨identity.1, ?_, ?_⟩
-  · intro job member deadline running done
-    refine ⟨outcome, ?_⟩
-    have branch := congrArg Assignment.branch (identity.2 job member worker deadline running).2
-    change job.branch = assignment.branch at branch
-    rw [branch]
-    exact safe.completed done
-  · intro job member deadline location count running forked
-    have branch := congrArg Assignment.branch (identity.2 job member worker deadline running).2
-    change job.branch = assignment.branch at branch
-    rw [branch]
-    exact safe.forked location count forked
 
 theorem initial (journal : Journal) : DoneRecords journal ({} : State).jobs := by
   intro job member done
@@ -218,57 +184,5 @@ theorem finished_has_return (state : State) (journal : Journal)
   simp only [State.finished, Array.any_eq_true', Bool.and_eq_true, beq_iff_eq, Scheduler.done_iff] at finished
   obtain ⟨job, member, branch, status⟩ := finished
   simpa only [branch] using completed job member status
-
-/-- A group made runnable by the scheduler has every required child return in
-global storage. Child reports may arrive in any order. -/
-theorem awakened_children_have_returns (state : State) (journal : Journal) (index : Nat)
-    (inside : index < state.jobs.size) (children : Array Location)
-    (completed : DoneRecords journal state.jobs)
-    (waiting : state.jobs[index].status = .waiting children)
-    (resumed : ((awaken state).jobs[index]'(by simpa [awaken] using inside)).status = .pending) :
-    ∀ child ∈ children, ∃ outcome, journal.lookup (ReplayStore.returnKey child) =
-      some ⟨ReplayStore.returnRequest, outcome⟩ := by
-  intro child member
-  obtain ⟨job, member, branch, done⟩ :=
-    Scheduler.join_requires_completed_children state index inside children waiting resumed child member
-  simpa only [branch] using completed job member done
-
-/-- The scheduler's wakeup condition establishes the interpreter's join
-precondition when stored records agree with the pure specification. -/
-theorem awakened_join_is_ready (state : State) (expected journal : Journal) (index : Nat)
-    (inside : index < state.jobs.size) (location : Location) (count : Nat)
-    (atLocation : state.jobs[index].location = location)
-    (completed : DoneRecords journal state.jobs) (consistent : Extends journal expected)
-    (waiting : state.jobs[index].status = .waiting ((Array.range count).map location.child))
-    (resumed : ((awaken state).jobs[index]'(by simpa [awaken] using inside)).status = .pending)
-    (group : Specification.Group expected location count) :
-    Recording.JoinReady expected journal ((awaken state).jobs[index]'(by simpa [awaken] using inside)).location := by
-  have sameLocation : ((awaken state).jobs[index]'(by simpa [awaken] using inside)).location = location := by
-    simp only [awaken, Array.getElem_map, waiting]
-    split <;> exact atLocation
-  rw [sameLocation]
-  apply Recording.JoinReady.of_group group consistent
-  intro child
-  exact awakened_children_have_returns state journal index inside _ completed waiting resumed
-    (location.child child) (Array.mem_map.mpr ⟨child.val, Array.mem_range.mpr child.isLt, rfl⟩)
-
-/-- Once the scheduler declares the root complete, its durable record decodes to
-the direct interpreter's typed result. The hypotheses are the record invariants
-preserved above and by worker execution; this is not yet a whole-Sim theorem. -/
-theorem finished_matches_direct [codec : Codec α] (state : State) (expected journal : Journal)
-    (blobs : BlobStorage M) (program : ι → Cloud M α) (input : ι) {outcome}
-    (meaning : Specification.Complete expected Location.root (program input) outcome)
-    (known : expected.lookup (ReplayStore.returnKey Location.root) =
-      some ⟨ReplayStore.returnRequest, Parallel.recorded codec.encode outcome⟩)
-    (completed : DoneRecords journal state.jobs) (consistent : Extends journal expected)
-    (finished : state.finished = true) (roundtrip : Pure.RoundTrips codec) :
-    ∃ stored, journal.lookup (ReplayStore.returnKey Location.root) =
-        some ⟨ReplayStore.returnRequest, stored⟩ ∧
-      (ReplayInterpreter.result (m := Id) (α := α) stored).run =
-        ((DirectInterpreter.interpret blobs program input).run []).1 := by
-  obtain ⟨stored, present⟩ := finished_has_return state journal completed finished
-  obtain ⟨steps, cached⟩ := meaning.cached
-  exact ⟨stored, present, Segment.root_record_matches_direct expected journal blobs program input
-    ⟨ReplayStore.returnRequest, stored⟩ cached known consistent present roundtrip⟩
 
 end LeanCloud.Proofs.SchedulerRecords

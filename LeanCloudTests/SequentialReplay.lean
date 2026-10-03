@@ -1,4 +1,5 @@
 import LeanCloudTests.Generated
+import LeanCloud.Proofs.ReplayModel
 
 namespace LeanCloudTests
 open Lean LeanCloud LeanCloud.Proofs.ReplayModel

@@ -1,5 +1,4 @@
 import LeanCloud.ReplayInterpreter
-import LeanCloud.DirectInterpreter
 
 namespace LeanCloud.Proofs.Parallel
 open Lean
@@ -74,27 +73,5 @@ theorem collect_matches_direct (outcomes : Array (Except CloudError α)) (encode
   cases outcomes.toList.mapM id with
   | error error => rfl
   | ok values => simp [recorded, Functor.map, Except.map, Except.mapError]
-
-/-- The ordered reduction above is the one used by the actual direct interpreter.
-Once child outcomes are available, replay's join has the same encoded result. -/
-theorem parallel_join_matches_direct (blobs : BlobStorage Id) (codec : Codec α)
-    (count : Nat) (branches : Fin count → Cloud Id α) :
-    let outcomes := (Array.ofFnM fun index =>
-      (DirectInterpreter.Internal.eval blobs (branches index)).run : Id _)
-    ReplayInterpreter.collect (outcomes.map (recorded codec.encode)) =
-      recorded (fun values => Json.arr (values.map codec.encode))
-        (DirectInterpreter.Internal.evalControl blobs (.parallel codec count branches)).run := by
-  let outcomes := (Array.ofFnM fun index =>
-    (DirectInterpreter.Internal.eval blobs (branches index)).run : Id _)
-  have direct :
-      (DirectInterpreter.Internal.evalControl blobs (.parallel codec count branches)).run =
-        outcomes.mapM id := by
-    change (match outcomes.mapM id with
-      | .ok values => Except.ok values
-      | .error error => Except.error error) = outcomes.mapM id
-    cases outcomes.mapM id <;> rfl
-  dsimp only
-  rw [direct]
-  exact collect_matches_direct outcomes codec.encode
 
 end LeanCloud.Proofs.Parallel

@@ -1,4 +1,4 @@
-import LeanCloud.Proofs.Resumption
+import LeanCloud.Proofs.Reconstruction
 
 namespace LeanCloud.Proofs.SequentialCursor
 open Lean LeanEff ReplayModel ReplayInterpreter Reconstruction Routing
@@ -70,9 +70,10 @@ theorem Cursor.joined {journal current encode} (codec : Codec β) (count : Nat)
   have before := different_follows edge follows (next_ne current nonempty)
   have skip := skip_follows edge follows (next_ne current nonempty) (skip_next current)
   rw [Nat.add_assoc, replay after extension assignment (edge.trans follows), Nat.add_comm 1, walk]
-  simp only [beq_eq_false_iff_ne.mpr before, Bool.false_or]
+  simp only [beq_eq_false_iff_ne.mpr before, Bool.false_or, Bool.not_false,
+    Bool.true_and, skip, Bool.false_eq_true, ite_false]
   erw [read_then]
-  simp [extension _ _ present, skip, Internal.check, Internal.decodeGroup, Internal.decode, decoded, size]
+  simp [extension _ _ present, Internal.check, Internal.decodeGroup, Internal.decode, decoded, size]
 
 theorem Cursor.child {journal current encode} (codec : Codec β) (count : Nat)
     (branches : Fin count → Cloud M β) (next : ArrsF (Control M) (Array β) γ)
@@ -89,7 +90,7 @@ theorem Cursor.child {journal current encode} (codec : Codec β) (count : Nat)
   have selected : assignment.location[current.size]!.1 = index.val := by
     simpa [LeanCloud.Location.child] using (follows.branch_at current.size (by simp [LeanCloud.Location.child])).symm
   rw [Nat.add_assoc, replay after extension assignment (edge.trans follows), Nat.add_comm 1, walk]
-  simp [beq_eq_false_iff_ne.mpr before, enters, read_then, selected, index.isLt]
+  simp [beq_eq_false_iff_ne.mpr before, enters, selected, index.isLt]
 
 /-- The ordinary worker entry point reconstructs this cursor from the root. -/
 theorem Cursor.step {journal current} {encode : β → Json} {remaining : Cloud M β}

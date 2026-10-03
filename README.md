@@ -85,8 +85,9 @@ lake exe cloud_runtime_tests
 lake exe cloud_chaos --seed 1
 ```
 
-The redesign replaces the previous shared-queue protocol and its proofs.
-[Current proofs](LeanCloud/Proofs/MainTheorems.lean) cover immutable records,
+[The main theorems](LeanCloud/Proofs/MainTheorems.lean) prove that sequential
+replay from empty storage agrees with direct evaluation of the same pure program.
+The concurrent proofs cover immutable records,
 durable mailbox operations, scheduler recovery, recorded-prefix reconstruction,
 and concurrent execution: whenever the scheduler finishes a pure workflow, its
 durable result equals direct evaluation, even after crashes and message redelivery.

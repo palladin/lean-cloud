@@ -46,6 +46,11 @@ Workers connect to RabbitMQ and blobs. The scheduler connects to RabbitMQ and
 opens only its local database. Matching worker images must support the submitted
 entry point and codecs.
 
+Reference workers use a fixed budget of 100,000 interpreter steps per assignment,
+including replay of its prefix. Exceeding it reports an interpreter error.
+The [completion theorem](Proofs/MainTheorems.lean) requires sufficient fuel for
+the program; it does not establish that this default suffices for every workflow.
+
 Each actor has a **durable classic queue**: one for the scheduler and one per
 worker. The C FFI uses rabbitmq-c; message types, handlers, scheduling, and workflow
 execution are Lean. There is no custom TCP mailbox server or shared work queue.

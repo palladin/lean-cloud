@@ -1,4 +1,5 @@
 import LeanCloud.Proofs.SchedulerRecords
+import LeanCloud.Proofs.Recording
 
 namespace LeanCloud.Proofs.SchedulerGroups
 open LeanCloud.Scheduler Internal ReplayModel SchedulerRecords
