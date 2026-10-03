@@ -1,71 +1,58 @@
-import LeanCloud.WorkerConfig
 import LeanCloud.ReplayInterpreter
-import LeanCloud.JournalDb
-import LeanCloud.LeaseQueue
-import LeanCloud.CompletionStore
-
-/-! Connection setup for a worker assigned to an existing workflow run.
-Adapters locate the services; the existing interpreter executes the workflow.
-Starting or restarting a worker neither seeds work nor resets durable state. -/
+import LeanCloud.Mailbox
 
 namespace LeanCloud.Worker
-open Lean
 
-/-- One acquired service handle. Closing releases this worker's resources, not
-the durable service. Queue close must leave unacknowledged work recoverable. -/
-structure Connection (α : Type) where
-  service : α
-  close : IO Unit
+/-- Volatile state. The broker retains unacknowledged assignments and confirmed
+reports across process failure, so the worker needs no local durable outbox. -/
+structure State where
+  stopped : Bool := false
+  retryIn : Nat := 0
 
-/-- Release a successfully acquired connection on return or IO failure. Nested
-uses also release earlier connections when a later connection fails to open.
-If opening itself fails, the connector must clean up its partial acquisition. -/
-def Connection.use (openConnection : IO (Connection α)) (body : α → IO β) : IO β := do
-  let connection ← openConnection
-  try body connection.service
-  finally connection.close
+/-- Observe successful global reads/writes; report only their keys. -/
+structure ObservedStore (m : Type → Type u) where
+  records : ReplayStore m
+  confirmed : m (Array String)
 
-/-- Adapters capture their connection handles in the existing interfaces, so
-the threaded backend state is `Unit`. The lease adapter adds the worker's own
-delivery receipt. Each call must acquire independently owned worker resources.
+structure Ports (m : Type → Type u) where
+  id : WorkerId
+  inbox : Mailbox m WorkerMessage
+  send : SchedulerMessage → m Unit
+  observe : ObservedStore m
+  blobs : BlobStorage m
+  retryPolls : Nat := 16
 
-Db and queue configurations must select the SAME existing run. Db keys are
-relative to that run; blobs may be shared by multiple runs. The Db connection
-exposes raw journal records, before `JournalDb.ofDb` is applied. Opening services
-must not clear records, enqueue a root, or initialize a workflow. -/
-structure Connectors (dbConfig queueConfig blobConfig receipt : Type) where
-  db : dbConfig → IO (Connection (Db Unit IO))
-  queue : queueConfig → IO (Connection (LeaseQueue Unit IO receipt))
-  blobs : blobConfig → IO (Connection (BlobStorage Unit IO))
+def execute [Monad m] [Codec α] (id : WorkerId) (store : ObservedStore m)
+    (blobs : BlobStorage m) (fuel : Nat) (program : ι → Cloud m α) (input : ι)
+    (assignment : Assignment) : m Report := do
+  let progress ← (ReplayInterpreter.step store.records blobs fuel program input assignment).run
+  return ⟨id, assignment.attempt, progress, ← store.confirmed⟩
 
-/-- Reserved physical key, distinct from location/result, fork, and child keys.
-It shares the raw Db's run namespace and survives worker restarts. -/
-abbrev completionKey : String := CompletionStore.key
-
-private def readCompleted (db : Db Unit IO) : StateT Unit IO (Option Exit) :=
-  CompletionStore.read db (fun message => throw (IO.userError message))
-
-private def writeCompleted (db : Db Unit IO) (outcome : Exit) : StateT Unit IO Unit :=
-  CompletionStore.write db (fun message => throw (IO.userError message)) outcome
-
-/-- Connect to the configured services, run the existing interpreter, and close
-all connections. `program` and `input` must be the same on every worker assigned
-to this run. Submission and entry-point/version selection belong to the caller.
-
-Workflow outcomes (including fuel exhaustion) are returned as `Except`.
-Connection, transport, and storage failures escape through IO for the process
-supervisor to handle. There is no hidden restart loop or workflow initialization.
-The journal's same-value writer assumption still applies to overlapping writes.
-Adapters own dequeue waiting, lease renewal, and durable publication. -/
-def run [Codec α] (connectors : Connectors d q b ρ) (config : WorkerConfig d q b)
-    (fuel : Nat) (program : ι → Cloud IO α) (input : ι) : IO (Except CloudError α) :=
-  Connection.use (connectors.db config.db) fun rawDb =>
-  Connection.use (connectors.blobs config.blobs) fun blobs =>
-  Connection.use (connectors.queue config.queue) fun transport => do
-    let db := LeaseQueue.db (JournalDb.ofDb rawDb)
-    let queue := transport.toWorkQueue (readCompleted rawDb) (writeCompleted rawDb)
-    let (outcome, _) ←
-      (interpret db (LeaseQueue.blobs blobs) queue fuel program input).run ⟨(), none⟩
-    return outcome
+/-- Finish an assignment by recording its values, publishing its report with a
+broker confirmation, and only then acknowledging its delivery. A crash before
+acknowledgement replays the assignment; duplicates reuse the immutable records. -/
+def turn [Monad m] [Codec α] (ports : Ports m) (fuel : Nat)
+    (program : ι → Cloud m α) (input : ι) (state : State) : m State := do
+  if state.stopped then return state
+  let delivery ← ports.inbox.receive
+  let mut state := { state with retryIn := state.retryIn - 1 }
+  if let some delivery := delivery then
+    match delivery.message with
+    | .execute assignment =>
+      let report ← execute ports.id ports.observe ports.blobs fuel program input assignment
+      ports.send (.report report)
+      state := { state with retryIn := max 1 ports.retryPolls }
+    | .acknowledged _ => state := { state with retryIn := 0 }
+    | .finished | .failed _ => state := { state with stopped := true }
+    | _ => pure ()
+    -- Publish any immediate successor before dropping the current delivery.
+    if !state.stopped && state.retryIn == 0 then
+      ports.send (.ready ports.id)
+      state := { state with retryIn := max 1 ports.retryPolls }
+    ports.inbox.acknowledge delivery.receipt
+  else if state.retryIn == 0 then
+    ports.send (.ready ports.id)
+    state := { state with retryIn := max 1 ports.retryPolls }
+  return state
 
 end LeanCloud.Worker

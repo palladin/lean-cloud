@@ -1,123 +1,154 @@
 import LeanCloudRuntime
-import LeanCloudTests.Recovery
-import LeanCloudTests.BackendAdapterLaws
-import LeanCloudTests.BackendContracts
-import Tests.PgSchema
+import LeanCloudTests.Generated
 
 open Lean LeanCloud LeanCloudRuntime LeanCloudTests
 
-private def require (condition : Bool) (message : String) : IO Unit :=
-  unless condition do throw (IO.userError message)
-
-private def nextDelivery (queue : LeaseQueue Unit IO RabbitMQ.Receipt) :
-    Nat → IO (Location × RabbitMQ.Receipt)
-  | 0 => throw (IO.userError "Timed out waiting for RabbitMQ delivery")
-  | fuel + 1 => do
-    let (delivery, _) ← queue.dequeue ()
-    match delivery with
-    | some result => return result
-    | none => nextDelivery queue fuel
-
-private def queueTest (config : Config) (run : String) : IO Unit := do
-  let first ← RabbitMQ.acquire config.queue run (create := true)
-  try
-    first.enqueue Location.root
-    let (location, receipt) ← nextDelivery (RabbitMQ.transport first) 40
-    assertEq location Location.root
-    -- Close without an ack, then recover through an independent connection.
-    first.close
-    let second ← RabbitMQ.acquire config.queue run
-    try
-      let (again, current) ← nextDelivery (RabbitMQ.transport second) 40
-      assertEq again Location.root
-      let (staleAccepted, _) ← (RabbitMQ.transport second).acknowledge receipt ()
-      require (!staleAccepted) "Receipt from another connection was accepted"
-      let (accepted, _) ← (RabbitMQ.transport second).acknowledge current ()
-      require accepted "Current acknowledgement was rejected"
-      -- Duplicate messages remain independently acknowledgeable.
-      second.enqueue Location.root.next
-      second.enqueue Location.root.next
-      for _ in [:2] do
-        let (next, token) ← nextDelivery (RabbitMQ.transport second) 40
-        assertEq next Location.root.next
-        require (← ((RabbitMQ.transport second).acknowledge token ()).map Prod.fst)
-          "Duplicate delivery acknowledgement failed"
-      let (remaining, _) ← (RabbitMQ.transport second).dequeue ()
-      require remaining.isNone "Acknowledged message was not removed"
-    finally second.close
-  finally first.close
-
-private def dbTest (config : Config) (run : String) : IO Unit := withDb config fun conn => do
-  Postgres.initializeSchema conn
-  let key := "quoted '\n key; SELECT 1"
-  let value := Json.arr #[toJson "Unicode λ 🌍", toJson (17 : Nat), Json.null]
-  require (← Postgres.put conn run key value) "Initial database write rejected"
-  require (← Postgres.put conn run key value) "Repeated database write rejected"
-  require (!(← Postgres.put conn run key Json.null)) "Conflicting database write accepted"
-  assertEq (← Postgres.get conn run key) (some value)
-  assertEq (← Postgres.get conn (run ++ "-other") key) none
-  -- Independent connections race for the same immutable key.
-  let first ← IO.asTask (withDb config fun other => Postgres.put other run "race" (toJson (1 : Nat))) .dedicated
-  let second ← IO.asTask (withDb config fun other => Postgres.put other run "race" (toJson (2 : Nat))) .dedicated
-  let left ← IO.ofExcept first.get
-  let right ← IO.ofExcept second.get
-  require (left != right) "Conflicting concurrent writers did not have exactly one winner"
-  assertEq (← Postgres.get conn run "race") (some (toJson (if left then 1 else 2 : Nat)))
-
-private def blobTest (config : Config) (run : String) : IO Unit := do
+private def checkAdapters (config : Config) (runPrefix : String) : IO Unit := do
   S3.initializeBucket config.blobs
-  let bytes := ByteArray.mk #[0, 255, 10, 34, 128, 65]
+  let records := S3.records config.blobs runPrefix
+  let record : ReplayRecord := ⟨ReplayStore.returnRequest, .success (toJson (7 : Nat))⟩
+  assertEq (← records.read "missing") none
+  let tasks ← (Array.range 8).mapM fun i => IO.asTask (records.create "race"
+    { record with outcome := .success (toJson i) }) .dedicated
+  let accepted ← tasks.mapM fun task => IO.ofExcept task.get
+  let some winner ← records.read "race" | throw (IO.userError "Concurrent create lost the record")
+  for result in accepted do assertEq result winner "Writers did not agree on the canonical record"
+  assertEq (← records.create "race" record) winner "Retry overwrote canonical record"
+  let bytes := "global blobs: λ 🌍\n".toUTF8
   let ref ← S3.putBytes config.blobs bytes
-  assertEq (← S3.putBytes config.blobs bytes) ref
-  let read ← (S3.readBytes config.blobs ref).run
-  assertOutcome (read.map (·.data)) (.ok bytes.data)
-  let name := run ++ "/λ ? #.bin"
-  S3.name config.blobs name ref
-  assertOutcome (← (S3.resolve config.blobs name).run) (.ok ref)
-  assertError (← (S3.readBytes config.blobs { ref with size := ref.size + 1 }).run) .integrity
-  assertError (← (S3.resolve config.blobs (run ++ "/absent")).run) .missingBlob
+  S3.name config.blobs (runPrefix ++ "/input") ref
+  let .ok resolved ← (S3.resolve config.blobs (runPrefix ++ "/input")).run
+    | throw (IO.userError "Cannot resolve test blob")
+  assertEq resolved ref
+  let .ok actual ← (S3.readBytes config.blobs ref).run
+    | throw (IO.userError "Cannot read test blob")
+  assertEq actual.data bytes.data
+  IO.FS.withTempFile fun _ path => do
+    let conn ← LeanLinq.Sqlite.connect path.toString
+    LocalDb.initializeSchema conn
+    let state := (Scheduler.handle 10 {} (.ready "adapter-worker")).1
+    LocalDb.save conn runPrefix state
+    conn.close
+    let reopened ← LeanLinq.Sqlite.connect path.toString
+    try assertEq (← LocalDb.load reopened runPrefix) state "Scheduler state did not survive reopen"
+    finally reopened.close
 
-private def generatedTest (config : Config) (run : String) (seed : Nat) : IO Unit := do
-  let tree := (generate 4 (seed + 1)).1
-  let input := seed % 13
-  let program : Nat → Cloud SimulationBackend.M Nat := RecoveryTests.lowerPure tree
-  let (direct, untouched) ← SimTest.finish
-    ((DirectInterpreter.interpret SimulationBackend.noBlobs program input).run ⟨(), none⟩)
-    SimulationBackend.initial
-  assertEq untouched SimulationBackend.initial
-  let (replay, modeled) ← SimTest.finish (SimulationBackend.attempt 10000 100 program input)
-    SimulationBackend.initial
-  assertOutcome replay.1 direct.1
-  let (common, commonState) ← BackendContracts.runReplay (RecoveryTests.lowerPure tree) input seed
-  assertOutcome common direct.1
-  assertEq (Backend.Db.view commonState CompletionStore.key) (modeled.completed.map toJson)
-  submit config run ⟨"generated-test/v1", toJson (seed, input), "nat/v1"⟩
-  let workers ← (Array.range 3).mapM fun _ =>
-    IO.asTask (Worker.run (connectors run) config 10000 (RecoveryTests.lowerPure tree) input) .dedicated
-  for worker in workers do
-    assertOutcome (← IO.ofExcept worker.get) direct.1
-  assertEq (← completed config run) modeled.completed
-  let repeated ← Worker.run (connectors run) config 10000 (RecoveryTests.lowerPure tree) input
-  assertOutcome repeated direct.1
+private def checkMailboxes (config : Config) (run : String) : IO Unit := do
+  let first ← RabbitMQ.openMailbox config.broker run "durability"
+  first.send (WorkerMessage.acknowledged 42)
+  let inbox : Mailbox IO WorkerMessage := RabbitMQ.inbox first
+  let some delivery ← inbox.receive | throw (IO.userError "Missing confirmed publication")
+  match delivery.message with
+  | .acknowledged 42 => pure ()
+  | _ => throw (IO.userError "Wrong mailbox payload")
+  -- Closing without ack must retain the delivery through repeated crashes.
+  -- The reference classic queues have no finite delivery limit.
+  first.close
+  for _ in [:24] do
+    let handle ← RabbitMQ.openMailbox config.broker run "durability"
+    try
+      let inbox : Mailbox IO WorkerMessage := RabbitMQ.inbox handle
+      let mut found := false
+      for _ in [:40] do
+        if let some delivery ← inbox.receive then
+          match delivery.message with
+          | .acknowledged 42 => found := true
+          | _ => throw (IO.userError "Redelivery changed payload")
+          break
+      assertTrue found "Unacknowledged message did not survive consumer restart"
+    finally handle.close
+  let handle ← RabbitMQ.openMailbox config.broker run "durability"
+  try
+    let inbox : Mailbox IO WorkerMessage := RabbitMQ.inbox handle
+    let mut acknowledged := false
+    for _ in [:40] do
+      if let some delivery ← inbox.receive then
+        inbox.acknowledge delivery.receipt
+        acknowledged := true
+        break
+    assertTrue acknowledged "Cannot acknowledge redelivered message"
+    assertTrue (← inbox.receive).isNone "Acknowledged message was retained"
+    handle.delete
+  finally handle.close
+
+/-- Real RabbitMQ, SQLite, and S3 ports run the same actor turns as Sim. -/
+private def compareProgram (config : Config) (run : String) (tree : Tree) (input : Nat) : IO Unit := do
+  let program (_ : Unit) : Cloud IO Nat := lower tree input
+  let expected ← (DirectInterpreter.interpret (S3.storage config.blobs) program ()).run
+  IO.FS.withTempFile fun _ path => do
+    let conn ← LeanLinq.Sqlite.connect path.toString
+    try
+      LocalDb.initializeSchema conn
+      let schedulerHandle ← RabbitMQ.openMailbox config.broker run "scheduler"
+      let handles ← (Array.range 3).mapM fun index =>
+        RabbitMQ.openMailbox config.broker run s!"worker.worker-{index}"
+      let records := S3.records config.blobs run
+      let workers := handles.mapIdx fun index handle => {
+        id := s!"worker-{index}"
+        inbox := RabbitMQ.inbox handle
+        send := fun message => RabbitMQ.send config.broker run "scheduler" message
+        observe := ⟨records, pure #[]⟩
+        blobs := S3.storage config.blobs : Worker.Ports IO }
+      let scheduler : SchedulerPorts IO := {
+        inbox := RabbitMQ.inbox schedulerHandle
+        localDb := LocalDb.store conn run
+        send := fun delivery =>
+          RabbitMQ.send config.broker run ("worker." ++ delivery.worker) delivery.message }
+      try
+        let mut states := Array.replicate 3 ({} : Worker.State)
+        let mut done := false
+        for _ in [:10000] do
+          for (worker, index) in workers.toList.zipIdx do
+            let some previous := states[index]? | throw (IO.userError "Missing worker state")
+            let state ← Worker.turn worker 100000 program () previous
+            states := states.set! index state
+            Scheduler.turn scheduler 100000
+          let state ← scheduler.localDb.load
+          if let some error := state.error then throw (IO.userError (reprStr error))
+          if state.finished then done := true; break
+        assertTrue done "Real backend program did not finish"
+        let .ok (some outcome) ← records.outcome.run
+          | throw (IO.userError "Missing durable result")
+        let actual : Except CloudError Nat := (ReplayInterpreter.result (m := Id) outcome).run
+        assertOutcome actual expected
+      finally
+        schedulerHandle.close
+        for handle in handles do handle.close
+    finally conn.close
+
+private def stagedMailbox (config : Config) (run : String) (publish : Bool) : IO Unit := do
+  let handle ← RabbitMQ.openMailbox config.broker run "broker-restart" (!publish)
+  try
+    if publish then handle.send (WorkerMessage.acknowledged 73)
+    else
+      let inbox : Mailbox IO WorkerMessage := RabbitMQ.inbox handle
+      let mut found := false
+      for _ in [:40] do
+        if let some delivery ← inbox.receive then
+          match delivery.message with
+          | .acknowledged 73 => found := true
+          | _ => throw (IO.userError "Wrong message after broker restart")
+          inbox.acknowledge delivery.receipt
+          break
+      assertTrue found "Confirmed message did not survive broker restart"
+      handle.delete
+  finally handle.close
 
 def main (args : List String) : IO UInt32 := do
   try
-    let [path, run] := args | throw (IO.userError "Usage: cloud_integration_tests CONFIG UNIQUE-RUN")
-    let config : Config ← WorkerConfig.load path
-    validateRun run
-    withDb config PgSchemaTests.run
-    dbTest config (run ++ "-db")
-    queueTest config (run ++ "-queue")
-    blobTest config run
-    for seed in [:4] do
-      let isolated := s!"{run}-contract-{seed}"
-      withDb config fun conn => do
-        let queue ← RabbitMQ.acquire config.queue isolated (create := true)
-        try
-          BackendAdapterLaws.run (Postgres.db conn isolated) (RabbitMQ.transport queue) seed
-        finally queue.close
-    for seed in [:32] do
-      generatedTest config s!"{run}-pure-{seed}" seed
-    IO.println "40/40 real-backend checks passed (including 4 shared-contract sequences and 32 generated differential cases)"
+    let path := args.headD "/etc/lean-cloud/config.json"
+    let config ← Config.load path
+    match args.drop 1 with
+    | ["mailbox-seed", run] => stagedMailbox config run true; return 0
+    | ["mailbox-check", run] => stagedMailbox config run false; return 0
+    | [] => pure ()
+    | _ => throw (IO.userError "Invalid integration test arguments")
+    let runPrefix := s!"properties-{← IO.Process.getPID}-{← IO.monoMsNow}"
+    checkAdapters config runPrefix
+    checkMailboxes config runPrefix
+    for seed in [:16] do
+      let tree := (generate 3 seed).1
+      compareProgram config s!"{runPrefix}-{seed}" tree (seed % 7)
+    IO.println "Real adapters: durable RabbitMQ redelivery, immutable writes, concurrent creation, blob integrity, SQLite recovery, and 16 differential programs passed."
     return 0
   catch error => IO.eprintln error.toString; return 1

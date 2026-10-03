@@ -1,28 +1,14 @@
 name: lean-cloud
 
 services:
-  db:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: lean_cloud
-      POSTGRES_USER: cloud
-      POSTGRES_PASSWORD: local-cloud
-    volumes:
-      - db-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U cloud -d lean_cloud"]
-      interval: 2s
-      timeout: 3s
-      retries: 30
-
-  queue:
+  broker:
     image: rabbitmq:4.3-management
-    hostname: queue
+    hostname: broker
     environment:
       RABBITMQ_DEFAULT_USER: cloud
       RABBITMQ_DEFAULT_PASS: local-cloud
     volumes:
-      - queue-data:/var/lib/rabbitmq
+      - broker-data:/var/lib/rabbitmq
       - ./deploy/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
@@ -51,9 +37,24 @@ services:
     volumes:
       - ./deploy/config.json:/etc/lean-cloud/config.json:ro
     depends_on:
-      db: {condition: service_healthy}
-      queue: {condition: service_healthy}
       blobs: {condition: service_healthy}
+
+  scheduler:
+    build: .
+    image: lean-cloud-worker:dev
+    command: ["scheduler", "/etc/lean-cloud/config.json", "${RUN_ID:-demo}"]
+    restart: on-failure
+    volumes:
+      - ./deploy/config.json:/etc/lean-cloud/config.json:ro
+      - scheduler-data:/data
+    depends_on:
+      submit: {condition: service_completed_successfully}
+      broker: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "cloud-demo", "status", "/etc/lean-cloud/config.json", "${RUN_ID:-demo}"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
 
   worker:
     build: .
@@ -63,7 +64,8 @@ services:
     volumes:
       - ./deploy/config.json:/etc/lean-cloud/config.json:ro
     depends_on:
-      submit: {condition: service_completed_successfully}
+      scheduler: {condition: service_healthy}
+      broker: {condition: service_healthy}
 
   checks:
     profiles: ["test"]
@@ -74,11 +76,10 @@ services:
     volumes:
       - ./deploy/config.json:/etc/lean-cloud/config.json:ro
     depends_on:
-      db: {condition: service_healthy}
-      queue: {condition: service_healthy}
       blobs: {condition: service_healthy}
+      broker: {condition: service_healthy}
 
 volumes:
-  db-data:
-  queue-data:
+  scheduler-data:
+  broker-data:
   blob-data:

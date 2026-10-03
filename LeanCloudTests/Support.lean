@@ -24,169 +24,113 @@ def assertError (actual : Except CloudError α) (kind : ErrorKind) : IO Unit :=
   | .error error => assertEq error.kind kind
   | .ok _ => throw (IO.userError s!"Expected {reprStr kind}, got success")
 
-structure World where
-  records : List (String × Json) := []
-  blobs : List (String × ByteArray) := []
-  names : List (String × BlobRef) := []
-  nextBlob : Nat := 0
-  trace : Array (String × Json) := #[]
-  recordGets : Nat := 0
-  recordPuts : Nat := 0
-  rejectPuts : Bool := false
-  rejectBlobPuts : Bool := false
-  crashAfterPut : Option Nat := none
-  crashBeforePut : Option Nat := none
-  pending : Array Location := #[Location.root]
-  completed : Option Exit := none
-
-abbrev Ref := IO.Ref World
-abbrev Program (α : Type) := Ref → Cloud IO α
-
 def makeRef (key : String) (bytes : ByteArray) : BlobRef :=
   ⟨key, bytes.size, modelChecksum bytes⟩
 
-def initial : World :=
-  let bytes := "seed: λ 🌍".toUTF8
-  { blobs := [("seed-bytes", bytes)], names := [("seed", makeRef "seed-bytes" bytes)] }
+/-- A sequential evaluator for simulation effects, used only to run the direct
+reference and inspect client results. It performs no scheduling or replay. -/
+def evaluate (fuel : Nat) (program : SimM δ α) (world : δ) : Except String (α × δ) :=
+  match fuel with
+  | 0 => .error "Simulation evaluation fuel exhausted"
+  | fuel + 1 =>
+    match program with
+    | LeanEff.EffF.pure value => .ok (value, world)
+    | .impure (.step _ _ operation) next =>
+      let (value, world) := operation world
+      evaluate fuel (LeanEff.ArrsF.apply next value) world
 
-def appendEvent (ref : Ref) (name : String) (payload : Json) : IO Unit :=
-  ref.modify fun world => { world with trace := world.trace.push (name, payload) }
+def unwrap (value : Except String α) : IO α :=
+  match value with
+  | .ok value => pure value
+  | .error error => throw (IO.userError error)
 
-def db : Db Ref IO where
-  get key ref := do
-    ref.modify fun world => { world with recordGets := world.recordGets + 1 }
-    return ((← ref.get).records.lookup key, ref)
-  put key value ref := do
-    let world ← ref.get
-    let writes := world.recordPuts + 1
-    ref.modify fun world => { world with recordPuts := writes }
-    if world.crashBeforePut == some writes then
-      ref.modify fun world => { world with crashBeforePut := none }
-      throw (IO.userError "injected crash before journal commit")
-    if world.rejectPuts then return (false, ref)
-    ref.modify fun world => { world with
-      records := (key, value) :: world.records.filter (fun entry => entry.1 != key) }
-    if world.crashAfterPut == some writes then
-      ref.modify fun world => { world with crashAfterPut := none }
-      throw (IO.userError "injected crash after journal commit")
-    return (true, ref)
+abbrev Machine := Simulation.State SimulationBackend.World Unit 4
+abbrev Start := Simulation.Start SimulationBackend.World Unit 4
 
-/-- Unique blob keys deliberately expose duplicate effects during replay. -/
-def blobStorage : BlobStorage Ref IO where
-  putBlob bytes ref := do
-    appendEvent ref "putBlob" (encodeBytes bytes)
-    let world ← ref.get
-    if world.rejectBlobPuts then
-      return (.error ⟨.application, "blob write rejected"⟩, ref)
-    let blob := makeRef s!"blob/{world.nextBlob}" bytes
-    ref.modify fun world => { world with
-      nextBlob := world.nextBlob + 1
-      blobs := (blob.key, bytes) :: world.blobs }
-    return (.ok blob, ref)
-  readBlob blob ref := do
-    appendEvent ref "readBlob" (toJson blob)
-    let some bytes := (← ref.get).blobs.lookup blob.key
-      | return (.error ⟨.missingBlob, s!"Missing blob: {blob.key}"⟩, ref)
-    if bytes.size != blob.size || modelChecksum bytes != blob.checksum then
-      return (.error ⟨.integrity, "Blob reference does not match its bytes"⟩, ref)
-    return (.ok bytes, ref)
-  resolveBlob name ref := do
-    appendEvent ref "resolveBlob" (toJson name)
-    match (← ref.get).names.lookup name with
-    | some blob => return (.ok blob, ref)
-    | none => return (.error ⟨.missingBlob, s!"Missing name: {name}"⟩, ref)
+def tick (start : Start) (actor : Fin 4) (state : Machine) : Except String Machine := do
+  let event := match state.actors actor with
+    | .waiting .. => some (Simulation.Event.commit actor)
+    | .responding .. => some (.resume actor)
+    | .stopped => some (.restart actor)
+    | .finished _ => none
+  match event with
+  | none => return state
+  | some event =>
+    match SimulationBackend.step start event state with
+    | .ok state => return state
+    | .error error => throw (reprStr error)
 
-def execValue [Codec α] (ref : Ref) (label : String) (value : α) : Cloud IO α :=
-  Cloud.exec (fun _ => do
-    appendEvent ref s!"exec:{label}" (Codec.encode value)
-    return value) label
+def event (start : Start) (event : Simulation.Event 4) (state : Machine) : Except String Machine :=
+  match SimulationBackend.step start event state with
+  | .ok state => pure state
+  | .error error => throw (reprStr error)
 
-/-- Compare observable backend state separately from replay bookkeeping. -/
-def externalState (world : World) : Json := Json.mkObj [
-  ("blobs", toJson (world.blobs.map fun (key, bytes) => (key, encodeBytes bytes))),
-  ("names", toJson world.names), ("nextBlob", toJson world.nextBlob)]
+def nextSeed (seed : Nat) : Nat := (1664525 * seed + 1013904223) % 4294967296
 
-def journal (world : World) : List (String × Json) :=
-  world.records.mergeSort (fun a b => a.1 ≤ b.1)
+/-- Finite chaos followed by fair delivery and actor scheduling. Includes crashes
+of the scheduler, orphan commits, delayed/duplicate messages, redelivery, and expiry. -/
+def runSystem (start : Start) (initial : Machine) (seed : Nat) (chaos : Bool) : Except String Machine := do
+  let mut state := initial
+  let mut random := seed
+  for step in [:if chaos then 1500 else 0] do
+    random := nextSeed random
+    let actor : Fin 4 := ⟨random % 4, Nat.mod_lt _ (by decide)⟩
+    let index := random / 16 % max 1 state.world.network.size
+    let networkEvent := match random / 256 % 13 with
+      | 0 => .hold
+      | 1 => .duplicate index
+      | _ => .deliver index
+    state := { state with world := SimulationBackend.networkStep networkEvent state.world }
+    if random / 65536 % 19 == 0 then
+      match state.actors actor with
+      | .waiting .. | .responding .. => state ← event start (.crash actor) state
+      | _ => state ← tick start actor state
+    else state ← tick start actor state
+    if !state.orphans.isEmpty && random / 1048576 % 7 == 0 then
+      state ← event start (.commitOrphan 0) state
+    if step % 97 == 0 then
+      state := { state with world := SimulationBackend.networkStep (.tick 500) state.world }
+  -- Expire abandoned assignments after faults stop. Retrying messages repairs
+  -- scheduler saves whose replies were lost. Late commits remain deliverable.
+  state := { state with world := SimulationBackend.networkStep (.tick 1000000) state.world }
+  for round in [:200000] do
+    if let some error := state.world.scheduler.error then
+      throw s!"Scheduler error: {reprStr error}"
+    if state.world.scheduler.finished then return state
+    if !state.orphans.isEmpty then state ← event start (.commitOrphan 0) state
+    if round % 5000 == 0 then
+      state := { state with world := SimulationBackend.networkStep (.tick 1000) state.world }
+    state := { state with world := SimulationBackend.networkStep (.deliver 0) state.world }
+    for actor in Array.finRange 4 do state ← tick start actor state
+  throw s!"System did not finish; jobs={reprStr state.world.scheduler.jobs}"
 
-def assertObservations (actual expected : World) : IO Unit := do
-  assertEq actual.trace expected.trace "Primitive effect order or multiplicity differs"
-  assertEq (externalState actual) (externalState expected) "Backend state differs"
-
-def replayFuel : Nat := 200000
-
-/-- Test policies belong to the queue model, not either interpreter. -/
-abbrev Select := (pending : Array Location) → 0 < pending.size → IO (Fin pending.size)
-
-def selectFirst : Select := fun _ nonempty => pure ⟨0, nonempty⟩
-def selectLast : Select := fun pending nonempty => pure ⟨pending.size - 1, by omega⟩
-
-private def earlier : List (Nat × Nat) → List (Nat × Nat) → Bool
-  | [], [] => false
-  | [], _ :: _ => true
-  | _ :: _, [] => false
-  | (branch, command) :: rest, (otherBranch, otherCommand) :: other =>
-    if branch != otherBranch then branch < otherBranch
-    else if command != otherCommand then command < otherCommand
-    else earlier rest other
-
-def orderedLocations (locations : Array Location) : Array Location :=
-  let unique := locations.foldl (fun found location =>
-    if found.contains location then found else found.push location) #[]
-  unique.qsort fun a b => earlier a.toList b.toList
-
-def updateWork (world : World) (location : Location) (update : StepResult) : World :=
-  match update with
-  | .done outcome => { world with pending := #[], completed := some outcome }
-  | .runnable locations => { world with
-      pending := orderedLocations (world.pending.filter (· != location) ++ locations) }
-
-/-- The selected item remains pending until the interpreter publishes its update. -/
-def workQueue (select : Select := selectFirst) : WorkQueue Ref IO where
-  next ref := do
-    let world ← ref.get
-    if let some outcome := world.completed then return (.completed outcome, ref)
-    if nonempty : 0 < world.pending.size then
-      let index ← select world.pending nonempty
-      return (.item world.pending[index], ref)
-    else return (.idle, ref)
-  complete location update ref := do
-    ref.modify (fun world => updateWork world location update)
-    return ((), ref)
-
-def runDirect (program : Program α) (ref : Ref) : IO (Except CloudError α) := do
-  let (result, _) ← (DirectInterpreter.interpret blobStorage program ref).run ref
-  return result
-
-def runReplay [Codec α] (program : Program α) (ref : Ref) (fuel : Nat := replayFuel)
-    (select : Select := selectFirst) :
-    IO (Except CloudError α) := do
-  let (result, _) ← (interpret db blobStorage (workQueue select) fuel program ref).run ref
-  return result
-
-/-- Fresh-run comparison plus a second replay that must perform no new primitive effects. -/
-def differential [Codec α] [BEq α] [Repr α] (program : Program α) (world : World := initial) :
-    IO (Except CloudError α × World) := do
-  let directRef ← IO.mkRef world
-  let replayRef ← IO.mkRef world
-  let expected ← runDirect program directRef
-  let actual ← runReplay program replayRef
+/-- The very same Cloud program runs directly and through the scheduler/worker
+actors. Compare the durable final outcome, not just a worker's transient return. -/
+def differential [Codec α] [BEq α] [Repr α]
+    (program : Unit → Cloud (SimM SimulationBackend.World) α) (seed := 0) (chaos := false) : IO SimulationBackend.World := do
+  let (expected, direct) ← unwrap (evaluate 1000000
+    (DirectInterpreter.interpret SimulationBackend.blobs program ()).run {})
+  assertEq direct.writes 0 "Direct interpreter wrote replay records"
+  assertEq direct.reads 0 "Direct interpreter read replay records"
+  let start := SimulationBackend.start (workers := 3) 100000 10000 1000 program ()
+  let finished ← unwrap ((runSystem start (Simulation.State.initial {} start) seed chaos).map (·.world))
+  let (recorded, _) ← unwrap (evaluate 100000 (SimulationBackend.records.outcome).run finished)
+  let outcome ← match recorded with
+    | .ok (some outcome) => pure outcome
+    | .ok none => throw (IO.userError "Scheduler finished without a durable root result")
+    | .error error => throw (IO.userError (reprStr error))
+  let actual : Except CloudError α := (ReplayInterpreter.result (m := Id) outcome).run
   assertOutcome actual expected
-  let directWorld ← directRef.get
-  let replayWorld ← replayRef.get
-  assertEq directWorld.recordGets world.recordGets "Direct interpreter read the journal"
-  assertEq directWorld.recordPuts world.recordPuts "Direct interpreter wrote the journal"
-  assertObservations replayWorld directWorld
-  let repeated ← runReplay program replayRef
-  assertOutcome repeated expected
-  assertObservations (← replayRef.get) replayWorld
-  assertEq (journal (← replayRef.get)) (journal replayWorld) "Warm replay changed recorded outcomes"
-  return (actual, replayWorld)
-
-def expect [Codec α] [BEq α] [Repr α] (name : String) (program : Program α)
-    (expected : Except CloudError α) (world : World := initial) : TestCase :=
-  ⟨s!"differential/{name}", do
-    let (actual, _) ← differential program world
-    assertOutcome actual expected⟩
+  -- Reconstructing any completed branch must reuse its result without writes.
+  for job in finished.scheduler.jobs do
+    let assignment : Assignment := ⟨9999999, job.branch, job.location, job.joining⟩
+    let (repeated, after) ← unwrap (evaluate 100000
+      (ReplayInterpreter.step SimulationBackend.records SimulationBackend.blobs 10000 program () assignment).run
+      finished)
+    match repeated with
+    | .ok .done => pure ()
+    | other => throw (IO.userError s!"Completed branch failed warm replay: {reprStr other}")
+    assertEq after.writes finished.writes "Warm replay wrote a record"
+  return finished
 
 end LeanCloudTests

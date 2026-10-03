@@ -1,0 +1,259 @@
+import LeanCloud.Proofs.Specification
+
+namespace LeanCloud.Proofs.Recording
+open Lean LeanEff ReplayModel ReplayInterpreter
+
+/-- The scheduler may authorize one join. Its immutable child records must be
+available and reduce to the result specified for that group. -/
+def JoinReady (expected journal : Journal) (location : Location) : Prop :=
+  ∀ (schema : String) (count : Nat) (outcome : Exit),
+    expected.lookup (ReplayStore.valueKey location) =
+      some ⟨⟨"parallel", s!"array({schema})/v1", toJson count⟩, outcome⟩ →
+    ∃ children : Nat → Exit,
+      (∀ index, index < count → journal.lookup (ReplayStore.returnKey (location.child index)) =
+        some ⟨ReplayStore.returnRequest, children index⟩) ∧
+      collect ((Array.range count).map children) = outcome
+
+theorem JoinReady.extend {expected before after location}
+    (ready : JoinReady expected before location) (extension : Extends before after) :
+    JoinReady expected after location := by
+  intro schema count outcome known
+  obtain ⟨children, present, collected⟩ := ready schema count outcome known
+  exact ⟨children, fun index inside => extension _ _ (present index inside), collected⟩
+
+/-- Completed child records establish the join obligation. Source order, not
+completion order, determines both the resulting array and the selected error. -/
+theorem JoinReady.of_children (expected journal : Journal) (location : Location)
+    (codec : Codec α) (count : Nat) (outcomes : Fin count → Except CloudError α)
+    (known : expected.lookup (ReplayStore.valueKey location) =
+      some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩,
+        Parallel.recorded (fun values => Json.arr (values.map codec.encode)) ((Array.ofFn outcomes).mapM id)⟩)
+    (completed : ∀ index : Fin count, journal.lookup (ReplayStore.returnKey (location.child index)) =
+      some ⟨ReplayStore.returnRequest, Parallel.recorded codec.encode (outcomes index)⟩) :
+    JoinReady expected journal location := by
+  intro schema size outcome stored
+  have same := Option.some.inj (known.symm.trans stored)
+  have counts := congrArg (fun record : ReplayRecord => record.request.payload.getNat?) same
+  change (Except.ok count : Except String Nat) = .ok size at counts
+  have sizes := Except.ok.inj counts
+  subst size
+  let children (index : Nat) : Exit :=
+    if inside : index < count then Parallel.recorded codec.encode (outcomes ⟨index, inside⟩)
+    else .success Json.null
+  refine ⟨children, ?_, ?_⟩
+  · intro index inside
+    simpa [children, inside] using completed ⟨index, inside⟩
+  · have ordered : (Array.range count).map children = (Array.ofFn outcomes).map (Parallel.recorded codec.encode) := by
+      ext index inside
+      · simp
+      · have bound : index < count := by simpa using inside
+        simp [children, bound]
+    rw [ordered, Parallel.collect_matches_direct]
+    exact congrArg ReplayRecord.outcome same
+
+/-- For a specified group, knowing that every child returned is enough. Storage
+agreement supplies the values; callers need not supply encoders or outcomes. -/
+theorem JoinReady.of_group {expected journal : Journal} {location : Location} {count : Nat}
+    (group : Specification.Group expected location count) (consistent : Extends journal expected)
+    (completed : ∀ index : Fin count, ∃ outcome,
+      journal.lookup (ReplayStore.returnKey (location.child index)) = some ⟨ReplayStore.returnRequest, outcome⟩) :
+    JoinReady expected journal location := by
+  obtain ⟨α, codec, outcomes, known, children⟩ := group
+  apply JoinReady.of_children expected journal location codec count outcomes known
+  intro index
+  obtain ⟨outcome, present⟩ := completed index
+  exact present.trans ((consistent _ _ present).symm.trans (children index))
+
+/-- The complete specification already contains every child return. This is a
+fact about the mathematical journal, not an assumption that storage is full. -/
+theorem JoinReady.of_specification {expected : Journal} {location : Location} {count : Nat}
+    (group : Specification.Group expected location count) : JoinReady expected expected location := by
+  apply JoinReady.of_group group (.refl _)
+  obtain ⟨α, codec, outcomes, _, children⟩ := group
+  exact fun index => ⟨_, children index⟩
+
+private theorem catch_pure (value : α) (handle : CloudError → ExceptT CloudError M α) :
+    (tryCatch (pure value) handle : ExceptT CloudError M α) = pure value := rfl
+
+theorem finish_within (journal expected : Journal) (branch : Location) (outcome : Exit)
+    (consistent : Extends journal expected)
+    (known : expected.lookup (ReplayStore.returnKey branch) = some ⟨ReplayStore.returnRequest, outcome⟩) :
+    ∃ after, Extends journal after ∧ Extends after expected ∧
+      after.lookup (ReplayStore.returnKey branch) = some ⟨ReplayStore.returnRequest, outcome⟩ ∧
+      ((Internal.finish store branch outcome).run journal) = (.ok .done, after) := by
+  have accepted := create_within journal expected _ _ consistent known
+  refine ⟨_, create_extends journal _ _, accepted.2, ?_, ?_⟩
+  · exact (create_visible journal _ _).trans (congrArg some accepted.1)
+  · simp only [Internal.finish, ReplayStore.finish, bind_assoc]
+    erw [lift_bind_run]
+    rw [accepted.1]
+    simp
+
+variable {β : Type} (encode : β → Json)
+
+/-- Executing a previously unrecorded pure operation writes its value before
+calling the same continuation used by direct evaluation. -/
+theorem exec_missing (journal : Journal) (blobs : BlobStorage M) (assignment : Assignment)
+    (current : Location) (fuel : Nat) (codec : Codec α) (label : String) (body : Unit → α)
+    (next : ArrsF (Control M) α β)
+    (missing : journal.lookup (ReplayStore.valueKey current) = none)
+    (roundtrip : codec.decode (codec.encode (body ())) = .ok (body ())) :
+    let operation : Operation M α := .exec label (fun _ => pure (body ()))
+    let record : ReplayRecord := ⟨Internal.request codec operation, .success (codec.encode (body ()))⟩
+    (walk store blobs assignment (fuel + 1) encode (.impure (.sequential codec operation) next) current true).run journal =
+      (walk store blobs assignment fuel encode (next.apply (body ())) current.next true).run
+        ((ReplayStore.valueKey current, record) :: journal) := by
+  dsimp only
+  rw [walk]
+  simp only [Bool.true_or]
+  erw [read_then]
+  simp [missing, BlobStorage.execute, catch_pure]
+  erw [lift_bind_run]
+  simp [store, StateT.run, missing, Internal.check, Internal.decode, roundtrip]
+
+/-- Reusing a correct record calls exactly the same continuation without adding
+another write, including when another attempt created the record first. -/
+theorem exec_present (journal : Journal) (blobs : BlobStorage M) (assignment : Assignment)
+    (current : Location) (fuel : Nat) (codec : Codec α) (label : String) (body : Unit → α)
+    (next : ArrsF (Control M) α β)
+    (present : journal.lookup (ReplayStore.valueKey current) =
+      some ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → M α)),
+        .success (codec.encode (body ()))⟩)
+    (roundtrip : codec.decode (codec.encode (body ())) = .ok (body ())) :
+    (walk store blobs assignment (fuel + 1) encode
+      (.impure (.sequential codec (.exec label (fun _ => pure (body ())))) next) current true).run journal =
+      (walk store blobs assignment fuel encode (next.apply (body ())) current.next true).run journal := by
+  rw [walk]
+  simp only [Bool.true_or]
+  erw [read_then]
+  simp [present, Internal.check, Internal.decode, roundtrip]
+
+/-- A pure computation either creates its specified record or reuses it. In
+both cases its continuation sees the computed value and the journal stays valid. -/
+theorem exec_within (journal expected : Journal) (blobs : BlobStorage M) (assignment : Assignment)
+    (current : Location) (fuel : Nat) (codec : Codec α) (label : String) (body : Unit → α)
+    (next : ArrsF (Control M) α β)
+    (roundtrip : codec.decode (codec.encode (body ())) = .ok (body ()))
+    (consistent : Extends journal expected)
+    (known : expected.lookup (ReplayStore.valueKey current) =
+      some ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → M α)),
+        .success (codec.encode (body ()))⟩) :
+    let operation : Operation M α := .exec label (fun _ => pure (body ()))
+    let record : ReplayRecord := ⟨Internal.request codec operation, .success (codec.encode (body ()))⟩
+    ∃ after, Extends journal after ∧ Extends after expected ∧
+      after.lookup (ReplayStore.valueKey current) = some record ∧
+      (walk store blobs assignment (fuel + 1) encode (.impure (.sequential codec operation) next) current true).run journal =
+        (walk store blobs assignment fuel encode (next.apply (body ())) current.next true).run after := by
+  dsimp only
+  have accepted := create_within journal expected _ _ consistent known
+  refine ⟨_, create_extends journal _ _, accepted.2, ?_, ?_⟩
+  · have visible := create_visible journal (ReplayStore.valueKey current)
+      ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → M α)),
+        .success (codec.encode (body ()))⟩
+    exact visible.trans (congrArg some accepted.1)
+  · cases found : journal.lookup (ReplayStore.valueKey current) with
+    | none =>
+      simpa [store, StateT.run, found] using
+        exec_missing (encode := encode) journal blobs assignment current fuel codec label body next found roundtrip
+    | some record =>
+      have same := Option.some.inj ((consistent _ _ found).symm.trans known)
+      subst record
+      simpa [store, StateT.run, found] using
+        exec_present (encode := encode) journal blobs assignment current fuel codec label body next found roundtrip
+
+/-- Joining completed children creates their ordered result once, then behaves
+exactly like replay from the newly cached join. This includes failed groups. -/
+theorem join_missing_is_cached (journal : Journal) (blobs : BlobStorage M) (assignment : Assignment)
+    (fuel : Nat) (codec : Codec α) (count : Nat) (branches : Fin count → Cloud M α)
+    (next : ArrsF (Control M) (Array α) β) (outcomes : Nat → Exit)
+    (joining : assignment.joining = true)
+    (missing : journal.lookup (ReplayStore.valueKey assignment.location) = none)
+    (completed : ∀ index, index < count →
+      journal.lookup (ReplayStore.returnKey (assignment.location.child index)) =
+        some ⟨ReplayStore.returnRequest, outcomes index⟩) :
+    let record : ReplayRecord :=
+      ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩,
+        collect ((Array.range count).map outcomes)⟩
+    let after := (ReplayStore.valueKey assignment.location, record) :: journal
+    let program := EffF.impure (.parallel codec count branches) next
+    (walk store blobs assignment (fuel + 1) encode program assignment.location true).run journal =
+      (walk store blobs assignment (fuel + 1) encode program assignment.location true).run after := by
+  dsimp only
+  rw [walk]
+  simp only [Bool.true_or]
+  erw [read_then]
+  simp [missing, joining]
+  rw [bind_run, Worker.join_reads_children journal assignment.location count outcomes completed]
+  erw [lift_bind_run]
+  simp [store, StateT.run, Internal.check]
+  erw [lift_bind_run]
+  simp [StateT.run, missing]
+
+/-- A group either suspends without writing, or obtains its correct immutable
+join record. The equality covers the rest of the actual worker execution. -/
+theorem group_record_or_suspend (journal expected : Journal) (blobs : BlobStorage M)
+    (assignment : Assignment) (current : Location) (fuel : Nat) (codec : Codec α) (count : Nat)
+    (branches : Fin count → Cloud M α) (next : ArrsF (Control M) (Array α) β) (outcome : Exit)
+    (consistent : Extends journal expected)
+    (known : expected.lookup (ReplayStore.valueKey current) =
+      some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, outcome⟩)
+    (ready : assignment.joining = true → JoinReady expected journal assignment.location) :
+    let record : ReplayRecord := ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, outcome⟩
+    let execute := walk store blobs assignment (fuel + 1) encode (.impure (.parallel codec count branches) next) current true
+    execute.run journal = (.ok (.fork current count), journal) ∨
+      ∃ after, Extends journal after ∧ Extends after expected ∧
+        after.lookup (ReplayStore.valueKey current) = some record ∧ execute.run journal = execute.run after := by
+  dsimp only
+  cases found : journal.lookup (ReplayStore.valueKey current) with
+  | some record =>
+    have same := Option.some.inj ((consistent _ _ found).symm.trans known)
+    subst record
+    exact .inr ⟨journal, .refl _, consistent, found, rfl⟩
+  | none =>
+    by_cases authorized : current = assignment.location ∧ assignment.joining = true
+    · obtain ⟨atLocation, joining⟩ := authorized
+      subst current
+      obtain ⟨children, completed, collected⟩ := ready joining codec.schema count outcome known
+      have accepted := create_within journal expected _ _ consistent known
+      right
+      refine ⟨_, create_extends journal _ _, accepted.2, ?_, ?_⟩
+      · exact (create_visible journal _ _).trans (congrArg some accepted.1)
+      · simpa [collected, store, StateT.run, found] using
+          join_missing_is_cached (encode := encode) journal blobs assignment fuel codec count branches next children joining found completed
+    · left
+      rw [walk]
+      simp only [Bool.true_or]
+      erw [read_then]
+      have suspend : (current != assignment.location || !assignment.joining) = true := by
+        cases joining : assignment.joining <;> simp_all
+      simp [found, suspend]
+
+theorem group_success (journal : Journal) (blobs : BlobStorage M) (assignment : Assignment)
+    (current : Location) (fuel : Nat) (codec : Codec α) (count : Nat) (branches : Fin count → Cloud M α)
+    (next : ArrsF (Control M) (Array α) β) (values : Array α)
+    (roundtrip : Pure.RoundTrips codec) (size : values.size = count)
+    (present : journal.lookup (ReplayStore.valueKey current) =
+      some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩,
+        .success (Json.arr (values.map codec.encode))⟩) :
+    (walk store blobs assignment (fuel + 1) encode (.impure (.parallel codec count branches) next) current true).run journal =
+      (walk store blobs assignment fuel encode (next.apply values) current.next true).run journal := by
+  rw [walk]
+  simp only [Bool.true_or]
+  erw [read_then]
+  have decoded := roundtrip.array codec
+  change ∀ values, (@instCodecArray _ codec).decode (Json.arr (values.map codec.encode)) = .ok values at decoded
+  simp [present, Internal.check, Internal.decodeGroup, Internal.decode, decoded, size]
+
+theorem group_failure (journal : Journal) (blobs : BlobStorage M) (assignment : Assignment)
+    (current : Location) (fuel : Nat) (codec : Codec α) (count : Nat) (branches : Fin count → Cloud M α)
+    (next : ArrsF (Control M) (Array α) β) (error : CloudError)
+    (present : journal.lookup (ReplayStore.valueKey current) =
+      some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, .failure error⟩) :
+    (walk store blobs assignment (fuel + 1) encode (.impure (.parallel codec count branches) next) current true).run journal =
+      (Internal.finish store assignment.branch (.failure error)).run journal := by
+  rw [walk]
+  simp only [Bool.true_or]
+  erw [read_then]
+  simp [present, Internal.check]
+
+end LeanCloud.Proofs.Recording

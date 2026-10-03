@@ -40,7 +40,7 @@ def plan (options : Options) : Array Fault := Id.run do
   let mut faults := #[]
   for _ in [:options.crashes] do
     seed := (1664525 * seed + 1013904223) % 4294967296
-    let worker := (seed / 65536) % options.workers
+    let worker := (seed / 65536) % (options.workers + 1)
     seed := (1664525 * seed + 1013904223) % 4294967296
     faults := faults.push ⟨worker, 100 + (seed / 65536) % 601⟩
   return faults
@@ -56,11 +56,12 @@ def run (options : Options) : IO Unit := withContext s!"chaos-{options.seed}" fu
   IO.FS.writeFile inputFile input.compress
   if options.build then
     discard <| ctx.compose #["build", "worker"] (timeout := 1800)
-  discard <| ctx.compose #["up", "-d", "--wait", "db", "queue", "blobs"] (timeout := 180)
+  discard <| ctx.compose #["up", "-d", "--wait", "broker", "blobs"] (timeout := 180)
   -- Seed global blobs through the ordinary application submission command.
   discard <| ctx.compose #["run", "--rm", "--no-deps", "submit", "submit", configPath, "seed-files"]
   discard <| ctx.compose #["run", "--rm", "--no-deps", "-v", s!"{inputFile}:/input.json:ro",
     "submit", "submit", configPath, "chaos", "/input.json"]
+  let scheduler ← ctx.createScheduler "scheduler" "chaos"
   let workers ← (Array.range options.workers).mapM fun i => ctx.createWorker s!"worker-{i}" "chaos"
   ctx.start workers
   ctx.event "started" [("seed", toJson options.seed), ("workers", toJson options.workers)]
@@ -68,7 +69,7 @@ def run (options : Options) : IO Unit := withContext s!"chaos-{options.seed}" fu
   for index in [:faults.size] do
     let fault := faults[index]!
     IO.sleep fault.delayMs.toUInt32
-    let worker := workers[fault.worker]!
+    let worker := if fault.worker == options.workers then scheduler else workers[fault.worker]!
     if ← ctx.crash worker then
       killed := killed + 1
       ctx.event "crashed" [("index", toJson index), ("worker", toJson worker), ("exitCode", toJson (137 : Nat))]
@@ -76,13 +77,13 @@ def run (options : Options) : IO Unit := withContext s!"chaos-{options.seed}" fu
       ctx.event "restarted" [("worker", toJson worker)]
     else
       ctx.event "already_finished" [("index", toJson index), ("worker", toJson worker)]
-  require (killed > 0) "No worker was crashed; this run did not exercise recovery"
+  require (killed > 0) "No actor was crashed; this run did not exercise recovery"
   ctx.event "faults_stopped" [("crashes", toJson killed)]
   ctx.waitAll workers options.timeout
   ctx.checkReport "chaos" "files=16, errors=24"
   let fresh ← ctx.compose #["run", "--rm", "--no-deps", "worker", "worker", configPath, "chaos"]
-  require (fresh.stdout.startsWith "completed chaos:" &&
-    !(fresh.stdout.splitOn "\n").any (·.startsWith "work "))
+  require ((fresh.stdout.splitOn "\n").contains "completed chaos" &&
+    !(fresh.stdout.splitOn "\n").any (fun line => (line.splitOn " location=").length > 1))
     "A fresh worker must read the saved outcome without processing new work"
   ctx.event "passed" [("crashes", toJson killed), ("report", toJson "files=16, errors=24")]
 

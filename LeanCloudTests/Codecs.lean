@@ -38,19 +38,22 @@ def codecCases : Array TestCase := #[
       match decodeBytes (encodeBytes bytes) with
       | .ok decoded => assertEq decoded.data bytes.data
       | .error error => throw (IO.userError error)⟩,
-  ⟨"codec/roundtrip/journal", do
-    for result in #[Result.suspended #[none, some (.success (toJson 7))],
-        Result.completed (.failure ⟨.application, "failed"⟩), Result.completed (.success (toJson "done"))] do
-      match (fromJson? (toJson result) : Except String Result) with
-      | .ok decoded => assertEq decoded result
-      | .error error => throw (IO.userError error)⟩,
-  ⟨"codec/broken-codec-is-not-an-equivalence-case", do
-    let bad : Codec Nat := ⟨"broken", fun _ => Json.null, fun _ => .error "broken codec"⟩
-    let program : Program Nat := fun _ => Cloud.send (.sequential bad (.exec "value" (fun _ => pure 7)))
-    let directRef ← IO.mkRef initial
-    let replayRef ← IO.mkRef initial
-    assertOutcome (← runDirect program directRef) (.ok 7)
-    assertError (← runReplay program replayRef) .codec⟩
+  ⟨"codec/roundtrip/replay-record", do
+    let record : ReplayRecord := ⟨ReplayStore.returnRequest, .success (toJson (7 : Nat))⟩
+    let decoded ← unwrap (fromJson? (toJson record) : Except String ReplayRecord)
+    assertEq decoded record⟩,
+  ⟨"protocol/request-check-survives-persistence", do
+    -- These are every payload shape emitted by replay's request signatures.
+    let payloads := #[Json.null, toJson "λ 🌍\n\u0000", toJson (2^128 : Nat),
+      encodeBytes (ByteArray.mk ((List.range 256).toArray.map Nat.toUInt8)),
+      toJson (makeRef "λ/ref" "content".toUTF8)]
+    for payload in payloads do
+      let request : Request := ⟨"operation", "schema/v1", payload⟩
+      let decoded ← unwrap (Json.parse (toJson request).compress >>= fromJson? (α := Request))
+      assertTrue (decoded == request) "Persisted request no longer matches"
+      assertTrue (decoded != { request with kind := "other" }) "Changed operation was accepted"
+      assertTrue (decoded != { request with schema := "schema/v2" }) "Changed codec was accepted"
+      assertTrue (decoded != { request with payload := Json.str "changed" }) "Changed input was accepted"⟩
 ]
 
 end LeanCloudTests

@@ -97,7 +97,16 @@ structure Request where
   kind : String
   schema : String
   payload : Json
-  deriving Repr, BEq, ToJson, FromJson
+  deriving Repr, ToJson, FromJson
+
+/-- Compare the serialized request payload. Unlike Json's opaque partial
+comparison, this gives the replay protocol a provably reflexive check. -/
+instance : BEq Request where
+  beq left right := left.kind == right.kind && left.schema == right.schema &&
+    left.payload.compress == right.payload.compress
+
+instance : ReflBEq Request where
+  rfl := by intro request; simp [BEq.beq]
 
 instance : Inhabited Request := ⟨⟨"", "", Json.null⟩⟩
 

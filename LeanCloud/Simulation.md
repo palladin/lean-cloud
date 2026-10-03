@@ -1,133 +1,90 @@
-# Simulating workers
+# Simulating the scheduler and workers
 
-`SimM` is the original executable simulator for atomic state operations and timed
-leases. It remains useful for tests and focused proofs. The main concurrent
-[workflow theorem](Proofs/MainTheorems.lean) now uses the broader
-[shared backend contracts](Backend.md), which also permit duplicate delivery
-after acknowledgement and requests that commit after their caller crashes.
-The two drivers use the same public replay interpreter; their execution models
-have different permitted behaviors.
+`SimM` is lean-eff's freer computation over atomic environment operations.
+`Cloud (SimM World)` uses the ordinary Cloud effects. The replay interpreter runs
+unchanged: storage and mailbox operations suspend its `SimM` continuation.
 
-[Simulation.lean](Simulation.lean) schedules the backend calls made by workers.
-[SimulationBackend.lean](SimulationBackend.lean) connects it to the existing
-replay interpreter, physical journal, and leased queue.
+Actor zero is the scheduler; the other actors are workers. Their programs call
+`Scheduler.turn` and `Worker.turn`, exactly as the real runtime does. The model
+world contains global immutable records and user blobs, private scheduler state,
+durable mailboxes, unacknowledged deliveries, confirmed publications awaiting
+delivery, and worker observation metadata. That combined
+model is not a deployed shared service.
 
-There are two effect languages, both using `lean-eff`:
+An external driver chooses events:
 
-```lean
-Cloud m α = EffF (Control m) α
-SimM δ α  = EffF (Atomic δ) α
-```
+- `commit`: execute one atomic operation and retain its reply.
+- `resume`: deliver that reply and evaluate until the next operation.
+- `crash`: discard the actor's continuation.
+- `restart`: create a fresh continuation and consumer session for the same actor mailbox.
+- `commitOrphan` / `discardOrphan`: settle a remote request left by a crash.
+- Broker delivery, duplication, delayed delivery, and scheduler timer ticks.
 
-`Cloud` describes the workflow. The replay interpreter handles it and calls the
-Db and queue. Their simulated implementations produce atomic requests in `SimM`.
-The external driver executes those requests against shared state. In a real
-backend the interpreter instead runs over `IO`.
+A confirmed message survives actor failure. Receiving reserves it; acknowledgement
+removes it. Consumer failure requeues unacknowledged deliveries. Old session
+receipts cannot acknowledge a replacement consumer’s delivery.
 
-## A worker attempt
+On scheduler startup, the shared `Scheduler.recover` operation reloads its private
+database and returns running assignments to pending. Completed jobs, partial
+joins, and attempt numbers survive. Worker crashes discard local observations of
+record keys; confirmed reports and global records still survive independently.
 
-For example, this workflow captures `input` in both parallel branches:
+A pending remote blob write can commit after its worker crashes. Its continuation
+cannot run again. A pending local scheduler database operation dies with the
+process; a committed database write survives even when its reply is lost. This
+prevents an old local save from overwriting state after scheduler restart.
 
-```lean
-import LeanCloud
+The scheduler's persisted transitions and the blob service's committed records
+are separate atomic operations. There is no transaction across those services.
+Retries, immutable records, and attempt numbers bridge their failure windows.
 
-open LeanCloud
+Generated tests run finite periods of faults, then keep delivering messages,
+advancing expiry time, and scheduling live actors. They compare the durable root
+result with the direct interpreter and check warm replay. Targeted cases kill
+actors before and after record creation, scheduler saves, and message sends.
 
-def workflow (input : Nat) : Cloud SimulationBackend.M Nat := cloud {
-  let (x, y) ← cloud { return input + 1 } || cloud { return input + 2 }
-  return x + y
-}
+Finite actor/interpreter budgets make simulation executable. Reaching a simulation
+budget is not workflow completion. Tests require the scheduler to finish and the
+expected root record to exist. These tests are evidence, not a general liveness
+theorem.
 
-def start (_ : Fin 2) :=
-  SimulationBackend.attempt 10000 100 workflow 7
+Separately, [completed_replay_matches_direct](Proofs/MainTheorems.lean) proves
+that scheduler completion implies a durable root result equal to direct
+evaluation for pure workflows. It covers all actual finite Sim traces from empty
+storage, including arbitrary crashes and message interleavings.
 
-def initial :=
-  Simulation.State.initial SimulationBackend.initial start
+`concurrent_replay_matches_direct` additionally proves eventual completion given
+sufficient interpreter fuel and recurring timely processing windows. A window
+allows a delivered assignment to execute, its report to arrive
+while the attempt is live, and the scheduler to save its transition. The proof
+derives report success from the worker code and a single source-dependent fuel
+bound. Other actors and broker events may interleave with the selected worker's
+atomic operations. No successful report or correct result is assumed of the environment.
+This is stronger than weak fairness or durable message delivery alone.
 
-def paused :=
-  Simulation.run start SimulationBackend.advance
-    [.commit 0, .commit 1, .resume 1] initial
-```
+[WorkerProgress.job_can_report](Proofs/WorkerProgress.lean) supplies one progress
+step: every reachable job can produce a fork or completion report in finitely
+many uninterrupted commit/reply events, given sufficient fuel. This includes
+reconstructing nested branches. Delivery and timely acceptance of reports are
+separate obligations; the lemma does not assume they happen automatically.
 
-The interpreter fuel is `10000`; the lease duration is `100` clock units. Worker
-IDs are `Fin 2` here; the driver supports any fixed number of workers.
+[SchedulerDelivery](Proofs/SchedulerDelivery.lean) checks the receiving side:
+an uninterrupted turn saves a selected live report's completion or child jobs,
+confirms its reply, and acknowledges the input. The proof keeps those as
+separate atomic operations and leaves replay values in worker-owned operations.
 
-Both workers first read the durable completion record. This schedule commits
-those reads, delivers worker 1's reply, and leaves worker 0's reply pending.
-No clock time passes automatically. The returned state can be supplied to another
-`Simulation.run` call to continue the schedule.
+`ConcurrentSafety.completed_branch_persists` lifts completed-job preservation
+through all subsequent actor and network events. Retries and recovery cannot
+reopen completed work; `completion_persists` gives the same guarantee for the
+whole workflow's finished status.
 
-An attempt has type:
-
-```lean
-SimM SimulationBackend.Durable
-  (Except CloudError Nat × SimulationBackend.Worker)
-```
-
-The inner worker handle contains local state such as the current receipt. Its
-state is captured by the suspended interpreter continuation. Shared journal and
-queue state live only in the simulation machine and are read at each commit.
-
-## External events
-
-| Event | Meaning |
-| --- | --- |
-| `commit worker` | Execute one waiting atomic operation and save its response. |
-| `resume worker` | Deliver that saved response; evaluate until the next request or return. |
-| `crash worker` | Discard a running worker's continuation, local state, and any pending response. |
-| `restart worker` | Replace a stopped worker with `start worker`, using fresh local state. |
-| `advanceTime elapsed` | Advance the queue clock without deleting messages. |
-
-Switching workers needs no separate event. A worker remains paused while the
-driver selects other workers. A delayed read response retains the value observed
-at commit; resuming does not reread storage.
-
-Crashing a waiting worker models interruption before an operation. Committing
-and then crashing before resume models interruption after commit with a lost
-reply. Neither crash nor restart releases leases, clears records, or seeds another
-root message. Time advancement permits expiry and later redelivery. A paused
-worker can also outlive its lease while another worker processes a newer delivery.
-
-Invalid events, such as resuming before commit or restarting a live worker, return
-a simulation `Error`. Script exhaustion leaves the machine paused. Neither is a
-workflow `CloudError` or evidence of workflow completion. The test driver's event
-budget is likewise separate from interpreter fuel.
-
-## Guarantees and limits
-
-This simulator uses the actual `JournalDb` and `LeaseQueue.toWorkQueue` adapters.
-Each physical Db get/put, queue operation and completion access is separately
-atomic. Multi-key reconstruction and publication before acknowledgement are not
-single transactions. The write history is proof metadata, not an adapter API.
-
-Its timed queue rotates receipts on redelivery. Its crash event discards a
-pending atomic operation. These are particular choices of this simulator; the
-shared model additionally allows stale receipts to succeed, post-acknowledgement
-duplicates and late commits from abandoned requests. See
-[Backend/Execution.lean](Backend/Execution.lean) for that request lifecycle.
-
-The narrower simulator's proofs remain in `Proofs/Concurrent*.lean`:
-
-- Journal publication, reconstruction, child completion and wakeups remain safe
-  under interleaved commits and delayed replies.
-- Every acknowledgement follows publication of replacement work or the final
-  result. Unfinished work retains an outstanding queue item.
-- Fair worker actions and delivery after recovery imply completion; sufficient
-  finite fuel realizes the completing execution prefix.
-
-The main theorem in [MainTheorems.lean](Proofs/MainTheorems.lean) derives these
-workflow guarantees directly from the broader primitive contracts. Its current
-supporting proofs are `Proofs/Backend*.lean`; the
-[proof guide](Proofs/README.md) explains the assumptions and reading order.
-
-[Simulation tests](../LeanCloudTests/Simulation.lean) exercise two-worker
-schedules, sibling completion races, lost replies, stale receipts, and crashes
-at backend boundaries. [Backend contract tests](../LeanCloudTests/BackendContracts.lean)
-exercise the broader model, including late orphan commits and duplicate delivery.
-Both compare pure workflows with direct interpretation. Integration tests also
-compare generated workflows with concurrent real workers.
-
-Neither model executes arbitrary external IO as part of the pure-workflow proof.
-Preemption occurs at backend request boundaries; intervening pure computation
-runs together. Service implementations are assessed through conformance tests;
-finite tests do not prove unbounded fairness or external-service correctness.
+[CoordinationProgress.productive_intervals_bounded](Proofs/CoordinationProgress.lean)
+proves a finite bound on useful scheduling work from the original pure source.
+A live successful report increases a bounded measure; crashes and retries cannot
+decrease it. Authorized joins cannot suspend again at the same fork.
+[DeploymentProgress](Proofs/DeploymentProgress.lean) proves that the processing
+windows are productive and that an unfinished run cannot contain infinitely
+many of them. The run is sampled at finite batches of events; the window
+assumption must hold at those sample points. Endless crashes, reports that
+always expire before acceptance, and exhausted actor-loop budgets without
+further processing opportunities are excluded by that assumption.

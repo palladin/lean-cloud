@@ -1,103 +1,113 @@
 import LeanEff.Core
 
-/-! External scheduling of atomic backend calls. Continuations are volatile:
-pausing retains them, crashing discards them, and restart creates a fresh attempt.
-This is a model of worker execution, not an additional Cloud control effect. -/
+/-! Atomic effects expose scheduling boundaries without changing the interpreter.
+Local operations die with their process. Remote requests may still commit after a
+crash; their abandoned continuations never run. Commit and reply are separate. -/
 
 namespace LeanCloud
 
 inductive Atomic (δ : Type) : Type → Type where
-  | step {α : Type} : (δ → α × δ) → Atomic δ α
+  | step {α : Type} (remote : Bool) (label : String) (operation : δ → α × δ) : Atomic δ α
 
 abbrev SimM (δ : Type) := LeanEff.EffF (Atomic δ)
 
-def SimM.atomic (operation : δ → α × δ) : SimM δ α :=
-  LeanEff.EffF.send (.step operation)
+def SimM.atomic (operation : δ → α × δ) (label : String := "remote") : SimM δ α :=
+  LeanEff.EffF.send (.step true label operation)
+
+def SimM.local (operation : δ → α × δ) (label : String := "local") : SimM δ α :=
+  LeanEff.EffF.send (.step false label operation)
 
 namespace Simulation
 open LeanEff
 
-inductive Phase where
-  | waiting | responding | stopped | finished
-  deriving Repr, BEq, DecidableEq
-
-/-- A reply is saved separately from its continuation so another worker can run,
-or this worker can crash, after commit and before receiving the response. -/
-inductive Worker (δ α : Type) where
-  | waiting {β : Type} (operation : δ → β × δ) (next : ArrsF (Atomic δ) β α)
+inductive Actor (δ α : Type) where
+  | waiting {β : Type} (remote : Bool) (label : String)
+      (operation : δ → β × δ) (next : ArrsF (Atomic δ) β α)
   | responding {β : Type} (value : β) (next : ArrsF (Atomic δ) β α)
   | stopped
   | finished (value : α)
 
-def Worker.ofProgram : SimM δ α → Worker δ α
+def Actor.ofProgram : SimM δ α → Actor δ α
   | .pure value => .finished value
-  | .impure (.step operation) next => .waiting operation next
+  | .impure (.step remote label operation) next => .waiting remote label operation next
 
-def Worker.phase : Worker δ α → Phase
-  | .waiting .. => .waiting
-  | .responding .. => .responding
-  | .stopped => .stopped
-  | .finished .. => .finished
-
-def Worker.outcome? : Worker δ α → Option α
-  | .finished value => some value
-  | _ => none
+structure Orphan (δ : Type) where
+  label : String
+  commit : δ → δ
 
 structure State (δ α : Type) (count : Nat) where
-  durable : δ
-  workers : Fin count → Worker δ α
+  world : δ
+  actors : Fin count → Actor δ α
+  generations : Fin count → Nat := fun _ => 0
+  orphans : Array (Orphan δ) := #[]
 
-def State.initial (durable : δ) (start : Fin count → SimM δ α) : State δ α count :=
-  ⟨durable, fun worker => .ofProgram (start worker)⟩
+/-- Generation distinguishes process attempts and consumer sessions. Scheduler
+restart replaces its continuation; its private durable database survives. -/
+abbrev Start (δ α : Type) (count : Nat) := Fin count → Nat → SimM δ α
 
-def State.setWorker (state : State δ α count) (worker : Fin count)
-    (next : Worker δ α) : State δ α count :=
-  { state with workers := fun index => if index = worker then next else state.workers index }
+def State.initial (world : δ) (start : Start δ α count) : State δ α count :=
+  ⟨world, fun actor => .ofProgram (start actor 0), fun _ => 0, #[]⟩
+
+def State.setActor (state : State δ α count) (actor : Fin count)
+    (next : Actor δ α) : State δ α count :=
+  { state with actors := fun index => if index = actor then next else state.actors index }
 
 inductive Event (count : Nat) where
-  | commit (worker : Fin count)
-  | resume (worker : Fin count)
-  | crash (worker : Fin count)
-  | restart (worker : Fin count)
-  | advanceTime (elapsed : Nat)
+  | commit (actor : Fin count)
+  | resume (actor : Fin count)
+  | crash (actor : Fin count)
+  | restart (actor : Fin count)
+  | commitOrphan (index : Nat)
+  | discardOrphan (index : Nat)
   deriving Repr, BEq, DecidableEq
 
 inductive Error where
-  | notWaiting | notResponding | notRunning | notStopped
+  | notWaiting | notResponding | notRunning | notStopped | noOrphan
   deriving Repr, BEq, DecidableEq
 
-/-- Exactly one external event. Only commit and explicit time advancement can
-change shared state. Pure continuation evaluation runs up to the next request.
-An invalid schedule is rejected rather than silently treated as progress. -/
-def step (start : Fin count → SimM δ α) (advance : Nat → δ → δ)
-    (event : Event count) (state : State δ α count) : Except Error (State δ α count) :=
+/-- One externally chosen event. Crashes preserve already committed state and
+retain remote requests for possible later commitment. Local DB calls cannot
+survive a scheduler crash and overwrite its recovered state. -/
+def step (start : Start δ α count) (event : Event count) (state : State δ α count) :
+    Except Error (State δ α count) :=
   match event with
-  | .commit worker =>
-    match state.workers worker with
-    | .waiting operation next =>
-      let (value, durable) := operation state.durable
-      .ok { state.setWorker worker (.responding value next) with durable }
+  | .commit actor =>
+    match state.actors actor with
+    | .waiting _ _ operation next =>
+      let (value, world) := operation state.world
+      .ok { state.setActor actor (.responding value next) with world }
     | _ => .error .notWaiting
-  | .resume worker =>
-    match state.workers worker with
-    | .responding value next =>
-      .ok (state.setWorker worker (.ofProgram (ArrsF.apply next value)))
+  | .resume actor =>
+    match state.actors actor with
+    | .responding value next => .ok (state.setActor actor (.ofProgram (ArrsF.apply next value)))
     | _ => .error .notResponding
-  | .crash worker =>
-    match state.workers worker with
-    | .waiting .. | .responding .. => .ok (state.setWorker worker .stopped)
+  | .crash actor =>
+    match state.actors actor with
+    | .waiting remote label operation _ =>
+      let orphans := if remote then state.orphans.push ⟨label, fun world => (operation world).2⟩ else state.orphans
+      .ok { state.setActor actor .stopped with orphans }
+    | .responding .. => .ok (state.setActor actor .stopped)
     | _ => .error .notRunning
-  | .restart worker =>
-    match state.workers worker with
-    | .stopped => .ok (state.setWorker worker (.ofProgram (start worker)))
+  | .restart actor =>
+    match state.actors actor with
+    | .stopped =>
+      let generation := state.generations actor + 1
+      .ok { state.setActor actor (.ofProgram (start actor generation)) with
+        generations := fun index => if index = actor then generation else state.generations index }
     | _ => .error .notStopped
-  | .advanceTime elapsed => .ok { state with durable := advance elapsed state.durable }
+  | .commitOrphan index =>
+    if h : index < state.orphans.size then
+      let orphan := state.orphans[index]
+      let world := orphan.commit state.world
+      .ok { state with world, orphans := state.orphans.eraseIdx index }
+    else .error .noOrphan
+  | .discardOrphan index =>
+    if h : index < state.orphans.size then .ok { state with orphans := state.orphans.eraseIdx index }
+    else .error .noOrphan
 
-/-- A finite reproducible schedule. Script exhaustion leaves the machine paused;
-it is neither workflow completion nor a CloudError. -/
-def run (start : Fin count → SimM δ α) (advance : Nat → δ → δ)
-    (events : List (Event count)) (state : State δ α count) : Except Error (State δ α count) :=
-  events.foldlM (fun state event => step start advance event state) state
+def run (start : Start δ α count) (events : List (Event count)) (state : State δ α count) :
+    Except Error (State δ α count) :=
+  events.foldlM (fun state event => step start event state) state
 
 end Simulation
 end LeanCloud

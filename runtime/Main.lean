@@ -30,8 +30,8 @@ private def showResult (config : Config) (run : String) : IO UInt32 := do
 def main (args : List String) : IO UInt32 := do
   try
     let command :: path :: run :: rest := args
-      | IO.eprintln "Usage: cloud-demo (submit|worker|result) CONFIG RUN [INPUT.json]"; return 2
-    let config : Config ← WorkerConfig.load path
+      | IO.eprintln "Usage: cloud-demo (submit|scheduler|worker|result|status) CONFIG RUN [INPUT.json]"; return 2
+    let config : Config ← Config.load path
     validateRun run
     match command with
     | "submit" =>
@@ -50,14 +50,13 @@ def main (args : List String) : IO UInt32 := do
       submit config run (definition input)
       IO.println s!"submitted {run}"
       return 0
+    | "scheduler" => runScheduler config run; return 0
     | "worker" =>
       let input ← decodeInput (← loadRun config run)
-      let result ← Worker.run (connectors run) config 100000 Demo.workflow input
-      match result with
-      | .ok ref => IO.println s!"completed {run}: {ref.key}"; return 0
-      | .error error =>
-        IO.eprintln error.message
-        return if (← completed config run).isSome then 0 else 1
+      runWorker config run Demo.workflow input
+      IO.println s!"completed {run}"
+      return 0
+    | "status" => IO.println (toJson (← status config run)).compress; return 0
     | "result" => showResult config run
     | _ => throw (IO.userError "Unknown command")
   catch error => IO.eprintln error.toString; return 1

@@ -3,7 +3,8 @@ import LeanCloudTests.Support
 namespace LeanCloudTests
 open LeanCloud
 
-/-- A finite description used only to generate varied well-typed Cloud programs. -/
+/-- A finite AST for property-based generation; production programs are ordinary
+Cloud computations with closures, never this test representation. -/
 inductive Tree where
   | value (n : Nat)
   | effect (n : Nat)
@@ -16,33 +17,30 @@ inductive Tree where
   deriving Repr
 
 mutual
-  def lower (ref : Ref) (tree : Tree) (input : Nat) : Cloud IO Nat :=
+  def lower [Pure m] (tree : Tree) (input : Nat) : Cloud m Nat :=
     match tree with
     | .value n => pure (input + n)
-    | .effect n => execValue ref s!"generated/{n}" (input + n)
+    | .effect n => Cloud.pure (fun _ => input + n) s!"generated/{n}"
     | .blob n => do
       let blob ← CloudBlob.putText s!"{input}:{n}"
       return (← CloudBlob.readText blob).length
     | .fail n => Cloud.fail s!"generated-failure/{n}"
-    | .delay child => Cloud.delay fun _ => lower ref child input
+    | .delay child => Cloud.delay fun _ => lower child input
     | .bind first next => do
-      let value ← lower ref first input
-      lower ref next (value + input)
-    | .branch even odd =>
-      if input % 2 == 0 then lower ref even input else lower ref odd input
+      let value ← lower first input
+      lower next (value + input)
+    | .branch even odd => if input % 2 == 0 then lower even input else lower odd input
     | .parallel children => do
-      let values ← Cloud.parallel (lowerChildren ref children input).toArray
-      execValue ref "generated/join" (values.foldl (· + ·) input)
+      let values ← Cloud.parallel (lowerChildren children input).toArray
+      Cloud.pure (fun _ => values.foldl (· + ·) input) "generated/join"
   termination_by structural tree
 
-  def lowerChildren (ref : Ref) (children : List Tree) (input : Nat) : List (Cloud IO Nat) :=
+  def lowerChildren [Pure m] (children : List Tree) (input : Nat) : List (Cloud m Nat) :=
     match children with
     | [] => []
-    | child :: rest => lower ref child input :: lowerChildren ref rest input
+    | child :: rest => lower child input :: lowerChildren rest input
   termination_by structural children
 end
-
-def nextSeed (seed : Nat) : Nat := (1664525 * seed + 1013904223) % 4294967296
 
 def generate (depth seed : Nat) : Tree × Nat :=
   let seed := nextSeed seed
@@ -76,22 +74,23 @@ def generate (depth seed : Nat) : Tree × Nat :=
         seed := next
       return (.parallel children.reverse, seed)
 
-def generatedCases : Array TestCase := (List.range 256).toArray.map fun seed =>
-  let tree := (generate (3 + seed % 3) seed).1
-  ⟨s!"generated/seed/{seed}", do
-    try
-      let _ ← differential (fun ref => lower ref tree (seed % 17))
-    catch error =>
-      throw (IO.userError s!"seed={seed}, program={reprStr tree}\n{error}")⟩
+def generatedCases : Array TestCase := (Array.range 256).flatMap fun seed =>
+  #[false, true].map fun chaos =>
+    let tree := (generate (3 + seed % 3) seed).1
+    ⟨s!"generated/{if chaos then "chaos" else "clean"}/{seed}", do
+      try
+        let _ ← differential (fun _ => lower tree (seed % 17)) seed chaos
+      catch error =>
+        throw (IO.userError s!"seed={seed}, program={reprStr tree}\n{error}")⟩
 
-def smallCompositions : Array TestCase := Id.run do
+def compositionCases : Array TestCase := Id.run do
   let leaves := #[Tree.value 0, Tree.effect 2, Tree.blob 3, Tree.fail 4]
   let mut cases := #[]
   for (a, i) in leaves.toList.zipIdx do
     for (b, j) in leaves.toList.zipIdx do
       for (tree, tag) in [(Tree.parallel [a, b], "parallel"), (Tree.bind a b, "bind")] do
-        cases := cases.push ⟨s!"generated/exhaustive/{tag}/{i}/{j}", do
-          let _ ← differential (fun ref => lower ref tree 1)
+        cases := cases.push ⟨s!"generated/composition/{tag}/{i}/{j}", do
+          let _ ← differential (fun _ => lower tree 1) (i * 4 + j) true
           pure ()⟩
   return cases
 

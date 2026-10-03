@@ -1,103 +1,100 @@
-import LeanCloud.Result
-import Init.Data.Array.Monadic
+import LeanCloud.ReplayInterpreter
+import LeanCloud.DirectInterpreter
 
-/-! Laws for the actual parallel-result bookkeeping used by replay.
-Repeated child completion requires explicit reflexivity of the outcome's
-equality check, because the existing comparator delegates to partial JSON
-comparison. -/
-
-namespace LeanCloud.Result
+namespace LeanCloud.Proofs.Parallel
 open Lean
 
-private theorem list_collect_missing {α : Type} :
-    (values : List (Option α)) → none ∈ values → values.mapM id = none
-  | [], missing => by simp at missing
-  | none :: _, _ => by simp [List.mapM_cons]
-  | some value :: rest, missing => by
-    have missingRest : none ∈ rest := by simpa using missing
-    simp [List.mapM_cons, list_collect_missing rest missingRest]
+/-- Representation of a direct result in the immutable replay journal. -/
+def recorded (encode : α → Json) : Except CloudError α → Exit
+  | .ok value => .success (encode value)
+  | .error error => .failure error
 
-/-- A group waits for every child, even if an already finished child failed. -/
-theorem settle_missing (children : Array (Option Exit)) (missing : none ∈ children) :
-    settle children = .suspended children := by
-  have collect : children.mapM id = none := by
-    rw [Array.mapM_eq_mapM_toList, list_collect_missing children.toList (by simpa using missing)]
+private theorem sequence_map (values : List (Except ε α)) (encode : α → β) (error : ε → ε') :
+    values.mapM (fun value => (value.map encode).mapError error) =
+      ((values.mapM id).map (List.map encode)).mapError error := by
+  induction values with
+  | nil => rfl
+  | cons first rest ih =>
+    simp only [List.mapM_cons]
+    rw [ih]
+    cases first <;> cases rest.mapM id <;> rfl
+
+private theorem sequence_length (outcomes : List (Except ε α)) (values : List α)
+    (collected : outcomes.mapM id = .ok values) : values.length = outcomes.length := by
+  induction outcomes generalizing values with
+  | nil =>
+    change Except.ok [] = Except.ok values at collected
+    cases collected
     rfl
-  simp [settle, collect]
+  | cons first rest ih =>
+    rw [List.mapM_cons] at collected
+    cases first with
+    | error error => contradiction
+    | ok value =>
+      cases tail : rest.mapM id with
+      | error error =>
+        rw [tail] at collected
+        contradiction
+      | ok remaining =>
+        rw [tail] at collected
+        change Except.ok (value :: remaining) = Except.ok values at collected
+        cases collected
+        simp [ih remaining tail]
 
-/-- Once all children have outcomes, result selection uses their array order. -/
-theorem settle_completed (outcomes : Array Exit) :
-    settle (outcomes.map some) =
-      match outcomes.mapM (fun outcome => match outcome with
+/-- Collecting successful children preserves the number of branches. -/
+theorem sequence_size (outcomes : Array (Except ε α)) (values : Array α)
+    (collected : outcomes.mapM id = .ok values) : values.size = outcomes.size := by
+  rw [Array.mapM_eq_mapM_toList] at collected
+  cases gathered : outcomes.toList.mapM id with
+  | error error =>
+    rw [gathered] at collected
+    contradiction
+  | ok remaining =>
+    rw [gathered] at collected
+    change Except.ok remaining.toArray = Except.ok values at collected
+    cases collected
+    simpa using sequence_length outcomes.toList remaining gathered
+
+/-- Replay joins exactly the results that direct sequential parallel evaluation
+would produce: values stay in source order and the first error in that order wins.
+The statement holds for any encoding and any number of children. -/
+theorem collect_matches_direct (outcomes : Array (Except CloudError α)) (encode : α → Json) :
+    ReplayInterpreter.collect (outcomes.map (recorded encode)) =
+      recorded (fun values => Json.arr (values.map encode)) (outcomes.mapM id) := by
+  have decode_recorded :
+      (fun outcome : Except CloudError α => match recorded encode outcome with
         | .success value => Except.ok value
-        | outcome => Except.error outcome) with
-      | .ok values => .completed (.success (Json.arr values))
-      | .error outcome => .completed outcome := by
-  have collect : (outcomes.map some).mapM id = some outcomes := by
-    simp only [Array.mapM_map, Function.comp_def, id_eq]
-    simpa [pure] using (Array.mapM_pure (m := Option) (xs := outcomes) (f := id))
-  simp only [settle, collect]
-  rfl
+        | other => Except.error other) =
+        (fun outcome => (outcome.map encode).mapError Exit.failure) := by
+    funext outcome
+    cases outcome <;> rfl
+  simp only [ReplayInterpreter.collect, Array.mapM_map, Function.comp_def]
+  erw [decode_recorded]
+  rw [Array.mapM_eq_mapM_toList, sequence_map, Array.mapM_eq_mapM_toList]
+  cases outcomes.toList.mapM id with
+  | error error => rfl
+  | ok values => simp [recorded, Functor.map, Except.map, Except.mapError]
 
-theorem recordChild_missing (children : Array (Option Exit)) (index : Nat) (outcome : Exit)
-    (inside : index < children.size) (missing : children[index]! = none) :
-    recordChild (.suspended children) index outcome =
-      .ok (settle (children.set! index (some outcome))) := by
-  simp [recordChild, Nat.not_le_of_lt inside, missing]
-  rfl
+/-- The ordered reduction above is the one used by the actual direct interpreter.
+Once child outcomes are available, replay's join has the same encoded result. -/
+theorem parallel_join_matches_direct (blobs : BlobStorage Id) (codec : Codec α)
+    (count : Nat) (branches : Fin count → Cloud Id α) :
+    let outcomes := (Array.ofFnM fun index =>
+      (DirectInterpreter.Internal.eval blobs (branches index)).run : Id _)
+    ReplayInterpreter.collect (outcomes.map (recorded codec.encode)) =
+      recorded (fun values => Json.arr (values.map codec.encode))
+        (DirectInterpreter.Internal.evalControl blobs (.parallel codec count branches)).run := by
+  let outcomes := (Array.ofFnM fun index =>
+    (DirectInterpreter.Internal.eval blobs (branches index)).run : Id _)
+  have direct :
+      (DirectInterpreter.Internal.evalControl blobs (.parallel codec count branches)).run =
+        outcomes.mapM id := by
+    change (match outcomes.mapM id with
+      | .ok values => Except.ok values
+      | .error error => Except.error error) = outcomes.mapM id
+    cases outcomes.mapM id <;> rfl
+  dsimp only
+  rw [direct]
+  exact collect_matches_direct outcomes codec.encode
 
-theorem recordChild_existing (children : Array (Option Exit)) (index : Nat) (outcome : Exit)
-    (inside : index < children.size) (recorded : children[index]! = some outcome)
-    (reflexive : (outcome == outcome) = true) :
-    recordChild (.suspended children) index outcome = .ok (settle children) := by
-  simp [recordChild, Nat.not_le_of_lt inside, recorded, reflexive]
-  rfl
-
-theorem settle_suspended {children slots : Array (Option Exit)}
-    (settled : settle children = .suspended slots) : children = slots := by
-  unfold settle at settled
-  split at settled
-  · cases settled; rfl
-  · split at settled <;> cases settled
-
-/-- A suspended result really has an unfilled position. This is about the
-returned array, independently of later publications to the physical journal. -/
-theorem settle_suspended_missing {children slots : Array (Option Exit)}
-    (settled : settle children = .suspended slots) : none ∈ slots := by
-  have same := settle_suspended settled
-  subst slots
-  classical
-  by_cases missing : none ∈ children
-  · exact missing
-  have collect (values : List (Option Exit)) (filled : none ∉ values) :
-      ∃ outcomes, values.mapM id = some outcomes := by
-    induction values with
-    | nil => exact ⟨[], rfl⟩
-    | cons value rest ih =>
-      cases value with
-      | none => exact False.elim (filled (by simp))
-      | some value =>
-        obtain ⟨outcomes, collected⟩ := ih (fun present => filled (by simp [present]))
-        exact ⟨value :: outcomes, by simp [List.mapM_cons, collected]⟩
-  obtain ⟨outcomes, collected⟩ := collect children.toList (by simpa using missing)
-  have complete : children.mapM id = some outcomes.toArray := by
-    rw [Array.mapM_eq_mapM_toList, collected]
-    rfl
-  simp only [settle, complete] at settled
-  split at settled <;> cases settled
-
-/-- A completed group has an outcome at every array position. -/
-theorem settle_filled {children : Array (Option Exit)} {outcome : Exit}
-    (settled : settle children = .completed outcome) (index : Nat) (inside : index < children.size) :
-    ∃ value, children[index]! = some value := by
-  cases slot : children[index]! with
-  | some value => exact ⟨value, rfl⟩
-  | none =>
-    have missing : none ∈ children := by
-      have same : children[index] = none := by simpa only [getElem!_pos children index inside] using slot
-      rw [← same]
-      exact Array.getElem_mem inside
-    rw [settle_missing children missing] at settled
-    cases settled
-
-end LeanCloud.Result
+end LeanCloud.Proofs.Parallel

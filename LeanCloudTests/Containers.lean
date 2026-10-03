@@ -96,6 +96,20 @@ def Context.createWorker (ctx : Context) (name run : String) : IO String := do
     "lean-cloud-worker:dev", "worker", configPath, run]
   return worker
 
+def Context.createScheduler (ctx : Context) (name run : String) : IO String := do
+  let scheduler := ctx.project ++ "-" ++ name
+  ctx.workers.modify (·.push scheduler)
+  discard <| ctx.docker #["create", "--network", ctx.project ++ "_default", "--network-alias", "scheduler",
+    "--name", scheduler, "-v", s!"{ctx.root / "deploy/config.json"}:{configPath}:ro",
+    "-v", ctx.project ++ "_scheduler-data:/data", "lean-cloud-worker:dev", "scheduler", configPath, run]
+  discard <| ctx.docker #["start", scheduler]
+  let deadline := (← IO.monoMsNow) + 30000
+  repeat
+    let result ← ctx.docker #["exec", scheduler, "cloud-demo", "status", configPath, run] (check := false)
+    if result.exitCode == 0 then return scheduler
+    require ((← IO.monoMsNow) < deadline) "Scheduler did not become ready"
+    IO.sleep 200
+
 def Context.start (ctx : Context) (workers : Array String) : IO Unit := do
   discard <| ctx.docker (#["start"] ++ workers)
 
@@ -141,7 +155,8 @@ def Context.checkReport (ctx : Context) (run expected : String)
       require (actual == expected) s!"Wrong durable report. Expected {expected}; got {actual}"
       return
     let temporary := [500, 502, 503, 504].any fun status =>
-      (report.stderr.splitOn "\n").contains s!"S3 read failed (HTTP {status})"
+      ["S3 read", "S3 record read"].any fun operation =>
+        (report.stderr.splitOn "\n").contains s!"{operation} failed (HTTP {status})"
     require (temporary && (← IO.monoMsNow) < deadline)
       s!"Cannot read durable report ({report.exitCode}): {report.stdout}{report.stderr}"
     say s!"S3 is recovering after restart; retrying report {run}."
@@ -163,6 +178,9 @@ private def Context.cleanup (ctx : Context) : IO Unit := do
     bestEffort do discard <| ctx.docker (#["rm", "-f"] ++ workers)
   bestEffort do
     discard <| ctx.compose #["down", "-v", "--remove-orphans"] (timeout := 120)
+  -- createScheduler uses `docker create`, so Compose does not own this volume.
+  bestEffort do
+    discard <| ctx.docker #["volume", "rm", ctx.project ++ "_scheduler-data"] (check := false)
   say s!"Test artifacts retained: {ctx.artifacts}"
 
 def withContext (name : String) (body : Context → IO Unit) : IO Unit := do

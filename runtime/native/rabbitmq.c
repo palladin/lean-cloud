@@ -67,10 +67,12 @@ LEAN_EXPORT lean_obj_res lc_queue_open(b_lean_obj_arg host, uint32_t port,
     amqp_table_entry_t entries[2] = {0};
     entries[0].key = amqp_cstring_bytes("x-queue-type");
     entries[0].value.kind = AMQP_FIELD_KIND_UTF8;
-    entries[0].value.value.bytes = amqp_cstring_bytes("quorum");
-    entries[1].key = amqp_cstring_bytes("x-delivery-limit");
-    entries[1].value.kind = AMQP_FIELD_KIND_I32;
-    entries[1].value.value.i32 = -1;
+    /* The reference deployment is a single persistent broker. Classic queues
+       have no finite redelivery limit; clustered quorum deployment is separate. */
+    entries[0].value.value.bytes = amqp_cstring_bytes("classic");
+    entries[1].key = amqp_cstring_bytes("x-single-active-consumer");
+    entries[1].value.kind = AMQP_FIELD_KIND_BOOLEAN;
+    entries[1].value.value.boolean = 1;
     amqp_table_t arguments = {2, entries};
     amqp_queue_declare(q->publisher, 1, amqp_cstring_bytes(q->queue), !create,
                        1, 0, 0, create ? arguments : amqp_empty_table);
@@ -103,6 +105,19 @@ LEAN_EXPORT lean_obj_res lc_queue_open(b_lean_obj_arg host, uint32_t port,
 LEAN_EXPORT lean_obj_res lc_queue_close(b_lean_obj_arg handle, lean_obj_arg world) {
     (void)world;
     disconnect(lean_get_external_data(handle));
+    return lean_io_result_mk_ok(lean_box(0));
+}
+
+/* Explicit cleanup is used only for completed, temporary status-query inboxes. */
+LEAN_EXPORT lean_obj_res lc_queue_delete(b_lean_obj_arg handle, lean_obj_arg world) {
+    (void)world;
+    cloud_queue *q = lean_get_external_data(handle);
+    if (!q->publisher) return error("RabbitMQ publisher is closed");
+    /* Callers retire only their own completed temporary inbox,
+       never an actor's live durable mailbox. */
+    amqp_queue_delete(q->publisher, 1, amqp_cstring_bytes(q->queue), 0, 0);
+    if (amqp_get_rpc_reply(q->publisher).reply_type != AMQP_RESPONSE_NORMAL)
+        return error("RabbitMQ mailbox deletion failed");
     return lean_io_result_mk_ok(lean_box(0));
 }
 

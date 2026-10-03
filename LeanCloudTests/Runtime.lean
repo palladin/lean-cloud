@@ -5,47 +5,36 @@ open Containers
 
 def run (build : Bool) : IO Unit := withContext "test" fun ctx => do
   if build then
-    discard <| ctx.compose #["build", "worker"] (timeout := 1800)
-    discard <| ctx.compose #["build", "checks"] (timeout := 1800)
-  discard <| ctx.compose #["up", "-d", "--wait", "db", "queue", "blobs"] (timeout := 180)
-  let checks ← ctx.compose #["run", "--rm", "--no-deps", "checks", configPath, "properties"] (timeout := 180)
+    discard <| ctx.compose #["build", "worker", "checks"] (timeout := 1800)
+  discard <| ctx.compose #["up", "-d", "--wait", "broker", "blobs"] (timeout := 180)
+  let checks ← ctx.compose #["run", "--rm", "--no-deps", "checks", configPath] (timeout := 300)
   say ((checks.stdout.trimAscii.toString.splitOn "\n").getLast!)
-
   discard <| ctx.compose #["run", "--rm", "--no-deps", "submit", "submit", configPath, "normal"]
+  let scheduler ← ctx.createScheduler "scheduler" "normal"
   let workers ← (Array.range 3).mapM fun i => ctx.createWorker s!"normal-{i}" "normal"
   ctx.start workers
   ctx.waitAll workers
   ctx.checkReport "normal" "files=16, errors=24"
   let mut participants := 0
   for worker in workers do
-    if ((← ctx.logs worker).splitOn "\n").any (·.startsWith "work ") then
+    if ((← ctx.logs worker).splitOn "\n").any (fun line => (line.splitOn " location=").length > 1) then
       participants := participants + 1
-  require (participants ≥ 2) s!"Expected multiple workers to process locations; observed {participants}"
+  require (participants ≥ 2) s!"Expected multiple workers; observed {participants}"
   say s!"Parallel demo: {participants} worker containers processed locations."
-
-  discard <| ctx.compose #["run", "--rm", "--no-deps", "-v",
-    s!"{ctx.root / "deploy/recovery-input.json"}:/input.json:ro",
-    "submit", "submit", configPath, "recovery", "/input.json"]
-  let victim ← ctx.createWorker "interrupted" "recovery"
-  ctx.start #[victim]
-  let deadline := (← IO.monoMsNow) + 10000
-  repeat
-    if ((← ctx.logs victim).splitOn "\n").contains "work 0:0/0:4" then break
-    require ((← IO.monoMsNow) < deadline) "Worker did not reach the expected exec location"
-    checkExit victim (← ctx.status victim)
-    IO.sleep 100
-  require (← ctx.crash victim) "Worker finished before the targeted crash"
-  let replacements ← (Array.range 2).mapM fun i => ctx.createWorker s!"recovery-{i}" "recovery"
-  ctx.start replacements
-  ctx.waitAll replacements
-  ctx.checkReport "recovery" "files=4, errors=6"
-  say "Recovery demo: killed a worker during exec; replacement workers completed the run."
-
-  discard <| ctx.compose #["restart", "db", "queue", "blobs"]
-  discard <| ctx.compose #["up", "-d", "--wait", "db", "queue", "blobs"] (timeout := 180)
+  require (← ctx.crash scheduler) "Scheduler was not running"
+  discard <| ctx.compose #["run", "--rm", "--no-deps", "checks", configPath, "mailbox-seed", "persistence"]
+  discard <| ctx.compose #["kill", "-s", "SIGKILL", "broker"]
+  discard <| ctx.compose #["restart", "blobs"]
+  discard <| ctx.compose #["up", "-d", "--wait", "broker", "blobs"] (timeout := 180)
+  discard <| ctx.compose #["run", "--rm", "--no-deps", "checks", configPath, "mailbox-check", "persistence"]
+  ctx.start #[scheduler]
   ctx.checkReport "normal" "files=16, errors=24" (restartTimeout := 60)
-  ctx.checkReport "recovery" "files=4, errors=6" (restartTimeout := 60)
-  say "Persistence: both reports survived restarting all three services."
+  let fresh ← ctx.createWorker "fresh" "normal"
+  ctx.start #[fresh]
+  ctx.waitAll #[fresh]
+  require (!((← ctx.logs fresh).splitOn "\n").any (fun line => (line.splitOn " location=").length > 1))
+    "A fresh worker executed work for a completed run"
+  say "Persistence: confirmed mail survived broker SIGKILL; scheduler state and blob results survived restart."
   say "All real runtime checks passed."
 
 end LeanCloudTests.Runtime

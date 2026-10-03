@@ -14,8 +14,8 @@ open LeanEff
 namespace Internal
 
 mutual
-  def eval {σ α : Type} {m : Type → Type u} [Monad m]
-      (blobs : BlobStorage σ m) (program : Cloud m α) : ExceptT CloudError (StateT σ m) α :=
+  def eval {α : Type} {m : Type → Type u} [Monad m]
+      (blobs : BlobStorage m) (program : Cloud m α) : ExceptT CloudError m α :=
     match program with
     | EffF.pure value => pure value
     | .impure request continuation => do
@@ -23,24 +23,24 @@ mutual
       evalContinuation blobs continuation value
   termination_by structural program
 
-  def evalControl {σ α : Type} {m : Type → Type u} [Monad m]
-      (blobs : BlobStorage σ m) (request : Control m α) : ExceptT CloudError (StateT σ m) α :=
+  def evalControl {α : Type} {m : Type → Type u} [Monad m]
+      (blobs : BlobStorage m) (request : Control m α) : ExceptT CloudError m α :=
     match request with
     | .delay => pure ()
     | .fail error => throw error
     | .sequential _ operation => blobs.execute operation
     | .choice .. => throw ⟨.unsupported, "Choice is not implemented yet"⟩
     | .parallel _ _ branches => do
-      let outcomes ← liftM (m := StateT σ m)
+      let outcomes ← liftM (m := m)
         (Array.ofFnM fun index => (eval blobs (branches index)).run)
       match outcomes.mapM id with
       | .ok values => return values
       | .error error => throw error
   termination_by structural request
 
-  def evalContinuation {σ α β : Type} {m : Type → Type u} [Monad m]
-      (blobs : BlobStorage σ m) (continuation : ArrsF (Control m) α β) (value : α) :
-      ExceptT CloudError (StateT σ m) β :=
+  def evalContinuation {α β : Type} {m : Type → Type u} [Monad m]
+      (blobs : BlobStorage m) (continuation : ArrsF (Control m) α β) (value : α) :
+      ExceptT CloudError m β :=
     match continuation with
     | .one k => eval blobs (k value)
     | .append first rest => do
@@ -52,9 +52,9 @@ end
 end Internal
 
 /-- Evaluate the original program directly, with no execution-step budget. -/
-def interpret {σ ι α : Type} {m : Type → Type u} [Monad m]
-    (blobs : BlobStorage σ m) (program : ι → Cloud m α) (input : ι) :
-    ExceptT CloudError (StateT σ m) α :=
+def interpret {ι α : Type} {m : Type → Type u} [Monad m]
+    (blobs : BlobStorage m) (program : ι → Cloud m α) (input : ι) :
+    ExceptT CloudError m α :=
   Internal.eval blobs (program input)
 
 end LeanCloud.DirectInterpreter

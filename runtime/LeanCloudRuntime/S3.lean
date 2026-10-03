@@ -99,14 +99,43 @@ def resolve (config : Config) (name : String) : ExceptT CloudError IO BlobRef :=
     return ref
   | .error _ => throw ⟨.codec, "Invalid blob name record"⟩
 
-def storage (config : Config) : BlobStorage Unit IO where
-  putBlob bytes state := return (.ok (← putBytes config bytes), state)
-  readBlob ref state := return (← (readBytes config ref).run, state)
-  resolveBlob name state := return (← (resolve config name).run, state)
+def storage (config : Config) : BlobStorage IO where
+  putBlob bytes := liftM (putBytes config bytes)
+  readBlob ref := readBytes config ref
+  resolveBlob name := resolve config name
 
-def connect (config : Config) : IO (Worker.Connection (BlobStorage Unit IO)) := do
-  unless config.endpoint.startsWith "http://" || config.endpoint.startsWith "https://" do
-    throw (IO.userError "S3 endpoint must use http or https")
-  return ⟨storage config, pure ()⟩
+private def recordPath (run key : String) : IO String := do
+  return "/runs/" ++ component run ++ "/records/" ++ (← digest key.toUTF8)
+
+/-- Run definitions and replay records share the global blob service, in a
+namespace separate from user blobs. The original key detects mismatched data. -/
+def readJson (config : Config) (run key : String) : IO (Option Json) := do
+  let (status, bytes) ← request config "GET" (← recordPath run key)
+  if status == 404 then return none
+  unless status == 200 do throw (IO.userError s!"S3 record read failed (HTTP {status})")
+  let some text := String.fromUTF8? bytes | throw (IO.userError "Invalid record UTF-8")
+  let (storedKey, value) ← IO.ofExcept (Json.parse text >>= fromJson? (α := String × Json))
+  unless storedKey == key do throw (IO.userError "Record does not match its key")
+  return some value
+
+/-- Conditional creation selects one durable value. A losing attempt uses the
+winner. A 409 can occur before any winner is visible, so retry that conflict. -/
+def createJson (config : Config) (run key : String) (value : Json) : IO Json := do
+  let path ← recordPath run key
+  for _ in [:8] do
+    let (status, _) ← request config "PUT" path (toJson (key, value)).compress.toUTF8 true
+    if 200 ≤ status && status < 300 then return value
+    unless status == 409 || status == 412 do
+      throw (IO.userError s!"S3 record creation failed (HTTP {status})")
+    if let some existing ← readJson config run key then return existing
+    IO.sleep 50
+  throw (IO.userError "S3 conditional creation did not settle")
+
+def records (config : Config) (run : String) : ReplayStore IO where
+  read key := do
+    let some value ← readJson config run key | return none
+    return some (← IO.ofExcept (fromJson? value))
+  create key record := do
+    IO.ofExcept (fromJson? (← createJson config run key (toJson record)))
 
 end LeanCloudRuntime.S3

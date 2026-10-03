@@ -37,11 +37,11 @@ the other contains the third. `Cloud.parallel` returns one count per batch. The
 workflow sums the counts, saves the report, and returns its `BlobRef`.
 
 Run the [complete example](runtime/LeanCloudRuntime/Demo.lean) with three worker
-containers, PostgreSQL, RabbitMQ, and shared S3 blob storage:
+containers, one scheduler, RabbitMQ mailboxes, and shared S3 blob storage:
 
 ```sh
 docker compose up --build -d --scale worker=3
-docker compose logs -f worker
+docker compose logs -f scheduler worker
 ```
 
 Once the workers finish, read the saved report:
@@ -62,53 +62,36 @@ calculation. Ordinary `pure value` and `return value` retain their usual meaning
 during replay; an external action may run again if interrupted before its result
 is recorded.
 
-The interpreters use separate interfaces: [Db](LeanCloud/Db.lean) stores execution
-records; [BlobStorage](LeanCloud/BlobStorage.lean) handles user blobs. The direct interpreter is a simple, structurally recursive reference:
-it runs parallel children in array order and needs no fuel or scheduling policy.
+One scheduler organizes assignments and parallel joins through durable RabbitMQ mailbox
+messages. Workers execute the workflow and write immutable replay records directly
+to shared blob storage. The scheduler keeps only coordination metadata in its own
+local SQLite database. Each actor has its own queue; there is no shared work queue or shared execution database.
 
-Replay takes work from an environment-provided [queue](LeanCloud/WorkQueue.lean).
-The environment retains pending locations and the final outcome across restarts;
-the interpreter executes each selected location without a discovery pass.
-Branches may interleave, while results retain their original array order.
-Each worker runs the same interpreter in its own process. The container runtime
-connects it to PostgreSQL through lean-linq, RabbitMQ, and S3-compatible storage.
-Choice, cancellation, and native Azure/AWS queue adapters remain future work.
-
-[JournalDb](LeanCloud/JournalDb.lean) stores each child's outcome separately, so
-sibling completions cannot overwrite each other. The
-[lease adapter](LeanCloud/LeaseQueue.lean) publishes successors or the final result
-before acknowledging a delivery.
-
-The [worker simulation](LeanCloud/Simulation.md) runs the same interpreter over
-`SimM`. An external driver interleaves atomic backend operations, delays replies,
-crashes workers, restarts them with fresh local state, and advances lease time.
-Durable records and queued work survive. Single-worker recovery and concurrent
-execution use this same model.
-
-Build and run the tests with the pinned Lean toolchain:
+The [direct interpreter](LeanCloud/DirectInterpreter.lean) remains the simple
+sequential reference. [Sim](LeanCloud/Simulation.md) runs the same scheduler,
+workers, and replay interpreter with controlled message delivery, crashes, and
+restarts. Parallel results keep their original array order.
 
 ```sh
 lake build
 lake test
 ```
 
-The [test suite](LeanCloudTests/README.md) compares the interpreters and checks
-recovery after interruption. The [main theorems](LeanCloud/Proofs/MainTheorems.lean)
-start with `pure_replay_matches_direct`: an entirely pure Db and deterministic
-work list give the same value or error as direct evaluation, with sufficient
-fuel. The next theorem generalizes this to a lawful, fair queue that may select
-branches in any order.
+The [tests](LeanCloudTests/README.md) compare direct and replay execution, including
+recovery after scheduler and worker crashes. Real adapter and container checks:
 
-The [proof model](LeanCloud/Proofs/README.md) covers ordinary pure values, delay,
-failure, and parallel control flow. The main
-[`ConcurrentRecovery.concurrent_replay_matches_direct`](LeanCloud/Proofs/MainTheorems.lean)
-theorem proves that concurrent replay returns the direct interpreter's outcome
-and stores its encoding in the durable completion record. Fair scheduling and
-delivery after crashes stop supply a completing prefix and sufficient finite fuel.
-Runtime exec and blob operations remain available outside this theorem; real
-adapters are checked separately by integration tests. The theorem uses
-[shared service contracts](LeanCloud/Backend.md), allowing unordered delivery,
-duplicates, stale acknowledgements, and requests that commit after a worker crashes.
-Run integration tests with
-`lake exe cloud_runtime_tests`, or inject random worker crashes with
-`lake exe cloud_chaos --seed 1`.
+```sh
+lake exe cloud_runtime_tests
+lake exe cloud_chaos --seed 1
+```
+
+The redesign replaces the previous shared-queue protocol and its proofs.
+[Current proofs](LeanCloud/Proofs/MainTheorems.lean) cover immutable records,
+durable mailbox operations, scheduler recovery, recorded-prefix reconstruction,
+and concurrent execution: whenever the scheduler finishes a pure workflow, its
+durable result equals direct evaluation, even after crashes and message redelivery.
+With sufficient interpreter fuel and recurring opportunities to execute an
+assignment and save its report before expiry, the workflow eventually finishes
+with that same result. These execution and delivery assumptions are explicit
+in the [proof guide](LeanCloud/Proofs/README.md). Choice, cancellation, and
+provider-specific deployment automation remain future work.

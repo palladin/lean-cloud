@@ -1,123 +1,112 @@
-import LeanCloud.Location
-import Init.Data.Nat.ToString
+import LeanCloud.ReplayStore
+import Std.Data.String.ToNat
+import Init.Data.String.Lemmas.Pattern.Split.Char
 import Init.Data.String.Lemmas.Intercalate
-import Init.Data.List.SplitOn.Lemmas
-import Init.Data.Array.Extract
-import Init.Omega
 
-/-! Navigation and unambiguous storage keys for nonempty replay locations.
-The decoder below is only a proof device; the runtime key format is unchanged. -/
+namespace LeanCloud.Proofs.Location
 
-namespace LeanCloud.Location
+private def label (address : Nat × Nat) : String := s!"{address.1}:{address.2}"
 
-private def levelKey (position : Nat × Nat) : String := s!"{position.1}:{position.2}"
-
-private theorem separator_not_in_digits (separator : Char) (notDigit : separator.isDigit = false)
-    (n : Nat) : separator ∉ Nat.toDigits 10 n := by
+private theorem repr_excludes (n : Nat) (separator : Char)
+    (notDigit : separator.isDigit = false) (notUnderscore : separator ≠ '_') :
+    separator ∉ (Nat.repr n).toList := by
   intro member
-  have digit := Nat.isDigit_of_mem_toDigits (by decide : 0 < 10) (by decide : 10 ≤ 10) member
-  simp [notDigit] at digit
+  have allowed := (String.isNat_iff.mp (Nat.isNat_repr n)).2.1 separator member
+  simp [notDigit, notUnderscore] at allowed
 
-private theorem level_no_separator (position : Nat × Nat) : '/' ∉ (levelKey position).toList := by
-  simp [levelKey, String.toList_append, show (toString ":").toList = [':'] from rfl,
-    separator_not_in_digits '/' (by decide)]
+private theorem label_excludes_slash (address : Nat × Nat) : '/' ∉ (label address).toList := by
+  simpa [label, ToString.toString, String.toList_append] using
+    And.intro (repr_excludes address.1 '/' (by decide) (by decide))
+      (repr_excludes address.2 '/' (by decide) (by decide))
 
-private def decodeLevel (chars : List Char) : Nat × Nat :=
-  match chars.splitOn ':' with
-  | [branch, command] => (Nat.ofDigitChars 10 branch 0, Nat.ofDigitChars 10 command 0)
-  | _ => (0, 0)
+private theorem label_nonempty (address : Nat × Nat) : label address ≠ "" := by
+  simp [label]
 
-private theorem decodeLevel_key (position : Nat × Nat) :
-    decodeLevel (levelKey position).toList = position := by
-  have split : (levelKey position).toList.splitOn ':' =
-      [Nat.toDigits 10 position.1, Nat.toDigits 10 position.2] := by
-    have separated := List.splitOn_intercalate ':'
-      (ls := [Nat.toDigits 10 position.1, Nat.toDigits 10 position.2])
-      (by simp [separator_not_in_digits ':' (by decide)]) (by simp)
-    simpa [levelKey, String.toList_append, List.intercalate,
-      show (toString ":").toList = [':'] from rfl] using separated
-  simp [decodeLevel, split]
+private theorem split_label (address : Nat × Nat) :
+    ((label address).split ':').toList.map (·.copy) = [Nat.repr address.1, Nat.repr address.2] := by
+  have parts := String.toList_split_intercalate (c := ':') (l := [Nat.repr address.1, Nat.repr address.2])
+    (by
+      intro text member
+      simp only [List.mem_cons, List.not_mem_nil, or_false] at member
+      rcases member with rfl | rfl
+      · exact repr_excludes address.1 ':' (by decide) (by decide)
+      · exact repr_excludes address.2 ':' (by decide) (by decide))
+  rw [String.intercalate_cons_cons, String.intercalate_singleton] at parts
+  simpa [label, ToString.toString] using! parts
 
-private def decodeKey (text : String) : List (Nat × Nat) :=
-  (text.toList.splitOn '/').map decodeLevel
+private theorem label_injective (left right : Nat × Nat) (same : label left = label right) : left = right := by
+  have parts := congrArg (fun text : String => (text.split ':').toList.map (·.copy)) same
+  simp only [split_label, List.cons.injEq, and_true, Nat.repr_inj] at parts
+  exact Prod.ext parts.1 parts.2
 
-private theorem decodeKey_key (location : Location) (nonempty : 0 < location.size) :
-    decodeKey location.key = location.toList := by
-  have separated := List.splitOn_intercalate '/'
-    (ls := location.toList.map fun position => (levelKey position).toList)
-    (by simp only [List.mem_map]; rintro _ ⟨position, _, rfl⟩; exact level_no_separator position)
-    (by simpa using (Nat.ne_of_gt nonempty))
-  have split : location.key.toList.splitOn '/' =
-      location.toList.map (fun position => (levelKey position).toList) := by
-    simpa only [key, levelKey, String.toList_intercalate, List.map_map, Function.comp_def,
-      show "/".toList = ['/'] from rfl] using separated
-  simp only [decodeKey, split, List.map_map, Function.comp_def, decodeLevel_key]
-  change location.toList.map id = location.toList
-  exact List.map_id _
+private theorem split_key (location : LeanCloud.Location) :
+    (((location.key).split '/').toList.map (·.copy)).filter (· != "") =
+      location.toList.map label := by
+  have parts := String.toList_split_intercalate (c := '/') (l := location.toList.map label) (by
+    intro text member
+    obtain ⟨address, _, rfl⟩ := List.mem_map.mp member
+    exact label_excludes_slash address)
+  have noEmpty : (location.toList.map label).filter (· != "") = location.toList.map label := by
+    apply List.filter_eq_self.mpr
+    intro text member
+    obtain ⟨address, _, rfl⟩ := List.mem_map.mp member
+    simpa using label_nonempty address
+  change (((String.intercalate (String.singleton '/') (location.toList.map label)).split '/').toList.map
+    (·.copy)).filter (· != "") = _
+  rw [parts]
+  split
+  · simp_all
+  · exact noEmpty
 
-/-- Distinct nonempty locations cannot alias the same journal key. Every location
-used by the interpreter is nonempty, beginning with the root position. -/
-theorem key_injective {left right : Location} (leftNonempty : 0 < left.size)
-    (rightNonempty : 0 < right.size) (equal : left.key = right.key) : left = right := by
-  have decoded := congrArg decodeKey equal
-  rw [decodeKey_key left leftNonempty, decodeKey_key right rightNonempty] at decoded
-  exact Array.toList_inj.mp decoded
+/-- The human-readable `branch:command/...` encoding never aliases locations. -/
+theorem key_injective {left right : LeanCloud.Location} (same : left.key = right.key) : left = right := by
+  have parts := congrArg (fun text : String =>
+    ((text.split '/').toList.map (·.copy)).filter (· != "")) same
+  rw [split_key, split_key] at parts
+  exact Array.toList_inj.mp ((List.map_inj_right label_injective).mp parts)
 
-@[simp] theorem size_child (location : Location) (index : Nat) :
-    (location.child index).size = location.size + 1 := by simp [child]
+theorem value_key_injective {left right : LeanCloud.Location}
+    (same : ReplayStore.valueKey left = ReplayStore.valueKey right) : left = right := by
+  apply key_injective
+  simpa [ReplayStore.valueKey] using same
 
-@[simp] theorem size_next (location : Location) : location.next.size = location.size := by
-  simp [next]
+theorem return_key_injective {left right : LeanCloud.Location}
+    (same : ReplayStore.returnKey left = ReplayStore.returnKey right) : left = right := by
+  apply key_injective
+  simpa [ReplayStore.returnKey] using same
 
-theorem parent_child (location : Location) (nonempty : 0 < location.size) (index : Nat) :
-    (location.child index).parent? = some (location, index) := by
-  simp [parent?, child, show ¬location.size + 1 ≤ 1 by omega]
+/-- An intermediate value can never overwrite any branch's completion record. -/
+theorem value_key_ne_return_key (valueLocation branch : LeanCloud.Location) :
+    ReplayStore.valueKey valueLocation ≠ ReplayStore.returnKey branch := by
+  intro same
+  have last := congrArg (fun text : String => text.toList.getLast?) same
+  simp [ReplayStore.valueKey, ReplayStore.returnKey, String.toList_append] at last
 
-/-- A child's current command may have advanced since entry; its parent still
-has exactly one fewer location level. -/
-theorem parent_size {current parent : Location} {index : Nat}
-    (hasParent : current.parent? = some (parent, index)) :
-    0 < parent.size ∧ current.size = parent.size + 1 := by
-  unfold parent? at hasParent
-  split at hasParent
-  · cases hasParent
-  · have equal := (Option.some.inj hasParent).symm
-    have parentEqual := congrArg Prod.fst equal
-    simp only at parentEqual
-    rw [parentEqual]
-    simp only [Array.size_extract]
-    omega
+/-- Advancing a command retains the complete ancestry and branch index. -/
+theorem next_push (parent : LeanCloud.Location) (branch command : Nat) :
+    LeanCloud.Location.next (parent.push (branch, command)) = parent.push (branch, command + 1) := by
+  simp [LeanCloud.Location.next, Array.setIfInBounds, Array.set_push]
 
-theorem parent_key_ne {current parent : Location} {index : Nat}
-    (hasParent : current.parent? = some (parent, index)) : parent.key ≠ current.key := by
-  obtain ⟨nonempty, size⟩ := parent_size hasParent
-  intro equal
-  have same := key_injective nonempty (by omega) equal
-  have sameSize := congrArg Array.size same
-  omega
+/-- Proof-only identification of the branch containing a replay command. -/
+def branchStart (location : LeanCloud.Location) : LeanCloud.Location :=
+  location.set! (location.size - 1) (location[location.size - 1]!.1, 0)
 
-theorem entersChild_size {current target : Location}
-    (enters : current.entersChild target = true) : current.size < target.size := by
-  simp only [entersChild, Bool.and_eq_true, decide_eq_true_eq] at enters
-  exact enters.1
+@[simp] theorem branchStart_push (parent : LeanCloud.Location) (branch command : Nat) :
+    branchStart (parent.push (branch, command)) = parent.push (branch, 0) := by
+  simp [branchStart, Array.setIfInBounds, Array.set_push]
 
-/-- Every position of an ancestor is preserved in a descendant's location. -/
-theorem entersChild_position {ancestor target : Location}
-    (enters : ancestor.entersChild target = true) (index : Nat)
-    (inside : index < ancestor.size) : target[index]! = ancestor[index]! := by
-  simp only [entersChild, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq] at enters
-  have same := congrArg (fun location : Location => location[index]!) enters.2
-  simpa [getElem!_pos, inside, show index < target.size by omega,
-    show index < min ancestor.size target.size by omega] using same.symm
+@[simp] theorem branchStart_next (location : LeanCloud.Location) :
+    branchStart location.next = branchStart location := by
+  by_cases empty : location = #[]
+  · subst location; rfl
+  · obtain ⟨parent, ⟨branch, command⟩, rfl⟩ := Array.exists_push_of_ne_empty empty
+    simp [next_push]
 
-/-- Descending through nested groups retains the outer ancestor. -/
-theorem entersChild_trans {ancestor middle target : Location}
-    (first : ancestor.entersChild middle = true) (second : middle.entersChild target = true) :
-    ancestor.entersChild target = true := by
-  simp only [entersChild, Bool.and_eq_true, decide_eq_true_eq, beq_iff_eq] at first second ⊢
-  refine ⟨by omega, ?_⟩
-  have same := congrArg (fun location : Location => location.extract 0 ancestor.size) second.2
-  simp only [Array.extract_extract, Nat.zero_add, Nat.min_eq_left (Nat.le_of_lt first.1)] at same
-  exact first.2.trans same
+@[simp] theorem branchStart_child (location : LeanCloud.Location) (index : Nat) :
+    branchStart (location.child index) = location.child index := by
+  simp [LeanCloud.Location.child]
 
-end LeanCloud.Location
+@[simp] theorem branchStart_root : branchStart LeanCloud.Location.root = LeanCloud.Location.root :=
+  branchStart_push #[] 0 0
+
+end LeanCloud.Proofs.Location
