@@ -8,7 +8,7 @@ open ConsoleModel (World Invocation)
 private def ctx : Context := ⟨"/work", "lean-cloud-console"⟩
 private def info : ProgramInfo :=
   ⟨"squares/v1", "array/nat", "nat/v1", "Square numbers", some (toJson (#[2, 3, 4] : Array Nat)),
-    some ⟨"Squares.lean", "cloud {\n  Cloud.pure \"square\" (fun () => 29)\n}", #[⟨"square", 2⟩]⟩⟩
+    #[⟨"Squares.lean", "cloud {\n  Cloud.pure \"square\" (fun () => 29)\n}", #[⟨"square", 2, 0, 2, 0⟩]⟩]⟩
 private def savedRun : Run := ⟨"one", "sha256:pinned", info, info.sampleInput.getD Json.null, defaultWorkerCount⟩
 private def has (text fragment : String) : Bool := (text.splitOn fragment).length > 1
 private def response (text : String := "") : Except String ProcessOutput := .ok { stdout := text }
@@ -30,7 +30,7 @@ private def process (completed : Bool) (call : Invocation) : Except String Proce
     response (toJson (if completed then Exit.success (toJson (29 : Nat)) else .cancelled "Killed by user")).compress
   else if args[0]? == some "logs" then
     let worker := (args.back?.getD "").splitOn "-" |>.getLast!
-    let event : ExecutionEvent := ⟨"boot", 1, 10, worker, some 1, "0:1", "execute", "square", savedRun.id⟩
+    let event : ExecutionEvent := ⟨"boot", 1, 10, worker, some 1, "0:1", "execute", "square", savedRun.id, some "square"⟩
     response ("@lean-cloud " ++ (toJson event).compress ++ "\n")
   else if args[0]? == some "stats" then
     response (Json.mkObj [("Name", toJson (ctx.node "worker1")),
@@ -396,7 +396,7 @@ def consoleEffectCases : Array TestCase := #[
       assertTrue (has world.stdout text) s!"Missing command output: {text}"
     assertTrue (!world.stdout.contains '\x1b' && !world.trace.contains "enterTerminal") "--once entered raw terminal"⟩,
   ⟨"console.effects.shared-node-traces-stay-with-the-run", do
-    let event : ExecutionEvent := ⟨"shared", 1, 1, "worker1", some 0, "0:0", "execute", "other-work", "another"⟩
+    let event : ExecutionEvent := ⟨"shared", 1, 1, "worker1", some 0, "0:0", "execute", "other-work", "another", none⟩
     let handle (call : Invocation) := do
       let out ← process true call
       if call.args[0]? == some "logs" then
@@ -411,7 +411,7 @@ def consoleEffectCases : Array TestCase := #[
   ⟨"console.effects.watch-history-offline-and-all-states", do
     for control in [RunControl.active, .paused, .killed] do
       let step : LeanCloudCli.Trace.Step := ⟨"2026-01-01T00:00:00.000000000Z",
-        ⟨"boot", 1, 10, "worker1", some 1, "0:1", "execute", "square", savedRun.id⟩, none⟩
+        ⟨"boot", 1, 10, "worker1", some 1, "0:1", "execute", "square", savedRun.id, some "square"⟩, none⟩
       let initial := (launched).json (ctx.directory savedRun.id / "trace.json") #[step]
         |>.json (ctx.directory savedRun.id / "watch-status.json") "completed"
         |>.json (ctx.directory savedRun.id / "control.json") control
@@ -434,7 +434,7 @@ def consoleEffectCases : Array TestCase := #[
       let worker := (call.args.back?.getD "").splitOn "-" |>.getLast!
       let lines := (Array.range 120).map fun i =>
         let event : ExecutionEvent := ⟨if i < 50 then "old" else "new", i, i, worker, some 1,
-          s!"0:{i}", "execute", "square", if i < 110 then savedRun.id else "other"⟩
+          s!"0:{i}", "execute", "square", if i < 110 then savedRun.id else "other", some "square"⟩
         "@lean-cloud " ++ (toJson event).compress
       return { out with stdout := String.intercalate "\n" lines.toList }
     let (snapshot, saved) ← checked (LeanCloudCli.Trace.load ctx savedRun) { launched with process := handler }

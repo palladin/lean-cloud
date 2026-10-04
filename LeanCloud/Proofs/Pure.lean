@@ -3,6 +3,8 @@ import LeanCloud.Proofs.Direct
 namespace LeanCloud.Proofs.Pure
 open LeanEff DirectInterpreter.Internal
 
+variable {info : Option SourceSiteId}
+
 /-- A codec must preserve the values crossing a replay boundary. -/
 def RoundTrips (codec : Codec α) : Prop :=
   ∀ value, codec.decode (codec.encode value) = .ok value
@@ -23,30 +25,30 @@ Arbitrary base-monad actions and blob effects are deliberately outside this
 relation. It describes existing Cloud programs, not another program type. -/
 inductive Evaluation {m : Type → Type u} [Monad m] :
     {α : Type} → Cloud m α → Except CloudError α → Prop where
-  | pure (value : α) : Evaluation (EffF.pure value) (.ok value)
-  | fail (error : CloudError) (next : ArrsF (Control m) α β) :
-      Evaluation (.impure (.fail error) next) (.error error)
-  | delay (next : ArrsF (Control m) Unit α)
+  | pure {info : Option SourceSiteId} (value : α) : Evaluation (EffF.pure info value) (.ok value)
+  | fail {info : Option SourceSiteId} (error : CloudError) (next : ArrsF (Control m) SourceSiteId α β) :
+      Evaluation (.impure info (.fail error) next) (.error error)
+  | delay {info : Option SourceSiteId} (next : ArrsF (Control m) SourceSiteId Unit α)
       (rest : Evaluation (next.apply ()) outcome) :
-      Evaluation (.impure .delay next) outcome
-  | exec (codec : Codec α) (label : String) (body : Unit → α)
-      (next : ArrsF (Control m) α β)
+      Evaluation (.impure info .delay next) outcome
+  | exec {info : Option SourceSiteId} (codec : Codec α) (label : String) (body : Unit → α)
+      (next : ArrsF (Control m) SourceSiteId α β)
       (roundtrip : codec.decode (codec.encode (body ())) = .ok (body ()))
       (rest : Evaluation (next.apply (body ())) outcome) :
-      Evaluation (.impure (.command codec (.exec label (fun _ => pure (body ())))) next) outcome
-  | parallelOk (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
-      (next : ArrsF (Control m) (Array α) β) (outcomes : Fin count → Except CloudError α)
+      Evaluation (.impure info (.command codec (.exec label (fun _ => pure (body ())))) next) outcome
+  | parallelOk {info : Option SourceSiteId} (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
+      (next : ArrsF (Control m) SourceSiteId (Array α) β) (outcomes : Fin count → Except CloudError α)
       (roundtrip : RoundTrips codec)
       (children : ∀ index, Evaluation (branches index) (outcomes index))
       (collected : (Array.ofFn outcomes).mapM id = .ok values)
       (rest : Evaluation (next.apply values) outcome) :
-      Evaluation (.impure (.parallel codec count branches) next) outcome
-  | parallelError (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
-      (next : ArrsF (Control m) (Array α) β) (outcomes : Fin count → Except CloudError α)
+      Evaluation (.impure info (.parallel codec count branches) next) outcome
+  | parallelError {info : Option SourceSiteId} (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
+      (next : ArrsF (Control m) SourceSiteId (Array α) β) (outcomes : Fin count → Except CloudError α)
       (roundtrip : RoundTrips codec)
       (children : ∀ index, Evaluation (branches index) (outcomes index))
       (collected : (Array.ofFn outcomes).mapM id = .error error) :
-      Evaluation (.impure (.parallel codec count branches) next) (.error error)
+      Evaluation (.impure info (.parallel codec count branches) next) (.error error)
 
 private theorem eval_parallel {m : Type → Type u} [Monad m] [LawfulMonad m]
     (blobs : BlobStorage m) (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)

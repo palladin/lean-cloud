@@ -1,5 +1,6 @@
 import LeanEff.Core
 import LeanCloud.Protocol
+import LeanCloud.SourceInfo
 
 universe u
 
@@ -18,7 +19,7 @@ inductive Control (m : Type → Type u) : Type → Type (max 1 u) where
   | delay : Control m Unit
   | fail {α : Type} : CloudError → Control m α
   | parallel {α : Type} (codec : Codec α) (count : Nat) :
-      (Fin count → EffF (Control m) α) → Control m (Array α)
+      (Fin count → EffF (Control m) SourceSiteId α) → Control m (Array α)
   | command {α : Type} (codec : Codec α) (operation : Operation m α) : Control m α
 
 end LeanCloud

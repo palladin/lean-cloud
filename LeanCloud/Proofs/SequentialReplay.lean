@@ -5,6 +5,8 @@ import LeanCloud.Proofs.Recording
 namespace LeanCloud.Proofs.SequentialReplay
 open Lean LeanEff ReplayModel ReplayInterpreter Reconstruction SequentialCursor SequentialExecution
 
+variable {info : Option SourceSiteId}
+
 variable [rootCodec : Codec α] (blobs : BlobStorage M) (source : Cloud M α)
 
 abbrev sourceSteps : Step := steps blobs (fun _ : Unit => source) ()
@@ -74,7 +76,7 @@ private theorem run_list (expected initial : Journal) (items : List κ)
 
 private theorem join_records (expected journal : Journal) (assignment : Assignment)
     (encode : β → Json) (codec : Codec γ) (count : Nat) (branches : Fin count → Cloud M γ)
-    (next : ArrsF (Control M) (Array γ) β) (outcome : Exit)
+    (next : ArrsF (Control M) SourceSiteId (Array γ) β) (outcome : Exit)
     (joining : assignment.joining = true) (consistent : Extends journal expected)
     (known : expected.lookup (ReplayStore.valueKey assignment.location) =
       some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, outcome⟩)
@@ -82,8 +84,8 @@ private theorem join_records (expected journal : Journal) (assignment : Assignme
     ∃ after, Extends journal after ∧ Extends after expected ∧
       after.lookup (ReplayStore.valueKey assignment.location) =
         some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, outcome⟩ ∧
-      ∀ fuel, (walk store blobs assignment (fuel + 1) encode (.impure (.parallel codec count branches) next) assignment.location true).run journal =
-        (walk store blobs assignment (fuel + 1) encode (.impure (.parallel codec count branches) next) assignment.location true).run after := by
+      ∀ fuel, (walk store blobs assignment (fuel + 1) encode (.impure info (.parallel codec count branches) next) assignment.location true).run journal =
+        (walk store blobs assignment (fuel + 1) encode (.impure info (.parallel codec count branches) next) assignment.location true).run after := by
   cases found : journal.lookup (ReplayStore.valueKey assignment.location) with
   | some record =>
     exact ⟨journal, .refl _, consistent, found.trans ((consistent _ _ found).symm.trans known), by intros; rfl⟩
@@ -98,9 +100,9 @@ private theorem join_records (expected journal : Journal) (assignment : Assignme
 
 private theorem parallel_runs (expected journal : Journal) (assignment : Assignment)
     (current : Location) (encode : β → Json) (codec : Codec γ) (count : Nat)
-    (branches : Fin count → Cloud M γ) (next : ArrsF (Control M) (Array γ) β)
+    (branches : Fin count → Cloud M γ) (next : ArrsF (Control M) SourceSiteId (Array γ) β)
     (outcomes : Fin count → Except CloudError γ) (outcome : Exit)
-    (cursor : Cursor blobs source journal current encode (.impure (.parallel codec count branches) next))
+    (cursor : Cursor blobs source journal current encode (.impure info (.parallel codec count branches) next))
     (consistent : Extends journal expected)
     (known : expected.lookup (ReplayStore.returnKey assignment.branch) = some ⟨ReplayStore.returnRequest, outcome⟩)
     (group : expected.lookup (ReplayStore.valueKey current) =
@@ -117,14 +119,14 @@ private theorem parallel_runs (expected journal : Journal) (assignment : Assignm
         some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩,
           Parallel.recorded (fun values => Json.arr (values.map codec.encode)) ((Array.ofFn outcomes).mapM id)⟩ →
       Verified blobs source expected target.branch outcome
-        (fun fuel => walk store blobs target fuel encode (.impure (.parallel codec count branches) next) current true) after) :
+        (fun fuel => walk store blobs target fuel encode (.impure info (.parallel codec count branches) next) current true) after) :
     Verified blobs source expected assignment.branch outcome
-      (fun fuel => walk store blobs assignment fuel encode (.impure (.parallel codec count branches) next) current true) journal := by
+      (fun fuel => walk store blobs assignment fuel encode (.impure info (.parallel codec count branches) next) current true) journal := by
   have joinRun : ∀ after, Extends journal after → Extends after expected →
       Recording.JoinReady expected after current →
       ∀ target : Assignment, target.branch = assignment.branch → target.location = current → target.joining = true →
       Verified blobs source expected target.branch outcome
-        (fun fuel => walk store blobs target fuel encode (.impure (.parallel codec count branches) next) current true) after := by
+        (fun fuel => walk store blobs target fuel encode (.impure info (.parallel codec count branches) next) current true) after := by
     intro after grows compatible ready target same atLocation joining
     obtain ⟨recorded, extension, consistentAfter, present, executes⟩ := join_records blobs expected after target encode codec count branches next _
       joining compatible (by simpa only [atLocation] using group) (by simpa only [atLocation] using ready)

@@ -11,29 +11,29 @@ universe u
 variable {e : Type → Type u}
 
 structure Ports (allowed : {β : Type} → e β → Prop)
-    (store : ReplayStore (EffF e)) (blobs : BlobStorage (EffF e)) : Prop where
+    (store : ReplayStore (EffF e Empty)) (blobs : BlobStorage (EffF e Empty)) : Prop where
   read : ∀ key, Effects.Program allowed (store.read key)
   create : ∀ key record, Effects.Program allowed (store.create key record)
-  execute : ∀ {β : Type} (codec : Codec β) (operation : Operation (EffF e) β),
+  execute : ∀ {β : Type} (codec : Codec β) (operation : Operation (EffF e Empty) β),
     CloudEffects.Request (fun action => Effects.Program allowed action) (.command codec operation) →
       Effects.Program allowed (blobs.execute operation).run
 
 variable {allowed : {β : Type} → e β → Prop}
-  {store : ReplayStore (EffF e)} {blobs : BlobStorage (EffF e)}
+  {store : ReplayStore (EffF e Empty)} {blobs : BlobStorage (EffF e Empty)}
 
 private theorem decode (codec : Codec α) (value : Json) :
-    Effects.Program allowed (Internal.decode (m := EffF e) codec value).run := by
+    Effects.Program allowed (Internal.decode (m := EffF e Empty) codec value).run := by
   unfold Internal.decode
   split <;> trivial
 
 private theorem decodeGroup (codec : Codec α) (count : Nat) (value : Json) :
-    Effects.Program allowed (Internal.decodeGroup (m := EffF e) codec count value).run := by
+    Effects.Program allowed (Internal.decodeGroup (m := EffF e Empty) codec count value).run := by
   apply Effects.except_bind _ (decode _ value)
   intro values
   split <;> trivial
 
 private theorem check (expected : Request) (record : ReplayRecord) :
-    Effects.Program allowed (Internal.check (m := EffF e) expected record).run := by
+    Effects.Program allowed (Internal.check (m := EffF e Empty) expected record).run := by
   unfold Internal.check
   split <;> trivial
 
@@ -66,15 +66,15 @@ private theorem join (ports : Ports allowed store blobs) (location : Location) (
     trivial
 
 private theorem resume (ports : Ports allowed store blobs) (branch : Location)
-    (decode : Json → ExceptT CloudError (EffF e) α)
-    (next : α → ExceptT CloudError (EffF e) Progress)
+    (decode : Json → ExceptT CloudError (EffF e Empty) α)
+    (next : α → ExceptT CloudError (EffF e Empty) Progress)
     (decoding : ∀ value, Effects.Program allowed (decode value).run) (continuing : ∀ value, Effects.Program allowed (next value).run)
     (enabled : Bool) (result : Exit) :
     Effects.Program allowed ((match result with
       | .success value => do next (← decode value)
       | result => do
         unless enabled do throw ⟨.divergence, "Replay prefix failed"⟩
-        Internal.finish store branch result) : ExceptT CloudError (EffF e) Progress).run := by
+        Internal.finish store branch result) : ExceptT CloudError (EffF e Empty) Progress).run := by
   cases result with
   | success value => exact Effects.except_bind _ (decoding value) continuing
   | failure error | cancelled reason =>
@@ -86,19 +86,19 @@ private theorem resume (ports : Ports allowed store blobs) (branch : Location)
 /-- Every replay segment respects its port and user-action contracts, for any
 fuel, location, or stored reply. This follows all decoded continuations. -/
 theorem walk_preserves (ports : Ports allowed store blobs) (assignment : Assignment) (fuel : Nat)
-    (encode : α → Json) (program : Cloud (EffF e) α) (current : Location) (active : Bool)
+    (encode : α → Json) (program : Cloud (EffF e Empty) α) (current : Location) (active : Bool)
     (valid : CloudEffects.Program (fun action => Effects.Program allowed action) program) :
     Effects.Program allowed (walk store blobs assignment fuel encode program current active).run := by
   induction fuel generalizing α encode program current active with
   | zero => trivial
   | succ fuel ih =>
     cases program with
-    | pure value =>
+    | pure info value =>
       simp only [walk]
       split
       · exact finish ports _ _
       · trivial
-    | impure control next =>
+    | impure info control next =>
       have request := valid.1
       have continuation := valid.2
       cases control with
@@ -158,7 +158,7 @@ theorem walk_preserves (ports : Ports allowed store blobs) (assignment : Assignm
               · trivial
 
 theorem step_preserves (ports : Ports allowed store blobs) [Codec α] (fuel : Nat)
-    (program : ι → Cloud (EffF e) α) (input : ι) (assignment : Assignment)
+    (program : ι → Cloud (EffF e Empty) α) (input : ι) (assignment : Assignment)
     (valid : CloudEffects.Program (fun action => Effects.Program allowed action) (program input)) :
     Effects.Program allowed (ReplayInterpreter.step store blobs fuel program input assignment).run := by
   unfold ReplayInterpreter.step

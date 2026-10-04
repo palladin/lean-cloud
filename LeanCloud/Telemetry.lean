@@ -1,4 +1,4 @@
-import Lean.Data.Json
+import LeanCloud.SourceInfo
 
 namespace LeanCloud
 open Lean
@@ -31,6 +31,7 @@ structure ExecutionEvent where
   activity : String
   operation : String
   run : String := ""
+  source : Option SourceSiteId := none
   deriving ToJson, FromJson
 
 end LeanCloud

@@ -147,7 +147,7 @@ def demo : Cli Unit := do
     let nodes := runNodes first (← ctx.nodes)
     require (nodes.all (fun n => n.run.isNone || n.run == some "first")) "Watch included another run's actors"
     require (nodes.toList.Pairwise (fun a b => a.name != b.name)) "Node inventory contains duplicate containers"
-    let some source := first.program.source | throw "Missing bundled source"
+    let some source := first.program.sources.find? (·.file.endsWith "Demo.lean") | throw "Missing bundled source"
     require (!source.sites.isEmpty) "No source locations bundled"
     discard (command ctx ["inspect", "first"])
     discard (command ctx ["watch", "first", "--once"])

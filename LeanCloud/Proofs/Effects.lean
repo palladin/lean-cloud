@@ -10,36 +10,37 @@ namespace LeanCloud.Proofs.Effects
 open LeanEff
 
 universe u
+variable {μ : Type}
 variable {e : Type → Type u} (allowed : {α : Type} → e α → Prop)
 
 mutual
-  def Program : EffF e α → Prop
-    | .pure _ => True
-    | .impure request next => allowed request ∧ Continuation next
+  def Program : EffF e μ α → Prop
+    | .pure _ _ => True
+    | .impure _ request next => allowed request ∧ Continuation next
   termination_by structural program => program
 
-  def Continuation : ArrsF e α β → Prop
+  def Continuation : ArrsF e μ α β → Prop
     | .one next => ∀ value, Program (next value)
     | .append first rest => Continuation first ∧ Continuation rest
   termination_by structural next => next
 end
 
-theorem pure (value : α) : Program allowed (EffF.pure value : EffF e α) := trivial
+theorem pure (value : α) : Program allowed (EffF.pure info value : EffF e μ α) := trivial
 
-theorem bind {program : EffF e α} {next : α → EffF e β}
+theorem bind {program : EffF e μ α} {next : α → EffF e μ β}
     (first : Program allowed program) (rest : ∀ value, Program allowed (next value)) :
     Program allowed (EffF.bind program next) := by
   cases program with
-  | pure value => exact rest value
-  | impure request continuation => exact ⟨first.1, first.2, rest⟩
+  | pure info value => exact rest value
+  | impure info request continuation => exact ⟨first.1, first.2, rest⟩
 
-theorem map (f : α → β) {program : EffF e α} (valid : Program allowed program) :
+theorem map (f : α → β) {program : EffF e μ α} (valid : Program allowed program) :
     Program allowed (f <$> program) := bind allowed valid (fun _ => trivial)
 
 theorem send {request : e α} (valid : allowed request) :
-    Program allowed (EffF.send (e := e) request) := ⟨valid, fun _ => trivial⟩
+    Program allowed (EffF.send (e := e) (μ := μ) request) := ⟨valid, fun _ => trivial⟩
 
-theorem forIn_list (items : List α) (initial : β) (body : α → β → EffF e (ForInStep β))
+theorem forIn_list (items : List α) (initial : β) (body : α → β → EffF e μ (ForInStep β))
     (valid : ∀ item state, Program allowed (body item state)) :
     Program allowed (forIn items initial body) := by
   induction items generalizing initial with
@@ -52,13 +53,13 @@ theorem forIn_list (items : List α) (initial : β) (body : α → β → EffF e
     | done _ => trivial
     | yield next => exact ih next
 
-theorem forIn_array (items : Array α) (initial : β) (body : α → β → EffF e (ForInStep β))
+theorem forIn_array (items : Array α) (initial : β) (body : α → β → EffF e μ (ForInStep β))
     (valid : ∀ item state, Program allowed (body item state)) :
     Program allowed (forIn items initial body) := by
   rw [← Array.forIn_toList]
   exact forIn_list allowed _ _ _ valid
 
-theorem except_bind {program : ExceptT ε (EffF e) α} {next : α → ExceptT ε (EffF e) β}
+theorem except_bind {program : ExceptT ε (EffF e μ) α} {next : α → ExceptT ε (EffF e μ) β}
     (valid : Program allowed program.run) (rest : ∀ value, Program allowed (next value).run) :
     Program allowed (program >>= next).run := by
   apply bind allowed valid
@@ -67,10 +68,10 @@ theorem except_bind {program : ExceptT ε (EffF e) α} {next : α → ExceptT ε
   | error _ => trivial
   | ok value => exact rest value
 
-theorem except_lift {program : EffF e α} (valid : Program allowed program) :
+theorem except_lift {program : EffF e μ α} (valid : Program allowed program) :
     Program allowed (ExceptT.lift (ε := ε) program).run := map allowed Except.ok valid
 
-theorem except_catch {program : ExceptT ε (EffF e) α} {handler : ε → ExceptT ε (EffF e) α}
+theorem except_catch {program : ExceptT ε (EffF e μ) α} {handler : ε → ExceptT ε (EffF e μ) α}
     (valid : Program allowed program.run) (handled : ∀ error, Program allowed (handler error).run) :
     Program allowed (ExceptT.tryCatch program handler).run := by
   apply bind allowed valid
@@ -79,18 +80,18 @@ theorem except_catch {program : ExceptT ε (EffF e) α} {handler : ε → Except
   | error error => exact handled error
   | ok _ => trivial
 
-theorem except_mapM (items : Array α) (body : α → ExceptT ε (EffF e) β)
+theorem except_mapM (items : Array α) (body : α → ExceptT ε (EffF e μ) β)
     (valid : ∀ item, Program allowed (body item).run) :
     Program allowed (items.mapM body).run :=
-  array_mapM_preserves (m := ExceptT ε (EffF e)) (fun program => Program allowed program.run)
+  array_mapM_preserves (m := ExceptT ε (EffF e μ)) (fun program => Program allowed program.run)
     (fun {_} value => pure allowed (Except.ok (ε := ε) value))
     (fun _ _ => except_bind allowed) items body valid
 
-private def View : ArrsF.ViewL e α β → Prop
+private def View : ArrsF.ViewL e μ α β → Prop
   | .one next => ∀ value, Program allowed (next value)
   | .cons next rest => (∀ value, Program allowed (next value)) ∧ Continuation allowed rest
 
-private theorem viewLAppend (first : ArrsF e α β) (rest : ArrsF e β γ)
+private theorem viewLAppend (first : ArrsF e μ α β) (rest : ArrsF e μ β γ)
     (firstValid : Continuation allowed first) (restValid : Continuation allowed rest) :
     View allowed (first.viewLAppend rest) := by
   cases first with
@@ -99,7 +100,7 @@ private theorem viewLAppend (first : ArrsF e α β) (rest : ArrsF e β γ)
     exact viewLAppend first (second.append rest) firstValid.1 ⟨firstValid.2, restValid⟩
 termination_by sizeOf first
 
-private theorem viewL (next : ArrsF e α β) (valid : Continuation allowed next) :
+private theorem viewL (next : ArrsF e μ α β) (valid : Continuation allowed next) :
     View allowed next.viewL := by
   cases next with
   | one next => exact valid
@@ -107,7 +108,7 @@ private theorem viewL (next : ArrsF e α β) (valid : Continuation allowed next)
 
 /-- A reply resumes only requests satisfying the original property, regardless
 of the association of lean-eff's continuation queue. -/
-theorem apply (next : ArrsF e α β) (valid : Continuation allowed next) (value : α) :
+theorem apply (next : ArrsF e μ α β) (valid : Continuation allowed next) (value : α) :
     Program allowed (next.apply value) := by
   have viewed := viewL allowed next valid
   rw [ArrsF.apply]

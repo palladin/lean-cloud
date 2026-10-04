@@ -39,14 +39,14 @@ structure Operation (remote : Bool) (operation : δ → α × δ)
 
 mutual
   def Program (rules : Rules δ) (pre : δ → Prop) (post : α → δ → Prop) : SimM δ α → Prop
-    | .pure value => rules.Implies pre (post value)
-    | .impure (.step remote _ operation) next =>
+    | .pure _ value => rules.Implies pre (post value)
+    | .impure _ (.step remote _ operation) next =>
         ∃ required reply,
           rules.Implies pre required ∧ rules.Operation remote operation required reply ∧
             rules.Continuation reply post next
   termination_by structural program => program
 
-  def Continuation (rules : Rules δ) (pre : α → δ → Prop) (post : β → δ → Prop) : ArrsF (Atomic δ) α β → Prop
+  def Continuation (rules : Rules δ) (pre : α → δ → Prop) (post : β → δ → Prop) : ArrsF (Atomic δ) Empty α β → Prop
     | .one next => ∀ value, rules.Program (pre value) post (next value)
     | .append first rest =>
         ∃ middle, rules.Continuation pre middle first ∧ rules.Continuation middle post rest
@@ -78,8 +78,8 @@ mutual
       rules.Program (fun world => ∃ index, pre index world)
         (fun value world => ∃ index, post index value world) program :=
     match program with
-    | .pure value => fun world invariant ⟨index, holds⟩ => ⟨index, valid index world invariant holds⟩
-    | .impure (.step _ _ _) next => by
+    | .pure _ value => fun world invariant ⟨index, holds⟩ => ⟨index, valid index world invariant holds⟩
+    | .impure _ (.step _ _ _) next => by
       classical
       let required := fun index => Classical.choose (valid index)
       let reply := fun index => Classical.choose (Classical.choose_spec (valid index))
@@ -91,7 +91,7 @@ mutual
       exact ⟨index, (evidence index).1 world invariant holds⟩
   termination_by structural program
 
-  theorem Continuation.exists_contract {ι : Sort v} (next : ArrsF (Atomic δ) α β)
+  theorem Continuation.exists_contract {ι : Sort v} (next : ArrsF (Atomic δ) Empty α β)
       {pre : ι → α → δ → Prop} {post : ι → β → δ → Prop}
       (valid : ∀ index, rules.Continuation (pre index) (post index) next) :
       rules.Continuation (fun value world => ∃ index, pre index value world)
@@ -112,8 +112,8 @@ theorem Program.weaken {pre required : δ → Prop} {post : α → δ → Prop} 
     (valid : rules.Program required post program) (implies : rules.Implies pre required) :
     rules.Program pre post program := by
   cases program with
-  | pure value => exact fun world invariant holds => valid world invariant (implies world invariant holds)
-  | impure request next =>
+  | pure info value => exact fun world invariant holds => valid world invariant (implies world invariant holds)
+  | impure info request next =>
     cases request
     obtain ⟨needed, reply, entails, operation, continuation⟩ := valid
     exact ⟨needed, reply, fun world invariant holds => entails world invariant (implies world invariant holds),
@@ -152,15 +152,15 @@ mutual
       rules.Program (fun world => pre world ∧ assertion world)
         (fun value world => post value world ∧ assertion world) program :=
     match program with
-    | .pure value => fun world invariant holds => ⟨valid world invariant holds.1, holds.2⟩
-    | .impure (.step _ _ _) next => by
+    | .pure _ value => fun world invariant holds => ⟨valid world invariant holds.1, holds.2⟩
+    | .impure _ (.step _ _ _) next => by
       obtain ⟨required, reply, entails, operation, continuation⟩ := valid
       exact ⟨fun world => required world ∧ assertion world, fun value world => reply value world ∧ assertion world,
         fun world invariant holds => ⟨entails world invariant holds.1, holds.2⟩,
         operation.frame rules framed, Continuation.frame next continuation framed⟩
   termination_by structural program
 
-  theorem Continuation.frame (next : ArrsF (Atomic δ) α β)
+  theorem Continuation.frame (next : ArrsF (Atomic δ) Empty α β)
       {pre : α → δ → Prop} {assertion : δ → Prop} {post : β → δ → Prop}
       (valid : rules.Continuation pre post next) (framed : rules.Frame assertion) :
       rules.Continuation (fun value world => pre value world ∧ assertion world)
@@ -179,13 +179,13 @@ mutual
       (valid : rules.Program pre post program) (implies : ∀ value, rules.Implies (post value) (weaker value)) :
       rules.Program pre weaker program :=
     match program with
-    | .pure value => fun world invariant holds => implies value world invariant (valid world invariant holds)
-    | .impure (.step _ _ _) next => by
+    | .pure _ value => fun world invariant holds => implies value world invariant (valid world invariant holds)
+    | .impure _ (.step _ _ _) next => by
       obtain ⟨needed, reply, entails, operation, continuation⟩ := valid
       exact ⟨needed, reply, entails, operation, Continuation.weaken_post next continuation implies⟩
   termination_by structural program
 
-  theorem Continuation.weaken_post (next : ArrsF (Atomic δ) α β)
+  theorem Continuation.weaken_post (next : ArrsF (Atomic δ) Empty α β)
       {pre : α → δ → Prop} {post weaker : β → δ → Prop}
       (valid : rules.Continuation pre post next) (implies : ∀ value, rules.Implies (post value) (weaker value)) :
       rules.Continuation pre weaker next :=
@@ -208,8 +208,8 @@ mutual
   theorem Program.impossible (program : SimM δ α) :
       rules.Program (fun _ => False) (fun _ _ => False) program :=
     match program with
-    | .pure _ => fun _ _ impossible => impossible
-    | .impure (.step _ _ _) next =>
+    | .pure _ _ => fun _ _ impossible => impossible
+    | .impure _ (.step _ _ _) next =>
       ⟨fun _ => False, fun _ _ => False, fun _ _ impossible => impossible,
         ⟨fun _ _ _ _ _ impossible => impossible,
           fun _ _ _ _ _ _ impossible => impossible,
@@ -218,7 +218,7 @@ mutual
         Continuation.impossible next⟩
   termination_by structural program
 
-  theorem Continuation.impossible (next : ArrsF (Atomic δ) α β) :
+  theorem Continuation.impossible (next : ArrsF (Atomic δ) Empty α β) :
       rules.Continuation (fun _ _ => False) (fun _ _ => False) next :=
     match next with
     | .one next => fun value => Program.impossible (next value)
@@ -238,7 +238,7 @@ theorem Program.assuming (fact : Prop) {program : SimM δ α} {pre : δ → Prop
     · exact fun _ _ required => holds required.1
 
 theorem pure (value : α) {pre : δ → Prop} {post : α → δ → Prop}
-    (valid : rules.Implies pre (post value)) : rules.Program pre post (EffF.pure value) := valid
+    (valid : rules.Implies pre (post value)) : rules.Program pre post (EffF.pure none value) := valid
 
 theorem bind {pre : δ → Prop} {middle : α → δ → Prop} {post : β → δ → Prop}
     {program : SimM δ α} {next : α → SimM δ β}
@@ -246,8 +246,8 @@ theorem bind {pre : δ → Prop} {middle : α → δ → Prop} {post : β → δ
     (rest : ∀ value, rules.Program (middle value) post (next value)) :
     rules.Program pre post (EffF.bind program next) := by
   cases program with
-  | pure value => exact (rest value).weaken rules first
-  | impure request continuation =>
+  | pure info value => exact (rest value).weaken rules first
+  | impure info request continuation =>
     cases request
     obtain ⟨required, reply, entails, operation, continuation⟩ := first
     exact ⟨required, reply, entails, operation, middle, continuation, rest⟩
@@ -342,12 +342,12 @@ theorem returns_mapM (pre : δ → Prop) (items : Array α) (body : α → Excep
     (fun value => rules.returns_pure pre value)
     (fun first next value result => rules.returns_bind first next value result) items body expected valid
 
-private def View (pre : α → δ → Prop) (post : β → δ → Prop) : ArrsF.ViewL (Atomic δ) α β → Prop
+private def View (pre : α → δ → Prop) (post : β → δ → Prop) : ArrsF.ViewL (Atomic δ) Empty α β → Prop
   | .one next => ∀ value, rules.Program (pre value) post (next value)
   | .cons next rest => ∃ middle,
       (∀ value, rules.Program (pre value) middle (next value)) ∧ rules.Continuation middle post rest
 
-private theorem viewLAppend (first : ArrsF (Atomic δ) α β) (rest : ArrsF (Atomic δ) β γ)
+private theorem viewLAppend (first : ArrsF (Atomic δ) Empty α β) (rest : ArrsF (Atomic δ) Empty β γ)
     {pre : α → δ → Prop} {middle : β → δ → Prop} {post : γ → δ → Prop}
     (firstValid : rules.Continuation pre middle first) (restValid : rules.Continuation middle post rest) :
     rules.View pre post (first.viewLAppend rest) := by
@@ -358,7 +358,7 @@ private theorem viewLAppend (first : ArrsF (Atomic δ) α β) (rest : ArrsF (Ato
     exact viewLAppend first (second.append rest) firstValid ⟨middle, secondValid, restValid⟩
 termination_by sizeOf first
 
-private theorem viewL (next : ArrsF (Atomic δ) α β)
+private theorem viewL (next : ArrsF (Atomic δ) Empty α β)
     {pre : α → δ → Prop} {post : β → δ → Prop} (valid : rules.Continuation pre post next) :
     rules.View pre post next.viewL := by
   cases next with
@@ -369,7 +369,7 @@ private theorem viewL (next : ArrsF (Atomic δ) α β)
 
 /-- Applying the actual continuation queue preserves the asserted relationship
 between its reply and the world. No syntactic monad laws are assumed for EffF. -/
-theorem apply (next : ArrsF (Atomic δ) α β) {pre : α → δ → Prop} {post : β → δ → Prop}
+theorem apply (next : ArrsF (Atomic δ) Empty α β) {pre : α → δ → Prop} {post : β → δ → Prop}
     (valid : rules.Continuation pre post next) (value : α) :
     rules.Program (pre value) post (next.apply value) := by
   have viewed := viewL rules next valid
@@ -403,8 +403,8 @@ theorem ofProgram {pre : δ → Prop} {post : α → δ → Prop} {program : Sim
     (valid : rules.Program pre post program) (invariant : rules.invariant world) (holds : pre world) :
     rules.ActorValid post (Actor.ofProgram program) world := by
   cases program with
-  | pure value => exact valid world invariant holds
-  | impure request next =>
+  | pure info value => exact valid world invariant holds
+  | impure info request next =>
     cases request
     obtain ⟨required, reply, entails, operation, continuation⟩ := valid
     exact ⟨required, reply, entails world invariant holds, operation, continuation⟩

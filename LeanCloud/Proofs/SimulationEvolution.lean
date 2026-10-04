@@ -23,8 +23,8 @@ def ActorValid : Actor δ α → Prop
 theorem ofProgram {program : SimM δ α} (valid : Effects.Program allowed program) :
     ActorValid allowed (Actor.ofProgram program) := by
   cases program with
-  | pure value => trivial
-  | impure operation next => cases operation; exact valid
+  | pure info value => trivial
+  | impure info operation next => cases operation; exact valid
 
 structure Valid (allowed : Fin count → {β : Type} → Atomic δ β → Prop)
     (orphanAdvance : δ → δ → Prop) (state : State δ α count) : Prop where

@@ -3,6 +3,8 @@ import LeanCloud.Proofs.Reconstruction
 namespace LeanCloud.Proofs.SequentialCursor
 open Lean LeanEff ReplayModel ReplayInterpreter Reconstruction Routing
 
+variable {info : Option SourceSiteId}
+
 variable [rootCodec : Codec α] (blobs : BlobStorage M) (source : Cloud M α)
 
 /-- A proof-only cursor into the source. Unlike an assigned location it can also
@@ -24,8 +26,8 @@ theorem Cursor.extend {journal after current} {encode : β → Json} {remaining 
   obtain ⟨route, cost, replay⟩ := cursor
   exact ⟨route, cost, fun later extension => replay later (grows.trans extension)⟩
 
-theorem Cursor.delay {journal current encode} (next : ArrsF (Control M) Unit β)
-    (cursor : Cursor blobs source journal current encode (.impure .delay next)) :
+theorem Cursor.delay {journal current encode} (next : ArrsF (Control M) SourceSiteId Unit β)
+    (cursor : Cursor blobs source journal current encode (.impure info .delay next)) :
     Cursor blobs source journal current encode (next.apply ()) := by
   obtain ⟨route, cost, replay⟩ := cursor
   refine ⟨route, cost + 1, ?_⟩
@@ -37,8 +39,8 @@ theorem Cursor.delay {journal current encode} (next : ArrsF (Control M) Unit β)
   · simp [beq_eq_false_iff_ne.mpr same]
 
 theorem Cursor.exec {journal current encode} (codec : Codec β) (label : String) (body : Unit → β)
-    (next : ArrsF (Control M) β γ)
-    (cursor : Cursor blobs source journal current encode (.impure (.command codec (.exec label (fun _ => pure (body ())))) next))
+    (next : ArrsF (Control M) SourceSiteId β γ)
+    (cursor : Cursor blobs source journal current encode (.impure info (.command codec (.exec label (fun _ => pure (body ())))) next))
     (present : journal.lookup (ReplayStore.valueKey current) =
       some ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → M β)), .success (codec.encode (body ()))⟩)
     (roundtrip : codec.decode (codec.encode (body ())) = .ok (body ())) :
@@ -55,8 +57,8 @@ theorem Cursor.exec {journal current encode} (codec : Codec β) (label : String)
   simp [extension _ _ present, Internal.check, Internal.decode, roundtrip]
 
 theorem Cursor.joined {journal current encode} (codec : Codec β) (count : Nat)
-    (branches : Fin count → Cloud M β) (next : ArrsF (Control M) (Array β) γ) (values : Array β)
-    (cursor : Cursor blobs source journal current encode (.impure (.parallel codec count branches) next))
+    (branches : Fin count → Cloud M β) (next : ArrsF (Control M) SourceSiteId (Array β) γ) (values : Array β)
+    (cursor : Cursor blobs source journal current encode (.impure info (.parallel codec count branches) next))
     (present : journal.lookup (ReplayStore.valueKey current) =
       some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, .success (Json.arr (values.map codec.encode))⟩)
     (decoded : (@instCodecArray β codec).decode (Json.arr (values.map codec.encode)) = .ok values)
@@ -76,8 +78,8 @@ theorem Cursor.joined {journal current encode} (codec : Codec β) (count : Nat)
   simp [extension _ _ present, Internal.check, Internal.decodeGroup, Internal.decode, decoded, size]
 
 theorem Cursor.child {journal current encode} (codec : Codec β) (count : Nat)
-    (branches : Fin count → Cloud M β) (next : ArrsF (Control M) (Array β) γ)
-    (cursor : Cursor blobs source journal current encode (.impure (.parallel codec count branches) next)) (index : Fin count) :
+    (branches : Fin count → Cloud M β) (next : ArrsF (Control M) SourceSiteId (Array β) γ)
+    (cursor : Cursor blobs source journal current encode (.impure info (.parallel codec count branches) next)) (index : Fin count) :
     Cursor blobs source journal (current.child index) codec.encode (branches index) := by
   obtain ⟨route, cost, replay⟩ := cursor
   have nonempty : 0 < current.size := Nat.lt_of_lt_of_le (by decide) route.depth

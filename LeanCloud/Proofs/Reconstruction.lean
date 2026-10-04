@@ -4,6 +4,8 @@ import LeanCloud.Proofs.Routing
 namespace LeanCloud.Proofs.Reconstruction
 open Lean LeanEff ReplayModel ReplayInterpreter Routing
 
+variable {info : Option SourceSiteId}
+
 /-- At the assigned location, the next worker instruction is active. -/
 theorem walk_at_assignment [Monad m] (store : ReplayStore m) (blobs : BlobStorage m)
     (assignment : Assignment) (fuel : Nat) (encode : α → Json) (program : Cloud m α) :
@@ -18,37 +20,37 @@ inductive Prefix {m : Type → Type u} (journal : Journal) (target : Location) :
     {α β : Type} → (α → Json) → Cloud m α → Location → Nat → (β → Json) → Cloud m β → Prop where
   | here (encode : α → Json) (program : Cloud m α) :
       Prefix journal target encode program target 0 encode program
-  | delay {encode : α → Json} {remainingEncode : β → Json} {remaining : Cloud m β} {current steps}
-      (next : ArrsF (Control m) Unit α) (before : current ≠ target)
+  | delay {info : Option SourceSiteId} {encode : α → Json} {remainingEncode : β → Json} {remaining : Cloud m β} {current steps}
+      (next : ArrsF (Control m) SourceSiteId Unit α) (before : current ≠ target)
       (rest : Prefix journal target encode (next.apply ()) current steps remainingEncode remaining) :
-      Prefix journal target encode (.impure .delay next) current (steps + 1) remainingEncode remaining
-  | command {encode : β → Json} {remainingEncode : γ → Json} {remaining : Cloud m γ} {current steps}
-      (codec : Codec α) (operation : Operation m α) (next : ArrsF (Control m) α β)
+      Prefix journal target encode (.impure info .delay next) current (steps + 1) remainingEncode remaining
+  | command {info : Option SourceSiteId} {encode : β → Json} {remainingEncode : γ → Json} {remaining : Cloud m γ} {current steps}
+      (codec : Codec α) (operation : Operation m α) (next : ArrsF (Control m) SourceSiteId α β)
       (record : ReplayRecord) (wire : Json) (value : α)
       (before : current ≠ target)
       (present : journal.lookup (ReplayStore.valueKey current) = some record)
       (checked : (record.request == Internal.request codec operation) = true)
       (success : record.outcome = .success wire) (decoded : codec.decode wire = .ok value)
       (rest : Prefix journal target encode (next.apply value) current.next steps remainingEncode remaining) :
-      Prefix journal target encode (.impure (.command codec operation) next) current (steps + 1)
+      Prefix journal target encode (.impure info (.command codec operation) next) current (steps + 1)
         remainingEncode remaining
-  | joined {encode : β → Json} {remainingEncode : γ → Json} {remaining : Cloud m γ} {current steps}
+  | joined {info : Option SourceSiteId} {encode : β → Json} {remainingEncode : γ → Json} {remaining : Cloud m γ} {current steps}
       (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
-      (next : ArrsF (Control m) (Array α) β) (record : ReplayRecord) (wire : Json) (values : Array α)
+      (next : ArrsF (Control m) SourceSiteId (Array α) β) (record : ReplayRecord) (wire : Json) (values : Array α)
       (before : current ≠ target) (skip : current.entersChild target = false)
       (present : journal.lookup (ReplayStore.valueKey current) = some record)
       (checked : (record.request == ⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩) = true)
       (success : record.outcome = .success wire)
       (decoded : (@instCodecArray α codec).decode wire = .ok values) (size : values.size = count)
       (rest : Prefix journal target encode (next.apply values) current.next steps remainingEncode remaining) :
-      Prefix journal target encode (.impure (.parallel codec count branches) next) current (steps + 1)
+      Prefix journal target encode (.impure info (.parallel codec count branches) next) current (steps + 1)
         remainingEncode remaining
-  | child {encode : β → Json} {remainingEncode : γ → Json} {remaining : Cloud m γ} {current steps}
+  | child {info : Option SourceSiteId} {encode : β → Json} {remainingEncode : γ → Json} {remaining : Cloud m γ} {current steps}
       (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
-      (next : ArrsF (Control m) (Array α) β) (index : Fin count) (before : current ≠ target)
+      (next : ArrsF (Control m) SourceSiteId (Array α) β) (index : Fin count) (before : current ≠ target)
       (enters : current.entersChild target = true) (selected : target[current.size]!.1 = index.val)
       (rest : Prefix journal target codec.encode (branches index) (current.child index) steps remainingEncode remaining) :
-      Prefix journal target encode (.impure (.parallel codec count branches) next) current (steps + 1)
+      Prefix journal target encode (.impure info (.parallel codec count branches) next) current (steps + 1)
         remainingEncode remaining
 
 /-- Other workers may add records without changing this reconstruction path. -/

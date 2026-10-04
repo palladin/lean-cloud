@@ -24,22 +24,23 @@ structure Ports (m : Type → Type u) where
 
 def execute [Monad m] [Codec α] (id : WorkerId) (store : ObservedStore m)
     (blobs : BlobStorage m) (fuel : Nat) (program : ι → Cloud m α) (input : ι)
-    (assignment : Assignment) : m Report := do
-  let progress ← (ReplayInterpreter.step store.records blobs fuel program input assignment).run
+    (assignment : Assignment) (observer : Option (ReplayInterpreter.Observer m) := none) : m Report := do
+  let progress ← (ReplayInterpreter.step store.records blobs fuel program input assignment observer).run
   return ⟨id, assignment.attempt, progress, ← store.confirmed⟩
 
 /-- Finish an assignment by recording its values, publishing its report with a
 broker confirmation, and only then acknowledging its delivery. A crash before
 acknowledgement replays the assignment; duplicates reuse the immutable records. -/
 def turn [Monad m] [Codec α] (ports : Ports m) (fuel : Nat)
-    (program : ι → Cloud m α) (input : ι) (state : State) : m State := do
+    (program : ι → Cloud m α) (input : ι) (state : State)
+    (observer : Option (ReplayInterpreter.Observer m) := none) : m State := do
   if state.stopped then return state
   let delivery ← ports.inbox.receive
   let mut state := { state with retryIn := state.retryIn - 1 }
   if let some delivery := delivery then
     match delivery.message with
     | .execute assignment =>
-      let report ← execute ports.id ports.observe ports.blobs fuel program input assignment
+      let report ← execute ports.id ports.observe ports.blobs fuel program input assignment observer
       ports.send (.report report)
       state := { state with retryIn := max 1 ports.retryPolls }
     | .acknowledged _ => state := { state with retryIn := 0 }

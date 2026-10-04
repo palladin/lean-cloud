@@ -39,6 +39,5 @@ def expected : String := "files=16, errors=24\n"
 
 instance : Codec Input := jsonCodec Input "log-summary-input/v1"
 
-def source : ProgramSource := cloud_source%
 
 end LeanCloudRuntime.Demo

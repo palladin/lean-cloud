@@ -11,8 +11,9 @@ structure RegisteredProgram where
   worker : Config → String → RunDefinition → IO Unit
   execute : RunDefinition → String → Worker.ObservedStore IO → BlobStorage IO → Trace.Sink → Assignment → IO Report
 
-def registerProgram [Codec ι] [Codec α] (program : LeanCloud.CloudProgram ι α) : RegisteredProgram where
-  info := program.info
+def registerProgram [Codec ι] [Codec α] (program : LeanCloud.CloudProgram ι α)
+    (sources : Array ProgramSource := by exact cloud_sources%) : RegisteredProgram where
+  info := { program.info with sources }
   validate input := (Codec.decode (α := ι) input).map (fun _ => ())
   worker config run definition := do
     unless definition.entry == program.info.entry && definition.resultSchema == program.info.resultSchema do
@@ -24,7 +25,7 @@ def registerProgram [Codec ι] [Codec α] (program : LeanCloud.CloudProgram ι �
       throw (IO.userError "Deployed program/codec does not match the submitted run")
     let input ← IO.ofExcept (Codec.decode (α := ι) definition.input)
     Worker.execute worker records blobs 100000
-      (fun input => trace.instrument 100000 (program.run input)) input assignment
+      (fun input => trace.instrument 100000 (program.run input)) input assignment (some trace.visit)
 
 structure Registry where
   programs : Array RegisteredProgram
@@ -40,13 +41,13 @@ def Registry.validate (registry : Registry) : Except String Unit := do
   for program in registry.programs do
     unless !program.info.entry.isEmpty do throw "Program entry cannot be empty"
     discard (registry.find program.info.entry)
-    if let some source := program.info.source then
+    for source in program.info.sources do
       unless !source.text.isEmpty do throw "Bundled source is empty"
       for site in source.sites do
         unless 0 < site.line && site.line ≤ (source.text.splitOn "\n").length do
           throw "Source location is outside the bundled file"
-        unless (source.sites.filter (·.operation == site.operation)).size == 1 do
-          throw "Ambiguous source location for operation"
+        unless (source.sites.filter (·.id == site.id)).size == 1 do
+          throw "Duplicate source site identifier"
 
 /-- Validate before creating a durable run, including all entry/version checks. -/
 def Registry.submit (registry : Registry) (config : Config) (run entry : String) (input : Json) : IO Unit := do
@@ -145,8 +146,9 @@ end LeanCloudRuntime
 
 namespace LeanCloud.CloudProgram
 
-def register [Codec ι] [Codec α] (program : CloudProgram ι α) :=
-  LeanCloudRuntime.registerProgram program
+def register [Codec ι] [Codec α] (program : CloudProgram ι α)
+    (sources : Array ProgramSource := by exact cloud_sources%) :=
+  LeanCloudRuntime.registerProgram program sources
 
 /-- Typed submission to the persistent pool. Confirmed registration survives scheduler downtime. -/
 def submit [Codec ι] [Codec α] (program : CloudProgram ι α)

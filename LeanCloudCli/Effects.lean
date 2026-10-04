@@ -96,11 +96,11 @@ namespace Cli
 partial def runWith [Monad m] (handle : {α : Type} → HostOp α → m (Except String α))
     (program : Cli α) : m (Except String α) := do
   match program.run with
-  | .pure result => return result
-  | .impure (.here (.request operation)) next =>
+  | EffF.pure _ result => return result
+  | EffF.impure _ (.here (.request operation)) next =>
     let result ← handle operation
     runWith handle (ExceptT.mk (ArrsF.apply next result))
-  | .impure (.there rest) _ => nomatch rest
+  | EffF.impure _ (.there rest) _ => nomatch rest
 
 end Cli
 end LeanCloudCli

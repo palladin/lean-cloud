@@ -1,4 +1,5 @@
 import LeanCloudRuntime.Application
+import LeanCloudRuntime.Programs
 import LeanCloudTests.Support
 
 namespace ApplicationTests
@@ -35,6 +36,13 @@ private def service : Application.Service α → StateM World (Except String α)
 
 def run : IO Unit := do
   let registry : Registry := ⟨#[program.register]⟩
+  -- Registration at a different module bundles both imported workflow files.
+  let some registered := LeanCloudRuntime.programs.programs[0]? | throw (IO.userError "No registered programs")
+  assertTrue (registered.info.sources.any (·.file.endsWith "Demo.lean")) "Imported demo source missing"
+  assertTrue (registered.info.sources.any (·.file.endsWith "Squares.lean")) "Imported helper source missing"
+  assertTrue (registered.info.sources.all fun file => !file.sites.isEmpty) "Empty source map"
+  let _ ← unwrap LeanCloudRuntime.programs.validate
+
   let saved : LeanCloudRuntime.Pool.Saved ← unwrap (fromJson? (Json.mkObj [
     ("state", Json.mkObj [("runs", toJson (#[] : Array LeanCloud.Pool.Run)), ("cursor", toJson (0 : Nat))]),
     ("replies", toJson (#[] : Array (String × Except String Json)))]))

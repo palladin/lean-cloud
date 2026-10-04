@@ -10,7 +10,7 @@ open Lean LeanEff LeanCloud LeanCloud.Proofs SimulationBackend SimulationProgres
 set_option maxRecDepth 10000
 set_option maxHeartbeats 2000000
 
-private def source (_ : Unit) : Cloud (SimM World) Bool := EffF.pure true
+private def source (_ : Unit) : Cloud (SimM World) Bool := EffF.pure none true
 private def actors : Simulation.Start World Unit 2 := start 10 10 100 source ()
 private abbrev State := Simulation.State World Unit 2
 private abbrev Trace := SchedulerOwnership.Trace actors (fun _ => True)
@@ -91,13 +91,13 @@ private def report : Report := ⟨"worker-1", 0, .ok .done, #[ReplayStore.return
 mutual
   private def denote (program : SimM δ α) (world : δ) : α × δ × Nat :=
     match program with
-    | .pure value => (value, world, 0)
-    | .impure (.step _ _ operation) next =>
+    | .pure _ value => (value, world, 0)
+    | .impure _ (.step _ _ operation) next =>
       let rest := denoteNext next (operation world).1 (operation world).2
       (rest.1, rest.2.1, rest.2.2 + 1)
   termination_by structural program
 
-  private def denoteNext (next : ArrsF (Atomic δ) α β) (value : α) (world : δ) : β × δ × Nat :=
+  private def denoteNext (next : ArrsF (Atomic δ) Empty α β) (value : α) (world : δ) : β × δ × Nat :=
     match next with
     | .one next => denote (next value) world
     | .append head tail =>
@@ -111,12 +111,12 @@ mutual
   private theorem denote_sound (program : SimM δ α) (world : δ) :
       Execution program world (denote program world).1 (denote program world).2.1 (denote program world).2.2 :=
     match program with
-    | .pure value => .pure value world
-    | .impure (.step remote label operation) next =>
+    | .pure _ value => .pure value world
+    | .impure _ (.step remote label operation) next =>
       .step remote label operation next world (denoteNext_sound next (operation world).1 (operation world).2)
   termination_by structural program
 
-  private theorem denoteNext_sound (next : ArrsF (Atomic δ) α β) (value : α) (world : δ) :
+  private theorem denoteNext_sound (next : ArrsF (Atomic δ) Empty α β) (value : α) (world : δ) :
       Continuation next value world (denoteNext next value world).1 (denoteNext next value world).2.1
         (denoteNext next value world).2.2 :=
     match next with
@@ -129,8 +129,8 @@ end
 
 private def resumeProgram (program : SimM World α) (world : World) : SimM World α :=
   match program with
-  | .pure value => .pure value
-  | .impure (.step _ _ operation) next => next.apply (operation world).1
+  | .pure info value => .pure info value
+  | .impure _ (.step _ _ operation) next => next.apply (operation world).1
 
 private def workerProgram := Worker.execute "worker-1" (observed "worker-1") blobs 10 source () assignment
 private def afterRead := resumeProgram workerProgram started.world

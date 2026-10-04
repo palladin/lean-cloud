@@ -8,15 +8,17 @@ It supplies a possible uninterrupted execution, not a fairness assumption. -/
 namespace LeanCloud.Proofs.SimulationProgress
 open LeanEff Simulation SimulationLogic
 
+variable {info : Option Empty}
+
 mutual
   inductive Execution : SimM δ α → δ → α → δ → Nat → Prop where
-    | pure (value : α) (world : δ) : Execution (.pure value) world value world 0
-    | step (remote : Bool) (label : String) (operation : δ → β × δ)
-        (next : ArrsF (Atomic δ) β α) (world : δ)
+    | pure {info : Option Empty} (value : α) (world : δ) : Execution (.pure info value) world value world 0
+    | step {info : Option Empty} (remote : Bool) (label : String) (operation : δ → β × δ)
+        (next : ArrsF (Atomic δ) Empty β α) (world : δ)
         (rest : Continuation next (operation world).1 (operation world).2 value final steps) :
-        Execution (.impure (.step remote label operation) next) world value final (steps + 1)
+        Execution (.impure info (.step remote label operation) next) world value final (steps + 1)
 
-  inductive Continuation : ArrsF (Atomic δ) α β → α → δ → β → δ → Nat → Prop where
+  inductive Continuation : ArrsF (Atomic δ) Empty α β → α → δ → β → δ → Nat → Prop where
     | one (next : α → SimM δ β) (value : α)
         (rest : Execution (next value) world result final steps) :
         Continuation (.one next) value world result final steps
@@ -29,13 +31,13 @@ mutual
   theorem execution_exists (program : SimM δ α) (world : δ) :
       ∃ value final steps, Execution program world value final steps :=
     match program with
-    | .pure value => ⟨value, world, 0, .pure value world⟩
-    | .impure (.step remote label operation) next => by
+    | .pure _ value => ⟨value, world, 0, .pure value world⟩
+    | .impure _ (.step remote label operation) next => by
       obtain ⟨value, final, steps, rest⟩ := continuation_exists next (operation world).1 (operation world).2
       exact ⟨value, final, steps + 1, .step remote label operation next world rest⟩
   termination_by structural program
 
-  theorem continuation_exists (next : ArrsF (Atomic δ) α β) (value : α) (world : δ) :
+  theorem continuation_exists (next : ArrsF (Atomic δ) Empty α β) (value : α) (world : δ) :
       ∃ result final steps, Continuation next value world result final steps :=
     match next with
     | .one next => by
@@ -53,7 +55,7 @@ theorem Execution.bind {program : SimM δ α} {next : α → SimM δ β}
     (rest : Execution (next value) between result final restSteps) :
     Execution (EffF.bind program next) world result final (firstSteps + restSteps) := by
   cases first with
-  | pure => simpa [EffF.bind] using rest
+  | pure info => simpa [EffF.bind] using rest
   | step remote label operation continuation world continued =>
     simpa [EffF.bind, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm] using
       Execution.step remote label operation (continuation.append (.one next)) world
@@ -61,16 +63,16 @@ theorem Execution.bind {program : SimM δ α} {next : α → SimM δ β}
 
 theorem Execution.send (remote : Bool) (label : String) (operation : δ → α × δ) (world : δ) :
     Execution (EffF.send (.step remote label operation)) world (operation world).1 (operation world).2 1 :=
-  .step remote label operation (.one .pure) world (.one .pure _ (.pure _ _))
+  .step remote label operation (.one (.pure none)) world (.one (.pure none) _ (.pure _ _))
 
-private def View : ArrsF.ViewL (Atomic δ) α β → α → δ → β → δ → Nat → Prop
+private def View : ArrsF.ViewL (Atomic δ) Empty α β → α → δ → β → δ → Nat → Prop
   | .one next, value, world, result, final, steps => Execution (next value) world result final steps
   | .cons next tail, value, world, result, final, steps =>
       ∃ middle between firstSteps restSteps,
         Execution (next value) world middle between firstSteps ∧
         Continuation tail middle between result final restSteps ∧ steps = firstSteps + restSteps
 
-private theorem viewLAppend (head : ArrsF (Atomic δ) α β) (tail : ArrsF (Atomic δ) β γ)
+private theorem viewLAppend (head : ArrsF (Atomic δ) Empty α β) (tail : ArrsF (Atomic δ) Empty β γ)
     (first : Continuation head value world middle between firstSteps)
     (rest : Continuation tail middle between result final restSteps) :
     View (head.viewLAppend tail) value world result final (firstSteps + restSteps) := by
@@ -80,14 +82,14 @@ private theorem viewLAppend (head : ArrsF (Atomic δ) α β) (tail : ArrsF (Atom
     simpa [ArrsF.viewLAppend, Nat.add_assoc] using viewLAppend _ _ first (.append second rest)
 termination_by sizeOf head
 
-private theorem viewL (next : ArrsF (Atomic δ) α β)
+private theorem viewL (next : ArrsF (Atomic δ) Empty α β)
     (executed : Continuation next value world result final steps) :
     View next.viewL value world result final steps := by
   cases executed with
   | one next value rest => exact rest
   | append first rest => exact viewLAppend _ _ first rest
 
-theorem Continuation.apply (next : ArrsF (Atomic δ) α β)
+theorem Continuation.apply (next : ArrsF (Atomic δ) Empty α β)
     (executed : Continuation next value world result final steps) :
     Execution (next.apply value) world result final steps := by
   have viewed := viewL next executed
@@ -119,7 +121,7 @@ mutual
       exact rest.post rules continuation invariant replied
   termination_by structural executed
 
-  theorem Continuation.post (rules : Rules δ) {next : ArrsF (Atomic δ) α β}
+  theorem Continuation.post (rules : Rules δ) {next : ArrsF (Atomic δ) Empty α β}
       (executed : Continuation next value world result final steps)
       {pre : α → δ → Prop} {post : β → δ → Prop}
       (valid : rules.Continuation pre post next) (invariant : rules.invariant world) (holds : pre value world) :

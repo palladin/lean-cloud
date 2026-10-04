@@ -17,8 +17,8 @@ mutual
   def eval {α : Type} {m : Type → Type u} [Monad m]
       (blobs : BlobStorage m) (program : Cloud m α) : ExceptT CloudError m α :=
     match program with
-    | EffF.pure value => pure value
-    | .impure request continuation => do
+    | EffF.pure _ value => pure value
+    | .impure _ request continuation => do
       let value ← evalControl blobs request
       evalContinuation blobs continuation value
   termination_by structural program
@@ -38,7 +38,7 @@ mutual
   termination_by structural request
 
   def evalContinuation {α β : Type} {m : Type → Type u} [Monad m]
-      (blobs : BlobStorage m) (continuation : ArrsF (Control m) α β) (value : α) :
+      (blobs : BlobStorage m) (continuation : ArrsF (Control m) SourceSiteId α β) (value : α) :
       ExceptT CloudError m β :=
     match continuation with
     | .one k => eval blobs (k value)

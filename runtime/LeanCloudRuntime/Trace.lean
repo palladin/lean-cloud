@@ -14,6 +14,7 @@ structure State where
   seq : Nat := 0
   attempt : Option Nat := none
   location : String := ""
+  source : Option SourceSiteId := none
 
 structure Sink where
   worker : String
@@ -33,7 +34,7 @@ def Sink.emit (sink : Sink) (activity operation : String) : IO Unit := do
     let state ← sink.state.get
     sink.state.set { state with seq := state.seq + 1 }
     let event : ExecutionEvent := ⟨sink.session, state.seq, (← IO.monoMsNow) - sink.started,
-      sink.worker, state.attempt, state.location, activity, operation, sink.run⟩
+      sink.worker, state.attempt, state.location, activity, operation, sink.run, state.source⟩
     let resources ← try pure ((Json.parse (← resourceCounters)).toOption) catch _ => pure none
     let resources := resources.map fun json => json.setObjVal! "incarnation" (toJson incarnation)
     let json := (toJson event).setObjVal! "resources" (resources.getD Json.null)
@@ -41,8 +42,12 @@ def Sink.emit (sink : Sink) (activity operation : String) : IO Unit := do
   catch _ => pure ()
 
 def Sink.assign (sink : Sink) (assignment : Assignment) : IO Unit := do
-  sink.state.modify fun state => { state with attempt := some assignment.attempt, location := assignment.location.key }
+  sink.state.modify fun state => { state with attempt := some assignment.attempt, location := assignment.location.key, source := none }
   sink.emit "assigned" ""
+
+/-- Set context before the interpreter touches a record, including replay hits. -/
+def Sink.visit (sink : Sink) (location : Location) (source : Option SourceSiteId) : IO Unit :=
+  sink.state.modify fun state => { state with location := location.key, source }
 
 private def operation (request : Request) : String :=
   if request.kind == "exec" then request.payload.getStr?.toOption.getD "exec" else request.kind
@@ -81,14 +86,14 @@ The bound limits diagnostic traversal; exhausting it leaves the program intact. 
 def Sink.instrument (sink : Sink) (fuel : Nat) (program : Cloud IO α) : Cloud IO α :=
   match fuel, program with
   | 0, _ => program
-  | _, EffF.pure _ => program
-  | fuel + 1, EffF.impure control next =>
+  | _, EffF.pure _ _ => program
+  | fuel + 1, EffF.impure info control next =>
     let control := match control with
       | .command codec (.exec label body) => .command codec (.exec label fun _ => do
           sink.emit "execute" label
           body ())
       | .parallel codec count branches => .parallel codec count fun i => sink.instrument fuel (branches i)
       | other => other
-    EffF.impure control (.one fun value => sink.instrument fuel (ArrsF.apply next value))
+    EffF.impure info control (.one fun value => sink.instrument fuel (ArrsF.apply next value))
 
 end LeanCloudRuntime.Trace

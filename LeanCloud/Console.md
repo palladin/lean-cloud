@@ -408,10 +408,18 @@ cannot reconstruct observations that were never collected. The display uses Dock
 log timestamps, which do not establish causal order between concurrent workers.
 Ordinary pure code and arbitrary lines inside an IO body are not instrumented.
 
-Source files are bundled when the application compiles. Programs explicitly map
-operation labels to source markers; missing or ambiguous markers are rejected.
-Unmapped operations still show their actual location/activity without a guessed
-source line. No input values, blob contents, or local variables are logged.
+`cloud { ... }` captures source spans automatically. `program.register` bundles
+the exact source files and site map from the build, including imported workflow
+modules. Workers report the site on each replay node; repeated operation labels
+and calls from different files remain distinct. Helper effects inherit the call
+site unless an inner cloud block supplies its own annotation. No manual labels
+or source-marker tables are required.
+
+Source sites identify code, while replay locations identify dynamic occurrences
+(such as different loop iterations or parallel branches). Source metadata never
+changes replay keys, requests, fuel, or scheduling. Unknown sites and legacy events
+still show their location/activity without a guessed source line. No input values,
+blob contents, or local variables are logged.
 
 Workers emit events through a best-effort nonblocking log channel. A full channel
 may drop events, and Docker rotates the logs. These observations never determine

@@ -39,14 +39,14 @@ mutual
   theorem program (refinement : Refinement first second) (source : SimM δ α) {pre : δ → Prop} {post : α → δ → Prop}
       (valid : first.Program pre post source) : second.Program pre post source :=
     match source with
-    | .pure value => fun world invariant holds => valid world (refinement.invariant _ invariant) holds
-    | .impure (.step _ _ _) next => by
+    | .pure _ value => fun world invariant holds => valid world (refinement.invariant _ invariant) holds
+    | .impure _ (.step _ _ _) next => by
       obtain ⟨required, reply, entails, operation, rest⟩ := valid
       exact ⟨required, reply, fun world invariant holds => entails world (refinement.invariant _ invariant) holds,
         refinement.atomic operation, continuation refinement next rest⟩
   termination_by structural source
 
-  theorem continuation (refinement : Refinement first second) (next : ArrsF (Atomic δ) α β)
+  theorem continuation (refinement : Refinement first second) (next : ArrsF (Atomic δ) Empty α β)
       {pre : α → δ → Prop} {post : β → δ → Prop}
       (valid : first.Continuation pre post next) : second.Continuation pre post next :=
     match next with

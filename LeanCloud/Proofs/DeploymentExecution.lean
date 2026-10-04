@@ -9,6 +9,8 @@ An uninterrupted segment is the existing finite SimM execution relation. -/
 namespace LeanCloud.Proofs.DeploymentExecution
 open LeanEff SimulationBackend SimulationLogic
 
+variable {info : Option Empty}
+
 private abbrev Trace (actors : Simulation.Start World Unit count) :=
   SchedulerOwnership.Trace actors (fun _ => True)
 
@@ -17,13 +19,13 @@ inductive Execution (actors : Simulation.Start World Unit count) :
       Simulation.State World Unit count → Prop where
   | uninterrupted (executed : SimulationProgress.Execution program before.world value after.world operations)
       (history : Trace actors before after) : Execution actors program before value after
-  | step (remote : Bool) (label : String) (operation : World → β × World)
-      (next : ArrsF (Atomic World) β α)
+  | step {info : Option Empty} (remote : Bool) (label : String) (operation : World → β × World)
+      (next : ArrsF (Atomic World) Empty β α)
       (waiting : Trace actors before ready)
       (committed : Trace actors ready saved)
       (effect : saved.world = (operation ready.world).2)
       (rest : Execution actors (next.apply (operation ready.world).1) saved value after) :
-      Execution actors (.impure (.step remote label operation) next) before value after
+      Execution actors (.impure info (.step remote label operation) next) before value after
 
 theorem Execution.trace {actors : Simulation.Start World Unit count}
     (executed : Execution actors program before value after) : Trace actors before after := by

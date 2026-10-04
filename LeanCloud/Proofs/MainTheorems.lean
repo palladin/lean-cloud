@@ -74,7 +74,7 @@ theorem completed_replay_matches_direct [codec : Codec α]
     | none => False
     | some record =>
         let replay := (ReplayInterpreter.result (m := Id) (α := α) record.outcome).run
-        direct = LeanEff.EffF.pure replay := by
+        direct = LeanEff.EffF.pure none replay := by
   obtain ⟨outcome, evaluation⟩ := pureProgram
   have durable := ConcurrentSafety.completed_result workers turns fuel duration program input evaluation history finished
   dsimp only
@@ -103,7 +103,7 @@ theorem concurrent_replay_matches_direct [codec : Codec α]
         | none => False
         | some record =>
             let replay := (ReplayInterpreter.result (m := Id) (α := α) record.outcome).run
-            direct = LeanEff.EffF.pure replay := by
+            direct = LeanEff.EffF.pure none replay := by
   obtain ⟨outcome, evaluation⟩ := pureProgram
   obtain ⟨sufficientFuel, finishes⟩ := DeploymentProgress.eventually_finishes program input evaluation
   refine ⟨sufficientFuel, ?_⟩

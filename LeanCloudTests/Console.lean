@@ -57,24 +57,17 @@ def consoleCases : Array TestCase := #[
     let restarted := remember history #[("worker", basicSample 90 "b")]
     assertEq restarted[0]!.points.size 1
     assertTrue (!(remember restarted #[])[0]!.fresh) "Missing sample reused as live data"⟩,
-  ⟨"console.source-map-validation", do
-    let source : ProgramSource := ⟨"Example.lean", "first\nCloud.exec body\nlast", #[]⟩
-    let mapped ← unwrap (source.locate #[("work", "Cloud.exec")])
-    assertEq mapped.sites[0]!.line 2
-    assertTrue (source.locate #[("work", "missing")]).toOption.isNone "Missing source marker accepted"
-    assertTrue (({ source with text := "same\nsame" }).locate #[("work", "same")]).toOption.isNone
-      "Ambiguous source marker accepted"⟩,
   ⟨"console.execution-event-roundtrip", do
-    let event : ExecutionEvent := ⟨"boot", 17, 42, "worker1", some 3, "0:1/0:2", "replay", "readBlob", "example"⟩
+    let event : ExecutionEvent := ⟨"boot", 17, 42, "worker1", some 3, "0:1/0:2", "replay", "readBlob", "example", none⟩
     let parsed := event? ("@lean-cloud " ++ (toJson event).compress)
     assertEq (parsed.map (·.location)) (some "0:1/0:2")
     assertTrue (event? "ordinary log line").isNone "Ordinary log interpreted as event"⟩,
   ⟨"console.watch-historical-source", do
     let ctx : Context := ⟨"/work", "test"⟩
-    let source : ProgramSource := ⟨"Example.lean", "cloud {\n  Cloud.exec work\n}", #[⟨"work", 2⟩]⟩
-    let info : ProgramInfo := ⟨"example/v1", "unit/v1", "nat/v1", "", none, some source⟩
+    let source : ProgramSource := ⟨"Example.lean", "cloud {\n  Cloud.exec work\n}", #[⟨"work", 2, 0, 2, 0⟩]⟩
+    let info : ProgramInfo := ⟨"example/v1", "unit/v1", "nat/v1", "", none, #[source]⟩
     let run : Run := ⟨"run-1", "image", info, Json.null, defaultWorkerCount⟩
-    let event : ExecutionEvent := ⟨"boot", 1, 20, "worker1", some 2, "0:1", "execute", "work", run.id⟩
+    let event : ExecutionEvent := ⟨"boot", 1, 20, "worker1", some 2, "0:1", "execute", "work", run.id, some "work"⟩
     let step : LeanCloudCli.Trace.Step := ⟨"2026-01-01T00:00:00.000000000Z", event, none⟩
     let node : Node := { name := ctx.node "worker1", state := "exited", started := "boot", role := "worker1" }
     for status in ["completed", "paused", "cancelled", "result pending"] do
@@ -89,7 +82,7 @@ def consoleCases : Array TestCase := #[
         assertTrue (lines.size < height && lines.all (·.length < width)) "Watch exceeds terminal dimensions"⟩,
   ⟨"console.watch-cursor-survives-refresh", do
     let steps := (Array.range 5).map fun n =>
-      ({ timestamp := toString (n + 1), event := ⟨"boot", n, n, "worker1", some 0, "0:1", "execute", "work", "run"⟩ } : LeanCloudCli.Trace.Step)
+      ({ timestamp := toString (n + 1), event := ⟨"boot", n, n, "worker1", some 0, "0:1", "execute", "work", "run", some "work"⟩ } : LeanCloudCli.Trace.Step)
     let back := Watch.navigate steps 1 2 {} .left
     assertEq (Watch.index steps back) 3
     let first := Watch.navigate steps 1 2 back .home
@@ -104,7 +97,7 @@ def consoleCases : Array TestCase := #[
     assertEq (Watch.index refreshed follow) 6
     assertEq (Watch.index #[] (Watch.navigate #[] 1 5 {} .left)) 0⟩,
   ⟨"console.trace-order-and-dedup", do
-    let event : ExecutionEvent := ⟨"old", 90, 9999, "worker1", some 2, "0:1", "execute", "work", "run"⟩
+    let event : ExecutionEvent := ⟨"old", 90, 9999, "worker1", some 2, "0:1", "execute", "work", "run", some "work"⟩
     let old : LeanCloudCli.Trace.Step := ⟨"2026-01-01T00:00:01.000000000Z", event, none⟩
     let new : LeanCloudCli.Trace.Step := ⟨"2026-01-01T00:00:02.000000000Z", { event with session := "new", seq := 0, elapsedMs := 0 }, none⟩
     let parsed := LeanCloudCli.Trace.parse (old.timestamp ++ " @lean-cloud " ++ (toJson event).compress)
@@ -114,7 +107,7 @@ def consoleCases : Array TestCase := #[
   ⟨"console.watch-global-and-worker-views", do
     let steps := (Array.range 6).map fun n =>
       ({ timestamp := toString n, event := ⟨"boot", n, n, if n % 2 == 0 then "worker1" else "worker2",
-        some 0, s!"0:{n}", "execute", "work", "run"⟩ } : LeanCloudCli.Trace.Step)
+        some 0, s!"0:{n}", "execute", "work", "run", some "work"⟩ } : LeanCloudCli.Trace.Step)
     let browsing := Watch.navigate steps 1 2 {} .left
     let focused := Watch.navigate steps 1 2 browsing (.text "2")
     assertEq focused.worker (some "worker2")
@@ -151,11 +144,11 @@ def consoleCases : Array TestCase := #[
   ⟨"console.history-global-panels-never-use-future-or-live-stats", do
     let ctx : Context := ⟨"/work", "test"⟩
     let source : ProgramSource := ⟨"Code.lean", "first\ndo_worker_one\nsecond\ndo_worker_two\nthird\ndo_worker_three",
-      #[⟨"one", 2⟩, ⟨"two", 4⟩, ⟨"three", 6⟩]⟩
-    let run : Run := ⟨"run", "image", ⟨"app/v1", "unit", "nat", "", none, some source⟩, Json.null, defaultWorkerCount⟩
+      #[⟨"one", 2, 0, 2, 0⟩, ⟨"two", 4, 0, 4, 0⟩, ⟨"three", 6, 0, 6, 0⟩]⟩
+    let run : Run := ⟨"run", "image", ⟨"app/v1", "unit", "nat", "", none, #[source]⟩, Json.null, defaultWorkerCount⟩
     let steps := (Array.range 3).map fun i =>
       ({ timestamp := s!"2026-01-01T00:00:0{i}.000000000Z"
-         event := ⟨"session", i, i, s!"worker{i + 1}", some 0, s!"0:{i}", "execute", #["one", "two", "three"][i]!, run.id⟩
+         event := ⟨"session", i, i, s!"worker{i + 1}", some 0, s!"0:{i}", "execute", #["one", "two", "three"][i]!, run.id, some #["one", "two", "three"][i]!⟩
          resources := some {
            incarnation := s!"boot{i}", timeNs := (i + 1) * 1000000000,
            memory := some ((i + 1) * 1048576), memoryLimit := some 4194304 } } : LeanCloudCli.Trace.Step)
@@ -178,7 +171,7 @@ def consoleCases : Array TestCase := #[
     let restarted := steps.push { future with event := { future.event with worker := "worker1" } }
     assertEq (RecordedMetrics.history restarted "worker1").size 1 "History crossed a container restart"⟩,
   ⟨"console.trace-legacy-cache-and-resource-roundtrip", do
-    let event : ExecutionEvent := ⟨"boot", 1, 10, "worker1", some 0, "0:0", "execute", "work", "run"⟩
+    let event : ExecutionEvent := ⟨"boot", 1, 10, "worker1", some 0, "0:0", "execute", "work", "run", some "work"⟩
     let legacy := Json.mkObj [("timestamp", toJson "stamp"), ("event", toJson event)]
     let old ← unwrap (fromJson? (α := LeanCloudCli.Trace.Step) legacy)
     assertTrue old.resources.isNone "Legacy trace fabricated a sample"

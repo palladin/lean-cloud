@@ -3,6 +3,8 @@ import LeanCloud.DirectInterpreter
 namespace LeanCloud.Proofs.Direct
 open LeanEff DirectInterpreter.Internal
 
+variable {info : Option SourceSiteId}
+
 variable {m : Type → Type u} [Monad m] [LawfulMonad m] (blobs : BlobStorage m)
 
 /-- Appending a continuation has ordinary monadic sequencing semantics. -/
@@ -11,8 +13,8 @@ theorem eval_bind (program : Cloud m α) (next : α → Cloud m β) :
       (eval blobs program >>= fun value => eval blobs (next value)) := by
   cases program <;> simp [EffF.bind, eval, evalContinuation, bind_assoc]
 
-private theorem eval_viewLAppend (first : ArrsF (Control m) α β)
-    (rest : ArrsF (Control m) β γ) (value : α) :
+private theorem eval_viewLAppend (first : ArrsF (Control m) SourceSiteId α β)
+    (rest : ArrsF (Control m) SourceSiteId β γ) (value : α) :
     (match first.viewLAppend rest with
       | .one next => eval blobs (next value)
       | .cons next tail => eval blobs (next value) >>= evalContinuation blobs tail) =
@@ -25,7 +27,7 @@ private theorem eval_viewLAppend (first : ArrsF (Control m) α β)
     simp [evalContinuation, bind_assoc]
 termination_by sizeOf first
 
-private theorem eval_viewL (continuation : ArrsF (Control m) α β) (value : α) :
+private theorem eval_viewL (continuation : ArrsF (Control m) SourceSiteId α β) (value : α) :
     (match continuation.viewL with
       | .one next => eval blobs (next value)
       | .cons next rest => eval blobs (next value) >>= evalContinuation blobs rest) =
@@ -36,7 +38,7 @@ private theorem eval_viewL (continuation : ArrsF (Control m) α β) (value : α)
 
 /-- Replay applies a continuation queue; direct evaluation traverses it
 structurally. Both operations have the same semantics. -/
-theorem eval_apply (continuation : ArrsF (Control m) α β) (value : α) :
+theorem eval_apply (continuation : ArrsF (Control m) SourceSiteId α β) (value : α) :
     eval blobs (continuation.apply value) = evalContinuation blobs continuation value := by
   rw [ArrsF.apply]
   split
@@ -54,8 +56,8 @@ decreasing_by
   simp_all
 
 /-- The replay loop's flattened continuation preserves the direct meaning. -/
-theorem eval_impure (control : Control m α) (continuation : ArrsF (Control m) α β) :
-    eval blobs (.impure control continuation) =
+theorem eval_impure (control : Control m α) (continuation : ArrsF (Control m) SourceSiteId α β) :
+    eval blobs (.impure info control continuation) =
       (evalControl blobs control >>= fun value => eval blobs (continuation.apply value)) := by
   simp only [eval, eval_apply]
 

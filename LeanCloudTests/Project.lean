@@ -56,7 +56,7 @@ def projectCases : Array TestCase := #[
     let source := (world.file "/work/my-app/Main.lean").getD ""
     assertTrue ((source.splitOn "Application.main").length > 1) "No reusable entry point"
     assertTrue ((source.splitOn "name := \"my-app\"").length > 1) "App name missing"
-    assertTrue ((source.splitOn "cloud_source%").length > 1) "App source is not bundled"
+    assertTrue ((source.splitOn "program.register").length > 1) "Generated app does not register its source map"
     for file in ["Main.lean", "lean-toolchain", "lakefile.lean", "lean-cloud.json", ".gitignore"] do
       assertTrue (world.file (System.FilePath.mk "/work/my-app" / file)).isSome s!"Missing {file}"
     assertTrue (world.file "/work/my-app/Dockerfile").isNone "Scaffold exposed Docker boilerplate"

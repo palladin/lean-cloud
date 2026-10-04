@@ -15,7 +15,6 @@ def program : CloudProgram (Array Nat) Nat := {
   version := "v1"
   run := workflow
   sampleInput := some #[1, 2, 3, 4, 5]
-  source := some cloud_source%
 }
 
 def main (args : List String) : IO UInt32 :=

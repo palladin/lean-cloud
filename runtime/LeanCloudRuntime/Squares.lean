@@ -10,5 +10,4 @@ def workflow (numbers : Array Nat) : Cloud IO Nat := cloud {
   return squares.foldl (· + ·) 0
 }
 
-def source : ProgramSource := cloud_source%
 end LeanCloudRuntime.Squares

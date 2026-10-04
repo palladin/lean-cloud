@@ -6,6 +6,8 @@ import LeanCloud.Proofs.JournalRegion
 namespace LeanCloud.Proofs.Specification
 open Lean LeanEff ReplayModel JournalRegion
 
+variable {info : Option SourceSiteId}
+
 /-- A real parallel group in the pure specification: its children have known
 returns, and their ordered reduction is the expected group result. -/
 def Group (journal : Journal) (location : LeanCloud.Location) (count : Nat) : Prop :=
@@ -21,22 +23,22 @@ record, and the ordered join result. The branch's own return record is separate.
 This relation describes the program; it does not execute another interpreter. -/
 inductive Complete {m : Type → Type u} [Monad m] (journal : Journal) :
     {α : Type} → LeanCloud.Location → Cloud m α → Except CloudError α → Prop where
-  | pure (value : α) : Complete journal current (EffF.pure value) (.ok value)
-  | fail (error : CloudError) (next : ArrsF (Control m) α β) :
-      Complete journal current (.impure (.fail error) next) (.error error)
-  | delay (next : ArrsF (Control m) Unit α)
+  | pure {info : Option SourceSiteId} (value : α) : Complete journal current (EffF.pure info value) (.ok value)
+  | fail {info : Option SourceSiteId} (error : CloudError) (next : ArrsF (Control m) SourceSiteId α β) :
+      Complete journal current (.impure info (.fail error) next) (.error error)
+  | delay {info : Option SourceSiteId} (next : ArrsF (Control m) SourceSiteId Unit α)
       (rest : Complete journal current (next.apply ()) outcome) :
-      Complete journal current (.impure .delay next) outcome
-  | exec (codec : Codec α) (label : String) (body : Unit → α) (next : ArrsF (Control m) α β)
+      Complete journal current (.impure info .delay next) outcome
+  | exec {info : Option SourceSiteId} (codec : Codec α) (label : String) (body : Unit → α) (next : ArrsF (Control m) SourceSiteId α β)
       (roundtrip : codec.decode (codec.encode (body ())) = .ok (body ()))
       (present : journal.lookup (ReplayStore.valueKey current) =
         some ⟨ReplayInterpreter.Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → m _)),
           .success (codec.encode (body ()))⟩)
       (rest : Complete journal current.next (next.apply (body ())) outcome) :
       Complete journal current
-        (.impure (.command codec (.exec label (fun _ => pure (body ())))) next) outcome
-  | parallelOk (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
-      (next : ArrsF (Control m) (Array α) β) (outcomes : Fin count → Except CloudError α)
+        (.impure info (.command codec (.exec label (fun _ => pure (body ())))) next) outcome
+  | parallelOk {info : Option SourceSiteId} (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
+      (next : ArrsF (Control m) SourceSiteId (Array α) β) (outcomes : Fin count → Except CloudError α)
       (roundtrip : Pure.RoundTrips codec)
       (children : ∀ index : Fin count, Complete journal (current.child index) (branches index) (outcomes index))
       (returned : ∀ index : Fin count, journal.lookup (ReplayStore.returnKey (current.child index)) =
@@ -46,9 +48,9 @@ inductive Complete {m : Type → Type u} [Monad m] (journal : Journal) :
         some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩,
           .success (Json.arr (values.map codec.encode))⟩)
       (rest : Complete journal current.next (next.apply values) outcome) :
-      Complete journal current (.impure (.parallel codec count branches) next) outcome
-  | parallelError (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
-      (next : ArrsF (Control m) (Array α) β) (outcomes : Fin count → Except CloudError α)
+      Complete journal current (.impure info (.parallel codec count branches) next) outcome
+  | parallelError {info : Option SourceSiteId} (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
+      (next : ArrsF (Control m) SourceSiteId (Array α) β) (outcomes : Fin count → Except CloudError α)
       (roundtrip : Pure.RoundTrips codec)
       (children : ∀ index : Fin count, Complete journal (current.child index) (branches index) (outcomes index))
       (returned : ∀ index : Fin count, journal.lookup (ReplayStore.returnKey (current.child index)) =
@@ -56,7 +58,7 @@ inductive Complete {m : Type → Type u} [Monad m] (journal : Journal) :
       (collected : (Array.ofFn outcomes).mapM id = .error error)
       (present : journal.lookup (ReplayStore.valueKey current) =
         some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, .failure error⟩) :
-      Complete journal current (.impure (.parallel codec count branches) next) (.error error)
+      Complete journal current (.impure info (.parallel codec count branches) next) (.error error)
 
 /-- Forget recorded values to recover the original pure source meaning. -/
 theorem Complete.evaluation {m : Type → Type u} [Monad m] {α : Type}
@@ -97,8 +99,8 @@ private theorem continuation_meanings {m : Type → Type u} [Monad m] {α : Type
     {journal current} {program : Cloud m α} {outcome}
     (complete : Complete journal current program outcome) :
     match program with
-    | EffF.pure _ => True
-    | .impure control next =>
+    | EffF.pure _ _ => True
+    | .impure _ control next =>
       match control with
       | .delay => Complete journal current (next.apply ()) outcome
       | .command codec _ =>
@@ -117,7 +119,7 @@ private theorem continuation_meanings {m : Type → Type u} [Monad m] {α : Type
           Complete journal current.next (next.apply values) outcome)
       | _ => True := by
   cases complete with
-  | pure => trivial
+  | pure info => trivial
   | fail => trivial
   | delay next rest => exact rest
   | exec codec label body next roundtrip present rest =>
@@ -129,7 +131,7 @@ private theorem continuation_meanings {m : Type → Type u} [Monad m] {α : Type
     subst value
     exact rest
   | parallelOk codec count branches next outcomes roundtrip children returned collected present rest =>
-    rename_i valueType expectedValues
+    rename_i valueType expectedValues sourceInfo
     refine ⟨fun index => ⟨outcomes index, children index, returned index⟩, ?_⟩
     intro record wire values found success decoded
     have same := Option.some.inj (found.symm.trans present)
@@ -226,7 +228,7 @@ theorem complete_journal_exists {m : Type → Type u} [Monad m] {α : Type}
     refine ⟨_, .exec codec label body next roundtrip present ?_, coverage⟩
     simpa only [Location.next_push] using complete.extend extension
   | parallelOk codec count branches next outcomes roundtrip children collected rest ihChildren ih =>
-    rename_i valueType resultType values result
+    rename_i valueType resultType values result sourceInfo
     obtain ⟨descendants, childSpecs, returned, childRegion⟩ :=
       children_exist (parent.push (branch, command)) codec count branches outcomes
         (fun index => ihChildren index (parent.push (branch, command)) index 0)
@@ -240,7 +242,7 @@ theorem complete_journal_exists {m : Type → Type u} [Monad m] {α : Type}
       (fun index => childExtension _ _ (returned index)) collected present ?_, coverage⟩
     simpa only [Location.next_push] using complete.extend extension
   | parallelError codec count branches next outcomes roundtrip children collected ihChildren =>
-    rename_i valueType resultType error
+    rename_i valueType resultType error sourceInfo
     obtain ⟨descendants, childSpecs, returned, childRegion⟩ :=
       children_exist (parent.push (branch, command)) codec count branches outcomes
         (fun index => ihChildren index (parent.push (branch, command)) index 0)

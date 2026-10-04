@@ -173,7 +173,7 @@ def runWorker [Codec α] (config : Config) (run : String)
     (← IO.getStdout).flush
     let mut state : Worker.State := {}
     repeat
-      state ← Worker.turn ports 100000 (fun input => trace.instrument 100000 (program input)) input state
+      state ← Worker.turn ports 100000 (fun input => trace.instrument 100000 (program input)) input state (some trace.visit)
       if state.stopped then
         if let some error ← failure.get then throw (IO.userError error.message)
         return

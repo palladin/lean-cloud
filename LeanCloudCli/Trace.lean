@@ -10,7 +10,7 @@ structure Step where
   resources : Option ResourceSample := none
   deriving ToJson
 
-instance : Inhabited Step := ⟨⟨"", ⟨"", 0, 0, "", none, "", "", "", ""⟩, none⟩⟩
+instance : Inhabited Step := ⟨⟨"", ⟨"", 0, 0, "", none, "", "", "", "", none⟩, none⟩⟩
 
 /-- Old trace caches remain readable. Absent or malformed telemetry never
 fabricates metrics or discards an otherwise valid execution observation. -/

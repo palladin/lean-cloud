@@ -8,6 +8,8 @@ initially be missing any record the current assignment is allowed to create. -/
 namespace LeanCloud.Proofs.ExecutionContracts
 open Lean LeanEff SimulationBackend ReplayModel ReplayInterpreter SimulationLogic
 
+variable {info : Option SourceSiteId}
+
 def Ready (expected : Journal) (assignment : Assignment) (world : World) : Prop :=
   assignment.joining = true → Recording.JoinReady expected world.records assignment.location
 
@@ -197,7 +199,7 @@ private theorem finish (expected : Journal) (worker : WorkerId) (branch : Locati
 specified group result before invoking the supplied continuation contract. -/
 private theorem parallel (expected : Journal) (worker : WorkerId) (assignment : Assignment)
     (fuel : Nat) (encode : β → Json) (current : Location) (codec : Codec α) (count : Nat)
-    (branches : Fin count → Cloud (SimM World) α) (next : ArrsF (Control (SimM World)) (Array α) β)
+    (branches : Fin count → Cloud (SimM World) α) (next : ArrsF (Control (SimM World)) SourceSiteId (Array α) β)
     (joined : Exit) (post : Except CloudError Progress → World → Prop)
     (known : expected.lookup (ReplayStore.valueKey current) =
       some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, joined⟩)
@@ -216,7 +218,7 @@ private theorem parallel (expected : Journal) (worker : WorkerId) (assignment : 
           ExceptT CloudError (SimM World) Progress).run)) :
     (ReplayContracts.rules expected).Program (Ready expected assignment) post
       (walk (observed worker).records blobs assignment (fuel + 1) encode
-        (.impure (.parallel codec count branches) next) current true).run := by
+        (.impure info (.parallel codec count branches) next) current true).run := by
   simp only [walk, Bool.true_or, Bool.not_true, Bool.false_and, Bool.false_eq_true, ite_false, ite_true]
   apply Rules.except_bind (middle := fun record world =>
     ReplayContracts.ReadReply (ReplayStore.valueKey current) record world ∧ Ready expected assignment world)

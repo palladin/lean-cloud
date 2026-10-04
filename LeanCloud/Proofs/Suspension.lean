@@ -3,6 +3,8 @@ import LeanCloud.Proofs.Resumption
 namespace LeanCloud.Proofs.Suspension
 open Lean LeanEff ReplayModel ReplayInterpreter Reconstruction
 
+variable {info : Option SourceSiteId}
+
 /-- After suspension the parent can resume at its fork, and every child can be
 reconstructed from the same source using the durable records already present. -/
 def Paths {m : Type → Type u} (journal : Journal) (encode : α → Json) (program : Cloud m α)
@@ -43,8 +45,8 @@ theorem ReportPaths.extend {m : Type → Type u} {before after} {encode : α →
   fun location count forked => (paths location count forked).extend extension
 
 theorem immediate {m : Type → Type u} (journal : Journal) (encode : β → Json) (current : Location)
-    (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α) (next : ArrsF (Control m) (Array α) β) :
-    Paths journal encode (.impure (.parallel codec count branches) next) current current count :=
+    (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α) (next : ArrsF (Control m) SourceSiteId (Array α) β) :
+    Paths journal encode (.impure info (.parallel codec count branches) next) current current count :=
   ⟨.here .., fun index => .child journal encode current codec count branches next index⟩
 
 end LeanCloud.Proofs.Suspension

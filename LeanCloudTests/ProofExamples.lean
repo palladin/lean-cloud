@@ -11,15 +11,15 @@ private theorem bool_roundtrip : Pure.RoundTrips (inferInstance : Codec Bool) :=
   cases value <;> rfl
 
 private def child [Monad m] (captured : Bool) : Cloud m Bool :=
-  .impure .delay (.one fun _ => .pure captured)
+  .impure none .delay (.one fun _ => .pure none captured)
 
 private theorem child_meaning [Monad m] (captured : Bool) : Pure.Evaluation (child (m := m) captured) (.ok captured) :=
-  .delay _ (by simpa [ArrsF.apply, ArrsF.viewL] using Pure.Evaluation.pure (m := m) captured)
+  .delay _ (by simpa [ArrsF.apply, ArrsF.viewL] using Pure.Evaluation.pure (info := none) (m := m) captured)
 
 private def nested [Monad m] (captured : Bool) : Cloud m Bool :=
-  .impure (.parallel (inferInstance : Codec Bool) 2
+  .impure none (.parallel (inferInstance : Codec Bool) 2
     (fun index => child (if index.val = 0 then captured else !captured)))
-    (.one fun values => .pure values[0]!)
+    (.one fun values => .pure none values[0]!)
 
 private theorem nested_meaning [Monad m] (captured : Bool) : Pure.Evaluation (nested (m := m) captured) (.ok captured) := by
   apply Pure.Evaluation.parallelOk (outcomes := fun index => .ok (if index.val = 0 then captured else !captured))
@@ -28,14 +28,14 @@ private theorem nested_meaning [Monad m] (captured : Bool) : Pure.Evaluation (ne
   · intro index
     exact child_meaning _
   · simp [Array.ofFn_succ, Array.mapM_eq_mapM_toList, List.mapM_cons] <;> rfl
-  · simpa [ArrsF.apply, ArrsF.viewL] using Pure.Evaluation.pure (m := m) captured
+  · simpa [ArrsF.apply, ArrsF.viewL] using Pure.Evaluation.pure (info := none) (m := m) captured
 
 private def source [Monad m] (_ : Unit) : Cloud m Json :=
-  .impure (.command (inferInstance : Codec Bool) (.exec "captured" fun _ => pure true))
+  .impure none (.command (inferInstance : Codec Bool) (.exec "captured" fun _ => pure true))
     (.one fun captured =>
-      .impure (.parallel (inferInstance : Codec Bool) 2
+      .impure none (.parallel (inferInstance : Codec Bool) 2
         (fun index => if index.val = 0 then nested captured else child (!captured)))
-        (.one fun values => .pure (toJson values)))
+        (.one fun values => .pure none (toJson values)))
 
 private theorem source_meaning [Monad m] : Pure.Evaluation (source (m := m) ()) (.ok (toJson #[true, false])) := by
   unfold source
@@ -50,11 +50,11 @@ private theorem source_meaning [Monad m] : Pure.Evaluation (source (m := m) ()) 
       · simpa only [first, ite_true] using nested_meaning true
       · simpa only [first, ite_false, Bool.not_true] using child_meaning false
     · simp [Array.ofFn_succ, Array.mapM_eq_mapM_toList, List.mapM_cons] <;> rfl
-    · simpa [ArrsF.apply, ArrsF.viewL] using Pure.Evaluation.pure (m := m) (toJson #[true, false])
+    · simpa [ArrsF.apply, ArrsF.viewL] using Pure.Evaluation.pure (info := none) (m := m) (toJson #[true, false])
 
 -- The same actual source is evaluated directly: no transformation or world.
 example : (DirectInterpreter.interpret blobs source ()).run =
-    EffF.pure (.ok (toJson #[true, false])) :=
+    EffF.pure none (.ok (toJson #[true, false])) :=
   PureDirect.evaluation_matches_direct blobs source_meaning
 
 -- All actor starts and all valid traces, not a hand-selected scheduler path.
@@ -67,7 +67,7 @@ example (workers turns fuel duration : Nat)
     | none => False
     | some record =>
       (DirectInterpreter.interpret blobs source ()).run =
-        EffF.pure ((ReplayInterpreter.result (m := Id) (α := Json) record.outcome).run) :=
+        EffF.pure none ((ReplayInterpreter.result (m := Id) (α := Json) record.outcome).run) :=
   completed_replay_matches_direct workers turns fuel duration source () ⟨_, source_meaning⟩
     (fun _ => rfl) final history finished
 

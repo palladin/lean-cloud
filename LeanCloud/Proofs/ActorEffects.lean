@@ -11,7 +11,7 @@ universe u
 variable {e : Type → Type u} {allowed : {β : Type} → e β → Prop}
 
 structure SchedulerContract (allowed : {β : Type} → e β → Prop)
-    (ports : SchedulerPorts (EffF e)) : Prop where
+    (ports : SchedulerPorts (EffF e Empty)) : Prop where
   receive : Effects.Program allowed ports.inbox.receive
   acknowledge : ∀ receipt, Effects.Program allowed (ports.inbox.acknowledge receipt)
   load : Effects.Program allowed ports.localDb.load
@@ -19,8 +19,8 @@ structure SchedulerContract (allowed : {β : Type} → e β → Prop)
   send : ∀ delivery, Effects.Program allowed (ports.send delivery)
 
 structure WorkerContract (allowed : {β : Type} → e β → Prop)
-    (ports : Worker.Ports (EffF e)) (fuel : Nat)
-    (program : ι → Cloud (EffF e) α) (input : ι) [Codec α] : Prop where
+    (ports : Worker.Ports (EffF e Empty)) (fuel : Nat)
+    (program : ι → Cloud (EffF e Empty) α) (input : ι) [Codec α] : Prop where
   receive : Effects.Program allowed ports.inbox.receive
   acknowledge : ∀ receipt, Effects.Program allowed (ports.inbox.acknowledge receipt)
   send : ∀ message, Effects.Program allowed (ports.send message)
@@ -28,11 +28,11 @@ structure WorkerContract (allowed : {β : Type} → e β → Prop)
   execution : ∀ assignment, Effects.Program allowed
     (ReplayInterpreter.step ports.observe.records ports.blobs fuel program input assignment).run
 
-theorem recover {ports : SchedulerPorts (EffF e)} (valid : SchedulerContract allowed ports) :
+theorem recover {ports : SchedulerPorts (EffF e Empty)} (valid : SchedulerContract allowed ports) :
     Effects.Program allowed (Scheduler.recover ports.localDb) :=
   Effects.bind _ valid.load (fun _ => valid.save _)
 
-theorem scheduler_turn {ports : SchedulerPorts (EffF e)} (valid : SchedulerContract allowed ports)
+theorem scheduler_turn {ports : SchedulerPorts (EffF e Empty)} (valid : SchedulerContract allowed ports)
     (duration : Nat) : Effects.Program allowed (Scheduler.turn ports duration) := by
   unfold Scheduler.turn
   apply Effects.bind _ valid.receive
@@ -53,15 +53,15 @@ theorem scheduler_turn {ports : SchedulerPorts (EffF e)} (valid : SchedulerContr
     · intro _
       exact valid.acknowledge delivery.receipt
 
-theorem worker_execute [Codec α] {ports : Worker.Ports (EffF e)}
-    {fuel : Nat} {program : ι → Cloud (EffF e) α} {input : ι}
+theorem worker_execute [Codec α] {ports : Worker.Ports (EffF e Empty)}
+    {fuel : Nat} {program : ι → Cloud (EffF e Empty) α} {input : ι}
     (valid : WorkerContract allowed ports fuel program input) (assignment : Assignment) :
     Effects.Program allowed (Worker.execute ports.id ports.observe ports.blobs fuel program input assignment) :=
   Effects.bind _ (valid.execution assignment) (fun _ =>
     Effects.bind _ valid.confirmed (fun _ => trivial))
 
-theorem worker_turn [Codec α] {ports : Worker.Ports (EffF e)}
-    {fuel : Nat} {program : ι → Cloud (EffF e) α} {input : ι}
+theorem worker_turn [Codec α] {ports : Worker.Ports (EffF e Empty)}
+    {fuel : Nat} {program : ι → Cloud (EffF e Empty) α} {input : ι}
     (valid : WorkerContract allowed ports fuel program input) (state : Worker.State) :
     Effects.Program allowed (Worker.turn ports fuel program input state) := by
   unfold Worker.turn

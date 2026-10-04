@@ -9,7 +9,7 @@ namespace LeanCloud
 inductive Atomic (δ : Type) : Type → Type where
   | step {α : Type} (remote : Bool) (label : String) (operation : δ → α × δ) : Atomic δ α
 
-abbrev SimM (δ : Type) := LeanEff.EffF (Atomic δ)
+abbrev SimM (δ : Type) := LeanEff.EffF (Atomic δ) Empty
 
 def SimM.atomic (operation : δ → α × δ) (label : String := "remote") : SimM δ α :=
   LeanEff.EffF.send (.step true label operation)
@@ -22,14 +22,14 @@ open LeanEff
 
 inductive Actor (δ α : Type) where
   | waiting {β : Type} (remote : Bool) (label : String)
-      (operation : δ → β × δ) (next : ArrsF (Atomic δ) β α)
-  | responding {β : Type} (value : β) (next : ArrsF (Atomic δ) β α)
+      (operation : δ → β × δ) (next : ArrsF (Atomic δ) Empty β α)
+  | responding {β : Type} (value : β) (next : ArrsF (Atomic δ) Empty β α)
   | stopped
   | finished (value : α)
 
 def Actor.ofProgram : SimM δ α → Actor δ α
-  | .pure value => .finished value
-  | .impure (.step remote label operation) next => .waiting remote label operation next
+  | .pure _ value => .finished value
+  | .impure _ (.step remote label operation) next => .waiting remote label operation next
 
 structure Orphan (δ : Type) where
   label : String

@@ -4,6 +4,8 @@ import LeanCloud.Proofs.Worker
 namespace LeanCloud.Proofs.Recording
 open Lean LeanEff ReplayModel ReplayInterpreter
 
+variable {info : Option SourceSiteId}
+
 /-- The scheduler may authorize one join. Its immutable child records must be
 available and reduce to the result specified for that group. -/
 def JoinReady (expected journal : Journal) (location : Location) : Prop :=
@@ -96,12 +98,12 @@ variable {β : Type} (encode : β → Json)
 calling the same continuation used by direct evaluation. -/
 theorem exec_missing (journal : Journal) (blobs : BlobStorage M) (assignment : Assignment)
     (current : Location) (fuel : Nat) (codec : Codec α) (label : String) (body : Unit → α)
-    (next : ArrsF (Control M) α β)
+    (next : ArrsF (Control M) SourceSiteId α β)
     (missing : journal.lookup (ReplayStore.valueKey current) = none)
     (roundtrip : codec.decode (codec.encode (body ())) = .ok (body ())) :
     let operation : Operation M α := .exec label (fun _ => pure (body ()))
     let record : ReplayRecord := ⟨Internal.request codec operation, .success (codec.encode (body ()))⟩
-    (walk store blobs assignment (fuel + 1) encode (.impure (.command codec operation) next) current true).run journal =
+    (walk store blobs assignment (fuel + 1) encode (.impure info (.command codec operation) next) current true).run journal =
       (walk store blobs assignment fuel encode (next.apply (body ())) current.next true).run
         ((ReplayStore.valueKey current, record) :: journal) := by
   dsimp only
@@ -116,13 +118,13 @@ theorem exec_missing (journal : Journal) (blobs : BlobStorage M) (assignment : A
 another write, including when another attempt created the record first. -/
 theorem exec_present (journal : Journal) (blobs : BlobStorage M) (assignment : Assignment)
     (current : Location) (fuel : Nat) (codec : Codec α) (label : String) (body : Unit → α)
-    (next : ArrsF (Control M) α β)
+    (next : ArrsF (Control M) SourceSiteId α β)
     (present : journal.lookup (ReplayStore.valueKey current) =
       some ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → M α)),
         .success (codec.encode (body ()))⟩)
     (roundtrip : codec.decode (codec.encode (body ())) = .ok (body ())) :
     (walk store blobs assignment (fuel + 1) encode
-      (.impure (.command codec (.exec label (fun _ => pure (body ())))) next) current true).run journal =
+      (.impure info (.command codec (.exec label (fun _ => pure (body ())))) next) current true).run journal =
       (walk store blobs assignment fuel encode (next.apply (body ())) current.next true).run journal := by
   rw [walk]
   simp only [Bool.true_or]
@@ -133,7 +135,7 @@ theorem exec_present (journal : Journal) (blobs : BlobStorage M) (assignment : A
 both cases its continuation sees the computed value and the journal stays valid. -/
 theorem exec_within (journal expected : Journal) (blobs : BlobStorage M) (assignment : Assignment)
     (current : Location) (codec : Codec α) (label : String) (body : Unit → α)
-    (next : ArrsF (Control M) α β)
+    (next : ArrsF (Control M) SourceSiteId α β)
     (roundtrip : codec.decode (codec.encode (body ())) = .ok (body ()))
     (consistent : Extends journal expected)
     (known : expected.lookup (ReplayStore.valueKey current) =
@@ -143,7 +145,7 @@ theorem exec_within (journal expected : Journal) (blobs : BlobStorage M) (assign
     let record : ReplayRecord := ⟨Internal.request codec operation, .success (codec.encode (body ()))⟩
     ∃ after, Extends journal after ∧ Extends after expected ∧
       after.lookup (ReplayStore.valueKey current) = some record ∧
-      ∀ fuel, (walk store blobs assignment (fuel + 1) encode (.impure (.command codec operation) next) current true).run journal =
+      ∀ fuel, (walk store blobs assignment (fuel + 1) encode (.impure info (.command codec operation) next) current true).run journal =
         (walk store blobs assignment fuel encode (next.apply (body ())) current.next true).run after := by
   dsimp only
   have accepted := create_within journal expected _ _ consistent known
@@ -167,7 +169,7 @@ theorem exec_within (journal expected : Journal) (blobs : BlobStorage M) (assign
 exactly like replay from the newly cached join. This includes failed groups. -/
 theorem join_missing_is_cached (journal : Journal) (blobs : BlobStorage M) (assignment : Assignment)
     (fuel : Nat) (codec : Codec α) (count : Nat) (branches : Fin count → Cloud M α)
-    (next : ArrsF (Control M) (Array α) β) (outcomes : Nat → Exit)
+    (next : ArrsF (Control M) SourceSiteId (Array α) β) (outcomes : Nat → Exit)
     (joining : assignment.joining = true)
     (missing : journal.lookup (ReplayStore.valueKey assignment.location) = none)
     (completed : ∀ index, index < count →
@@ -177,7 +179,7 @@ theorem join_missing_is_cached (journal : Journal) (blobs : BlobStorage M) (assi
       ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩,
         collect ((Array.range count).map outcomes)⟩
     let after := (ReplayStore.valueKey assignment.location, record) :: journal
-    let program := EffF.impure (.parallel codec count branches) next
+    let program := EffF.impure info (.parallel codec count branches) next
     (walk store blobs assignment (fuel + 1) encode program assignment.location true).run journal =
       (walk store blobs assignment (fuel + 1) encode program assignment.location true).run after := by
   dsimp only
@@ -193,12 +195,12 @@ theorem join_missing_is_cached (journal : Journal) (blobs : BlobStorage M) (assi
 
 theorem group_success (journal : Journal) (blobs : BlobStorage M) (assignment : Assignment)
     (current : Location) (fuel : Nat) (codec : Codec α) (count : Nat) (branches : Fin count → Cloud M α)
-    (next : ArrsF (Control M) (Array α) β) (values : Array α)
+    (next : ArrsF (Control M) SourceSiteId (Array α) β) (values : Array α)
     (roundtrip : Pure.RoundTrips codec) (size : values.size = count)
     (present : journal.lookup (ReplayStore.valueKey current) =
       some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩,
         .success (Json.arr (values.map codec.encode))⟩) :
-    (walk store blobs assignment (fuel + 1) encode (.impure (.parallel codec count branches) next) current true).run journal =
+    (walk store blobs assignment (fuel + 1) encode (.impure info (.parallel codec count branches) next) current true).run journal =
       (walk store blobs assignment fuel encode (next.apply values) current.next true).run journal := by
   rw [walk]
   simp only [Bool.true_or]
@@ -209,10 +211,10 @@ theorem group_success (journal : Journal) (blobs : BlobStorage M) (assignment : 
 
 theorem group_failure (journal : Journal) (blobs : BlobStorage M) (assignment : Assignment)
     (current : Location) (fuel : Nat) (codec : Codec α) (count : Nat) (branches : Fin count → Cloud M α)
-    (next : ArrsF (Control M) (Array α) β) (error : CloudError)
+    (next : ArrsF (Control M) SourceSiteId (Array α) β) (error : CloudError)
     (present : journal.lookup (ReplayStore.valueKey current) =
       some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, .failure error⟩) :
-    (walk store blobs assignment (fuel + 1) encode (.impure (.parallel codec count branches) next) current true).run journal =
+    (walk store blobs assignment (fuel + 1) encode (.impure info (.parallel codec count branches) next) current true).run journal =
       (Internal.finish store assignment.branch (.failure error)).run journal := by
   rw [walk]
   simp only [Bool.true_or]

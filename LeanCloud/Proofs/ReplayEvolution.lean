@@ -179,7 +179,7 @@ theorem creation_reply_survives [Codec α] (workers turns fuel duration : Nat)
     (past : SchedulerOwnership.Trace (start turns fuel duration program input) (fun _ => True)
       (Simulation.State.initial world (start turns fuel duration program input)) before)
     (actor : Fin (workers + 1)) (key : String) (proposed : ReplayRecord)
-    (next : ArrsF (Atomic World) ReplayRecord Unit)
+    (next : ArrsF (Atomic World) Empty ReplayRecord Unit)
     (waiting : before.actors actor = .waiting true s!"record.create:{key}" (SimulationBackend.create key proposed) next)
     (executed : SimulationBackend.step (start turns fuel duration program input) (.commit actor) before = .ok committed)
     (future : SchedulerOwnership.Trace (start turns fuel duration program input) (fun _ => True) committed after) :

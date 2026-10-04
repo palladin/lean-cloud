@@ -58,9 +58,13 @@ def navigate (steps : Array Trace.Step) (autoOffset page : Nat)
     | .text "a" => { nav with offset := 0 }
     | _ => nav
 
-def sourceLine (run : Run) (step : Trace.Step) : Option Nat := do
-  let source ← run.program.source
-  return (← source.sites.find? (·.operation == step.event.operation)).line
+def sourcePosition (run : Run) (step : Trace.Step) : Option (ProgramSource × SourceSite) := do
+  let id ← step.event.source
+  run.program.sources.findSome? fun source =>
+    (source.sites.find? (·.id == id)).map (source, ·)
+
+def sourceLine (run : Run) (step : Trace.Step) : Option Nat :=
+  (sourcePosition run step).map (·.2.line)
 
 private def sourceStart (run : Run) (steps : Array Trace.Step) (nav : Navigation) (context := 1) : Nat :=
   let displayed := visible steps nav
@@ -70,7 +74,7 @@ private def sourceStart (run : Run) (steps : Array Trace.Step) (nav : Navigation
     let cutoff ← steps.findIdx? (·.id == selected.id)
     (steps.extract 0 (cutoff + 1)).findSomeRev? fun step =>
       if step.event.worker == selected.event.worker then sourceLine run step else none
-  let fallback := (run.program.source >>= fun source => source.sites[0]?.map (·.line)).getD 1
+  let fallback := (run.program.sources[0]? >>= fun source => source.sites[0]?.map (·.line)).getD 1
   max 1 ((mapped.orElse (fun _ => previous)).getD fallback - context)
 
 private def tableRows (height : Nat) := max 1 (min 7 ((height - 16) / 2))
@@ -103,8 +107,9 @@ def metrics (ctx : Context) (worker : String) (observed : Array Trace.Step)
 
 private def sourceRows (run : Run) (observed : Array Trace.Step) (worker : String)
     (rows offset : Nat) : Array Styled.Line := Id.run do
-  let some source := run.program.source | return #[Styled.text "Source not bundled" .muted]
   let mapped := workerSource run observed worker
+  let some source := (mapped >>= sourcePosition run).map (·.1) |>.orElse (fun _ => run.program.sources[0]?)
+    | return #[Styled.text "Source not bundled" .muted]
   let line := mapped >>= sourceLine run
   let latest := workerStep observed worker
   let exact := mapped.map (·.id) == latest.map (·.id) && mapped.isSome
@@ -142,12 +147,14 @@ private def panel (ctx : Context) (run : Run) (observed : Array Trace.Step)
     | none => "Recorded metrics"
     | some s => "Recorded " ++ timestamp s.timestamp
   let title := Styled.text (pad width s!" {worker} · {if live then "Live" else "History"}") .header
+  let position := workerSource run observed worker >>= sourcePosition run
+  let file := position.map (fun (source, site) => s!"{source.file}:{site.line}") |>.getD "source unavailable"
   let code := sourceRows run observed worker codeRows offset
   if compact then
-    return #[Styled.text (pad width s!" {worker} · {detail}") .header] ++ code ++
+    return #[Styled.text (pad width s!" {worker} · {file} · {detail}") .header] ++ code ++
       metrics ctx worker observed histories disks live width true
   return #[title, Styled.text detail .cyan,
-      Styled.text s!"Source: {run.program.source.map (·.file) |>.getD "unavailable"}" .muted] ++ code ++
+      Styled.text s!"Source: {file}" .muted] ++ code ++
     #[Styled.text stamp .muted] ++ metrics ctx worker observed histories disks live width
 
 /-- Global pages cover every worker. Each panel has its own code window and

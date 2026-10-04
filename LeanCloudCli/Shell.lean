@@ -162,8 +162,8 @@ private def draw (ctx : Context) (catalog : Completion.Catalog) (state : State)
 partial def execute (ctx : Context) (catalog : Completion.Catalog) (state : State)
     (program : Cli (Context × Bool)) (lastSize : Nat × Nat := (0, 0)) : Cli (Except String (Context × Bool) × State) := do
   match program.run with
-  | .pure result => return (result, state)
-  | .impure (.here (.request (.write text stderr))) next =>
+  | EffF.pure _ result => return (result, state)
+  | EffF.impure _ (.here (.request (.write text stderr))) next =>
     let state := appendOutput state text (if stderr then .red else .normal)
     let result ← observing do
       let size ← request .dimensions
@@ -171,7 +171,7 @@ partial def execute (ctx : Context) (catalog : Completion.Catalog) (state : Stat
       return size
     execute ctx catalog state (ExceptT.mk (ArrsF.apply next (result.map fun _ => ())))
       (result.toOption.getD lastSize)
-  | .impure (.here (.request (.writeStyled line))) next =>
+  | EffF.impure _ (.here (.request (.writeStyled line))) next =>
     let state := appendStyled state line
     let result ← observing do
       let size ← request .dimensions
@@ -179,7 +179,7 @@ partial def execute (ctx : Context) (catalog : Completion.Catalog) (state : Stat
       return size
     execute ctx catalog state (ExceptT.mk (ArrsF.apply next (result.map fun _ => ())))
       (result.toOption.getD lastSize)
-  | .impure (.here (.request (.pollProcess id timeout))) next =>
+  | EffF.impure _ (.here (.request (.pollProcess id timeout))) next =>
     let chunk ← observing (request (.pollProcess id timeout))
     let result ← observing do
       let chunk ← liftExcept chunk
@@ -194,10 +194,10 @@ partial def execute (ctx : Context) (catalog : Completion.Catalog) (state : Stat
     let state := result.toOption.map (·.2.1) |>.getD state
     let size := result.toOption.map (·.2.2) |>.getD lastSize
     execute ctx catalog state (ExceptT.mk (ArrsF.apply next (result.map Prod.fst))) size
-  | .impure (.here (.request operation)) next =>
+  | EffF.impure _ (.here (.request operation)) next =>
     let result ← observing (request operation)
     execute ctx catalog state (ExceptT.mk (ArrsF.apply next result)) lastSize
-  | .impure (.there rest) _ => nomatch rest
+  | EffF.impure _ (.there rest) _ => nomatch rest
 
 private def screenOn : Cli Unit := request (.write "\x1b[?1049h\x1b[?2004h\x1b[H\x1b[2J")
 private def screenOff : Cli Unit := do

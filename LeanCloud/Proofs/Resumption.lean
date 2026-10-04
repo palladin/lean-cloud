@@ -3,6 +3,8 @@ import LeanCloud.Proofs.Reconstruction
 namespace LeanCloud.Proofs.Reconstruction
 open Lean LeanEff ReplayModel ReplayInterpreter Routing
 
+variable {info : Option SourceSiteId}
+
 /-- A location can be reconstructed from the source program. The continuation,
 its result type, encoder, and prefix budget are proof witnesses, not runtime data. -/
 def Resumable {m : Type → Type u} (journal : Journal) (encode : α → Json) (program : Cloud m α)
@@ -24,8 +26,8 @@ private theorem Resumable.continuation {m : Type → Type u} {journal current ta
     {encode : α → Json} {program : Cloud m α}
     (available : Resumable journal encode program current target) (before : current ≠ target) :
     match program with
-    | EffF.pure _ => False
-    | .impure control next =>
+    | EffF.pure _ _ => False
+    | .impure _ control next =>
       match control with
       | .delay => Resumable journal encode (next.apply ()) current target
       | .command codec operation =>
@@ -122,21 +124,21 @@ theorem Resumable.prepend {m : Type → Type u} {journal current middle target s
   exact ⟨γ, finalEncode, final, steps + tailSteps, witness.append suffix nonempty⟩
 
 theorem Resumable.delay {m : Type → Type u} {journal current target} {encode : α → Json}
-    (next : ArrsF (Control m) Unit α) (rest : Resumable journal encode (next.apply ()) current target) :
-    Resumable journal encode (.impure .delay next) current target := by
+    (next : ArrsF (Control m) SourceSiteId Unit α) (rest : Resumable journal encode (next.apply ()) current target) :
+    Resumable journal encode (.impure info .delay next) current target := by
   by_cases same : current = target
   · subst target; exact .here ..
   · obtain ⟨β, remainingEncode, remaining, steps, witness⟩ := rest
     exact ⟨β, remainingEncode, remaining, steps + 1, .delay next same witness⟩
 
 theorem Resumable.command {m : Type → Type u} {journal current target} {encode : β → Json}
-    (codec : Codec α) (operation : Operation m α) (next : ArrsF (Control m) α β)
+    (codec : Codec α) (operation : Operation m α) (next : ArrsF (Control m) SourceSiteId α β)
     (record : ReplayRecord) (wire : Json) (value : α) (nonempty : 0 < current.size)
     (present : journal.lookup (ReplayStore.valueKey current) = some record)
     (checked : (record.request == Internal.request codec operation) = true)
     (success : record.outcome = .success wire) (decoded : codec.decode wire = .ok value)
     (rest : Resumable journal encode (next.apply value) current.next target) :
-    Resumable journal encode (.impure (.command codec operation) next) current target := by
+    Resumable journal encode (.impure info (.command codec operation) next) current target := by
   obtain ⟨γ, remainingEncode, remaining, steps, witness⟩ := rest
   have edge := next_follows current nonempty
   have later := witness.follows (Nat.lt_of_lt_of_le nonempty edge.depth)
@@ -145,13 +147,13 @@ theorem Resumable.command {m : Type → Type u} {journal current target} {encode
       present checked success decoded witness⟩
 
 theorem Resumable.joined {m : Type → Type u} {journal current target} {encode : β → Json}
-    (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α) (next : ArrsF (Control m) (Array α) β)
+    (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α) (next : ArrsF (Control m) SourceSiteId (Array α) β)
     (record : ReplayRecord) (wire : Json) (values : Array α) (nonempty : 0 < current.size)
     (present : journal.lookup (ReplayStore.valueKey current) = some record)
     (checked : (record.request == ⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩) = true)
     (success : record.outcome = .success wire) (decoded : (@instCodecArray α codec).decode wire = .ok values)
     (size : values.size = count) (rest : Resumable journal encode (next.apply values) current.next target) :
-    Resumable journal encode (.impure (.parallel codec count branches) next) current target := by
+    Resumable journal encode (.impure info (.parallel codec count branches) next) current target := by
   obtain ⟨γ, remainingEncode, remaining, steps, witness⟩ := rest
   have edge := next_follows current nonempty
   have later := witness.follows (Nat.lt_of_lt_of_le nonempty edge.depth)
@@ -161,9 +163,9 @@ theorem Resumable.joined {m : Type → Type u} {journal current target} {encode 
       present checked success decoded size witness⟩
 
 theorem Resumable.child {m : Type → Type u} (journal : Journal) (encode : β → Json) (current : Location)
-    (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α) (next : ArrsF (Control m) (Array α) β)
+    (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α) (next : ArrsF (Control m) SourceSiteId (Array α) β)
     (index : Fin count) :
-    Resumable journal encode (.impure (.parallel codec count branches) next) current (current.child index) := by
+    Resumable journal encode (.impure info (.parallel codec count branches) next) current (current.child index) := by
   refine ⟨α, codec.encode, branches index, 1, .child codec count branches next index ?_
     (enters_child current index) (by simp [LeanCloud.Location.child]) (.here _ _)⟩
   intro same

@@ -13,11 +13,11 @@ variable {m : Type → Type u} (allowed : {α : Type} → m α → Prop)
 
 mutual
   def Program : Cloud m α → Prop
-    | EffF.pure _ => True
-    | .impure request next => Request request ∧ Continuation next
+    | EffF.pure _ _ => True
+    | .impure _ request next => Request request ∧ Continuation next
   termination_by structural program => program
 
-  def Continuation : ArrsF (Control m) α β → Prop
+  def Continuation : ArrsF (Control m) SourceSiteId α β → Prop
     | .one next => ∀ value, Program (next value)
     | .append first rest => Continuation first ∧ Continuation rest
   termination_by structural next => next
@@ -34,11 +34,11 @@ mutual
   private theorem program_iff (program : Cloud m α) :
       Program allowed program ↔ Effects.Program (Request allowed) program :=
     match program with
-    | EffF.pure _ => Iff.rfl
-    | .impure _ next => and_congr Iff.rfl (continuation_iff next)
+    | EffF.pure _ _ => Iff.rfl
+    | .impure _ _ next => and_congr Iff.rfl (continuation_iff next)
   termination_by structural program
 
-  private theorem continuation_iff (next : ArrsF (Control m) α β) :
+  private theorem continuation_iff (next : ArrsF (Control m) SourceSiteId α β) :
       Continuation allowed next ↔ Effects.Continuation (Request allowed) next :=
     match next with
     | .one next => forall_congr' fun value => program_iff (next value)
@@ -46,7 +46,7 @@ mutual
   termination_by structural next
 end
 
-theorem pure (value : α) : Program allowed (EffF.pure value : Cloud m α) := trivial
+theorem pure (value : α) : Program allowed (EffF.pure info value : Cloud m α) := trivial
 
 theorem bind {program : Cloud m α} {next : α → Cloud m β}
     (valid : Program allowed program) (rest : ∀ value, Program allowed (next value)) :
@@ -76,7 +76,7 @@ theorem parallel [Codec α] (branches : Array (Cloud m α))
     (valid : ∀ index : Fin branches.size, Program allowed branches[index]) :
     Program allowed (Cloud.parallel branches) := send allowed valid
 
-theorem apply (next : ArrsF (Control m) α β) (valid : Continuation allowed next) (value : α) :
+theorem apply (next : ArrsF (Control m) SourceSiteId α β) (valid : Continuation allowed next) (value : α) :
     Program allowed (next.apply value) := by
   rw [continuation_iff] at valid
   exact (program_iff allowed _).mpr (Effects.apply _ next valid value)

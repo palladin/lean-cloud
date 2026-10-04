@@ -34,8 +34,8 @@ def evaluate (fuel : Nat) (program : SimM δ α) (world : δ) : Except String (�
   | 0 => .error "Simulation evaluation fuel exhausted"
   | fuel + 1 =>
     match program with
-    | LeanEff.EffF.pure value => .ok (value, world)
-    | .impure (.step _ _ operation) next =>
+    | LeanEff.EffF.pure _ value => .ok (value, world)
+    | .impure _ (.step _ _ operation) next =>
       let (value, world) := operation world
       evaluate fuel (LeanEff.ArrsF.apply next value) world
 
