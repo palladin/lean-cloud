@@ -18,6 +18,7 @@ def commands : Array Item := #[
   ⟨"run", "Launch a cloud program"⟩, ⟨"ps", "List cloud processes"⟩,
   ⟨"inspect", "Inspect jobs and workers"⟩, ⟨"result", "Read a completed result"⟩,
   ⟨"watch", "Live code and resource graphs"⟩, ⟨"nodes", "Inspect deployment nodes"⟩,
+  ⟨"top", "Live worker and scheduler resource graphs"⟩,
   ⟨"logs", "Read actor logs"⟩, ⟨"resume", "Resume a paused run or repair a launch"⟩,
   ⟨"pause", "Stop a run; preserve replay state for resume"⟩,
   ⟨"kill", "Permanently cancel a run"⟩,
@@ -95,6 +96,10 @@ def candidates (catalog : Catalog) (ctx : Context) : Array Item :=
     | ["inspect"] | ["result"] | ["watch"] | ["logs"] | ["resume"] | ["pause"] | ["kill"] => catalog.runs
     | ["logs", _] => #[⟨"worker1", ""⟩, ⟨"worker2", ""⟩, ⟨"worker3", ""⟩, ⟨"scheduler", ""⟩]
     | ["watch", _] => #[⟨"--once", "Print one frame"⟩]
+    | ["top"] => #[⟨"--once", "Print a snapshot of all workers and schedulers"⟩]
+    | "deploy" :: rest | "up" :: rest =>
+      if rest.contains "-v" || rest.contains "--verbose" then #[]
+      else #[⟨"--verbose", "Stream full build/startup output (-v)"⟩, ⟨"-v", "Stream full build/startup output"⟩]
     | "run" :: _ :: rest =>
       if rest.getLast? == some "--input" then catalog.files
       else if rest.getLast? == some "--id" then #[]

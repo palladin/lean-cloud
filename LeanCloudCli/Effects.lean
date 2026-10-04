@@ -1,5 +1,6 @@
 import LeanEff.Core
 import Lean
+import LeanCloudCli.Styled
 
 namespace LeanCloudCli
 open LeanEff
@@ -34,6 +35,7 @@ inductive HostOp : Type → Type where
   | closeProcess (id : ProcessId) : HostOp Unit
   | readFile (path : System.FilePath) : HostOp String
   | writeFile (path : System.FilePath) (text : String) : HostOp Unit
+  | appendFile (path : System.FilePath) (text : String) : HostOp Unit
   | rename (source target : System.FilePath) : HostOp Unit
   | exists (path : System.FilePath) : HostOp Bool
   | readDir (path : System.FilePath) : HostOp (Array String)
@@ -46,6 +48,7 @@ inductive HostOp : Type → Type where
   | now : HostOp Nat
   | sleep (milliseconds : UInt32) : HostOp Unit
   | write (text : String) (stderr : Bool := false) : HostOp Unit
+  | writeStyled (line : Styled.Line) : HostOp Unit
   | flush : HostOp Unit
   | readLine : HostOp String
   | enterTerminal : HostOp Bool
@@ -64,8 +67,14 @@ abbrev Cli := ExceptT String (Eff [Host])
 def request (operation : HostOp α) : Cli α :=
   ExceptT.mk (send (Host.request operation))
 
-def printLine (text : String) : Cli Unit := request (.write (text ++ "\n"))
+def printStyled (line : Styled.Line) : Cli Unit := request (.writeStyled line)
+def printLine (text : String) : Cli Unit := do
+  for line in text.splitOn "\n" do printStyled (Styled.text line)
+def printHeading (text : String) : Cli Unit := printStyled (Styled.text text .header)
 def printError (text : String) : Cli Unit := request (.write (text ++ "\n") true)
+
+def colorsEnabled : Cli Bool := do
+  return (← request (.getEnv "NO_COLOR")).isNone && (← request (.getEnv "TERM")) != some "dumb"
 
 /-- Cleanup is part of the effect program and also runs after a host failure.
     As with IO, a cleanup failure takes precedence over the original failure. -/

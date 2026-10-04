@@ -17,24 +17,31 @@ structure State where
   history : Array String := #[]
   browsing : Option Nat := none
   draft : String := ""
-  transcript : Array String := #[]
+  transcript : Array Styled.Line := #[]
   partialLine : String := ""
   scroll : Nat := 0
   cycle : Option Cycle := none
 
-def appendOutput (state : State) (text : String) : State := Id.run do
+def appendOutput (state : State) (text : String) (color : Styled.Color := .normal) : State := Id.run do
   let lines := (state.partialLine ++ text).splitOn "\n"
-  let mut all := state.transcript ++ (lines.dropLast.map safe).toArray
+  let mut all := state.transcript ++ (lines.dropLast.map (fun line => Styled.text (safe line) color)).toArray
   let mut partialLine := safe (lines.getLast!)
   -- A program can emit an unbounded line; keep the transcript bounded too.
   while partialLine.length > 4096 do
-    all := all.push (String.ofList (partialLine.toList.take 4096))
+    all := all.push (Styled.text (String.ofList (partialLine.toList.take 4096)) color)
     partialLine := String.ofList (partialLine.toList.drop 4096)
   let removed := all.size - 2000
   let added := all.size - state.transcript.size
   return { state with
     transcript := all.extract removed all.size, partialLine
     scroll := if state.scroll == 0 then 0 else state.scroll + added }
+
+def appendStyled (state : State) (line : Styled.Line) : State :=
+  let state := if state.partialLine.isEmpty then state else appendOutput state "\n"
+  let all := state.transcript.push (Styled.slice line 0 4096)
+  { state with
+    transcript := all.extract (all.size - 2000) all.size
+    scroll := if state.scroll == 0 then 0 else state.scroll + 1 }
 
 private def replace (state : State) (start stop : Nat) (text : String) : State :=
   { state with
@@ -94,11 +101,10 @@ structure Frame where
   cursorColumn : Nat
   deriving Repr
 
-private def outputLines (state : State) (width : Nat) : Array String :=
-  (state.transcript ++ (if state.partialLine.isEmpty then #[] else #[state.partialLine])).flatMap fun line =>
-    let chars := line.toList.toArray
-    (Array.range (max 1 ((chars.size + width - 1) / width))).map fun i =>
-      String.ofList (chars.extract (i * width) ((i + 1) * width)).toList
+private def outputLines (state : State) (width : Nat) : Array Styled.Line :=
+  (state.transcript ++ (if state.partialLine.isEmpty then #[] else #[Styled.text state.partialLine])).flatMap fun line =>
+    (Array.range (max 1 ((Styled.length line + width - 1) / width))).map fun i =>
+      Styled.slice line (i * width) ((i + 1) * width)
 
 private def clampScroll (state : State) (columns rows : Nat) : State :=
   let count := (outputLines state (max 1 (columns - 1))).size
@@ -106,48 +112,47 @@ private def clampScroll (state : State) (columns rows : Nat) : State :=
 
 /-- The last two rows belong to completion and hints, immediately below the prompt. -/
 def frame (project : String) (catalog : Completion.Catalog) (state : State)
-    (columns rows : Nat) (busy := false) : Frame := Id.run do
+    (columns rows : Nat) (busy := false) (color := false) : Frame := Id.run do
   let width := max 1 (columns - 1) -- avoid terminal autowrap in the last column
   let height := max 1 rows
   let promptRow := max 1 (height - 2)
-  let mut lines := Array.replicate height ""
+  let mut lines := Array.replicate height (#[] : Styled.Line)
   if height ≥ 6 then
-    lines := lines.set! 0 s!"lean-cloud  /  {project}"
+    lines := lines.set! 0 (Styled.text (pad width s!" lean-cloud  /  {project}") .header)
     let room := height - 5
     let output := outputLines state width
     let stop := output.size - min state.scroll (output.size - room)
     let visible := output.extract (stop - room) stop
     for (line, i) in visible.toList.zipIdx do lines := lines.set! (i + 1) line
-    lines := lines.set! (promptRow - 2) (String.ofList (List.replicate width '─'))
+    lines := lines.set! (promptRow - 2) (Styled.text (String.ofList (List.replicate width '─')) .cyan)
   let prompt := if busy then "running> " else "cloud> "
   let room := width - prompt.length
   let start := state.cursor - (room - 1)
   let input := String.ofList (state.line.toList.drop start |>.take room)
-  lines := lines.set! (promptRow - 1) (prompt ++ input)
+  lines := lines.set! (promptRow - 1)
+    (Styled.text prompt (if busy then .yellow else .green) ++ Styled.text input)
   let (items, selected) := match state.cycle with
     | some cycle => (cycle.items, cycle.selected)
     | none => (Completion.candidates catalog (Completion.context state.line state.cursor), 0)
   let visible := items.extract (selected - 2) (selected + 6)
-  let suggestions := visible.toList.zipIdx |>.map fun (item, i) =>
-    if i + (selected - 2) == selected then "[" ++ item.value ++ "]" else item.value
+  let suggestions := visible.toList.zipIdx |>.foldl (fun spans (item, i) =>
+    spans ++ (if i + (selected - 2) == selected then Styled.text ("[" ++ item.value ++ "]") .selected
+      else Styled.text item.value .cyan) ++ Styled.text "   ") (Styled.text "  ")
   if promptRow < height then
-    lines := lines.set! promptRow (if items.isEmpty then "  No completions"
-      else "  " ++ String.intercalate "   " suggestions)
+    lines := lines.set! promptRow (if items.isEmpty then Styled.text "  No completions" .muted else suggestions)
   if promptRow + 1 < height then
     let description := (items[selected]?.map (·.description)).getD ""
-    lines := lines.set! (promptRow + 1) (if busy then "  Working · PgUp/PgDn scroll · Ctrl-C interrupt · draft runs only after completion"
+    lines := lines.set! (promptRow + 1) (Styled.text (if busy then "  Working · PgUp/PgDn scroll · Ctrl-C interrupt · draft runs only after completion"
       else "  Tab / Shift-Tab complete · ↑↓ history · PgUp/PgDn output" ++
-        (if description.isEmpty then "" else " · " ++ description))
-  return ⟨lines.map (clip width), promptRow, min width (prompt.length + state.cursor - start + 1)⟩
+        (if description.isEmpty then "" else " · " ++ description)) .muted)
+  return ⟨lines.map (fun line => Styled.render line width color), promptRow, min width (prompt.length + state.cursor - start + 1)⟩
 
 private def draw (ctx : Context) (catalog : Completion.Catalog) (state : State)
     (size : Nat × Nat) (busy := false) : Cli Unit := do
-  let view := frame ctx.project catalog state size.1 size.2 busy
+  let view := frame ctx.project catalog state size.1 size.2 busy (← colorsEnabled)
   let mut output := "\x1b[?25l"
   for (line, index) in view.lines.toList.zipIdx do
-    let color := if index + 1 == view.promptRow then "\x1b[1;36m"
-      else if index + 1 > view.promptRow then "\x1b[2m" else ""
-    output := output ++ s!"\x1b[{index + 1};1H\x1b[2K" ++ color ++ line ++ "\x1b[0m"
+    output := output ++ s!"\x1b[{index + 1};1H\x1b[2K" ++ line
   output := output ++ s!"\x1b[{view.promptRow};{view.cursorColumn}H\x1b[?25h"
   request (.write output)
   request .flush
@@ -158,8 +163,16 @@ partial def execute (ctx : Context) (catalog : Completion.Catalog) (state : Stat
     (program : Cli (Context × Bool)) (lastSize : Nat × Nat := (0, 0)) : Cli (Except String (Context × Bool) × State) := do
   match program.run with
   | .pure result => return (result, state)
-  | .impure (.here (.request (.write text _))) next =>
-    let state := appendOutput state text
+  | .impure (.here (.request (.write text stderr))) next =>
+    let state := appendOutput state text (if stderr then .red else .normal)
+    let result ← observing do
+      let size ← request .dimensions
+      draw ctx catalog state size true
+      return size
+    execute ctx catalog state (ExceptT.mk (ArrsF.apply next (result.map fun _ => ())))
+      (result.toOption.getD lastSize)
+  | .impure (.here (.request (.writeStyled line))) next =>
+    let state := appendStyled state line
     let result ← observing do
       let size ← request .dimensions
       draw ctx catalog state size true
@@ -194,13 +207,13 @@ private def screenOff : Cli Unit := do
 private def submit (ctx : Context) (catalog : Completion.Catalog) (state : State) : Cli (Context × Bool × State) := do
   let line := state.line.trimAscii.toString
   if line.isEmpty then return (ctx, true, { state with line := "", cursor := 0, cycle := none })
-  let state := appendOutput state ("cloud> " ++ line ++ "\n")
+  let state := appendStyled state (Styled.text "cloud> " .green ++ Styled.text line)
   let state := { state with line := "", cursor := 0, cycle := none, browsing := none, draft := "" }
   draw ctx catalog state (← request .dimensions) true
   let (result, state) ← match words line with
     | .error error => pure (.error error, state)
     | .ok args =>
-      if args.length == 2 && args.head? == some "watch" then do
+      if args == ["top"] || (args.length == 2 && args.head? == some "watch") then do
         -- Give the live view terminal ownership, then rebuild the shell screen.
         screenOff
         request .leaveTerminal
@@ -211,7 +224,7 @@ private def submit (ctx : Context) (catalog : Completion.Catalog) (state : State
         pure (result, state)
       else execute ctx catalog state (dispatch ctx args)
   let state := match result with
-    | .error error => appendOutput state ((if state.partialLine.isEmpty then "" else "\n") ++ "Error: " ++ error ++ "\n")
+    | .error error => appendStyled state (Styled.text ("Error: " ++ error) .red)
     | .ok _ => state
   let history := if state.history.back? == some line then state.history else state.history.push line
   let history := history.extract (history.size - 500) history.size
@@ -241,8 +254,8 @@ def run (ctx : Context) : Cli Unit := do
   try
     screenOn
     let catalog ← Completion.load ctx
-    loop ctx catalog { transcript := #["Cloud programs, processes and workers.",
-      "Type a command or press Tab to complete. Use help for all commands.", ""] }
+    loop ctx catalog { transcript := #[Styled.text "Cloud programs, processes and workers." .cyan,
+      Styled.text "Type a command or press Tab to complete. Use help for all commands." .muted, #[]] }
   finally
     try request .leaveTerminal finally screenOff
 

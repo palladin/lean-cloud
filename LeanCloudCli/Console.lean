@@ -1,4 +1,5 @@
 import LeanCloudCli.Diagnostics
+import LeanCloudCli.Top
 
 namespace LeanCloudCli
 open Lean LeanCloud
@@ -10,29 +11,31 @@ private def exitLabel : Exit → String
 
 private def inspectRun (ctx : Context) (id : String) : Cli Unit := do
   let run ← ctx.loadRun id
-  printLine s!"{run.id}  {run.program.entry}"
+  printHeading s!"{run.id}  {run.program.entry}"
   let control ← ctx.control id
   let outcome ← try ctx.outcome run catch error =>
     if control != .active then pure none else throw error
-  if let some outcome := outcome then printLine s!"Outcome: {exitLabel outcome}"
+  if let some outcome := outcome then
+    printStyled (Styled.text "Outcome: " ++ Styled.text (exitLabel outcome) (Styled.statusColor (exitLabel outcome)))
   if control != .active then
-    if outcome.isNone then printLine s!"Status: {control.label}"
+    if outcome.isNone then printStyled (Styled.text "Status: " ++ Styled.text control.label (Styled.statusColor control.label))
     return
   let state ← try pure (some (← ctx.scheduler run)) catch error =>
     if outcome.isSome then pure none else throw error
   let some state := state | return
-  printLine "LOCATION             STATUS       WORKER      ATTEMPT"
+  printHeading "LOCATION             STATUS       WORKER      ATTEMPT"
   for job in state.jobs do
     let (status, worker, attempt) := match job.status with
       | .pending => ("pending", "—", "—")
       | .waiting children => (s!"join ({children.size})", "—", "—")
       | .done => ("done", "—", "—")
       | .running worker attempt _ => ("running", worker, toString attempt)
-    printLine s!"{pad 21 job.location.key}{pad 13 status}{pad 12 worker}{attempt}"
+    printStyled (Styled.text (pad 21 job.location.key) .cyan ++
+      Styled.text (pad 13 status) (Styled.statusColor status) ++ Styled.text s!"{pad 12 worker}{attempt}")
   if let some error := state.error then printLine s!"Scheduler error: {safe error.message}"
 
 private def listRuns (ctx : Context) : Cli Unit := do
-  printLine "RUN                            PROGRAM                  STATUS"
+  printHeading "RUN                            PROGRAM                  STATUS"
   for run in ← ctx.allRuns do
     let status ← try
       match ← ctx.outcome run with
@@ -46,17 +49,22 @@ private def listRuns (ctx : Context) : Cli Unit := do
     catch _ =>
       let control ← ctx.control run.id
       pure (if control != .active then control.label else "unavailable / launch incomplete")
-    printLine s!"{pad 31 run.id}{pad 25 run.program.entry}{status}"
+    printStyled (Styled.text (pad 31 run.id) .cyan ++ Styled.text (pad 25 run.program.entry) ++
+      Styled.text status (Styled.statusColor status))
 
 private def showNodes (ctx : Context) : Cli Unit := do
   let nodes ← ctx.nodes
   let values ← samples nodes
-  printLine "NODE                                          STATE      CPU        MEMORY"
+  printHeading "NODE                                STATE      CPU                     MEMORY"
   for node in nodes do
     let value := values.find? (·.1 == node.name)
     let cpu := value.map (fun (_, s) => percent s.cpu) |>.getD "—"
     let memory := value.map (fun (_, s) => humanBytes s.memory) |>.getD "—"
-    printLine s!"{pad 46 node.name}{pad 11 node.state}{pad 11 cpu}{memory}"
+    let cpuBar := value.map (fun (_, s) => meter s.cpu 100000 10) |>.getD (Styled.text "[unavailable]" .muted)
+    let memBar := value.map (fun (_, s) => meter s.memory s.limit 10) |>.getD (Styled.text "[unavailable]" .muted)
+    printStyled (Styled.text (pad 36 node.name) .cyan ++
+      Styled.text (pad 11 node.state) (Styled.statusColor node.state) ++ cpuBar ++
+      Styled.text (" " ++ pad 10 cpu) ++ memBar ++ Styled.text (" " ++ memory))
 
 private def lastEvent (events : Array ExecutionEvent) : Option ExecutionEvent := events.back?
 
@@ -73,28 +81,32 @@ private def sourceStart (run : Run) (events : Array (String × Array ExecutionEv
 /-- A compact terminal frame. Source markers are observations, not a debugger PC. -/
 def frame (ctx : Context) (run : Run) (nodes : Array Node)
     (events : Array (String × Array ExecutionEvent)) (histories : Array History)
-    (selected sourceOffset width height : Nat) (status := "") (disk : Option String := none) : Array String := Id.run do
+    (selected sourceOffset width height : Nat) (status := "") (disk : Option DiskUsage := none)
+    (color := false) : Array String := Id.run do
   let selectedNode := nodes[selected % max 1 nodes.size]?
-  let mut lines := #[s!"lean-cloud  {run.id}  {run.program.entry}  {status}", "q: back · last observed · Tab: node · 1/2/3: worker · j/k: source · a: auto"]
+  let mut lines := #[Styled.text (pad width s!" lean-cloud  {run.id}  {run.program.entry}  {status}") .header,
+    Styled.text "q: back · Tab: node · 1/2/3: worker · j/k: source · a: auto" .cyan]
   for (worker, trace) in events do
     let node := nodes.find? (·.name == ctx.container run worker)
     let state := node.map (·.state) |>.getD "absent"
     let detail := match lastEvent trace with
       | none => "no execution event"
       | some e => s!"a{e.attempt.getD 0}  {e.location}  {e.activity} {e.operation}"
-    lines := lines.push s!"{worker} [{state}] {detail}"
+    lines := lines.push (Styled.text worker .cyan ++ Styled.text s!" [{state}] " (Styled.statusColor state) ++ Styled.text detail)
+  let graphWidth := if width ≥ 110 then width - width / 2 - 3 else width
   let graph := match selectedNode with
-    | none => #["No nodes"]
+    | none => #[Styled.text "No nodes" .muted]
     | some node =>
       let history := histories.find? (fun h => h.name == node.name && h.fresh && h.points.back?.map (·.session) == some node.started)
-      #[s!"Node: {node.name}", s!"State: {node.state}"] ++
-        (if node.state == "running" then metricLines (history.map (·.points) |>.getD #[])
-         else #["No live samples; process is stopped"]) ++ disk.toArray
+      #[Styled.text (pad graphWidth s!" Node: {node.name}") .selected,
+        Styled.text s!"State: {node.state}" (Styled.statusColor node.state)] ++
+        (if node.state == "running" then metricLines (history.map (·.points) |>.getD #[]) graphWidth disk
+         else #[Styled.text "No live samples; process is stopped" .muted])
   let available := max 4 (height - lines.size - 3)
   let codeRows := if width ≥ 110 then available else max 4 (available - graph.size - 1)
-  let mut code := #[]
+  let mut code : Array Styled.Line := #[]
   if let some source := run.program.source then
-    code := code.push s!"Source: {source.file} (bundled with deployed image)"
+    code := code.push (Styled.text s!"Source: {source.file} (bundled with deployed image)" .cyan)
     let sourceLines := source.text.splitOn "\n" |>.toArray
     let start := min (sourceLines.size - 1) ((if sourceOffset == 0 then sourceStart run events else sourceOffset) - 1)
     for index in [start:min sourceLines.size (start + codeRows - 1)] do
@@ -106,15 +118,19 @@ def frame (ctx : Context) (run : Run) (nodes : Array Node)
           if alive && e.activity != "returned" && (source.sites.any fun site => site.operation == e.operation && site.line == index + 1) then
             text ++ (worker.drop 6 |>.toString)
           else text) ""
-      code := code.push s!"{pad 3 (toString (index + 1))} {pad 3 markers} {sourceLines[index]!}"
-  else code := #["This program has no bundled source locations."]
+      code := code.push (Styled.text s!"{pad 3 (toString (index + 1))} " .muted ++
+        Styled.text (pad 3 markers) (if markers.isEmpty then .muted else .selected) ++
+        Styled.text (" " ++ sourceLines[index]!))
+  else code := #[Styled.text "This program has no bundled source locations." .muted]
   if width ≥ 110 then
     let left := width / 2
     for i in [:max code.size graph.size] do
-      lines := lines.push (pad left (code[i]?.getD "") ++ " │ " ++ (graph[i]?.getD ""))
-  else lines := lines ++ code ++ #[""] ++ graph
-  lines := lines.push "CPU is per container; I/O graphs are rates; · means no rate sample."
-  return (lines.extract 0 (height - 1)).map (clip width)
+      let source := code[i]?.getD #[]
+      let source := Styled.slice source 0 left ++ Styled.text (String.ofList (List.replicate (left - Styled.length source) ' '))
+      lines := lines.push (source ++ Styled.text " │ " .muted ++ (graph[i]?.getD #[]))
+  else lines := lines ++ code ++ #[#[]] ++ graph
+  lines := lines.push (Styled.text "CPU 100%=1 core (+ overflow); rates auto-scale; _ zero; · missing." .muted)
+  return (lines.extract 0 (height - 1)).map (fun line => Styled.render line width color)
 
 private structure Navigation where
   selected : Nat := 0
@@ -137,7 +153,7 @@ private partial def watchKeys (draw : Navigation → Cli Unit) (autoOffset refre
   if key == 0 && (← request .now) ≥ refresh then return some nav
   watchKeys draw autoOffset refresh nav (key != 0)
 
-private partial def watchLoop (ctx : Context) (run : Run) (interactive : Bool)
+private partial def watchLoop (ctx : Context) (run : Run) (interactive color : Bool)
     (history : Array History := #[]) (nav : Navigation := {}) : Cli Unit := do
   let nodes := runNodes run (← ctx.nodes)
   let events ← ctx.events run nodes
@@ -154,28 +170,44 @@ private partial def watchLoop (ctx : Context) (run : Run) (interactive : Bool)
   let (width, height) ← if interactive then request .dimensions else pure (120, 35)
   let draw (nav : Navigation) : Cli Unit := do
     let disk := if nav.selected % max 1 nodes.size == diskNode then disk else none
-    let lines := frame ctx run nodes events history nav.selected nav.offset width height status disk
+    let lines := frame ctx run nodes events history nav.selected nav.offset width height status disk color
     if interactive then request (.write "\x1b[H\x1b[2J")
-    printLine (String.intercalate "\n" lines.toList)
+    request (.write (String.intercalate "\n" lines.toList ++ "\n"))
     request .flush
   if !interactive then draw nav; return
   let refresh := (← request .now) + 1000
   let some nav ← watchKeys draw (sourceStart run events) refresh nav | return
-  watchLoop ctx run interactive history nav
+  watchLoop ctx run interactive color history nav
 
 private def watch (ctx : Context) (id : String) (once := false) : Cli Unit := do
   let run ← ctx.loadRun id
   let interactive ← if once then pure false else request .enterTerminal
   try
     if interactive then request (.write "\x1b[?1049h\x1b[?25l")
-    watchLoop ctx run interactive
+    watchLoop ctx run interactive (interactive && (← colorsEnabled))
   finally
     if interactive then
       request .leaveTerminal
       request (.write "\x1b[?25h\x1b[?1049l")
       request .flush
 
-private def help : String := "Commands:\n  init DIRECTORY               Create and select a cloud application\n  open DIRECTORY               Select an existing application\n  deploy [EXECUTABLE]           Build this application's image and start shared services\n  deployments                  List known deployments, including stopped ones\n  use NAME                     Select and remember a deployment\n  status                       Show selected deployment health\n  up                           Start services without rebuilding\n  doctor                       Diagnose local configuration and Docker\n  down                         Stop this deployment, preserving its data\n  programs                     List compiled entry points\n  run PROGRAM [--input FILE] [--id ID]\n  ps                           List runs launched from this checkout\n  inspect RUN                  Inspect scheduler jobs and assignments\n  result RUN                   Read the durable result\n  watch RUN [--once]            Live source positions and container graphs\n  nodes                        Inspect workers, schedulers, brokers and blobs\n  logs RUN [worker1|worker2|worker3|scheduler]\n  pause RUN                    Stop a run and preserve replay state\n  kill RUN                     Permanently cancel a run\n  resume RUN                   Resume a paused run or repair a launch\n  help | quit"
+private def help : String := "Commands:\n  init DIRECTORY               Create and select a cloud application\n  open DIRECTORY               Select an existing application\n  deploy [EXECUTABLE] [-v]      Build this application's image and start shared services\n  deployments                  List known deployments, including stopped ones\n  use NAME                     Select and remember a deployment\n  status                       Show selected deployment health\n  up [-v]                      Start services without rebuilding\n  doctor                       Diagnose local configuration and Docker\n  down                         Stop this deployment, preserving its data\n  programs                     List compiled entry points\n  run PROGRAM [--input FILE] [--id ID]\n  ps                           List runs launched from this checkout\n  inspect RUN                  Inspect scheduler jobs and assignments\n  result RUN                   Read the durable result\n  watch RUN [--once]            Live source positions and container graphs\n  nodes                        Inspect workers, schedulers, brokers and blobs\n  top [--once]                 Live worker and scheduler resource graphs\n  logs RUN [worker1|worker2|worker3|scheduler]\n  pause RUN                    Stop a run and preserve replay state\n  kill RUN                     Permanently cancel a run\n  resume RUN                   Resume a paused run or repair a launch\n  -v | --verbose               Stream full build/startup output\n  help | quit"
+
+/-- Reject malformed flags before deployment changes any files or services. -/
+private def deploymentOptions (args : List String) (allowExecutable : Bool)
+    : Except String (Option String × Bool) := do
+  let usage := if allowExecutable then "Usage: deploy [EXECUTABLE] [-v|--verbose]"
+    else "Usage: up [-v|--verbose]"
+  let mut executable := none
+  let mut verbose := false
+  for arg in args do
+    if arg == "-v" || arg == "--verbose" then
+      if verbose then throw "Duplicate verbose flag (-v/--verbose)"
+      verbose := true
+    else if allowExecutable && executable.isNone && !arg.startsWith "-" then
+      executable := some arg
+    else throw usage
+  return (executable, verbose)
 
 private def runOptions (args : List String) : Except String (Option String × Option String) := do
   let mut file := none
@@ -196,25 +228,35 @@ def command (ctx : Context) (args : List String) : Cli Bool := do
   match args with
   | [] => return true
   | ["quit"] | ["exit"] => return false
-  | ["help"] | ["--help"] => printLine help
-  | ["deploy"] => ctx.deploy
-  | ["deploy", executable] => ctx.deploy (some executable)
+  | ["help"] | ["--help"] =>
+    for line in help.splitOn "\n" do
+      if line == "Commands:" then printHeading line
+      else printStyled (Styled.text (String.ofList (line.toList.take 31)) .cyan ++
+        Styled.text (String.ofList (line.toList.drop 31)))
+  | "deploy" :: options =>
+    let (executable, verbose) ← liftExcept (deploymentOptions options true)
+    ctx.deploy executable verbose
   | ["down"] => ctx.down
-  | ["up"] => ctx.up
+  | "up" :: options =>
+    let (_, verbose) ← liftExcept (deploymentOptions options false)
+    ctx.up verbose
   | ["deployments"] => listDeployments ctx
   | ["status"] => ctx.status
   | ["doctor"] => ctx.doctor
   | ["init", directory] => Project.init ctx directory
   | ["init", directory, "--sdk", path] => Project.init ctx directory (some path)
   | ["programs"] =>
+    printHeading "PROGRAM                  DESCRIPTION"
     for program in (← ctx.deployment).programs do
-      printLine s!"{pad 25 program.entry}{safe program.description}"
+      printStyled (Styled.text (pad 25 program.entry) .cyan ++ Styled.text program.description)
   | "run" :: name :: args =>
     let (file, id) ← liftExcept (runOptions args)
     ctx.launch name file id
   | ["ps"] => listRuns ctx
   | ["inspect", id] => inspectRun ctx id
   | ["nodes"] => showNodes ctx
+  | ["top"] => Top.run ctx
+  | ["top", "--once"] => Top.run ctx true
   | ["resume", id] => ctx.resume id
   | ["pause", id] => ctx.pause id
   | ["kill", id] => ctx.kill id

@@ -77,6 +77,22 @@ def run : IO Unit := do
   match ← Cli.runIO tests with
   | .error error => throw (IO.userError error)
   | .ok () => pure ()
+  -- Exercise the real append handler, decoder, and log path on a streamed child.
+  let logDir := (← IO.Process.getCurrentDir) / ".lean-cloud" / s!"logging-test-{← IO.Process.getPID}"
+  IO.FS.createDirAll logDir
+  let log := logDir / "output.log"
+  try
+    match ← Cli.runIO (Process.runLogged self #["--child", "stream"] log) with
+    | .error error => throw (IO.userError error)
+    | .ok () => pure ()
+    let text ← IO.FS.readFile log
+    -- stdout and stderr have independent pipes, so their relative order may vary.
+    if (text.splitOn "first λ🙂\n").length != 2 || (text.splitOn "warning\n").length != 2 ||
+        !text.endsWith "last" then
+      throw (IO.userError s!"Incomplete saved output: {text}")
+  finally
+    if ← log.pathExists then IO.FS.removeFile log
+    IO.FS.removeDir logDir
   for scenario in ["explicit", "outer", "orphan", "signal"] do
     let directory := (← IO.Process.getCurrentDir) / ".lean-cloud" / s!"process-test-{← IO.Process.getPID}"
     IO.FS.createDirAll directory
@@ -103,7 +119,7 @@ def run : IO Unit := do
   match ← Cli.runIO (checkOutput self "stream" "first λ🙂\nlast".toUTF8 "warning\n".toUTF8 0) with
   | .error error => throw (IO.userError error)
   | .ok () => pure ()
-  IO.println "Process tests passed: incremental bytes, both pipes beyond capacity, exit codes, invalid argv, SIGINT recovery, and process-group cleanup."
+  IO.println "Process tests passed: incremental bytes, saved logs, both pipes beyond capacity, exit codes, invalid argv, SIGINT recovery, and process-group cleanup."
 
 end LeanCloudTests.ProcessRuntime
 

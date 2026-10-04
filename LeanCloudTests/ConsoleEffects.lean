@@ -69,6 +69,39 @@ private def checked (program : Cli α) (world : World) : IO (α × World) := do
   return (← unwrap result, world)
 
 def consoleEffectCases : Array TestCase := #[
+  ⟨"console.effects.deploy-output-flags-and-retained-logs", do
+    let noise := "Docker output\n"
+    let initial := { (base) with stream := some (fun _ => .ok [
+      { stdout := noise.toUTF8, exitCode := some 0 }]) }
+    let oldLog := ctx.home / "logs" / "build-42-0.log"
+    let initial := initial.save oldLog "previous attempt"
+      |>.save (ctx.root / "lean-toolchain") "leanprover/lean4:v4.34.1\n"
+    for args in [["deploy"], ["deploy", "-v"], ["deploy", "--verbose"],
+      ["deploy", "my_app", "-v"], ["deploy", "--verbose", "my_app"]] do
+      let (_, world) ← checked (command ctx args) initial
+      let verbose := args.contains "-v" || args.contains "--verbose"
+      assertEq (has world.stdout noise) verbose
+      assertTrue (has world.stdout "Building worker image" && has world.stdout "Starting blob" &&
+        has world.stdout "Logs:") "Missing concise stage/log messages"
+      assertEq (world.file oldLog) (some "previous attempt")
+      assertEq (world.file (ctx.home / "logs" / "build-42-0-1.log")) (some noise)
+      let logs := world.files.filter (fun (path, _) => path.endsWith ".log")
+      assertEq logs.size 3 "Build and startup did not each save a new log"
+      assertTrue (!world.processes.any (fun call => call.args.contains "-v" || call.args.contains "--verbose"))
+        "CLI verbosity flag was passed to Docker"
+      if args.contains "my_app" then
+        let (app, _) ← checked (Project.load ctx.root) world
+        assertEq app.executable "my_app"⟩,
+  ⟨"console.effects.failed-build-does-not-start-services", do
+    let initial := { (base) with stream := some (fun _ => .ok [
+      { stderr := "compiler error\n".toUTF8, exitCode := some 1 }]) }
+    let (result, world) := ConsoleModel.run (command ctx ["deploy"]) initial
+    let .error error := result | throw (IO.userError "Failed build accepted")
+    assertTrue (has error ".log" && has world.stderr "compiler error") "Missing failure details"
+    assertTrue (!world.processes.any (·.args.contains "up")) "Started services after build failure"
+    assertTrue (world.file (ctx.home / "deployment.json")).isNone "Failed deployment was published"
+    assertTrue (!has world.stdout "— done" && world.locks.isEmpty && world.children.isEmpty)
+      "Failure was labeled done or leaked resources"⟩,
   ⟨"console.effects.pause-resume-and-kill", do
     let initial := launched false
     let (_, paused) ← checked (command ctx ["pause", "one"]) initial

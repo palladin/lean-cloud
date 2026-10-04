@@ -45,6 +45,13 @@ Docker without modifying the local Lake dependency manifest.
 On an interactive terminal, the prompt stays at the bottom with completion
 suggestions directly beneath it. Command output appears in the area above.
 
+The console uses a shared htop-style theme: cyan table headers, blue selections,
+green running/completed states, yellow pending/paused states, and red failures or
+cancellations. The prompt, completion suggestions, deployment diagnostics, process
+tables, and live monitor use the same renderer. Styles survive wrapping and
+scrolling; text from programs and external services cannot supply terminal escapes.
+Set `NO_COLOR=1` to disable colors. Piped output and `--once` views remain plain text.
+
 - **Tab / Shift-Tab:** complete and cycle through suggestions for commands,
   deployed programs, run IDs, flags, actor names and `--input` file paths.
 - **↑ / ↓:** recall command history and return to the draft you were editing.
@@ -54,19 +61,33 @@ suggestions directly beneath it. Command output appears in the area above.
 - **Ctrl-C:** clear input, or exit when empty. **Ctrl-D:** exit when empty.
 
 The layout follows terminal resizing. Bracketed multiline paste inserts a single
-command for review; it does not submit on pasted newlines. `watch RUN` temporarily
+command for review; it does not submit on pasted newlines. `watch RUN` and `top` temporarily
 takes over the screen, then returns to the anchored prompt when you press `q`.
 Piped input and one-shot commands keep plain text output.
 
-Image builds and service startup stream their output as they run. The prompt
-shows `running>`; you can scroll with PgUp/PgDn, resize the terminal, and edit a
+`deploy` and `up` show short, colored stage messages by default. Add `-v` or
+`--verbose` to stream the full Docker build/startup output:
+
+```text
+cloud> deploy --verbose
+cloud> deploy my_app -v
+cloud> up -v
+```
+
+Both modes save the complete decoded plain-text output under
+`.lean-cloud/PROJECT/logs/`, with a separate file for each build or service-start
+attempt. Previous logs are kept. A failed command in quiet mode shows the last
+20 output lines (long lines are clipped on screen), and errors include the log
+path. Interrupted commands keep whatever output has already been captured.
+
+While a command runs, the prompt shows `running>`; you can scroll with PgUp/PgDn, resize the terminal, and edit a
 draft command with completion. Press Enter after the current command finishes
 to submit that draft. Enter during execution does not queue or launch a command.
 
 Ctrl-C interrupts the local build/startup command and releases its process and
 deployment lock. Services already started remain running; use `status` to inspect
 them. Docker may retain build cache and other partial work. This is not a workflow
-cancellation command. Noninteractive build/startup commands also stream output
+cancellation command. One-shot commands use the same quiet/verbose behavior
 and handle SIGINT/SIGTERM with process cleanup.
 
 To try the bundled examples instead, open the lean-cloud repository. The shell and one-shot commands use the same implementation:
@@ -175,6 +196,7 @@ as shell code. `logs RUN [worker1|worker2|worker3|scheduler]` prints recent acto
 | `deployments` | List registered deployments, their directories, and observed service state. |
 | `use NAME` | Select a registered deployment and remember it for later sessions. |
 | `status` | Show its image, program/run counts, service health, and actor counts. |
+| `top [--once]` | Live worker and scheduler resource graphs across the selected deployment. |
 | `up` | Restart existing services without rebuilding the application. |
 | `doctor` | Check configuration, Docker/Compose, retained images, volumes, and container health. |
 
@@ -295,6 +317,22 @@ The console currently targets local Docker deployments with three workers per ru
 
 ## Live view
 
+Use `top` for worker and scheduler graphs across all runs in the selected
+deployment. No run ID is needed:
+
+```text
+cloud> top
+```
+
+Each node gets a panel with CPU, memory, filesystem usage, network RX/TX, and
+disk read/write rates. Panels resize with the terminal. Use PgUp/PgDn or the
+left/right arrows to change pages, and `q` to return to the console. Running
+actors appear first; stopped actors remain visible with their status.
+Mailbox brokers and blob services are listed separately by `nodes`.
+
+`top --once` (or piped `top`) prints a plain-text snapshot of every page. Rates
+need two samples, so that first snapshot shows `—` for network and I/O rates.
+
 `watch RUN` displays real runtime observations. Press `1`, `2`, or `3` to select a
 worker, Tab to cycle through this run's actors and shared service containers,
 `j`/`k` to scroll source, `a` to resume automatic source following, and `q` to
@@ -324,11 +362,22 @@ Resource graphs use live Docker container statistics:
 - block-device read/write rates;
 - filesystem used/capacity where the container provides `df`.
 
+CPU, memory, and filesystem usage have text meters. Their fill is green below
+70%, yellow from 70%, and red from 90%. A CPU meter represents one core; usage
+above 100% keeps its full numeric value and adds `+` to the meter. Memory and
+filesystem meters use their reported capacity. The `nodes` table also shows CPU
+and memory meters.
+
+Network receive/send and disk read/write rates have distinct colored histories.
+Graphs use `_` for measured zero and `·` for an unavailable rate; the first counter
+sample has no rate yet. CPU and memory histories appear when the panel is wide
+enough, scaled to one core and the reported memory limit respectively.
+
 Actor and broker containers are measured separately. CPU can exceed 100% on
 multiple cores. Filesystem capacity can be shared between containers; it is not
 space attributed exclusively to the selected container. Missing samples are not
 zero utilization. Rate series restart when a container restarts or counters reset.
-Graphs retain up to 30 samples while the view is open and scale independently;
+Graphs retain up to 30 samples while the view is open. Rate graphs scale independently;
 there is no persistent resource-metric history yet.
 
 ## Validation
@@ -338,6 +387,10 @@ terminal escape sanitization, metric units, counter resets, bounded history, and
 live/stopped source markers at several terminal widths. Docker integration tests
 validate the typed registry and compare an instrumented workflow against direct
 evaluation, including durable typed results and conflicting submissions.
+Theme tests check styled wrapping/clipping, missing samples, meter saturation,
+multicore CPU values, shared shell/table styling, and color opt-out.
+Dashboard tests cover all-run paging, resizing, unavailable statistics, stopped
+nodes, terminal cleanup, and returning from `top` to the anchored prompt.
 
 Pure effect tests execute complete deployment, launch/resume, pause/kill,
 inspection and REPL commands, plus keyboard navigation and timed live-view refresh.

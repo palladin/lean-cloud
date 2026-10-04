@@ -43,13 +43,13 @@ def streamingCases : Array TestCase := #[
     assertEq state.partialLine "fir"
     assertTrue state.transcript.isEmpty "Partial output was prematurely split"
     let state := Shell.appendOutput state "st\nseco"
-    assertEq state.transcript #["first"]
+    assertEq (state.transcript.map Styled.plain) #["first"]
     assertEq state.partialLine "seco"
     let view := Shell.frame "test" {} state 80 24 true
     assertTrue (view.lines.any (· == "seco")) "Partial line is not visible"
     let long := Shell.appendOutput {} (String.ofList (List.replicate 20000 'x'))
-    assertTrue (long.partialLine.length ≤ 4096 && long.transcript.all (·.length ≤ 4096)) "Unbounded partial line"
-    let old : Shell.State := { transcript := (Array.range 100).map toString, scroll := 20 }
+    assertTrue (long.partialLine.length ≤ 4096 && long.transcript.all (fun line => Styled.length line ≤ 4096)) "Unbounded partial line"
+    let old : Shell.State := { transcript := (Array.range 100).map (Styled.text ∘ toString), scroll := 20 }
     let updated := Shell.appendOutput old "new\n"
     assertEq updated.scroll 21 "Live output reset the scroll position"⟩,
   ⟨"console.stream.plain-output", do
@@ -67,11 +67,11 @@ def streamingCases : Array TestCase := #[
     let (result, state) ← unwrap result
     discard (unwrap result)
     assertEq state.line "he" "Draft typing was lost while command ran"
-    assertEq state.transcript #["first", "warning", "last"]
+    assertEq (state.transcript.map Styled.plain) #["first", "warning", "last"]
     assertTrue (has world.stdout "\x1b[22;" && has world.stdout "\x1b[10;") "Busy prompt ignored resize"
     assertTrue (world.children.isEmpty && world.locks.isEmpty) "Completed command leaked resources"⟩,
   ⟨"console.stream.busy-scroll", do
-    let state : Shell.State := { transcript := (Array.range 100).map (fun i => s!"line {i}") }
+    let state : Shell.State := { transcript := (Array.range 100).map (fun i => Styled.text s!"line {i}") }
     let (result, _) := ConsoleModel.run (Shell.execute ctx {} state program)
       { initial with keys := bytes "\x1b[5~" ++ [0] }
     let (_, state) ← unwrap result

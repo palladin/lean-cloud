@@ -1,4 +1,5 @@
 import LeanCloudCli.Docker
+import LeanCloudCli.Styled
 
 namespace LeanCloudCli
 open Lean LeanCloud
@@ -84,18 +85,25 @@ def runNodes (run : Run) (nodes : Array Node) : Array Node :=
   (nodes.filter (fun n => n.run.isNone || n.run == some run.id)).qsort fun a b =>
     order a < order b || (order a == order b && a.name < b.name)
 
+structure DiskUsage where
+  path : String
+  used : Nat
+  capacity : Nat
+
+def decodeFilesystem (path output : String) : Option DiskUsage := do
+  let fields := (output.trimAscii.toString.splitOn "\n").getLast!.splitOn " " |>.filter (!·.isEmpty)
+  let capacity ← fields[1]? >>= String.toNat?
+  let used ← fields[2]? >>= String.toNat?
+  if capacity == 0 then none else some ⟨path, used * 1024, capacity * 1024⟩
+
 /-- Filesystem capacity, not bytes attributed to a single container or volume. -/
-def filesystem (node : Node) : Cli (Option String) := do
+def filesystem (node : Node) : Cli (Option DiskUsage) := do
   if node.state != "running" then return none
-  let path := if node.role == "scheduler" then "/data"
+  let path := if node.role == "scheduler" || node.role == "blobs" then "/data"
     else if (node.role.splitOn "mailbox").length > 1 then "/var/lib/rabbitmq" else "/"
   let output ← docker #["exec", node.name, "df", "-Pk", path] false
   if output.exitCode != 0 then return none
-  let lines := output.stdout.trimAscii.toString.splitOn "\n"
-  let fields := (lines.getLast!).splitOn " " |>.filter (!·.isEmpty)
-  let some capacity := fields[1]? >>= String.toNat? | return none
-  let some used := fields[2]? >>= String.toNat? | return none
-  return some s!"Filesystem {path}: {used / 1024} / {capacity / 1024} MiB used"
+  return decodeFilesystem path output.stdout
 
 def samples (nodes : Array Node) : Cli (Array (String × Sample)) := do
   let running := nodes.filter (·.state == "running")
@@ -135,13 +143,16 @@ def percent (value : Nat) : String :=
   let fraction := toString (value % 1000 / 10)
   s!"{value / 1000}.{if fraction.length == 1 then "0" ++ fraction else fraction}%"
 
-def spark (values : Array (Option Nat)) (width : Nat := 24) : String := Id.run do
+def spark (values : Array (Option Nat)) (width : Nat := 24) (scale : Option Nat := none) : String := Id.run do
   let values := values.extract (values.size - width) values.size
-  let peak := max 1 (values.foldl (fun n v => max n (v.getD 0)) 0)
+  let peak := max 1 (scale.getD (values.foldl (fun n v => max n (v.getD 0)) 0))
   let marks := "▁▂▃▄▅▆▇█".toList.toArray
   let mut result := String.ofList (List.replicate (width - values.size) ' ')
   for value in values do
-    result := result.push (match value with | none => '·' | some n => marks[min 7 (n * 7 / peak)]!)
+    result := result.push (match value with
+      | none => '·'
+      | some 0 => '_'
+      | some n => marks[min 7 ((n * 8 + peak - 1) / peak - 1)]!)
   return result
 
 structure History where
@@ -160,18 +171,54 @@ def remember (histories : Array History) (values : Array (String × Sample)) : A
       history.set! i ⟨name, points.extract (points.size - 30) points.size, true⟩)
     (histories.map fun history => { history with fresh := false })
 
-def metricLines (points : Array Sample) : Array String := Id.run do
-  let some current := points.back? | return #["No sample: node stopped or unavailable"]
+private def pressure (used capacity : Nat) : Styled.Color :=
+  if used * 100 ≥ capacity * 90 then .red
+  else if used * 100 ≥ capacity * 70 then .yellow else .green
+
+/-- A fixed-capacity meter. Overflow stays visible as `+` and in the numeric
+value; missing capacity is not rendered as an empty (zero-usage) meter. -/
+def meter (used capacity width : Nat) : Styled.Line := Id.run do
+  if capacity == 0 then return Styled.text "[unavailable]" .muted
+  let filled := min width ((used * width + capacity - 1) / capacity)
+  let color := pressure used capacity
+  let bars := String.ofList (List.replicate filled '|')
+  let bars := if used > capacity && width > 0 then
+    String.ofList (bars.toList.take (width - 1)) ++ "+" else bars
+  return Styled.text "[" .muted ++ Styled.text bars color ++
+    Styled.text (String.ofList (List.replicate (width - filled) '·')) .muted ++ Styled.text "]" .muted
+
+private def usageLine (label : String) (used capacity : Nat) (detail : String)
+    (width : Nat) (history : Array (Option Nat) := #[]) : Styled.Line :=
+  let room := width - 6 - detail.length - 3
+  let historyWidth := if !history.isEmpty && room ≥ 26 then min 18 (room / 2) else 0
+  let barWidth := min 24 (room - (if historyWidth > 0 then historyWidth + 1 else 0))
+  Styled.text (pad 6 label) .cyan ++
+    (if barWidth ≥ 4 then meter used capacity barWidth ++ Styled.text " " else #[]) ++
+    Styled.text detail (if capacity == 0 then .muted else pressure used capacity) ++
+    (if historyWidth > 0 then Styled.text (" " ++ spark history historyWidth (some capacity)) .green else #[])
+
+def metricLines (points : Array Sample) (width : Nat := 56)
+    (disk : Option DiskUsage := none) : Array Styled.Line := Id.run do
+  let some current := points.back? | return #[Styled.text "No sample: node stopped or unavailable" .muted]
   let direct (select : Sample → Nat) := points.map (fun p => some (select p))
   let rates (select : Sample → Nat) := (Array.range points.size).map fun i =>
     if i == 0 then none else rate points[i - 1]! points[i]! select
-  let rateLine (label : String) (select : Sample → Nat) :=
+  let rateLine (label : String) (color : Styled.Color) (select : Sample → Nat) :=
     let values := rates select
     let value := match (values.back? >>= id) with | some n => humanBytes n ++ "/s" | none => "—"
-    s!"{pad 8 label}{spark values} {value}"
-  return #[s!"{pad 8 "CPU"}{spark (direct (·.cpu))} {percent current.cpu}",
-    s!"{pad 8 "Memory"}{spark (direct (·.memory))} {humanBytes current.memory} / {humanBytes current.limit}",
-    rateLine "Net RX" (·.rx), rateLine "Net TX" (·.tx),
-    rateLine "Disk R" (·.readBytes), rateLine "Disk W" (·.writeBytes)]
+    let graphWidth := min 30 (width - 8 - value.length)
+    Styled.text (pad 7 label) color ++ Styled.text (spark values graphWidth) color ++
+      Styled.text (" " ++ value) (if (values.back? >>= id).isSome then color else .muted)
+  let mut lines := #[
+    usageLine "CPU" current.cpu 100000 (percent current.cpu) width (direct (·.cpu)),
+    usageLine "Mem" current.memory current.limit
+      s!"{humanBytes current.memory} / {humanBytes current.limit}" width (direct (·.memory))]
+  lines := lines ++ (match disk with
+    | some disk => #[usageLine "Disk" disk.used disk.capacity
+        s!"{humanBytes disk.used} / {humanBytes disk.capacity}" width,
+        Styled.text s!"      filesystem {disk.path}" .muted]
+    | none => #[Styled.text "Disk  unavailable" .muted])
+  return lines ++ #[rateLine "Net RX" .cyan (·.rx), rateLine "Net TX" .magenta (·.tx),
+    rateLine "I/O R" .blue (·.readBytes), rateLine "I/O W" .yellow (·.writeBytes)]
 
 end LeanCloudCli

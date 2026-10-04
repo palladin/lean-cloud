@@ -23,6 +23,12 @@ def shellCases : Array TestCase := #[
     assertEq (suggestions "logs demo wo") #["worker1", "worker2", "worker3"]
     assertEq (suggestions "run squares/v1 --input file.json --") #["--id"]
     assertEq (suggestions "run squares/v1 --id ") #[]⟩,
+  ⟨"console.shell.verbose-completion", do
+    for line in ["deploy --", "deploy my_app --", "up --"] do
+      assertEq (suggestions line) #["--verbose"]
+    assertEq (suggestions "deploy -v") #["-v"]
+    for line in ["deploy -v ", "deploy --verbose my_app ", "up --verbose "] do
+      assertEq (suggestions line) #[]⟩,
   ⟨"console.shell.completion-cycles", do
     let start : Shell.State := { line := "r", cursor := 1 }
     let first := Shell.complete {} start
@@ -62,7 +68,7 @@ def shellCases : Array TestCase := #[
     assertEq (Shell.edit {} recalled .down).line "draft"
     assertEq (Shell.edit {} recalled .clear).line ""⟩,
   ⟨"console.shell.anchored-frame", do
-    let transcript := (Array.range 70).map (fun i => s!"Output {i}")
+    let transcript := (Array.range 70).map (fun i => Styled.text s!"Output {i}")
     let state : Shell.State := { line := "watch demo", cursor := 10, transcript }
     for (width, height) in [(120, 35), (80, 24), (40, 12), (12, 6), (5, 3)] do
       let view := Shell.frame "test" {} state width height

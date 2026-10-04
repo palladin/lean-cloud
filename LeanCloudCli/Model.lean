@@ -47,8 +47,7 @@ def validateId (id : String) : Cli Unit :=
   unless validId id do throw "IDs require 1–80 ASCII letters, digits, '-' or '_'"
 
 /-- Escape all terminal controls in remote labels, code, and diagnostics. -/
-def safe (value : String) : String := String.ofList (value.toList.map fun c =>
-  if c.toNat < 32 || (127 ≤ c.toNat && c.toNat ≤ 159) then ' ' else c)
+def safe (value : String) : String := Styled.sanitize value
 
 def clip (width : Nat) (value : String) : String :=
   let value := safe value

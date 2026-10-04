@@ -38,6 +38,16 @@ private def checked (program : Cli α) (world : World := base) : IO (α × World
   return (← unwrap result, world)
 
 def deploymentCommandCases : Array TestCase := #[
+  ⟨"console.deployment.up-output-flags", do
+    let noise := "Service startup output\n"
+    for args in [["up"], ["up", "-v"], ["up", "--verbose"]] do
+      let (_, world) ← checked (command ctx args) { base with stream := some (fun _ =>
+        .ok [{ stderr := noise.toUTF8, exitCode := some 0 }]) }
+      assertEq world.stderr (if args.length > 1 then noise else "")
+      let logs := world.files.filter (fun (path, _) => path.endsWith ".log")
+      assertEq (logs.map Prod.snd) #[noise]
+      assertTrue (has world.stdout "Starting blob" && has world.stdout "— done") "No startup progress"
+      assertTrue world.locks.isEmpty "Startup leaked lock"⟩,
   ⟨"console.deployment.selection-persists", do
     let other : Context := ⟨"/other", "second"⟩
     let initial := { base with directories := base.directories.push "/other" }

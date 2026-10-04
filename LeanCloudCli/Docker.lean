@@ -12,9 +12,22 @@ def docker (args : Array String) (check := true) (input : Option String := none)
     throw (safe (output.stdout ++ output.stderr).trimAscii.toString)
   return output
 
-private def dockerLive (args : Array String) : Cli Unit := do
-  let code ← Process.stream "docker" args
-  unless code == 0 do throw s!"Docker exited with code {code}; see output above."
+private def Context.dockerLogged (ctx : Context) (stage title : String)
+    (args : Array String) (verbose : Bool) : Cli Unit := do
+  let directory := ctx.home / "logs"
+  request (.createDir directory)
+  let stamp := s!"{stage}-{← request .pid}-{← request .now}"
+  let mut suffix := 0
+  let mut log := directory / s!"{stamp}.log"
+  -- Called under the deployment lock; never overwrite a previous attempt's log.
+  while ← request (.exists log) do
+    suffix := suffix + 1
+    log := directory / s!"{stamp}-{suffix}.log"
+  printStyled (Styled.text ("… " ++ title) .yellow)
+  request .flush
+  Process.runLogged "docker" args log verbose
+  printStyled (Styled.text ("✓ " ++ title ++ " — done") .green)
+  request .flush
 
 def Context.composeFile (ctx : Context) : Cli System.FilePath := do
   if ← request (.exists (Project.manifest ctx.root)) then
@@ -62,12 +75,12 @@ def Context.configFile (ctx : Context) : Cli System.FilePath := do
   if ← request (.exists (Project.manifest ctx.root)) then
     pure (Project.assets ctx / "config.json") else pure (ctx.root / "deploy/config.json")
 
-private def Context.startServices (ctx : Context) : Cli Unit := do
-  printLine "Starting the blob service and four independent mailbox brokers…"
-  dockerLive (#["compose", "-p", ctx.project, "-f", (← ctx.composeFile).toString,
-    "--ansi", "never", "up", "-d", "--wait", "--no-build"] ++ deploymentServices)
+private def Context.startServices (ctx : Context) (verbose : Bool) : Cli Unit := do
+  ctx.dockerLogged "services" "Starting blob and mailbox services"
+    (#["compose", "-p", ctx.project, "-f", (← ctx.composeFile).toString,
+      "--ansi", "never", "up", "-d", "--wait", "--no-build"] ++ deploymentServices) verbose
 
-def Context.deploy (ctx : Context) (executable : Option String := none) : Cli Unit := do
+def Context.deploy (ctx : Context) (executable : Option String := none) (verbose := false) : Cli Unit := do
   Deployments.remember ctx
   request (.createDir ctx.home)
   withLock (ctx.home / "deploy.lock") do
@@ -79,12 +92,12 @@ def Context.deploy (ctx : Context) (executable : Option String := none) : Cli Un
     if ← request (.exists (Project.manifest ctx.root)) then Project.prepare ctx
     else unless ← request (.exists (ctx.root / "compose.yaml")) do
       throw "Use 'init DIRECTORY' for a new app, or 'deploy EXECUTABLE' for an existing app"
-    printLine "Building the worker image…"
     let buildTag := ctx.project ++ "-app:build"
     let overlay := ctx.home / "build.json"
     saveJson overlay (Json.mkObj [("services", Json.mkObj [("worker", Json.mkObj [("image", toJson buildTag)])])])
-    dockerLive #["compose", "-p", ctx.project, "-f", (← ctx.composeFile).toString,
-      "-f", overlay.toString, "--ansi", "never", "--progress", "plain", "build", "worker"]
+    ctx.dockerLogged "build" "Building worker image"
+      #["compose", "-p", ctx.project, "-f", (← ctx.composeFile).toString,
+        "-f", overlay.toString, "--ansi", "never", "--progress", "plain", "build", "worker"] verbose
     let output ← docker #["image", "inspect", buildTag, "--format", "{{.Id}}"]
     let image := output.stdout.trimAscii.toString
     -- An ID alone is not a retention root in every Docker image store.
@@ -93,13 +106,14 @@ def Context.deploy (ctx : Context) (executable : Option String := none) : Cli Un
     let output ← docker #["run", "--rm", image, "programs"]
     let programs ← liftExcept (Json.parse output.stdout >>= fromJson? (α := Array ProgramInfo))
     unless !programs.isEmpty do throw "Application has no registered programs"
-    ctx.startServices
+    ctx.startServices verbose
     discard <| docker #["volume", "create", ctx.project ++ "_scheduler-data"]
     saveJson (ctx.home / "deployment.json") (Deployment.mk ctx.project image programs)
-    printLine s!"Deployed {programs.size} programs. Use 'programs' to list them, then 'run NAME'."
+    printStyled (Styled.text s!"Deployed {programs.size} programs. Use 'programs' to list them, then 'run NAME'." .green)
+    printStyled (Styled.text s!"Logs: {ctx.home / "logs"}" .muted)
 
 /-- Start existing services without rebuilding or silently replacing lost durable volumes. -/
-def Context.up (ctx : Context) : Cli Unit := do
+def Context.up (ctx : Context) (verbose := false) : Cli Unit := do
   discard ctx.deployment
   Deployments.remember ctx
   withLock (ctx.home / "deploy.lock") do
@@ -111,8 +125,9 @@ def Context.up (ctx : Context) : Cli Unit := do
       let result ← docker #["volume", "inspect", ctx.project ++ "_" ++ volume] false
       unless result.exitCode == 0 do
         throw s!"Cannot verify volume {ctx.project}_{volume}. Use 'doctor'; restore missing data before resuming."
-    ctx.startServices
-    printLine "Services are up. Use 'resume RUN' for an unfinished run, or 'run NAME' for a new one."
+    ctx.startServices verbose
+    printStyled (Styled.text "Services are up. Use 'resume RUN' for an unfinished run, or 'run NAME' for a new one." .green)
+    printStyled (Styled.text s!"Logs: {ctx.home / "logs"}" .muted)
 
 def Context.container (ctx : Context) (run : Run) (role : String) : String :=
   s!"{ctx.project}-{run.id}-{role}"
@@ -131,7 +146,7 @@ def Context.down (ctx : Context) : Cli Unit := do
       discard <| docker (#["stop"] ++ actors)
       discard <| docker (#["rm"] ++ actors)
     discard <| ctx.compose #["down", "--remove-orphans"]
-    printLine "Deployment stopped. Data is preserved. Use 'up', then 'resume RUN' to continue a run."
+    printStyled (Styled.text "Deployment stopped. Data is preserved. Use 'up', then 'resume RUN' to continue a run." .yellow)
 
 def Context.mounts (ctx : Context) (run : Run) : Array String :=
   #["--network", ctx.project ++ "_default", "-v", s!"{ctx.directory run.id / "config.json"}:/etc/lean-cloud/config.json:ro"]
@@ -194,7 +209,7 @@ def Context.resume (ctx : Context) (id : String) : Cli Unit := do
     -- Consumer reconnects are handled by the ordinary process restart policy.
     for worker in ["worker1", "worker2", "worker3"] do
       ctx.startContainer run worker #["worker", "/etc/lean-cloud/config.json", id]
-    printLine s!"Started {id}. Use 'watch {id}' or 'inspect {id}'."
+    printStyled (Styled.text s!"Started {id}. Use 'watch {id}' or 'inspect {id}'." .green)
 
 /-- Stop only this run's actors. Restart is disabled before stopping any actor;
 the services, replay records, broker messages and scheduler database survive. -/
@@ -215,7 +230,7 @@ def Context.pause (ctx : Context) (id : String) : Cli Unit := do
     ctx.setControl id .pausing
     ctx.stopRun run
     ctx.setControl id .paused
-    printLine s!"Paused {id}. Use 'resume {id}' to continue from its replay records."
+    printStyled (Styled.text s!"Paused {id}. Use 'resume {id}' to continue from its replay records." .yellow)
 
 def Context.kill (ctx : Context) (id : String) : Cli Unit := do
   let run ← ctx.loadRun id
@@ -227,7 +242,7 @@ def Context.kill (ctx : Context) (id : String) : Cli Unit := do
     match outcome with
     | .cancelled _ =>
       ctx.setControl id .killed
-      printLine s!"Killed {id}. Its replay records are preserved; it cannot be resumed."
+      printStyled (Styled.text s!"Killed {id}. Its replay records are preserved; it cannot be resumed." .red)
     | _ =>
       ctx.setControl id .active
       printLine s!"{id} had already completed. Its result is unchanged; use 'result {id}'."

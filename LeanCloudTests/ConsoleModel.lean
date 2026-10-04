@@ -46,12 +46,13 @@ def World.json [ToJson α] (world : World) (path : System.FilePath) (value : α)
 
 private def label : HostOp α → String
   | .process .. => "process" | .readFile .. => "readFile" | .writeFile .. => "writeFile"
+  | .appendFile .. => "appendFile"
   | .startProcess .. => "startProcess" | .pollProcess .. => "pollProcess" | .closeProcess .. => "closeProcess"
   | .rename .. => "rename" | .exists .. => "exists" | .readDir .. => "readDir"
   | .isDir .. => "isDir"
   | .createDir .. => "createDir" | .realPath .. => "realPath" | .currentDir => "currentDir"
   | .getEnv .. => "getEnv" | .pid => "pid" | .now => "now" | .sleep .. => "sleep"
-  | .write .. => "write" | .flush => "flush" | .readLine => "readLine"
+  | .write .. | .writeStyled .. => "write" | .flush => "flush" | .readLine => "readLine"
   | .enterTerminal => "enterTerminal" | .leaveTerminal => "leaveTerminal"
   | .key .. => "key" | .dimensions => "dimensions" | .lock .. => "lock" | .unlock .. => "unlock"
 
@@ -85,6 +86,7 @@ private def operation : HostOp α → ExceptT String (StateM World) α
     let some text := (← get).file path | throw s!"Missing file: {path}"
     return text
   | .writeFile path text => modify (·.save path text)
+  | .appendFile path text => modify fun world => world.save path ((world.file path).getD "" ++ text)
   | .rename source target => do
     let some text := (← get).file source | throw s!"Missing source: {source}"
     modify fun w => { (w.save target text) with files :=
@@ -114,6 +116,7 @@ private def operation : HostOp α → ExceptT String (StateM World) α
   | .sleep ms => modify fun w => { w with time := w.time + ms.toNat }
   | .write text stderr => modify fun w =>
     if stderr then { w with stderr := w.stderr ++ text } else { w with stdout := w.stdout ++ text }
+  | .writeStyled line => modify fun w => { w with stdout := w.stdout ++ Styled.plain line ++ "\n" }
   | .flush => pure ()
   | .readLine => do
     let line := (← get).lines.headD ""

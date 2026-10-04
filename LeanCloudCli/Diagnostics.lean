@@ -18,28 +18,30 @@ def deploymentState (nodes : Array Node) : String :=
 def listDeployments (ctx : Context) : Cli Unit := do
   Deployments.discover ctx
   let catalog ← Deployments.load
-  printLine "  DEPLOYMENT                    STATE                     DIRECTORY"
+  printHeading "  DEPLOYMENT                    STATE                     DIRECTORY"
   for entry in catalog.entries.qsort (fun a b => a.project < b.project) do
     let target := entry.context
     let state ← if !(← request (.isDir target.root)) then pure "directory missing"
       else if !(← request (.exists (target.home / "deployment.json"))) then pure "not deployed"
       else try pure (deploymentState (← target.nodes)) catch _ => pure "Docker unavailable"
     let marker := if entry.project == ctx.project && entry.root == ctx.root.toString then "* " else "  "
-    printLine s!"{marker}{pad 30 entry.project}{pad 26 state}{safe entry.root}"
+    printStyled (Styled.text (marker ++ pad 30 entry.project) (if marker == "* " then .selected else .cyan) ++
+      Styled.text (pad 26 state) (Styled.statusColor state) ++ Styled.text entry.root)
   if catalog.entries.isEmpty then printLine "No known deployments. Use 'deploy' or 'open DIRECTORY'."
   printLine "* selected · local catalog for the current Docker context"
 
 def Context.status (ctx : Context) : Cli Unit := do
-  printLine s!"Deployment: {safe ctx.project}"
+  printHeading s!"Deployment: {safe ctx.project}"
   printLine s!"Directory:  {safe ctx.root.toString}"
   let deployment ← ctx.deployment
   printLine s!"Image:      {safe deployment.image}"
   printLine s!"Programs:   {deployment.programs.size}"
   printLine s!"Runs:       {(← ctx.allRuns).size} recorded; use 'ps' for workflow results"
   let nodes ← try ctx.nodes catch _ => throw "Docker unavailable; use 'doctor' to diagnose connectivity"
-  printLine s!"Services:   {deploymentState nodes}"
+  printStyled (Styled.text "Services:   " ++ Styled.text (deploymentState nodes) (Styled.statusColor (deploymentState nodes)))
   for service in deploymentServices do
-    printLine s!"  {pad 22 service}{serviceState nodes service}"
+    printStyled (Styled.text ("  " ++ pad 22 service) .cyan ++
+      Styled.text (serviceState nodes service) (Styled.statusColor (serviceState nodes service)))
   let actors := nodes.filter (·.run.isSome)
   printLine s!"Actors:     {(actors.filter (·.state == "running")).size} running / {actors.size} containers"
   if nodes.isEmpty then printLine "Use 'up' to start services, then 'resume RUN' for an unfinished run."
@@ -47,8 +49,8 @@ def Context.status (ctx : Context) : Cli Unit := do
 private def check (label : String) (action : Cli Unit) : Cli Bool := do
   let result ← observing action
   match result with
-  | .ok () => printLine s!"[ok]   {label}"; return true
-  | .error error => printLine s!"[fail] {label}: {safe error}"; return false
+  | .ok () => printStyled (Styled.text "[ok]   " .green ++ Styled.text label); return true
+  | .error error => printStyled (Styled.text "[fail] " .red ++ Styled.text s!"{label}: {safe error}"); return false
 
 private def checkProcess (args : Array String) (hint : String) : Cli Unit := do
   let result ← docker args false
@@ -56,7 +58,7 @@ private def checkProcess (args : Array String) (hint : String) : Cli Unit := do
 
 /-- Read-only host and deployment diagnostics. Health checks are not end-to-end probes. -/
 def Context.doctor (ctx : Context) : Cli Unit := do
-  printLine s!"Checking {safe ctx.project}…"
+  printHeading s!"Checking {safe ctx.project}…"
   let mut failures := 0
   let record (passed : Bool) := if passed then 0 else 1
   failures := failures + record (← check "Deployment catalog" (discard Deployments.load))
@@ -105,9 +107,9 @@ def Context.doctor (ctx : Context) : Cli Unit := do
               throw s!"{state}; use 'up' for stopped services or inspect the service's Docker logs")
         for node in nodes.filter (·.run.isSome) do
           if node.state != "running" then
-            printLine s!"[note] {safe node.name}: {safe node.state}; check 'ps' before resuming"
+            printStyled (Styled.text s!"[note] {safe node.name}: {safe node.state}; check 'ps' before resuming" .yellow)
   printLine "Checks cover local files, images, volumes and container health; runtime credentials and workflow execution are not probed."
   unless failures == 0 do throw s!"Doctor found {failures} failed check(s)."
-  printLine "All checks passed."
+  printStyled (Styled.text "All checks passed." .green)
 
 end LeanCloudCli

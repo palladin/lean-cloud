@@ -29,6 +29,7 @@ private def handle (resources : IO.Ref Resources) : HostOp α → IO α
     resources.modify fun state => { state with processes := state.processes.set! token.value none }
   | .readFile path => IO.FS.readFile path
   | .writeFile path text => IO.FS.writeFile path text
+  | .appendFile path text => IO.FS.withFile path .append (fun file => file.putStr text)
   | .rename source target => IO.FS.rename source target
   | .exists path => path.pathExists
   | .readDir path => return (← path.readDir).map (·.fileName)
@@ -43,7 +44,8 @@ private def handle (resources : IO.Ref Resources) : HostOp α → IO α
   | .write text stderr => do
     let stream ← if stderr then IO.getStderr else IO.getStdout
     stream.putStr text
-  | .flush => do (← IO.getStdout).flush
+  | .writeStyled line => do (← IO.getStdout).putStr (Styled.plain line ++ "\n")
+  | .flush => do (← IO.getStdout).flush; (← IO.getStderr).flush
   | .readLine => do (← IO.getStdin).getLine
   | .enterTerminal => do
     let active ← Native.enter
