@@ -1,0 +1,22 @@
+import LeanCloudRuntime
+import LeanCloud.Source
+
+open LeanCloud LeanCloudRuntime
+
+def workflow (numbers : Array Nat) : Cloud IO Nat := cloud {
+  let squares ← Cloud.parallel (numbers.map fun n => cloud {
+    Cloud.pure (fun _ => n * n) "square"
+  })
+  return squares.foldl (· + ·) 0
+}
+
+def program : CloudProgram (Array Nat) Nat := {
+  name := "APP_NAME"
+  version := "v1"
+  run := workflow
+  sampleInput := some #[1, 2, 3, 4, 5]
+  source := some cloud_source%
+}
+
+def main (args : List String) : IO UInt32 :=
+  Application.main ⟨#[program.register]⟩ args

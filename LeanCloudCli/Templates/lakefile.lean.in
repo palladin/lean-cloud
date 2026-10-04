@@ -1,0 +1,26 @@
+import Lake
+open Lake DSL
+
+package «APP_NAME»
+
+private def localSdk : Option String := run_io do
+  if let some root := get_config? leanCloudSdk then return some root
+  let config := __dir__ / "lean-cloud.local.json"
+  unless ← config.pathExists do return none
+  let json ← IO.ofExcept (Lean.Json.parse (← IO.FS.readFile config))
+  return some (← IO.ofExcept (json.getObjValAs? String "sdk"))
+
+@[package_dep] def lean_cloud_runtime : Dependency := {
+  name := `lean_cloud_runtime
+  scope := ""
+  version := .none
+  opts := {}
+  src? := some (match localSdk with
+    | some root => .path (System.FilePath.mk root / "runtime")
+    | none => .git "https://github.com/palladin/lean-cloud.git" (some "main") (some "runtime"))
+}
+
+@[default_target]
+lean_exe cloud_app where
+  root := `Main
+  moreLinkArgs := if System.Platform.isOSX then #[] else #["-Wl,--allow-shlib-undefined"]

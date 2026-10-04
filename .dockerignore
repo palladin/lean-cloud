@@ -1,4 +1,6 @@
 .git
 .lake
 runtime/.lake
+.lean-cloud
+output
 **/.DS_Store

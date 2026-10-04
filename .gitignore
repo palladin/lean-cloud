@@ -1,5 +1,6 @@
 # Lake dependencies and build output.
 .lake/
+.lean-cloud/
 
 # Lean output produced outside Lake's build directory.
 *.olean

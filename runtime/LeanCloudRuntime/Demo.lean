@@ -1,4 +1,4 @@
-import LeanCloud.Core
+import LeanCloud.Source
 
 namespace LeanCloudRuntime.Demo
 open Lean LeanCloud
@@ -36,5 +36,9 @@ def sampleFiles : Array (String × String) := (Array.range 16).map fun i =>
 
 def input : Input := ⟨sampleFiles.map Prod.fst, 2, 500⟩
 def expected : String := "files=16, errors=24\n"
+
+instance : Codec Input := jsonCodec Input "log-summary-input/v1"
+
+def source : ProgramSource := cloud_source%
 
 end LeanCloudRuntime.Demo

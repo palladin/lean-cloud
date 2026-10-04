@@ -1,4 +1,11 @@
-**lean-cloud** brings parallel and distributed programming to Lean.
+# lean-cloud
+
+[![CI](https://github.com/palladin/lean-cloud/actions/workflows/ci.yml/badge.svg)](https://github.com/palladin/lean-cloud/actions/workflows/ci.yml)
+[![Lean 4](https://img.shields.io/badge/Lean-v4.34.1-blue)](https://leanprover.github.io/)
+[![Runtime](https://img.shields.io/badge/Runtime-SQLite%20%7C%20RabbitMQ%20%7C%20S3-informational)](LeanCloud/Deployment.md)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green)](LICENSE)
+
+Parallel and distributed programming for Lean.
 
 Use simple monadic code to split work into smaller computations, run them in
 parallel, and combine their results.
@@ -43,6 +50,24 @@ containers, one scheduler, a RabbitMQ broker per actor, and shared S3 blob stora
 docker compose up --build -d
 docker compose logs -f scheduler worker worker2 worker3
 ```
+
+Create your own application from the interactive console:
+
+```sh
+lake exe lean_cloud
+```
+
+```text
+cloud> init my-app
+```
+
+Edit `my-app/Main.lean`, then run `deploy` and `run my-app` in the same console.
+Use `deployments` and `use NAME` to switch applications, `status` or `doctor` to
+inspect them, and `down` / `up` to stop and restart services while preserving data.
+
+The CLI generates the deployment configuration and builds your executable in
+Docker. `ps` lists runs; `watch RUN` shows runtime activity and resource graphs.
+See the [console guide](LeanCloud/Console.md) for inputs, registration, and recovery.
 
 Once the workers finish, read the saved report:
 

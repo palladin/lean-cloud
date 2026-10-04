@@ -1,0 +1,208 @@
+import LeanCloudTests.Support
+import LeanCloudTests.ConsoleModel
+
+namespace LeanCloudTests
+open Lean LeanCloud LeanCloudCli
+open ConsoleModel (World Invocation)
+
+private def ctx : Context := ⟨"/work", "lean-cloud-console"⟩
+private def info : ProgramInfo :=
+  ⟨"squares/v1", "array/nat", "nat/v1", "Square numbers", some (toJson (#[2, 3, 4] : Array Nat)),
+    some ⟨"Squares.lean", "cloud {\n  Cloud.pure \"square\" (fun () => 29)\n}", #[⟨"square", 2⟩]⟩⟩
+private def savedRun : Run := ⟨"one", "sha256:pinned", info, info.sampleInput.getD Json.null⟩
+private def has (text fragment : String) : Bool := (text.splitOn fragment).length > 1
+private def response (text : String := "") : Except String ProcessOutput := .ok { stdout := text }
+
+/-- Protocol fixtures; unrecognized host processes fail instead of running anything. -/
+private def process (completed : Bool) (call : Invocation) : Except String ProcessOutput := do
+  unless call.command == "docker" do throw "Unexpected executable"
+  let args := call.args
+  if args.contains "validate" then
+    match Json.parse (call.input.getD "") >>= fromJson? (α := Array Nat) with
+    | .ok _ => response
+    | .error _ => return { exitCode := 2, stderr := "Invalid numbers" }
+  else if args.contains "programs" then response (toJson #[info]).compress
+  else if args.contains "outcome" then
+    response (toJson (if completed then some (Exit.success (toJson (29 : Nat))) else none)).compress
+  else if args.contains "status" then response (toJson ({} : Scheduler.State)).compress
+  else if args.contains "result" then response "29"
+  else if args[0]? == some "logs" then
+    let worker := (args.back?.getD "").splitOn "-" |>.getLast!
+    let event : ExecutionEvent := ⟨"boot", 1, 10, worker, some 1, "0:1", "execute", "square"⟩
+    response ("@lean-cloud " ++ (toJson event).compress ++ "\n")
+  else if args[0]? == some "stats" then
+    response (Json.mkObj [("Name", toJson (ctx.container savedRun "worker1")),
+      ("CPUPerc", toJson "10.00%"), ("MemUsage", toJson "1MiB / 2MiB"),
+      ("NetIO", toJson "1kB / 2kB"), ("BlockIO", toJson "3kB / 4kB")]).compress
+  else if args[0]? == some "ps" then response "node1\n"
+  else if args[0]? == some "inspect" then
+    response (toJson (#["worker1", "worker2", "worker3", "scheduler"].map fun role =>
+      Json.mkObj [("Name", toJson ("/" ++ ctx.container savedRun role)),
+        ("State", Json.mkObj [("Status", toJson "running"), ("StartedAt", toJson "boot")]),
+        ("Config", Json.mkObj [("Labels", Json.mkObj [("lean-cloud.run", toJson savedRun.id),
+          ("lean-cloud.role", toJson role)])])])).compress
+  else if args[0]? == some "exec" then response "Filesystem 1024-blocks Used Available Capacity Mounted\ndisk 2048 1024 1024 50% /\n"
+  else if args.toList.take 2 == ["container", "inspect"] then return { exitCode := 1 }
+  else if args.toList.take 2 == ["image", "inspect"] then response "sha256:pinned\n"
+  else if args[0]? == some "compose" || args[0]? == some "tag" ||
+      args[0]? == some "stop" || args[0]? == some "rm" ||
+      args.toList.take 2 == ["volume", "create"] || args.contains "submit-entry" ||
+      args.toList.take 2 == ["run", "-d"] then response
+  else throw s!"Unexpected Docker request: {reprStr args}"
+
+private def base (completed := true) : World :=
+  ({ process := process completed : World }.save (ctx.root / "compose.yaml") "services: {}")
+    |>.json (ctx.root / "deploy/config.json") (Json.mkObj [("scheduler", Json.mkObj [])])
+
+private def deployed (completed := true) : World :=
+  (base completed).json (ctx.home / "deployment.json") (Deployment.mk ctx.project savedRun.image #[info])
+
+private def launched (completed := true) : World :=
+  (deployed completed).json (ctx.directory savedRun.id / "run.json") savedRun
+    |>.json (ctx.directory savedRun.id / "input.json") savedRun.input
+    |>.json (ctx.directory savedRun.id / "config.json") Json.null
+
+private def checked (program : Cli α) (world : World) : IO (α × World) := do
+  let (result, world) := ConsoleModel.run program world
+  return (← unwrap result, world)
+
+def consoleEffectCases : Array TestCase := #[
+  ⟨"console.effects.down-preserves-data", do
+    let initial := launched
+    let (_, world) ← checked (discard (command ctx ["down"])) initial
+    assertEq world.files initial.files
+    assertEq (world.processes.map (·.args.toList)) #[
+      ["ps", "-aq", "--filter", "label=lean-cloud.project=" ++ ctx.project],
+      ["stop", "node1"], ["rm", "node1"],
+      ["compose", "-p", ctx.project, "-f", "/work/compose.yaml", "down", "--remove-orphans"]]
+    assertTrue world.locks.isEmpty "Shutdown leaked a lock"⟩,
+  ⟨"console.effects.down-with-no-actors", do
+    let handle (call : Invocation) :=
+      if call.args[0]? == some "ps" then response else process true call
+    let initial := { (deployed) with process := handle }
+    let (_, world) ← checked ctx.down initial
+    assertEq world.processes.size 2
+    assertTrue (world.processes.all (fun call => call.args[0]? != some "stop" && call.args[0]? != some "rm"))
+      "Shutdown tried to stop an empty container list"
+    let (_, empty) ← checked ctx.down {}
+    assertTrue empty.processes.isEmpty "Shutdown of an unconfigured app invoked Docker"⟩,
+  ⟨"console.effects.deploy-and-launch", do
+    let (_, world) ← checked (do ctx.deploy; ctx.launch "squares" none (some "one")) (base false)
+    assertTrue world.locks.isEmpty "Deployment/launch leaked a lock"
+    let manifest ← unwrap (Json.parse (world.file (ctx.directory "one" / "run.json")).get! >>= fromJson? (α := Run))
+    assertEq manifest.image savedRun.image
+    assertEq manifest.input.compress savedRun.input.compress
+    let actors := world.processes.filter (·.args.toList.take 2 == ["run", "-d"])
+    assertEq actors.size 4
+    assertTrue (actors.all (fun call => call.args.contains savedRun.image &&
+      call.args.contains "lean-cloud.run=one")) "Launch lost image/run isolation"
+    assertTrue (world.processes.any (·.args.contains "lean-cloud-console-app:pinned")) "No retained image tag"
+    assertTrue (!world.files.any (fun (path, _) => path.endsWith ".tmp")) "Atomic manifest replacement incomplete"⟩,
+  ⟨"console.effects.reject-before-launch", do
+    let input := ctx.root / "bad input.json"
+    let (result, world) := ConsoleModel.run (ctx.launch "squares" (some input.toString) (some "one"))
+      ((deployed).json input (toJson "invalid"))
+    assertTrue result.toOption.isNone "Invalid input accepted"
+    assertTrue (world.file (ctx.directory "one" / "run.json")).isNone "Invalid input persisted a run"
+    assertEq world.processes.size 1
+    assertEq world.processes[0]!.input (some "\"invalid\"\n")
+    assertTrue world.locks.isEmpty "Input rejection acquired/leaked a lock"⟩,
+  ⟨"console.effects.launch-identity-and-resume", do
+    let (result, duplicate) := ConsoleModel.run (ctx.launch "squares" none (some "one")) (launched)
+    assertTrue result.toOption.isNone "Duplicate run accepted"
+    assertTrue duplicate.locks.isEmpty "Duplicate run leaked catalog lock"
+    let (_, completed) ← checked (ctx.resume "one") (launched)
+    assertTrue (completed.processes.all (·.args.toList.take 2 != ["run", "-d"])) "Completed run restarted"
+    let (result, mismatch) := ConsoleModel.run (ctx.resume "one")
+      ((launched).json (ctx.directory "one" / "input.json") (toJson (#[100] : Array Nat)))
+    assertTrue result.toOption.isNone "Changed run input accepted"
+    assertTrue (mismatch.locks.isEmpty && mismatch.processes.isEmpty) "Changed input submitted/leaked lock"⟩,
+  ⟨"console.effects.all-inspection-commands", do
+    let initial := { (launched) with directories := (launched).directories.push ctx.runs.toString }
+    let (_, world) ← checked (do
+      for args in [["programs"], ["ps"], ["inspect", "one"], ["result", "one"],
+          ["nodes"], ["logs", "one", "worker2"], ["watch", "one", "--once"]] do
+        discard (command ctx args)) initial
+    for text in ["squares/v1", "completed", "LOCATION", "29", "CPU", "Source:"] do
+      assertTrue (has world.stdout text) s!"Missing command output: {text}"
+    assertTrue (!world.stdout.contains '\x1b' && !world.trace.contains "enterTerminal") "--once entered raw terminal"⟩,
+  ⟨"console.effects.interactive-repl", do
+    let lines := ["unknown\n", "run 'unfinished\n", "help\n", "quit\n", "deploy\n"]
+    let initial := { (base) with terminalAvailable := false, lines }
+    let (code, world) ← checked (application []) initial
+    assertEq code 0
+    assertTrue (has world.stderr "Unknown command" && has world.stderr "Unclosed quote") "REPL lost errors"
+    assertTrue (has world.stdout "Commands:") "REPL did not continue after errors"
+    assertEq world.lines ["deploy\n"]
+    assertTrue world.processes.isEmpty "REPL executed after quit"
+    let (code, _) ← checked (application []) { (base) with terminalAvailable := false }
+    assertEq code 0 "EOF did not exit"
+    let (code, _) ← checked (application ["unknown"]) (base)
+    assertEq code 1 "One-shot errors must fail"
+    let (code, _) ← checked (application ["--help"]) {}
+    assertEq code 0 "Help requires a checkout"⟩,
+  ⟨"console.effects.live-navigation-and-refresh", do
+    let (_, world) ← checked (command ctx ["watch", "one"])
+      { (launched) with keys := [9, 51, 106, 107, 97] ++ List.replicate 10 0 ++ [113] }
+    assertTrue (!world.terminal && world.keys.isEmpty) "Watch did not restore terminal or consume keys"
+    assertTrue (has world.stdout ("Node: " ++ ctx.container savedRun "worker2")) "Tab did not select second node"
+    assertTrue (has world.stdout ("Node: " ++ ctx.container savedRun "worker3")) "Worker shortcut did not redraw"
+    assertTrue ((world.processes.filter (·.args[0]? == some "stats")).size == 2) "Timed refresh did not resample"
+    assertTrue (world.stdout.endsWith "\x1b[?25h\x1b[?1049l") "Watch did not restore display"
+    let (_, world) ← checked (command ctx ["watch", "one"]) { (launched) with terminalAvailable := false }
+    assertTrue (!world.stdout.contains '\x1b' && !world.trace.contains "key") "Non-TTY watch did not return"⟩,
+  ⟨"console.effects.failure-cleanup", do
+    -- Inject a failure at every operation of each successful execution. A failure
+    -- of release itself is reported, not assumed to have released the resource.
+    for (program, initial) in [(ctx.deploy, base), (ctx.down, launched), (ctx.launch "squares" none (some "one"), deployed false),
+        (discard (command ctx ["watch", "one"]), launched)] do
+      let (_, successful) ← checked program initial
+      for index in [:successful.trace.size] do
+        let operation := successful.trace[index]!
+        if operation == "unlock" || operation == "leaveTerminal" || operation == "closeProcess" then continue
+        let (_, world) := ConsoleModel.run program { initial with failAt := some index }
+        assertTrue world.locks.isEmpty s!"Lock leaked at {index}: {operation}"
+        assertTrue world.children.isEmpty s!"Process leaked at {index}: {operation}"
+        assertTrue (!world.terminal) s!"Terminal leaked at {index}: {operation}"⟩,
+  ⟨"console.effects.anchored-shell", do
+    let keys := "unknown\rhe\t\rqu\t\r".toUTF8.data.toList.map (·.toUInt32)
+    let (code, world) ← checked (application []) { (base) with keys, sizes := [(80, 24), (50, 12)] }
+    assertEq code 0
+    assertTrue (world.keys.isEmpty && !world.terminal) "Shell did not consume input/restore terminal"
+    assertTrue (has world.stdout "Unknown command" && has world.stdout "help | quit") "Command output missing from transcript"
+    assertTrue world.stderr.isEmpty "Shell errors bypassed transcript"
+    assertTrue (has world.stdout "\x1b[22;1H" && has world.stdout "\x1b[10;1H") "Prompt did not follow terminal resize"
+    assertTrue world.processes.isEmpty "Typing/completion ran a Docker process"
+    assertTrue (world.stdout.endsWith "\x1b[?1049l") "Shell screen not restored"⟩,
+  ⟨"console.effects.shell-watch-handoff", do
+    let keys := "watch one\rqquit\r".toUTF8.data.toList.map (·.toUInt32)
+    let (_, world) ← checked (application []) { (launched) with keys }
+    assertTrue (world.keys.isEmpty && !world.terminal) "Watch did not return to shell"
+    assertEq (world.trace.filter (· == "enterTerminal")).size 3
+    assertEq (world.trace.filter (· == "leaveTerminal")).size 3
+    assertTrue (has world.stdout "Source:" && has world.stdout "[init]") "Watch or shell was not rendered"⟩,
+  ⟨"console.effects.shell-failure-cleanup", do
+    let initial := { (base) with keys := "deploy\rhelp\rquit\r".toUTF8.data.toList.map (·.toUInt32) }
+    let (_, successful) ← checked (application []) initial
+    for index in [:successful.trace.size] do
+      -- A failed release is observable but cannot be modeled as a successful release.
+      if ["leaveTerminal", "unlock", "closeProcess"].contains successful.trace[index]! then continue
+      let (_, world) := ConsoleModel.run (application []) { initial with failAt := some index }
+      assertTrue (!world.terminal && world.locks.isEmpty && world.children.isEmpty)
+        s!"Shell leaked resources at operation {index} ({successful.trace[index]!}); locks={reprStr world.locks}, terminal={world.terminal}, trace={reprStr (world.trace.extract (index - 3) (index + 8))}"⟩,
+  ⟨"console.effects.finalizer-error", do
+    let program : Cli Unit := do
+      try throw "body failure"
+      finally request (.write "cleanup")
+    let (result, _) := ConsoleModel.run program { failAt := some 0 }
+    match result with
+    | .error error => assertEq error "injected host failure"
+    | .ok _ => assertTrue false "Cleanup failure was swallowed"
+    let (result, world) := ConsoleModel.run program {}
+    match result with
+    | .error error => assertEq error "body failure"
+    | .ok _ => assertTrue false "Body failure was swallowed"
+    assertEq world.stdout "cleanup"⟩
+]
+
+end LeanCloudTests

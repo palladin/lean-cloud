@@ -1,7 +1,35 @@
 import LeanCloudRuntime
+import LeanCloudRuntime.Programs
+import ApplicationTests
 import LeanCloudTests.Generated
 
 open Lean LeanCloud LeanCloudRuntime LeanCloudTests
+
+private def checkPrograms (config : Config) (runPrefix : String) : IO Unit := do
+  ApplicationTests.run
+  IO.ofExcept programs.validate
+  assertEq programs.programs.size 2
+  assertTrue (programs.find "missing/v1").toOption.isNone "Unknown entry accepted"
+  let duplicate : Registry := ⟨#[sumSquares.register, sumSquares.register]⟩
+  assertTrue duplicate.validate.toOption.isNone "Duplicate entry accepted"
+  assertTrue (sumSquares.register.validate (toJson "wrong input")).toOption.isNone "Invalid typed input accepted"
+  let input := #[2, 3, 4]
+  let process ← sumSquares.submit config (runPrefix ++ "-typed") input
+  assertTrue (← process.poll).isNone "New typed process already completed"
+  let trace ← Trace.create "registry-test"
+  let direct ← (DirectInterpreter.interpret (S3.storage config.blobs) Squares.workflow input).run
+  let recorded ← (SequentialReplay.interpret (trace.records (S3.records config.blobs process.id))
+    (trace.blobs (S3.storage config.blobs)) 1000
+    (fun values => trace.instrument 1000 (Squares.workflow values)) input).run
+  assertOutcome recorded direct
+  assertOutcome (← process.await) (.ok 29)
+  -- A second typed submission is idempotent; incompatible input is rejected.
+  discard (sumSquares.submit config process.id input)
+  let conflict ← try
+    discard (sumSquares.submit config process.id #[9])
+    pure false
+  catch _ => pure true
+  assertTrue conflict "Conflicting typed submission overwrote a run"
 
 private def checkAdapters (config : Config) (runPrefix : String) : IO Unit := do
   S3.initializeBucket config.blobs
@@ -177,6 +205,7 @@ def main (args : List String) : IO UInt32 := do
     | _ => throw (IO.userError "Invalid integration test arguments")
     let runPrefix := s!"properties-{← IO.Process.getPID}-{← IO.monoMsNow}"
     checkAdapters config runPrefix
+    checkPrograms config runPrefix
     checkIsolation config runPrefix
     for broker in #[config.mailboxes.scheduler] ++ config.mailboxes.workers.map (·.broker) do
       checkMailboxes broker runPrefix

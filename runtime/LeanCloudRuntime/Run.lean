@@ -2,6 +2,7 @@ import LeanCloudRuntime.LocalDb
 import LeanCloudRuntime.RabbitMQ
 import LeanCloudRuntime.ProcessLock
 import LeanCloudRuntime.S3
+import LeanCloudRuntime.Trace
 
 namespace LeanCloudRuntime
 open Lean LeanCloud
@@ -127,6 +128,7 @@ def runWorker [Codec α] (config : Config) (run : String)
   let broker ← IO.ofExcept (config.mailboxes.worker id)
   let handle ← RabbitMQ.openMailbox broker run ("worker." ++ id)
   try
+    let trace ← Trace.create id
     let inbox : Mailbox IO WorkerMessage := RabbitMQ.inbox handle
     let failure ← IO.mkRef (none : Option CloudError)
     let ports : Worker.Ports IO := {
@@ -137,20 +139,27 @@ def runWorker [Codec α] (config : Config) (run : String)
           if let some delivery := delivery then
             match delivery.message with
             | .execute assignment =>
+              trace.assign assignment
               IO.println s!"worker {id} attempt={assignment.attempt} location={assignment.location.key}"
               (← IO.getStdout).flush
             | .failed error => failure.set (some error)
             | _ => pure ()
           return delivery
         acknowledge := inbox.acknowledge }
-      send := fun message => RabbitMQ.send config.mailboxes.scheduler run "scheduler" message
-      observe := ← observe (S3.records config.blobs run)
-      blobs := S3.storage config.blobs }
+      send := fun message => do
+        if let .report report := message then
+          match report.progress with
+          | .ok (.fork _ _) => trace.emit "suspended" "parallel"
+          | .ok .done => trace.emit "returned" "return"
+          | .error _ => trace.emit "failed" ""
+        RabbitMQ.send config.mailboxes.scheduler run "scheduler" message
+      observe := ← observe (trace.records (S3.records config.blobs run))
+      blobs := trace.blobs (S3.storage config.blobs) }
     IO.println s!"worker {id} joined {run} via RabbitMQ"
     (← IO.getStdout).flush
     let mut state : Worker.State := {}
     repeat
-      state ← Worker.turn ports 100000 program input state
+      state ← Worker.turn ports 100000 (fun input => trace.instrument 100000 (program input)) input state
       if state.stopped then
         if let some error ← failure.get then throw (IO.userError error.message)
         return

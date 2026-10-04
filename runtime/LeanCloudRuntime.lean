@@ -1,2 +1,2 @@
 import LeanCloudRuntime.Run
-import LeanCloudRuntime.Demo
+import LeanCloudRuntime.Application

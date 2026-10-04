@@ -8,7 +8,7 @@ x-broker: &broker
     RABBITMQ_DEFAULT_PASS: local-cloud
     RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "+S 2:2 +sbwt none +sbwtdcpu none +sbwtdio none"
   healthcheck:
-    test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+    test: ["CMD", "gosu", "rabbitmq", "rabbitmq-diagnostics", "-q", "ping"]
     interval: 3s
     timeout: 5s
     retries: 30
