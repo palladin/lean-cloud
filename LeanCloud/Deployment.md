@@ -142,8 +142,9 @@ lake exe cloud_runtime_tests
 lake exe cloud_chaos --seed 1 --crashes 8 --workers 3
 ```
 
-Inbox tests check real SQLite against the simulator's mailbox model over generated
-operation traces. They also check session expiry, renewal, duplicate publication,
+The native inbox suite also runs the application-command and registry unit tests.
+It checks real SQLite against the simulator's mailbox model over generated
+operation traces, plus session expiry, renewal, duplicate publication,
 stale acknowledgements, HTTP authentication, registry access, and committed mail
 surviving a SIGKILL. Console tests cover the production layout, shared processes,
 controls, scaling, generated applications, and node restarts. Component tests run

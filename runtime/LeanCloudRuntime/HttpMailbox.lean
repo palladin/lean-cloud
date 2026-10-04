@@ -86,7 +86,8 @@ private def acquireSession (config : Config) (queue session : String) (waitMs : 
         throw error
       IO.sleep 100
 
-def openMailbox (config : Config) (run actor : String) (consume := true)
+/-- Acquire the inbox's consumer session. Publishing alone uses `send`. -/
+def openMailbox (config : Config) (run actor : String)
     (waitMs : Nat := 0) : IO Handle := do
   let random ← IO.Process.output { cmd := "openssl", args := #["rand", "-hex", "16"] }
   unless random.exitCode == 0 do throw (IO.userError "Cannot allocate consumer session")
@@ -94,13 +95,12 @@ def openMailbox (config : Config) (run actor : String) (consume := true)
   let session := random.stdout.trimAscii.toString
   let closed ← IO.mkRef false
   let failure ← IO.mkRef none
-  let lease ← if consume then acquireSession config queue session waitMs
-    else pure 15000
+  let lease ← acquireSession config queue session waitMs
   let heartbeat ← IO.asTask (do
     let mut next := (← IO.monoMsNow) + lease / 3
     while !(← closed.get) do
       IO.sleep 100
-      if consume && !(← closed.get) && (← IO.monoMsNow) ≥ next then
+      if !(← closed.get) && (← IO.monoMsNow) ≥ next then
         try
           discard <| call config ⟨queue, session, .renew⟩
           next := (← IO.monoMsNow) + lease / 3

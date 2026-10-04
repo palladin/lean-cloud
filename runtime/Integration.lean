@@ -1,12 +1,10 @@
 import LeanCloudRuntime
 import LeanCloudRuntime.Programs
-import ApplicationTests
 import LeanCloudTests.Generated
 
 open Lean LeanCloud LeanCloudRuntime LeanCloudTests
 
 private def checkPrograms (config : Config) (runPrefix : String) : IO Unit := do
-  ApplicationTests.run
   IO.ofExcept programs.validate
   assertEq programs.programs.size 2
   assertTrue (programs.find "missing/v1").toOption.isNone "Unknown entry accepted"
@@ -190,13 +188,14 @@ private def compareProgram (config : Config) (run : String) (tree : Tree) (input
 private def stagedMailbox (config : Config) (run : String) (index : Nat) (publish : Bool) : IO Unit := do
   let endpoints := #[config.mailboxes.scheduler] ++ config.mailboxes.workers.map (·.endpoint)
   let some endpoint := endpoints[index]? | throw (IO.userError "Invalid inbox service index")
-  let handle ← HttpMailbox.openMailbox endpoint run "inbox-restart" (!publish)
+  if publish then
+    HttpMailbox.send endpoint run "inbox-restart" (WorkerMessage.acknowledged 73)
+    return
+  let handle ← HttpMailbox.openMailbox endpoint run "inbox-restart"
   try
-    if publish then handle.send (WorkerMessage.acknowledged 73)
-    else
-      let inbox : Mailbox IO WorkerMessage := HttpMailbox.inbox handle
-      inbox.acknowledge (← receiveAcknowledged handle 73)
-      handle.delete
+    let inbox : Mailbox IO WorkerMessage := HttpMailbox.inbox handle
+    inbox.acknowledge (← receiveAcknowledged handle 73)
+    handle.delete
   finally handle.close
 
 def main (args : List String) : IO UInt32 := do

@@ -237,9 +237,6 @@ theorem Program.assuming (fact : Prop) {program : SimM δ α} {pre : δ → Prop
       exact fun _ _ _ impossible => impossible.elim
     · exact fun _ _ required => holds required.1
 
-theorem pure (value : α) {pre : δ → Prop} {post : α → δ → Prop}
-    (valid : rules.Implies pre (post value)) : rules.Program pre post (EffF.pure none value) := valid
-
 theorem bind {pre : δ → Prop} {middle : α → δ → Prop} {post : β → δ → Prop}
     {program : SimM δ α} {next : α → SimM δ β}
     (first : rules.Program pre middle program)

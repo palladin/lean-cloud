@@ -3,6 +3,7 @@ import LeanCloudRuntime.Application
 import LeanCloudRuntime.Programs
 import LeanCloud.MailboxModel
 import LeanCloudTests.Support
+import ApplicationTests
 
 open Lean LeanCloud LeanCloudRuntime LeanCloudTests
 
@@ -234,6 +235,8 @@ def main (args : List String) : IO UInt32 := do
   if args == ["signal-worker"] then signalWorker; return 0
   if let ["crash-writer", path] := args then crashWriter path; return 0
   try
+    ApplicationTests.run
+    IO.println "Application commands and registry passed"
     laws
     for seed in [:32] do differential seed
     IO.println "SQLite laws and 6,400 model operations passed"

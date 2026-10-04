@@ -140,8 +140,8 @@ def demo : Cli Unit := do
     request (.sleep 2000)
     discard <| awaitOutcome ctx recover ((← request .now) + 120000)
     require ((← ctx.remote recover "result") == "files=16, errors=24") "Recovery returned a different report"
-    -- Pause preserves execution records and disables restart, while other runs
-    -- still use the shared services. Kill is terminal and can be retried.
+    -- Pause preserves records and withholds new assignments; shared nodes and
+    -- other runs keep working. Kill is terminal and can be retried.
     ctx.launch "log-summary" (some inputFile.toString) (some "paused")
     let paused ← ctx.loadRun "paused"
     require (← ctx.outcome paused).isNone "Pause test missed the active run"

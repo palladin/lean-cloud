@@ -1,9 +1,5 @@
 import LeanCloud.Proofs.ConcurrentSafety
 import LeanCloud.Proofs.PureDirect
-import LeanCloud.Proofs.WorkerOwnership
-import LeanCloud.Proofs.WorkerProgress
-import LeanCloud.Proofs.SchedulerDelivery
-import LeanCloud.Proofs.CoordinationProgress
 import LeanCloud.Proofs.DeploymentProgress
 import LeanCloud.Proofs.SequentialReplay
 
@@ -22,8 +18,10 @@ windows. The source determines one fuel bound for all workers and assignments.
 The environment must allow execution, delivery, and a save while the attempt is
 live; it does not supply successful reports or the expected result.
 
-Both concurrent theorems use the original program, the actual actor code, and traces from empty
-storage. Durable delivery alone does not guarantee the processing windows:
+Both concurrent theorems use the original program, the actual per-workflow actor
+code, and traces from empty storage. The multi-run `Pool` coordinator and its
+pause/resume/kill controls are outside these theorems.
+Durable delivery alone does not guarantee the processing windows:
 endless crashes or expiry before every report can prevent completion.
 
 `ConcurrentSafety.root_result` also proves any published root result correct

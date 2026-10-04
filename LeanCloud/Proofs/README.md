@@ -37,8 +37,10 @@ The concurrent deployment adds scheduling and recovery:
 > least that fuel and recurring timely processing windows, the scheduler
 > eventually finishes and stores the direct interpreter's result.
 
-Both concurrent theorems start with empty storage and the actual scheduler and worker
-programs. The safety result covers any finite trace of their atomic operations, delayed replies,
+Both concurrent theorems start with empty storage and the actual per-workflow
+scheduler and worker programs. They do not cover the multi-run `Pool` coordinator
+or its administrative controls. The safety result covers any finite trace of
+the modeled actors' atomic operations, delayed replies,
 independent crashes and restarts, late remote requests, message delivery,
 duplication, and timer events. Neither theorem assumes that intermediate records,
 assignments, reports, or scheduler states are correct: their correctness is proved.
@@ -58,10 +60,10 @@ processing-window assumption. Both are checked when building the test suite.
 - `Pure.Evaluation` covers pure values, delay, failure, delayed pure computations,
   and parallel groups, including nested and empty groups. It describes the
   original Cloud program. Arbitrary IO actions, user blob effects, and
-  administrative cancellation are outside this correctness theorem. Pause uses
-  the existing stop/restart behavior; eventual completion requires resuming and
-  satisfying the processing-window assumption. Kill deliberately terminates a
-  run with cancellation instead of evaluating it to the direct result.
+  administrative pause, resume, and kill are outside these correctness theorems.
+  The deployed pool pauses a run by withholding new assignments; in-flight work
+  may still finish. Kill terminates a run with cancellation. These controls are
+  covered by pool and deployment tests, not by the equivalence proofs.
 - Codecs preserve the values crossing replay boundaries. The root codec also
   round-trips so the final stored value can be decoded.
 - The model has one scheduler with a private durable database. Its local writes
@@ -90,7 +92,7 @@ state is unfinished. A window consists of:
 3. A scheduler save applying that report's transition.
 
 The window has actual deployment states and traces between them. Other actors,
-broker delivery, and recovery may interleave between the worker's atomic
+message delivery, and recovery may interleave between the worker's atomic
 operations. [DeploymentExecution](DeploymentExecution.lean) connects each
 operation and reply to those states; existing invariants prove that the worker's
 contract survives the intervening events. No

@@ -18,16 +18,6 @@ inductive Envelope where
   | configure (replyTo : String) (routes : Array HttpMailbox.WorkerEndpoint)
   deriving ToJson, FromJson
 
--- Accept queued messages from the previous wire format during an upgrade.
-private structure Incoming where
-  envelope : Envelope
-
-private instance : FromJson Incoming where
-  fromJson? json := do
-    match fromJson? (α := Envelope) json with
-    | .ok envelope => return ⟨envelope⟩
-    | .error _ => return ⟨.event (← fromJson? json)⟩
-
 def send (config : Config) (message : LeanCloud.Pool.Message) : IO Unit :=
   HttpMailbox.send config.mailboxes.scheduler address "scheduler" (Envelope.event message)
 
@@ -95,7 +85,7 @@ def scheduler (config : Config) : IO Unit := do
         if run.mode == .killed then discard (LeanCloudRuntime.cancel config run.id)
       let handle ← HttpMailbox.openMailbox config.mailboxes.scheduler address "scheduler"
       try
-        let inbox : Mailbox IO Incoming := HttpMailbox.inbox handle
+        let inbox : Mailbox IO Envelope := HttpMailbox.inbox handle
         let mut lastTime ← IO.monoMsNow
         IO.println "deployment scheduler ready"
         (← IO.getStdout).flush
@@ -104,7 +94,7 @@ def scheduler (config : Config) : IO Unit := do
           saved := { saved with state := LeanCloud.Pool.tick (now - lastTime) saved.state }
           lastTime := now
           let some delivery ← inbox.receive | continue
-          match delivery.message.envelope with
+          match delivery.message with
           | .configure replyTo routes =>
             let cached := saved.replies.find? (·.1 == replyTo)
             let (updated, response) := match cached with

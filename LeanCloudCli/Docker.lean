@@ -110,15 +110,18 @@ private def Context.savedOutcome (ctx : Context) (image : String) (run : Run) : 
 /-- Stable containers belong to the deployment, independently of its runs. -/
 def Context.node (ctx : Context) (role : String) : String := s!"{ctx.project}-{role}"
 
-def Context.execApp (ctx : Context) (args : Array String) (input : Option String := none) : Cli String := do
-  let endpoint ← readJson (α := Json) (ctx.home / "api.json")
-  -- Docker may reassign an ephemeral published port when the same container
-  -- restarts. Resolve it before sending, so a stale address never needs a POST retry.
+/-- Docker may reassign a published port on restart. Always resolve the current
+localhost address before sending; an ambiguous POST must not be retried. -/
+private def Context.apiUrl (ctx : Context) : Cli String := do
   let port ← docker #["port", ctx.node "scheduler", "8080/tcp"]
   let address := port.stdout.trimAscii.toString
   unless address.startsWith "127.0.0.1:" && (address.drop 10 |>.toString).toNat?.isSome do
     throw "Scheduler HTTP port is not published on localhost"
-  let url := "http://" ++ address
+  return "http://" ++ address
+
+def Context.execApp (ctx : Context) (args : Array String) (input : Option String := none) : Cli String := do
+  let endpoint ← readJson (α := Json) (ctx.home / "api.json")
+  let url ← ctx.apiUrl
   if (endpoint.getObjValAs? String "url").toOption != some url then
     saveJson (ctx.home / "api.json") (endpoint.setObjVal! "url" (toJson url))
   let token ← liftExcept (endpoint.getObjValAs? String "token")
@@ -188,13 +191,10 @@ private def Context.startNodes (ctx : Context) (deployment : Deployment) : Cli U
     if health.stdout.trimAscii.toString.splitOn "\n" == List.replicate roles.size "healthy" then break
     unless (← request .now) < deadline do throw "Nodes did not become healthy; use 'status' and Docker logs to diagnose startup."
     request (.sleep 500)
-  let port ← docker #["port", ctx.node "scheduler", "8080/tcp"]
-  let address := port.stdout.trimAscii.toString
-  unless address.startsWith "127.0.0.1:" && (address.drop 10 |>.toString).toNat?.isSome do
-    throw "Scheduler HTTP port is not published on localhost"
+  let url ← ctx.apiUrl
   let config ← readJson (α := Json) (← ctx.configFile)
   let token ← liftExcept (config.getObjVal? "mailboxes" >>= (·.getObjVal? "scheduler") >>= (·.getObjValAs? String "token"))
-  saveJson (ctx.home / "api.json") (Json.mkObj [("url", toJson ("http://" ++ address)), ("token", toJson token)])
+  saveJson (ctx.home / "api.json") (Json.mkObj [("url", toJson url), ("token", toJson token)])
   discard <| ctx.execApp #["pool-health", "/etc/lean-cloud/config.json"]
   printStyled (Styled.text s!"✓ Scheduler and {deployment.workers} worker{if deployment.workers == 1 then "" else "s"} — ready" .green)
 

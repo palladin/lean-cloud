@@ -46,6 +46,6 @@ jobs:
       - name: Check native process streaming and cleanup
         run: lake exe cloud_process_tests
 
-      - name: Check HTTP inbox durability and model agreement
+      - name: Check application commands and HTTP inbox durability
         working-directory: runtime
         run: lake exe cloud_inbox_tests

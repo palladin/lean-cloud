@@ -34,14 +34,6 @@ private theorem ports (worker : WorkerId) :
     InterpreterEffects.Ports (SchedulerOwnership.Allowed false) (observed worker).records blobs :=
   ⟨SchedulerOwnership.observed_read worker, SchedulerOwnership.observed_create worker, execute⟩
 
-/-- Every replay segment preserves ownership, for any fuel, location, or stored
-reply. The shared structural proof checks the actual interpreter. -/
-theorem walk_preserves (worker : WorkerId) (assignment : Assignment) (fuel : Nat)
-    (encode : α → Json) (program : Cloud (SimM World) α) (current : Location) (active : Bool)
-    (valid : CloudProgram program) :
-    Protected (walk (observed worker).records blobs assignment fuel encode program current active).run :=
-  InterpreterEffects.walk_preserves (ports worker) assignment fuel encode program current active valid
-
 theorem step_preserves [Codec α] (worker : WorkerId) (fuel : Nat)
     (program : ι → Cloud (SimM World) α) (input : ι) (assignment : Assignment)
     (valid : CloudProgram (program input)) :

@@ -2,7 +2,7 @@ import LeanCloud.Proofs.MainTheorems
 
 /-! A kernel-checked witness that the completion theorem's processing-window
 assumption can hold for the actual deployment, starting from empty storage.
-The trace uses broker delivery and separate operation commit/reply events. -/
+The trace uses message delivery and separate operation commit/reply events. -/
 
 namespace LeanCloudTests.ProgressWitness
 open Lean LeanEff LeanCloud LeanCloud.Proofs SimulationBackend SimulationProgress
