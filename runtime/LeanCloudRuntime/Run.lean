@@ -35,9 +35,8 @@ def validateRun (run : String) : IO Unit :=
       c.toNat < 128 && (c.isAlphanum || c == '-' || c == '_')) do
     throw (IO.userError "Run id must contain 1–100 ASCII letters, digits, '-' or '_'")
 
-/-- Submitting the same definition is idempotent. Deploy one scheduler for this
-run; its initial private state contains the root job. Workers load the immutable
-entry point/input from blobs. The scheduler never loads workflow data. -/
+/-- Persist the immutable definition before publishing a pool registration.
+This lower-level operation is also used by the single-run adapter harness. -/
 def submit (config : Config) (run : String) (definition : RunDefinition) : IO Unit := do
   validateRun run
   let stored ← S3.createJson config.blobs run "definition" (toJson definition)
@@ -54,7 +53,7 @@ def completed (config : Config) (run : String) : IO (Option Exit) := do
   | .ok outcome => return outcome
   | .error error => throw (IO.userError (reprStr error))
 
-/-- Call after stopping every actor for the run. Atomic creation preserves a
+/-- Seal the root after the coordinator durably revokes the run. Atomic creation preserves a
 normal completion that won the race with the administrative cancellation. -/
 def cancel (config : Config) (run : String) : IO Exit := do
   validateRun run
@@ -105,7 +104,7 @@ def runScheduler (config : Config) (run : String) : IO Unit := do
     finally conn.close
   finally ProcessLock.release lock
 
-private def observe (records : ReplayStore IO) : IO (Worker.ObservedStore IO) := do
+def observe (records : ReplayStore IO) : IO (Worker.ObservedStore IO) := do
   let keys ← IO.mkRef (#[] : Array String)
   let note (key : String) := keys.modify fun found => if found.contains key then found else found.push key
   return {
@@ -122,7 +121,7 @@ private def observe (records : ReplayStore IO) : IO (Worker.ObservedStore IO) :=
 
 /-- Stable across container restarts so RabbitMQ redelivers into the same inbox.
 On a host running several processes, provide a distinct CLOUD_WORKER_ID for each. -/
-private def workerId : IO String := do
+def workerId : IO String := do
   let id ← match ← IO.getEnv "CLOUD_WORKER_ID" with
     | some id => pure id
     | none => do

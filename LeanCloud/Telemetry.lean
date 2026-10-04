@@ -14,6 +14,7 @@ structure ExecutionEvent where
   location : String
   activity : String
   operation : String
+  run : String := ""
   deriving ToJson, FromJson
 
 end LeanCloud

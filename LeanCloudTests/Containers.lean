@@ -147,7 +147,7 @@ def Context.createScheduler (ctx : Context) (name run : String) : IO String := d
   discard <| ctx.docker #["start", scheduler]
   let deadline := (← IO.monoMsNow) + 30000
   repeat
-    let result ← ctx.docker #["exec", scheduler, "cloud-demo", "status", configPath, run] (check := false)
+    let result ← ctx.docker #["exec", scheduler, "cloud-demo", "reference-status", configPath, run] (check := false)
     if result.exitCode == 0 then return scheduler
     require ((← IO.monoMsNow) < deadline) "Scheduler did not become ready"
     IO.sleep 200

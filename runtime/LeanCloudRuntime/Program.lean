@@ -1,5 +1,5 @@
 import LeanCloud.Program
-import LeanCloudRuntime.Run
+import LeanCloudRuntime.Pool
 
 namespace LeanCloudRuntime
 open Lean LeanCloud
@@ -9,6 +9,7 @@ structure RegisteredProgram where
   info : ProgramInfo
   validate : Json → Except String Unit
   worker : Config → String → RunDefinition → IO Unit
+  execute : RunDefinition → String → Worker.ObservedStore IO → BlobStorage IO → Trace.Sink → Assignment → IO Report
 
 def registerProgram [Codec ι] [Codec α] (program : LeanCloud.CloudProgram ι α) : RegisteredProgram where
   info := program.info
@@ -18,6 +19,12 @@ def registerProgram [Codec ι] [Codec α] (program : LeanCloud.CloudProgram ι �
       throw (IO.userError "Worker program version or result codec does not match the submitted run")
     let input ← IO.ofExcept (Codec.decode (α := ι) definition.input)
     runWorker config run program.run input
+  execute definition worker records blobs trace assignment := do
+    unless definition.entry == program.info.entry && definition.resultSchema == program.info.resultSchema do
+      throw (IO.userError "Deployed program/codec does not match the submitted run")
+    let input ← IO.ofExcept (Codec.decode (α := ι) definition.input)
+    Worker.execute worker records blobs 100000
+      (fun input => trace.instrument 100000 (program.run input)) input assignment
 
 structure Registry where
   programs : Array RegisteredProgram
@@ -53,6 +60,61 @@ def Registry.runWorker (registry : Registry) (config : Config) (run : String) : 
   let program ← IO.ofExcept (registry.find definition.entry)
   program.worker config run definition
 
+/-- A persistent worker executes one assignment at a time, selecting the entry
+from the deployed registry. IO failures escape CloudError and trigger broker
+redelivery. Administrative revocation is cooperative at record boundaries. -/
+def Registry.serveWorker (registry : Registry) (config : Config) : IO Unit := do
+  let id ← workerId
+  let broker ← IO.ofExcept (config.mailboxes.worker id)
+  let handle ← RabbitMQ.openMailbox broker Pool.address ("worker." ++ id)
+  try
+    let inbox : Mailbox IO LeanCloud.Pool.Reply := RabbitMQ.inbox handle
+    let send (message : LeanCloud.Pool.Message) :=
+      RabbitMQ.send config.mailboxes.scheduler Pool.address "scheduler" message
+    let mut nextReady := 0
+    IO.println s!"worker {id} ready for deployed programs"
+    (← IO.getStdout).flush
+    repeat
+      if (← IO.monoMsNow) ≥ nextReady then
+        send (.ready id)
+        nextReady := (← IO.monoMsNow) + 2000
+      let some delivery ← inbox.receive | continue
+      match delivery.message with
+      | .execute run assignment =>
+        let revoked ← IO.mkRef false
+        let check : IO Unit := do
+          let allowed : Bool ← IO.ofExcept (fromJson? (← Pool.request config (.check run id assignment.attempt)))
+          unless allowed do
+            revoked.set true
+            throw (IO.userError "Assignment revoked")
+        let trace ← Trace.create id run
+        try
+          check
+          trace.assign assignment
+          let report ← if (← completed config run).isSome then
+              pure (Report.mk id assignment.attempt (.ok .done) #[])
+            else do
+              let definition ← loadRun config run
+              let program ← IO.ofExcept (registry.find definition.entry)
+              let records := trace.records (S3.records config.blobs run)
+              let guarded : ReplayStore IO := {
+                read := fun key => do check; records.read key
+                create := fun key value => do check; records.create key value }
+              let observed ← observe guarded
+              program.execute definition id observed (trace.blobs (S3.storage config.blobs)) trace assignment
+          trace.emit (match report.progress with | .ok (.fork ..) => "suspended" | .ok .done => "returned" | .error _ => "failed") ""
+          send (.report run report)
+        catch error =>
+          if ← revoked.get then trace.emit "revoked" "" else throw error
+        trace.emit "idle" ""
+        -- Confirm readiness before ack. A crash can duplicate assignments; the
+        -- coordinator and immutable records tolerate that redelivery.
+        send (.ready id)
+        nextReady := (← IO.monoMsNow) + 2000
+      | .idle | .acknowledged => pure ()
+      inbox.acknowledge delivery.receipt
+  finally handle.close
+
 /-- A typed handle can inspect the durable result without a live scheduler. -/
 structure CloudProcess (α : Type) [Codec α] where
   config : Config
@@ -62,6 +124,7 @@ structure CloudProcess (α : Type) [Codec α] where
 def submitProgram [Codec ι] [Codec α] (program : LeanCloud.CloudProgram ι α)
     (config : Config) (id : String) (input : ι) : IO (CloudProcess α) := do
   Registry.submit ⟨#[registerProgram program]⟩ config id program.info.entry (Codec.encode input)
+  Pool.submit config id
   return ⟨config, id, program.info.entry⟩
 
 def CloudProcess.poll [Codec α] (process : CloudProcess α) : IO (Option (Except CloudError α)) := do
@@ -84,8 +147,7 @@ namespace LeanCloud.CloudProgram
 def register [Codec ι] [Codec α] (program : CloudProgram ι α) :=
   LeanCloudRuntime.registerProgram program
 
-/-- Typed submission to already provisioned services. The console also launches
-the scheduler and worker containers; this API only creates the durable run. -/
+/-- Typed submission to the persistent pool. Confirmed registration survives scheduler downtime. -/
 def submit [Codec ι] [Codec α] (program : CloudProgram ι α)
     (config : LeanCloudRuntime.Config) (id : String) (input : ι) :=
   LeanCloudRuntime.submitProgram program config id input

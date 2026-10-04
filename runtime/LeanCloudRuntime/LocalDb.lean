@@ -13,17 +13,17 @@ volume. It contains coordination metadata; replay values live in shared blobs. -
 def initializeSchema (conn : Sqlite.Conn) : IO Unit :=
   conn.createTable table (primaryKey := [.column "run"])
 
-def load (conn : Sqlite.Conn) (run : String) : IO Scheduler.State := do
+def loadValue [FromJson α] (conn : Sqlite.Conn) (run : String) (initial : α) : IO α := do
   let query : Query Context [("state", .string)] :=
     Query.from' (ts := Context) table
       |>.where' (fun row => row["run"] ==. SqlExpr.str run)
       |>.select (fun row => ![row["state"].as "state"])
   match ← conn.query query with
-  | [] => return {}
+  | [] => return initial
   | [.cons text .nil] => IO.ofExcept (Json.parse text >>= fromJson?)
   | _ => throw (IO.userError "Duplicate scheduler state")
 
-def save (conn : Sqlite.Conn) (run : String) (state : Scheduler.State) : IO Unit :=
+def saveValue [ToJson α] (conn : Sqlite.Conn) (run : String) (state : α) : IO Unit :=
   conn.withTransaction do
     let update : UpdateStmt Context "scheduler" Row := table.update
       |>.set "state" (SqlExpr.str (toJson state).compress)
@@ -33,6 +33,10 @@ def save (conn : Sqlite.Conn) (run : String) (state : Scheduler.State) : IO Unit
         |>.value "run" (SqlExpr.str run)
         |>.value "state" (SqlExpr.str (toJson state).compress)
       discard (conn.execInsert insert)
+
+def load (conn : Sqlite.Conn) (run : String) : IO Scheduler.State := loadValue conn run {}
+
+def save (conn : Sqlite.Conn) (run : String) (state : Scheduler.State) : IO Unit := saveValue conn run state
 
 def store (conn : Sqlite.Conn) (run : String) : SchedulerStore IO :=
   ⟨load conn run, save conn run⟩

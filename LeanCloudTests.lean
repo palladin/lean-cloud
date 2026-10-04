@@ -14,10 +14,12 @@ import LeanCloudTests.DeploymentCommands
 import LeanCloudTests.Streaming
 import LeanCloudTests.ProcessLogging
 import LeanCloudTests.Top
+import LeanCloudTests.Help
+import LeanCloudTests.Pool
 
 namespace LeanCloudTests
 
 def allCases : Array TestCase := codecCases ++ mailboxCases ++ coordinationCases ++ simulationBoundaryCases ++
-  crashBoundaryCases ++ generatedCases ++ compositionCases ++ blobFailureCases ++ sequentialReplayCases ++ replayCases ++ consoleCases ++ styledCases ++ consoleEffectCases ++ shellCases ++ projectCases ++ deploymentCommandCases ++ streamingCases ++ processLoggingCases ++ topCases
+  crashBoundaryCases ++ generatedCases ++ compositionCases ++ blobFailureCases ++ sequentialReplayCases ++ replayCases ++ consoleCases ++ styledCases ++ consoleEffectCases ++ shellCases ++ projectCases ++ deploymentCommandCases ++ streamingCases ++ processLoggingCases ++ topCases ++ helpCases ++ poolCases
 
 end LeanCloudTests

@@ -124,13 +124,14 @@ def Context.events (ctx : Context) (run : Run) (knownNodes : Array Node := #[]) 
   let nodes ← if knownNodes.isEmpty then ctx.nodes else pure knownNodes
   let mut result := #[]
   for worker in ["worker1", "worker2", "worker3"] do
-    let name := ctx.container run worker
+    let name := ctx.node worker
     let since := match nodes.find? (·.name == name) with
       | some node => if node.started.isEmpty then #[] else #["--since", node.started]
       | none => #[]
     let output ← docker (#["logs", "--tail", "80"] ++ since ++ #[name]) false
     let events := output.stdout.splitOn "\n" |>.filterMap event? |>.toArray
-    result := result.push (worker, events)
+    result := result.push (worker, if events.back?.any (fun event => event.run == run.id) then
+      events.filter (·.run == run.id) else #[])
   return result
 
 def humanBytes (value : Nat) : String :=

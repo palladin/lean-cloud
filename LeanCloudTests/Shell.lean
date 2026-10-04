@@ -19,13 +19,13 @@ def shellCases : Array TestCase := #[
     assertEq (suggestions "ki") #["kill"]
     for command in ["pause", "kill", "resume"] do
       assertEq (suggestions (command ++ " de")) #["demo"]
-    assertEq (suggestions "watch demo --") #["--once"]
+    assertEq (suggestions "watch demo --") #["--once", "--help"]
     assertEq (suggestions "logs demo wo") #["worker1", "worker2", "worker3"]
-    assertEq (suggestions "run squares/v1 --input file.json --") #["--id"]
+    assertEq (suggestions "run squares/v1 --input file.json --") #["--id", "--help"]
     assertEq (suggestions "run squares/v1 --id ") #[]⟩,
   ⟨"console.shell.verbose-completion", do
     for line in ["deploy --", "deploy my_app --", "up --"] do
-      assertEq (suggestions line) #["--verbose"]
+      assertEq (suggestions line) #["--verbose", "--help"]
     assertEq (suggestions "deploy -v") #["-v"]
     for line in ["deploy -v ", "deploy --verbose my_app ", "up --verbose "] do
       assertEq (suggestions line) #[]⟩,

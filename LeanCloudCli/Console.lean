@@ -1,5 +1,6 @@
 import LeanCloudCli.Diagnostics
 import LeanCloudCli.Top
+import LeanCloudCli.Help
 
 namespace LeanCloudCli
 open Lean LeanCloud
@@ -87,7 +88,7 @@ def frame (ctx : Context) (run : Run) (nodes : Array Node)
   let mut lines := #[Styled.text (pad width s!" lean-cloud  {run.id}  {run.program.entry}  {status}") .header,
     Styled.text "q: back · Tab: node · 1/2/3: worker · j/k: source · a: auto" .cyan]
   for (worker, trace) in events do
-    let node := nodes.find? (·.name == ctx.container run worker)
+    let node := nodes.find? (·.name == ctx.node worker)
     let state := node.map (·.state) |>.getD "absent"
     let detail := match lastEvent trace with
       | none => "no execution event"
@@ -114,8 +115,8 @@ def frame (ctx : Context) (run : Run) (nodes : Array Node)
         match lastEvent trace with
         | none => text
         | some e =>
-          let alive := nodes.any (fun n => n.name == ctx.container run worker && n.state == "running")
-          if alive && e.activity != "returned" && (source.sites.any fun site => site.operation == e.operation && site.line == index + 1) then
+          let alive := nodes.any (fun n => n.name == ctx.node worker && n.state == "running")
+          if alive && e.activity != "returned" && e.activity != "idle" && e.activity != "revoked" && (source.sites.any fun site => site.operation == e.operation && site.line == index + 1) then
             text ++ (worker.drop 6 |>.toString)
           else text) ""
       code := code.push (Styled.text s!"{pad 3 (toString (index + 1))} " .muted ++
@@ -191,7 +192,6 @@ private def watch (ctx : Context) (id : String) (once := false) : Cli Unit := do
       request (.write "\x1b[?25h\x1b[?1049l")
       request .flush
 
-private def help : String := "Commands:\n  init DIRECTORY               Create and select a cloud application\n  open DIRECTORY               Select an existing application\n  deploy [EXECUTABLE] [-v]      Build this application's image and start shared services\n  deployments                  List known deployments, including stopped ones\n  use NAME                     Select and remember a deployment\n  status                       Show selected deployment health\n  up [-v]                      Start services without rebuilding\n  doctor                       Diagnose local configuration and Docker\n  down                         Stop this deployment, preserving its data\n  programs                     List compiled entry points\n  run PROGRAM [--input FILE] [--id ID]\n  ps                           List runs launched from this checkout\n  inspect RUN                  Inspect scheduler jobs and assignments\n  result RUN                   Read the durable result\n  watch RUN [--once]            Live source positions and container graphs\n  nodes                        Inspect workers, schedulers, brokers and blobs\n  top [--once]                 Live worker and scheduler resource graphs\n  logs RUN [worker1|worker2|worker3|scheduler]\n  pause RUN                    Stop a run and preserve replay state\n  kill RUN                     Permanently cancel a run\n  resume RUN                   Resume a paused run or repair a launch\n  -v | --verbose               Stream full build/startup output\n  help | quit"
 
 /-- Reject malformed flags before deployment changes any files or services. -/
 private def deploymentOptions (args : List String) (allowExecutable : Bool)
@@ -225,14 +225,12 @@ private def runOptions (args : List String) : Except String (Option String × Op
   return (file, id)
 
 def command (ctx : Context) (args : List String) : Cli Bool := do
+  if Help.requested args then
+    Help.display args
+    return true
   match args with
   | [] => return true
   | ["quit"] | ["exit"] => return false
-  | ["help"] | ["--help"] =>
-    for line in help.splitOn "\n" do
-      if line == "Commands:" then printHeading line
-      else printStyled (Styled.text (String.ofList (line.toList.take 31)) .cyan ++
-        Styled.text (String.ofList (line.toList.drop 31)))
   | "deploy" :: options =>
     let (executable, verbose) ← liftExcept (deploymentOptions options true)
     ctx.deploy executable verbose
@@ -276,13 +274,16 @@ def command (ctx : Context) (args : List String) : Cli Bool := do
     let role := args[2]?.getD "worker1"
     unless ["worker1", "worker2", "worker3", "scheduler"].contains role do throw "Unknown actor"
     let run ← ctx.loadRun id
-    let output ← docker #["logs", "--tail", "100", ctx.container run role]
-    for line in (output.stdout ++ output.stderr).splitOn "\n" do printLine (safe line)
+    let output ← docker #["logs", "--tail", "100", ctx.node role]
+    for line in (output.stdout ++ output.stderr).splitOn "\n" do
+      if let some event := event? line then
+        if event.run == run.id then printLine (safe line)
   | _ => throw "Unknown command. Use 'help'."
   return true
 
 /-- Project selection belongs to the CLI state, not the process's working directory. -/
 def dispatch (ctx : Context) (args : List String) : Cli (Context × Bool) := do
+  if Help.requested args then return (ctx, ← command ctx args)
   match args with
   | ["use", name] =>
     unless (← Deployments.load).entries.any (·.project == name) do Deployments.discover ctx

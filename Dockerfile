@@ -38,4 +38,5 @@ ENTRYPOINT ["cloud-integration-tests"]
 
 FROM runner AS worker
 COPY --from=build /out/cloud_demo /usr/local/bin/cloud-demo
-ENTRYPOINT ["cloud-demo"]
+COPY --from=build /out/cloud_demo /usr/local/bin/cloud-app
+ENTRYPOINT ["cloud-app"]

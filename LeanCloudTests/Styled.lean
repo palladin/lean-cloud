@@ -56,7 +56,7 @@ def styledCases : Array TestCase := #[
     let ctx : Context := ⟨"/work", "test"⟩
     let run : Run := ⟨"one", "image", ⟨"demo/v1", "unit", "nat", "", none,
       some ⟨"Demo.lean", "cloud {\n  return 42\n}", #[]⟩⟩, Json.null⟩
-    let node : Node := { name := ctx.container run "worker1", state := "running", started := "boot" }
+    let node : Node := { name := ctx.node "worker1", state := "running", started := "boot" }
     let points : Array Sample := #[⟨1000, "boot", 12000, 1048576, 2097152, 0, 0, 0, 0⟩,
       ⟨2000, "boot", 92000, 1048576, 2097152, 10000, 20000, 30000, 40000⟩]
     for width in [5, 40, 80, 120, 180] do

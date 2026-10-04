@@ -25,11 +25,13 @@ private def waitFor (ctx : Context) (run : Run) (expected : Nat) : Cli Unit := d
     require (actual == expected) "Console run returned a different result"
   | _ => throw "Console run failed"
 
-private def stopped (ctx : Context) (run : Run) : Cli Unit := do
-  let actors := #["scheduler", "worker1", "worker2", "worker3"].map (ctx.container run)
+private def poolNodes (ctx : Context) : Cli String := do
+  let actors := #["scheduler", "worker1", "worker2", "worker3"].map ctx.node
   let states ← docker (#["inspect", "--format", "{{.State.Running}} {{.HostConfig.RestartPolicy.Name}}"] ++ actors)
-  require (states.stdout.trimAscii.toString.splitOn "\n" == List.replicate 4 "false no")
-    "Stopped run has a live actor or an enabled restart policy"
+  require (states.stdout.trimAscii.toString.splitOn "\n" == List.replicate 4 "true unless-stopped")
+    "Persistent pool is not running"
+  let ids ← docker (#["inspect", "--format", "{{.Id}}"] ++ actors)
+  return ids.stdout
 
 private def cleanup (ctx : Context) : Cli Unit := do
   let nodes ← docker #["ps", "-aq", "--filter", "label=lean-cloud.project=" ++ ctx.project] false
@@ -41,12 +43,14 @@ private def cleanup (ctx : Context) : Cli Unit := do
   for tag in images.stdout.splitOn "\n" do
     if tag.startsWith (ctx.project ++ "-app:") then discard <| docker #["image", "rm", tag] false
 
-private def demo : Cli Unit := do
+def demo : Cli Unit := do
   let root ← request (.realPath (← request .currentDir))
   let ctx : Context := ⟨root, s!"lean-cloud-console-test-{← request .pid}"⟩
+  Deployments.isolate ctx
   printLine s!"Console test project: {ctx.project}"
   try
     ctx.deploy
+    let originalNodes ← poolNodes ctx
     let deployment ← ctx.deployment
     require (deployment.programs.size ≥ 2) "Registry discovery lost an entry"
     let invalid := ctx.home / "invalid.json"
@@ -76,8 +80,9 @@ private def demo : Cli Unit := do
     ctx.resume "first"
     waitFor ctx first 29
     discard <| docker #["tag", deployment.image, ctx.project ++ "-app:build"]
-    let histories ← ctx.events first
+    let histories ← ctx.events second
     require (histories.any (fun (_, events) => !events.isEmpty)) "Workers emitted no execution observations"
+    require (histories.all (fun (_, events) => events.all (·.run == second.id))) "Watch crossed run traces"
     let nodes := runNodes first (← ctx.nodes)
     require (nodes.all (fun n => n.run.isNone || n.run == some "first")) "Watch included another run's actors"
     require (nodes.toList.Pairwise (fun a b => a.name != b.name)) "Node inventory contains duplicate containers"
@@ -85,8 +90,8 @@ private def demo : Cli Unit := do
     require (!source.sites.isEmpty) "No source locations bundled"
     discard (command ctx ["inspect", "first"])
     discard (command ctx ["watch", "first", "--once"])
-    -- Completion and result inspection do not depend on a live scheduler.
-    discard <| docker #["stop", ctx.container first "scheduler"]
+    -- Completed workflows keep using the same deployed nodes.
+    require ((← poolNodes ctx) == originalNodes) "Submitting workflows created or replaced nodes"
     waitFor ctx first 29
     ctx.resume "first"
     let some logs := deployment.programs.find? (·.entry == "log-summary/v1")
@@ -97,8 +102,10 @@ private def demo : Cli Unit := do
     ctx.launch "log-summary" (some inputFile.toString) (some "recover")
     let recover ← ctx.loadRun "recover"
     require (← ctx.outcome recover).isNone "Recovery test missed the active run"
-    discard <| docker #["kill", ctx.container recover "worker1", ctx.container recover "scheduler"]
-    ctx.resume "recover"
+    discard <| docker #["kill", ctx.node "worker1", ctx.node "scheduler"]
+    -- docker kill is an explicit operator stop; simulate the external restart.
+    discard <| docker #["start", ctx.node "worker1", ctx.node "scheduler"]
+    request (.sleep 2000)
     discard <| awaitOutcome ctx recover ((← request .now) + 120000)
     require ((← ctx.remote recover "result") == "files=16, errors=24") "Recovery returned a different report"
     -- Pause preserves execution records and disables restart, while other runs
@@ -108,18 +115,21 @@ private def demo : Cli Unit := do
     require (← ctx.outcome paused).isNone "Pause test missed the active run"
     discard (command ctx ["pause", "paused"])
     ctx.pause "paused"
-    stopped ctx paused
+    require ((← poolNodes ctx) == originalNodes) "Pause replaced or stopped shared nodes"
     require ((← ctx.control "paused") == .paused) "Pause intent was not saved"
     require (← ctx.outcome paused).isNone "Pause published a terminal result"
+    ctx.launch "sum-squares" none (some "while-paused")
+    waitFor ctx (← ctx.loadRun "while-paused") 55
+    require (← ctx.outcome paused).isNone "Paused workflow made progress to completion"
     ctx.launch "log-summary" (some inputFile.toString) (some "killed")
     let killed ← ctx.loadRun "killed"
     require (← ctx.outcome killed).isNone "Kill test missed the active run"
     discard (command ctx ["kill", "killed"])
-    stopped ctx killed
+    require ((← poolNodes ctx) == originalNodes) "Kill replaced or stopped shared nodes"
     require ((← ctx.outcome killed) == some (.cancelled "Killed by user")) "Kill did not publish cancellation"
     ctx.kill "killed"
     require (← observing (ctx.resume "killed")).toOption.isNone "Killed run resumed"
-    stopped ctx paused
+    require ((← poolNodes ctx) == originalNodes) "Pause replaced or stopped shared nodes"
     ctx.resume "paused"
     discard <| awaitOutcome ctx paused ((← request .now) + 120000)
     require ((← ctx.remote paused "result") == "files=16, errors=24") "Pause/resume changed the result"
@@ -137,7 +147,7 @@ private def demo : Cli Unit := do
     waitFor ctx first 29
     require ((← ctx.outcome killed) == some (.cancelled "Killed by user")) "Shutdown lost cancellation"
     require (← observing (ctx.resume "killed")).toOption.isNone "Killed run resumed after deployment restart"
-    ctx.resume "shutdown"
+    -- Active runs recover automatically when the pool returns; no resume command.
     discard <| awaitOutcome ctx interrupted ((← request .now) + 120000)
     require ((← ctx.remote interrupted "result") == "files=16, errors=24") "Run failed to resume after shutdown"
     printLine "Console tests passed: registry, validation, concurrent runs, image retention, typed results, source events, crash recovery, pause/resume, and terminal kill."
@@ -151,6 +161,7 @@ def generatedApp : Cli Unit := do
   let directory := owner.home / "application-test"
   Project.init owner directory.toString (some root.toString)
   let ctx : Context := ⟨directory, owner.project⟩
+  Deployments.isolate ctx
   try
     -- Exercise an ordinary executable target, not the SDK's demonstration binary.
     let lakefile ← request (.readFile (directory / "lakefile.lean"))
@@ -185,7 +196,25 @@ def generatedApp : Cli Unit := do
     require ((← ctx.deployment).image == deployment.image) "up replaced the pinned application image"
     discard (command ctx ["doctor"])
     waitFor ctx custom 29
+    -- Reproduce redeploying from down with a changed image. Keep one legacy
+    -- per-run config and one current run so both result-reader paths execute.
+    saveJson (ctx.directory custom.id / "config.json") (← readJson (α := Json) (← ctx.configFile))
+    ctx.down
+    let network ← docker #["network", "inspect", ctx.project ++ "_default"] false
+    require (network.exitCode != 0) "Redeploy test still had its old network"
+    let source ← request (.readFile (directory / "Main.lean"))
+    request (.writeFile (directory / "Main.lean") (source.replace "version := \"v1\"" "version := \"v2\""))
+    ctx.deploy
+    let updated ← ctx.deployment
+    require (updated.image != deployment.image) "Redeploy did not build a changed image"
+    require (updated.programs.map (·.entry) == #["application-test/v2"]) "Redeploy lost the new registry"
+    waitFor ctx custom 29
+    waitFor ctx (← ctx.loadRun "sample") 55
+    ctx.launch "application-test" none (some "updated")
+    waitFor ctx (← ctx.loadRun "updated") 55
+    discard (poolNodes ctx)
     printLine "Standalone app tests passed: generated source, deployment catalog, selection, status, doctor, up without rebuilding, relative input, and typed results."
+    printLine "Redeploy from down passed: changed image, missing network, legacy/current result checks, and preserved completed runs."
   finally
     cleanup ctx
     printLine s!"Standalone app retained: {directory}"
@@ -199,8 +228,9 @@ end LeanCloudTests.ConsoleRuntime
 def main (args : List String) : IO UInt32 := do
   let program := match args with
     | [] => LeanCloudTests.ConsoleRuntime.run
+    | ["--pool-only"] => LeanCloudTests.ConsoleRuntime.demo
     | ["--app-only"] => LeanCloudTests.ConsoleRuntime.generatedApp
-    | _ => throw "Usage: cloud_console_tests [--app-only]"
+    | _ => throw "Usage: cloud_console_tests [--pool-only|--app-only]"
   -- Keep test registrations out of the user's deployment catalog.
   let catalog := (← IO.Process.getCurrentDir) / ".lean-cloud" / s!"console-catalog-test-{← IO.Process.getPID}"
   let result ← LeanCloudCli.withHostIO fun handle =>

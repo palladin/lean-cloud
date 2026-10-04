@@ -42,9 +42,9 @@ def Context.status (ctx : Context) : Cli Unit := do
   for service in deploymentServices do
     printStyled (Styled.text ("  " ++ pad 22 service) .cyan ++
       Styled.text (serviceState nodes service) (Styled.statusColor (serviceState nodes service)))
-  let actors := nodes.filter (·.run.isSome)
+  let actors := nodes.filter (fun node => #["scheduler", "worker1", "worker2", "worker3"].contains node.role)
   printLine s!"Actors:     {(actors.filter (·.state == "running")).size} running / {actors.size} containers"
-  if nodes.isEmpty then printLine "Use 'up' to start services, then 'resume RUN' for an unfinished run."
+  if nodes.isEmpty then printLine "Use 'up' to start the node pool and recover active runs."
 
 private def check (label : String) (action : Cli Unit) : Cli Bool := do
   let result ← observing action
@@ -105,7 +105,7 @@ def Context.doctor (ctx : Context) : Cli Unit := do
             let state := serviceState nodes service
             unless state == "healthy" do
               throw s!"{state}; use 'up' for stopped services or inspect the service's Docker logs")
-        for node in nodes.filter (·.run.isSome) do
+        for node in nodes.filter (fun node => #["scheduler", "worker1", "worker2", "worker3"].contains node.role) do
           if node.state != "running" then
             printStyled (Styled.text s!"[note] {safe node.name}: {safe node.state}; check 'ps' before resuming" .yellow)
   printLine "Checks cover local files, images, volumes and container health; runtime credentials and workflow execution are not probed."

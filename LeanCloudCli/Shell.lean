@@ -213,7 +213,7 @@ private def submit (ctx : Context) (catalog : Completion.Catalog) (state : State
   let (result, state) ← match words line with
     | .error error => pure (.error error, state)
     | .ok args =>
-      if args == ["top"] || (args.length == 2 && args.head? == some "watch") then do
+      if !Help.requested args && (args == ["top"] || (args.length == 2 && args.head? == some "watch")) then do
         -- Give the live view terminal ownership, then rebuild the shell screen.
         screenOff
         request .leaveTerminal

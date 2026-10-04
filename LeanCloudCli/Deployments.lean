@@ -39,7 +39,24 @@ private def read (directory : System.FilePath) : Cli Catalog := do
     unless names.contains selected do throw "Selected deployment is missing from catalog"
   return catalog
 
-def load : Cli Catalog := do read (← home)
+/-- Isolated tooling can retain deployment artifacts without making them part
+of another catalog's discovery. Unmarked existing deployments remain visible. -/
+private def belongsTo (directory : System.FilePath) (ctx : Context) : Cli Bool := do
+  let marker := ctx.home / "catalog-owner.json"
+  unless ← request (.exists marker) do return true
+  return (← readJson (α := String) marker) == directory.toString
+
+def load : Cli Catalog := do
+  let directory ← home
+  let catalog ← read directory
+  let entries ← catalog.entries.filterM (fun entry => belongsTo directory entry.context)
+  return { entries, selected := catalog.selected.filter fun name => entries.any (·.project == name) }
+
+/-- Call before an isolated test creates its deployment manifest. Discovery in
+the ordinary user catalog then leaves these retained artifacts alone. -/
+def isolate (ctx : Context) : Cli Unit := do
+  request (.createDir ctx.home)
+  saveJson (ctx.home / "catalog-owner.json") (← home).toString
 
 private def insert (catalog : Catalog) (ctx : Context) (select : Bool) : Cli Catalog := do
   validateId ctx.project
@@ -63,6 +80,7 @@ def remember (ctx : Context) (select := true) : Cli Unit := do
 
 /-- Import catalogs from this application directory, including deployments taken down. -/
 def discover (ctx : Context) : Cli Unit := do
+  let owner ← home
   let directory := ctx.root / ".lean-cloud"
   let mut projects := #[ctx.project]
   if ← request (.exists directory) then
@@ -70,6 +88,7 @@ def discover (ctx : Context) : Cli Unit := do
   for project in projects do
     if !validId project || project != project.toLower then continue
     let candidate : Context := ⟨ctx.root, project⟩
+    unless ← belongsTo owner candidate do continue
     if ← request (.exists (candidate.home / "deployment.json")) then
       let deployment ← readJson (α := Deployment) (candidate.home / "deployment.json")
       unless deployment.project == project do throw "Deployment context mismatch"

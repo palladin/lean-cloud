@@ -45,6 +45,10 @@ private def checked (program : Cli α) (world := initial) : IO (α × ConsoleMod
   return (← unwrap result, world)
 
 def topCases : Array TestCase := #[
+  ⟨"console.top.persistent-idle-nodes", do
+    let shared := actors.map fun node => { node with run := none }
+    assertEq (Top.actors (shared ++ inventory.extract 8 inventory.size)).size shared.size
+    assertTrue ((Top.actors shared).all (·.run.isNone)) "Idle pool was hidden"⟩,
   ⟨"console.top.all-runs-without-workflow-files", do
     let (_, world) ← checked (command ctx ["top", "--once"])
     for node in actors do assertTrue (has world.stdout node.name) s!"Missing node {node.name}"
@@ -113,7 +117,7 @@ def topCases : Array TestCase := #[
     assertEq (world.trace.filter (· == "enterTerminal")).size 3
     assertEq (world.trace.filter (· == "leaveTerminal")).size 3
     assertTrue (has world.stdout "Commands:" && has world.stdout "I/O W") "Dashboard or subsequent command missing"
-    assertEq ((Completion.candidates {} (Completion.context "top --" 6)).map (·.value)) #["--once"]
+    assertEq ((Completion.candidates {} (Completion.context "top --" 6)).map (·.value)) #["--once", "--help"]
     assertEq ((Completion.candidates {} (Completion.context "to" 2)).map (·.value)) #["top"]⟩
 ]
 

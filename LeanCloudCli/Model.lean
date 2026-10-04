@@ -19,7 +19,7 @@ structure Run where
   input : Json
   deriving FromJson, ToJson
 
-/-- Intent is saved before changing containers, so interrupted commands can be retried. -/
+/-- Intent is saved before requesting scheduler controls, so interrupted commands can be retried. -/
 inductive RunControl where
   | active | pausing | paused | killing | killed
   deriving BEq, FromJson, ToJson

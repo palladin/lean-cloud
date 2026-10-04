@@ -1,4 +1,5 @@
 import LeanCloudCli.Docker
+import LeanCloudCli.Help
 
 namespace LeanCloudCli.Completion
 
@@ -7,22 +8,8 @@ structure Item where
   description : String := ""
   deriving Inhabited, BEq, Repr
 
-def commands : Array Item := #[
-  ⟨"init", "Create a ready-to-deploy Lean application"⟩,
-  ⟨"open", "Select an application directory"⟩,
-  ⟨"deploy", "Build and start services"⟩, ⟨"programs", "List available programs"⟩,
-  ⟨"down", "Stop deployment and preserve data"⟩,
-  ⟨"deployments", "List known deployments"⟩, ⟨"use", "Select a deployment"⟩,
-  ⟨"status", "Show deployment health"⟩, ⟨"up", "Start services without rebuilding"⟩,
-  ⟨"doctor", "Diagnose configuration and Docker"⟩,
-  ⟨"run", "Launch a cloud program"⟩, ⟨"ps", "List cloud processes"⟩,
-  ⟨"inspect", "Inspect jobs and workers"⟩, ⟨"result", "Read a completed result"⟩,
-  ⟨"watch", "Live code and resource graphs"⟩, ⟨"nodes", "Inspect deployment nodes"⟩,
-  ⟨"top", "Live worker and scheduler resource graphs"⟩,
-  ⟨"logs", "Read actor logs"⟩, ⟨"resume", "Resume a paused run or repair a launch"⟩,
-  ⟨"pause", "Stop a run; preserve replay state for resume"⟩,
-  ⟨"kill", "Permanently cancel a run"⟩,
-  ⟨"help", "Show commands"⟩, ⟨"quit", "Exit the console"⟩]
+def commands : Array Item :=
+  Help.commands.map (fun command => ⟨command.name, command.summary⟩)
 
 structure Catalog where
   programs : Array Item := #[]
@@ -91,6 +78,8 @@ def context (line : String) (cursor : Nat) : Context :=
 def candidates (catalog : Catalog) (ctx : Context) : Array Item :=
   let available := match ctx.before.toList with
     | [] => commands
+    | ["help"] => commands ++ (Help.commands.flatMap fun command =>
+        command.aliases.map fun name => Item.mk name s!"Alias for {command.name}")
     | ["run"] => catalog.programs
     | ["use"] => catalog.deployments
     | ["inspect"] | ["result"] | ["watch"] | ["logs"] | ["resume"] | ["pause"] | ["kill"] => catalog.runs
@@ -106,7 +95,11 @@ def candidates (catalog : Catalog) (ctx : Context) : Array Item :=
       else (#[⟨"--input", "Read input from a JSON file"⟩, ⟨"--id", "Choose a run ID"⟩] : Array Item).filter
         (fun item => !rest.contains item.value)
     | _ => #[]
-  available.filter (fun item => item.value.startsWith ctx.fragment)
+  let expectsValue := [some "--input", some "--id", some "--sdk"].contains ctx.before.back?
+  let help := if ctx.fragment.startsWith "-" && !expectsValue &&
+      (ctx.before[0]? >>= Help.find?).isSome && !ctx.before.any Help.isFlag then
+    #[Item.mk "--help" "Show usage, options, and examples", Item.mk "-h" "Show command help"] else #[]
+  (available ++ help).filter (fun item => item.value.startsWith ctx.fragment)
 
 /-- File candidates follow the typed directory, including quoted paths. -/
 def refreshFiles (ctx : LeanCloudCli.Context) (catalog : Catalog) (line : String) (cursor : Nat) : Cli Catalog := do

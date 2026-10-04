@@ -7,6 +7,7 @@ import LeanCloud.DirectInterpreter
 import LeanCloud.ReplayInterpreter
 import LeanCloud.SequentialReplay
 import LeanCloud.Scheduler
+import LeanCloud.Pool
 import LeanCloud.Mailbox
 import LeanCloud.Worker
 import LeanCloud.SimulationBackend

@@ -16,10 +16,11 @@ structure Sink where
   session : String
   started : Nat
   state : IO.Ref State
+  run : String := ""
 
-def create (worker : String) : IO Sink := do
+def create (worker : String) (run : String := "") : IO Sink := do
   let started ← IO.monoMsNow
-  return ⟨worker, s!"{← IO.Process.getPID}-{started}", started, ← IO.mkRef {}⟩
+  return ⟨worker, s!"{← IO.Process.getPID}-{started}", started, ← IO.mkRef {}, run⟩
 
 /-- Diagnostics never turn a successful operation into a workflow error.
 Docker's bounded log driver retains recent events; gaps are allowed. -/
@@ -28,7 +29,7 @@ def Sink.emit (sink : Sink) (activity operation : String) : IO Unit := do
     let state ← sink.state.get
     sink.state.set { state with seq := state.seq + 1 }
     let event : ExecutionEvent := ⟨sink.session, state.seq, (← IO.monoMsNow) - sink.started,
-      sink.worker, state.attempt, state.location, activity, operation⟩
+      sink.worker, state.attempt, state.location, activity, operation, sink.run⟩
     emitLine ("@lean-cloud " ++ (toJson event).compress ++ "\n")
   catch _ => pure ()
 

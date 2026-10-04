@@ -55,7 +55,7 @@ def consoleCases : Array TestCase := #[
     assertTrue (({ source with text := "same\nsame" }).locate #[("work", "same")]).toOption.isNone
       "Ambiguous source marker accepted"⟩,
   ⟨"console.execution-event-roundtrip", do
-    let event : ExecutionEvent := ⟨"boot", 17, 42, "worker1", some 3, "0:1/0:2", "replay", "readBlob"⟩
+    let event : ExecutionEvent := ⟨"boot", 17, 42, "worker1", some 3, "0:1/0:2", "replay", "readBlob", "example"⟩
     let parsed := event? ("@lean-cloud " ++ (toJson event).compress)
     assertEq (parsed.map (·.location)) (some "0:1/0:2")
     assertTrue (event? "ordinary log line").isNone "Ordinary log interpreted as event"⟩,
@@ -64,9 +64,9 @@ def consoleCases : Array TestCase := #[
     let source : ProgramSource := ⟨"Example.lean", "cloud {\n  Cloud.exec work\n}", #[⟨"work", 2⟩]⟩
     let info : ProgramInfo := ⟨"example/v1", "unit/v1", "nat/v1", "", none, some source⟩
     let run : Run := ⟨"run-1", "image", info, Json.null⟩
-    let event : ExecutionEvent := ⟨"boot", 1, 20, "worker1", some 2, "0:1", "execute", "work"⟩
+    let event : ExecutionEvent := ⟨"boot", 1, 20, "worker1", some 2, "0:1", "execute", "work", "example"⟩
     let events := #[("worker1", #[event])]
-    let node : Node := { name := ctx.container run "worker1", state := "running", started := "boot", run := some run.id, role := "worker1" }
+    let node : Node := { name := ctx.node "worker1", state := "running", started := "boot", run := some run.id, role := "worker1" }
     let live := frame ctx run #[node] events #[] 0 0 120 30
     assertTrue (live.any (fun l => (l.splitOn "2   1").length > 1)) "Live source marker absent"
     let stopped := frame ctx run #[{ node with state := "exited" }] events #[] 0 0 120 30

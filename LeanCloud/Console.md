@@ -23,7 +23,7 @@ cloud> result first
 
 `init` generates a complete Lean application and selects it in the console.
 The included parallel example returns `55`. `deploy` builds the executable in
-Docker and configures the mailbox brokers, scheduler storage, and global blobs.
+Docker and starts the scheduler, three workers, their mailbox brokers, scheduler storage, and global blobs.
 The CLI generates Docker and service configuration under `.lean-cloud/`; users
 only maintain their Lean code and package metadata.
 
@@ -45,6 +45,20 @@ Docker without modifying the local Lake dependency manifest.
 On an interactive terminal, the prompt stays at the bottom with completion
 suggestions directly beneath it. Command output appears in the area above.
 
+Type `help` to list commands. Use `help COMMAND`, `COMMAND --help`, or
+`COMMAND -h` for usage, options, and examples:
+
+```text
+cloud> help deploy
+cloud> run --help
+cloud> top -h
+```
+
+Tab completes command names after `help` and help flags after commands. Help
+stays in the prompt's output area and does not execute the command. One-shot
+help, such as `lake exe lean_cloud deploy --help`, works without Docker or a
+configured application.
+
 The console uses a shared htop-style theme: cyan table headers, blue selections,
 green running/completed states, yellow pending/paused states, and red failures or
 cancellations. The prompt, completion suggestions, deployment diagnostics, process
@@ -62,7 +76,7 @@ Set `NO_COLOR=1` to disable colors. Piped output and `--once` views remain plain
 
 The layout follows terminal resizing. Bracketed multiline paste inserts a single
 command for review; it does not submit on pasted newlines. `watch RUN` and `top` temporarily
-takes over the screen, then returns to the anchored prompt when you press `q`.
+take over the screen, then return to the anchored prompt when you press `q`.
 Piped input and one-shot commands keep plain text output.
 
 `deploy` and `up` show short, colored stage messages by default. Add `-v` or
@@ -106,31 +120,29 @@ cloud> nodes
 cloud> quit
 ```
 
-The example results are `55` and `files=16, errors=24`. `deploy` builds the
-application image and starts three worker brokers, a scheduler broker, and global
-blob storage. A run starts one scheduler and three worker containers. Multiple
-runs share those services, using distinct mailbox namespaces, replay namespaces,
-and scheduler SQLite files. Closing the console leaves the runs executing.
+The example results are `55` and `files=16, errors=24`. `deploy` starts one
+scheduler, three persistent workers, their four RabbitMQ brokers, and global
+blob storage: nine long-lived containers. Every compute node contains the same
+application executable and complete registered-program registry.
 
-Use `down` to stop and remove all containers in the selected deployment:
+`run PROGRAM` submits a logical cloud process to this existing pool. It does
+not create containers. The scheduler assigns work from different runs to free
+workers, rotating between runnable runs. A worker loads the run's immutable
+entry point and input, selects the registered program, and executes an assignment
+with the existing replay interpreter. Results remain isolated by run ID.
+After completing an assignment, the worker asks for more work; nodes remain
+running even when every workflow has finished. Closing the console leaves the
+pool running. `ps` lists workflows; `top` shows the deployed compute nodes,
+including idle nodes; `nodes` also includes brokers and blobs.
 
-```text
-cloud> down
-```
-
-This preserves blobs, mailbox data, scheduler state, images, and the local run
-catalog. To start the services again and continue an interrupted run:
-
-```text
-cloud> up
-cloud> resume logs-1
-```
-
-`up` starts existing services without building an image or changing the deployment
-manifest. It checks the saved image and durable volumes before starting; restore
-missing data before resuming. Use `deploy` when your application code changes.
-Resume each unfinished run explicitly. Completed results remain available after
-services restart. `quit` only closes the console.
+Use `down` to stop and remove the deployment's containers while preserving blobs,
+mailboxes, scheduler state, images, and the local catalog. `up` starts the saved
+image without rebuilding and automatically recovers active runs. Paused runs
+remain paused. It checks that durable volumes still exist before starting.
+Use `deploy` when application code changes. Changing the image requires completing
+or killing unfinished runs first: replay must use the same application code.
+Redeploying after `down` starts the retained services before checking saved
+results. Missing durable volumes are reported instead of silently recreated.
 
 ## Pause and kill a run
 
@@ -142,38 +154,25 @@ cloud> kill logs-1
 cloud> result logs-1
 ```
 
-`pause RUN` disables automatic restart and stops only that run's scheduler and
-workers. Shared services and other runs keep running. The broker messages,
-private scheduler database, and global replay records remain available.
-`resume RUN` restores the restart policy and reconstructs execution from those
-records. This stops containers and replays on resume; it does not freeze their
-in-memory continuations. An interrupted `Cloud.exec` may execute again if its
-result was not recorded, so external actions still need retry-safe behavior.
+`pause RUN` tells the scheduler to stop assigning work for that run and revoke
+its current attempts. Workers check assignment validity at replay-record
+boundaries. An IO action already executing can finish before the worker notices
+revocation. The shared containers and other runs keep running. `resume RUN`
+reactivates the run with fresh attempts and reconstructs execution from its
+immutable records; it does not restore an in-memory continuation.
 
-`kill RUN` stops those same containers and creates a terminal cancellation in
-the run's global root record. It cannot overwrite an existing result: if normal
-completion won the race, that result is preserved. A killed run cannot be resumed
-or reuse its ID; use a new run ID to start again. Killing does not undo external
-actions or delete the run's data. Typed process handles report a `cancelled`
-`CloudError`.
+`kill RUN` durably revokes the run and creates a terminal cancellation in its
+root record. A normal result that won the atomic creation race is preserved.
+A killed run cannot resume or reuse its ID. Killing does not undo external
+actions or delete records. `Cloud.exec` can execute again if interruption occurs
+before its result is recorded, so external actions must tolerate retries.
 
-These commands use the deployment and per-run locks, and save their intent in
-the local catalog before changing containers. After an interrupted command,
-`ps` / `inspect` show `pausing` or `killing`; retry the same command. A pending
-kill blocks resume until cancellation is resolved. A kill needs blob storage to
-record its result, but stopping the actors happens first. The runtime's low-level
-`cancel` command only writes that result and must be called after all actors stop;
-use the console's `kill` command to perform the complete operation.
-
-The pinned application image must include the runtime's `cancel` command for
-kill to finish. Rebuild with this SDK before launching new runs. Existing runs
-retain their original image; an older image without that command can be paused,
-but kill will stop its actors and report the unsupported command.
-
-This first console preserves the existing per-run scheduler and worker algorithm.
-It does not introduce a shared worker pool or a scheduler that assigns across runs.
-Each scheduler remains the sole writer of its own SQLite state through lean-linq.
-The cost is three worker processes and one scheduler process per active run.
+The scheduler alone writes its SQLite state through lean-linq. It saves control
+changes before confirming replies. The console also saves pending control intent:
+if `ps` shows `pausing` or `killing`, retry that command. A pending kill blocks
+resume. Process controls need the deployment scheduler; use `up` if it is down.
+The console executes short application commands inside the existing scheduler
+container, including validation, submission and result queries.
 
 Use a JSON file for other input:
 
@@ -187,7 +186,7 @@ lake exe lean_cloud watch squares-2 --once
 input with its registered codec before the console creates a launch manifest.
 Omitting `--input` uses the program's registered sample input, if available.
 Shell arguments support single/double quotes and escapes; they are never evaluated
-as shell code. `logs RUN [worker1|worker2|worker3|scheduler]` prints recent actor logs.
+as shell code. `logs RUN [worker1|worker2|worker3|scheduler]` prints recent structured events for that run from the selected shared node.
 
 ## Deployment commands
 
@@ -197,7 +196,7 @@ as shell code. `logs RUN [worker1|worker2|worker3|scheduler]` prints recent acto
 | `use NAME` | Select a registered deployment and remember it for later sessions. |
 | `status` | Show its image, program/run counts, service health, and actor counts. |
 | `top [--once]` | Live worker and scheduler resource graphs across the selected deployment. |
-| `up` | Restart existing services without rebuilding the application. |
+| `up` | Restart services and the node pool without rebuilding the application. |
 | `doctor` | Check configuration, Docker/Compose, retained images, volumes, and container health. |
 
 `status` counts locally recorded runs; use `ps` for workflow completion status.
@@ -218,6 +217,10 @@ A Docker project name cannot belong to two different directories in the index.
 The CLI does not scan your entire filesystem. The remembered selection overrides
 the shell's current directory; `open` selects a different directory explicitly,
 and `LEAN_CLOUD_PROJECT` overrides the remembered selection at startup.
+
+Isolated test deployments keep a `catalog-owner.json` marker with their catalog
+directory. Discovery and listing respect that ownership, so retained test artifacts
+do not appear in the ordinary deployment list.
 
 This index targets the current Docker context. It does not configure Docker contexts
 or manage remote deployments. Keep the same Docker context when stopping or resuming
@@ -278,18 +281,18 @@ def main (args : List String) : IO UInt32 :=
 It uses typed Eff requests with an IO handler. Your application only supplies the
 registry; it does not implement command dispatch or connection setup.
 
-The runtime application exposes `programs`, `validate`, `submit-entry`, `worker`,
-`scheduler`, `status`, `outcome`, `result`, and `cancel`; the console discovers that
+The runtime application exposes `programs`, `validate`, `submit-entry`, `serve-worker`,
+`serve-scheduler`, `pause`, `resume`, `status`, `outcome`, `result`, and `cancel`; the console discovers that
 registry from the built image. Register additional programs in the application and redeploy. There
 is no closure serialization or runtime compilation of submitted source.
 
 A typed client can also call `program.submit config id input`, receiving a
-`CloudProcess Output` with `poll` and `await`. This low-level API submits a durable
-definition to provisioned services; the console additionally launches containers.
+`CloudProcess Output` with `poll` and `await`. This API persists the definition and publishes a confirmed registration to the
+deployment scheduler. Existing workers execute it; no containers are created.
 
-Every run pins its image ID, and deployment retains a versioned image tag.
-Redeployment does not retarget existing runs. Keep those tagged images while runs
-may need recovery; changing program semantics or codecs requires a new version.
+Every run records its image ID, and deployment retains a versioned image tag.
+Complete or kill unfinished runs before deploying a changed image. Changing
+program semantics or codecs also requires a new registered version.
 
 ## Run catalog and recovery
 
@@ -308,12 +311,12 @@ the authority for progress and completion; the catalog is not a shared execution
 database. `ps` queries those services and reports unavailable state explicitly.
 
 `resume RUN` repairs an interrupted launch. Submission is idempotent, existing
-containers must match the run and pinned image, and completed runs are not
-re-executed. A per-run launch lock prevents two consoles from starting the same
+the deployment image must match the saved run image, and completed runs are not
+re-executed. A per-run launch lock prevents two consoles from changing the same
 run concurrently. Preserve the local catalog, broker volumes, scheduler volume,
 blob volume, and application images for recovery.
 
-The console currently targets local Docker deployments with three workers per run. It does not provision remote hosts or cloud accounts.
+The console currently targets local Docker deployments with three workers per deployment. It does not provision remote hosts or cloud accounts.
 
 ## Live view
 
@@ -334,7 +337,7 @@ Mailbox brokers and blob services are listed separately by `nodes`.
 need two samples, so that first snapshot shows `—` for network and I/O rates.
 
 `watch RUN` displays real runtime observations. Press `1`, `2`, or `3` to select a
-worker, Tab to cycle through this run's actors and shared service containers,
+worker, Tab to cycle through the shared compute and service containers,
 `j`/`k` to scroll source, `a` to resume automatic source following, and `q` to
 return to the prompt. A noninteractive terminal
 or `--once` prints one frame without terminal control sequences.
@@ -352,7 +355,7 @@ source line. No input values, blob contents, or local variables are logged.
 Workers emit events through a best-effort nonblocking log channel. A full channel
 may drop events, and Docker rotates the logs. These observations never determine
 assignments, commit results, or acknowledge workflow messages. The event format
-includes a worker incarnation, sequence number, attempt, location, and activity;
+includes a run ID, worker incarnation, sequence number, attempt, location, and activity;
 sequence numbers are local to each incarnation, not a global execution order.
 
 Resource graphs use live Docker container statistics:
@@ -410,7 +413,7 @@ SIGINT recovery, and cleanup of descendants, including when their parent exits f
 Run `lake exe cloud_console_tests` for the console's Docker smoke test. It checks
 input rejection before launch, concurrent runs, retained images after replacing
 the build tag, source events, and recovery after killing a worker and scheduler.
-It also checks pause/resume, disabled restart policies, terminal cancellation,
+It checks stable node identities across submissions, pause/resume, terminal cancellation,
 preserved completed results, and cancellation after deployment restart.
 It cleans up its own containers, volumes, and image tags and retains its local
 catalog for diagnosis.
@@ -420,4 +423,4 @@ Lake executable with generated deployment files, and verifies results for sample
 and supplied input. It checks deployment selection, status and diagnostics, then
 takes the app down and verifies its results after `up` without rebuilding.
 Tests use an isolated deployment index. Run only the generated-app check with
-`lake exe cloud_console_tests --app-only`.
+`lake exe cloud_console_tests --app-only`, or the shared-pool check with\n`lake exe cloud_console_tests --pool-only`.

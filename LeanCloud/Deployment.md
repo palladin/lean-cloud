@@ -1,28 +1,33 @@
 # Local and on-premise deployment
 
-```sh
-RUN_ID=example-1 docker compose up --build -d
-docker compose logs -f scheduler worker worker2 worker3
-docker compose run --rm --no-deps worker result /etc/lean-cloud/config.json example-1
+The [console](Console.md) builds your application and starts a persistent node
+pool. Every scheduler and worker container contains the complete program registry.
+
+```text
+cloud> deploy
+cloud> run sum-squares --id example-1
+cloud> run log-summary --id example-2
+cloud> top
+cloud> ps
 ```
 
-This starts one temporary submission container, one scheduler, three workers,
-four independent RabbitMQ brokers, and one S3-compatible blob service. Each actor
-has its own broker container and persistent volume. Submission stores the immutable program version
-and input and seeds the example files. The scheduler's initial state contains the
-root assignment. Workers request work through their individual typed mailboxes.
-The example produces `files=16, errors=24`.
+There is one scheduler, three workers, four independent RabbitMQ brokers and one
+S3-compatible blob service. Runs share these nine containers. Submission records
+the immutable program and input, then publishes a durable registration message.
+Workers request assignments; the scheduler routes them across registered runs.
 
-Use the same `RUN_ID` on subsequent Compose commands that recreate containers.
-`docker compose down` preserves data. `down -v` deletes this deployment's data.
-A new run id creates a new execution; resubmitting an existing id with different
-input is rejected. The initial deployment serves one run per scheduler process.
+For direct Compose use:
 
-For individual process control, use the [CLI](Console.md): `pause RUN` stops a
-run's actors while retaining replay state, `resume RUN` restarts them, and
-`kill RUN` stops them and records permanent cancellation. These are deployment
-operations, not workflow effects. The CLI manages its own run containers;
-containers started directly by Compose are managed through Compose.
+```sh
+docker compose up --build -d scheduler worker worker2 worker3
+docker compose exec scheduler cloud-app submit /etc/lean-cloud/config.json example-1
+docker compose exec scheduler cloud-app result /etc/lean-cloud/config.json example-1
+```
+
+`docker compose down` preserves data; `down -v` deletes it. Use the same deployment
+configuration and image when restarting unfinished workflows. CLI `pause`,
+`resume`, and `kill` affect logical runs and leave the shared containers running.
+Pause/kill are cooperative at replay-record boundaries: in-flight IO may finish.
 
 ## Responsibilities
 
@@ -46,7 +51,7 @@ flowchart LR
 ```
 
 The scheduler saves assignments, attempts, child dependencies, and confirmed
-record keys. It never reads or writes replay values. It is the only writer of
+record keys. It never evaluates workflow code or assembles results. Administrative kill alone seals the root cancellation record. It is the only writer of
 its local database. Typed lean-linq schemas generate its DDL and queries.
 
 Workers reconstruct captured variables from the root program, read recorded
@@ -64,7 +69,7 @@ scheduler's private database path and assignment timeout, and blob credentials.
 Workers consume their own broker and publish reports directly to the scheduler's
 broker. The scheduler publishes assignments directly to the selected worker's
 broker. These are independent brokers: no cluster, federation, or forwarding service.
-The scheduler connects to RabbitMQ and opens only its local database.
+The scheduler connects to RabbitMQ and owns its local database. Administrative cancellation also uses global blob storage.
 Matching worker images must support the submitted
 entry point and codecs.
 
@@ -107,7 +112,7 @@ Set `CLOUD_WORKER_ID` to the stable identity in `mailboxes.workers`. It falls ba
 to `HOSTNAME` only if that hostname is configured as a worker identity. A replacement
 container with the same identity reopens the same queue on the same broker.
 Assignment expiry allows another worker to take over abandoned work. Temporary
-status-query reply queues live on the scheduler's broker and are deleted after use.
+control/status reply queues live on the scheduler's broker and are deleted after use.
 
 The deployment assumes a trusted private network. TLS, automatic scheduler
 failover, provider-specific provisioning, and mailbox retirement automation remain
@@ -127,7 +132,7 @@ The scheduler is a single active process. An OS lock prevents two processes from
 using the same private volume. Restart loads its previous database and expires
 old assignments. Preserve that volume across container restarts; loss of the
 volume is outside the current recovery contract. Another node with a separate
-volume must not run a second scheduler for the same run.
+volume must not run a second scheduler for the same deployment.
 
 A worker writes global records, confirms its completion report in RabbitMQ, then
 acknowledges its assignment. It may crash between
@@ -158,3 +163,15 @@ Chaos injects SIGKILL into workers and the
 scheduler, restarts them, and checks the durable result after faults stop. Test
 artifacts are retained in a temporary directory; only the test project's
 containers and volumes are removed.
+
+## Shared-pool scope
+
+`LeanCloud/Pool.lean` composes one ordinary scheduler state per run. It adds run
+routing, round-robin selection, and administrative revocation. The existing
+interpreter and scheduler proofs still cover their original per-run model;
+they are not a proof of this entire deployment coordinator. Pure transition tests
+cover routing, duplicate messages, stale attempts, restart, expiry and controls.
+The console integration test exercises the same coordinator with real services,
+concurrent workflows, worker/scheduler crashes, and deployment down/up recovery.
+The separate single-run actor harness remains for differential and chaos tests
+of the original interpreter/backend contracts.

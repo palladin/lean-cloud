@@ -80,6 +80,83 @@ private def Context.startServices (ctx : Context) (verbose : Bool) : Cli Unit :=
     (#["compose", "-p", ctx.project, "-f", (← ctx.composeFile).toString,
       "--ansi", "never", "up", "-d", "--wait", "--no-build"] ++ deploymentServices) verbose
 
+private def Context.checkVolumes (ctx : Context) : Cli Unit := do
+  for volume in deploymentVolumes do
+    let result ← docker #["volume", "inspect", ctx.project ++ "_" ++ volume] false
+    unless result.exitCode == 0 do
+      throw s!"Cannot verify volume {ctx.project}_{volume}. Use 'doctor'; restore missing data before resuming."
+
+/-- Deployment checks must also work when every compute node is stopped or
+uses the previous runtime protocol. The services/network must already be up.
+This temporary reader executes no workflow and never opens scheduler storage. -/
+private def Context.savedOutcome (ctx : Context) (image : String) (run : Run) : Cli (Option Exit) := do
+  let legacyConfig := ctx.directory run.id / "config.json"
+  let config ← if ← request (.exists legacyConfig) then pure legacyConfig else ctx.configFile
+  let args := #["run", "--rm", "--network", ctx.project ++ "_default",
+    "-v", s!"{config}:/etc/lean-cloud/config.json:ro",
+    image, "outcome", "/etc/lean-cloud/config.json", run.id]
+  let deadline := (← request .now) + 60000
+  let mut waiting := false
+  repeat
+    let result ← docker args false
+    if result.exitCode == 0 then
+      return ← liftExcept (Json.parse result.stdout >>= fromJson?)
+    let error := (result.stdout ++ result.stderr).trimAscii.toString
+    let transient := [500, 502, 503, 504].any fun status =>
+      (error.splitOn "\n").contains s!"S3 record read failed (HTTP {status})"
+    unless transient && (← request .now) < deadline do throw (safe error)
+    unless waiting do printLine "Waiting for blob storage to restore saved records…"
+    waiting := true
+    request (.sleep 1000)
+
+/-- Stable containers belong to the deployment, independently of its runs. -/
+def Context.node (ctx : Context) (role : String) : String := s!"{ctx.project}-{role}"
+
+def Context.execApp (ctx : Context) (args : Array String) (input : Option String := none) : Cli String := do
+  let output ← docker (#["exec"] ++ (if input.isSome then #["-i"] else #[]) ++
+    #[ctx.node "scheduler", "cloud-app"] ++ args) (input := input)
+  return output.stdout.trimAscii.toString
+
+def Context.remote (ctx : Context) (run : Run) (command : String) : Cli String :=
+  ctx.execApp #[command, "/etc/lean-cloud/config.json", run.id]
+
+private def Context.startNodes (ctx : Context) (image : String) : Cli Unit := do
+  let roles := #["scheduler", "worker1", "worker2", "worker3"]
+  let mut existingNodes : Array String := #[]
+  let mut replacing := false
+  for role in roles do
+    let name := ctx.node role
+    let existing ← docker #["container", "inspect", name] false
+    if existing.exitCode == 0 then
+      let rows ← liftExcept (Json.parse existing.stdout >>= Json.getArr?)
+      let row := rows[0]!
+      let labels ← liftExcept (row.getObjVal? "Config" >>= (·.getObjVal? "Labels"))
+      unless (labels.getObjValAs? String "lean-cloud.project").toOption == some ctx.project &&
+          (labels.getObjValAs? String "lean-cloud.role").toOption == some role do
+        throw s!"Container {name} is not a node of this deployment"
+      existingNodes := existingNodes.push name
+      replacing := replacing || (row.getObjValAs? String "Image").toOption != some image
+  -- Never leave workers with the old code consuming the new pool's assignments.
+  if replacing then
+    discard <| docker (#["stop"] ++ existingNodes)
+    discard <| docker (#["rm"] ++ existingNodes)
+  for role in roles do
+    let name := ctx.node role
+    if !replacing && existingNodes.contains name then
+      discard <| docker #["update", "--restart", "unless-stopped", name]
+      discard <| docker #["start", name]
+    else
+      let extra := if role == "scheduler" then
+        #["-v", ctx.project ++ "_scheduler-data:/data"] else #["-e", "CLOUD_WORKER_ID=" ++ role]
+      let command := if role == "scheduler" then "serve-scheduler" else "serve-worker"
+      discard <| docker (#["run", "-d", "--name", name, "--restart", "unless-stopped",
+        "--label", "lean-cloud.project=" ++ ctx.project, "--label", "lean-cloud.role=" ++ role,
+        "--log-opt", "max-size=10m", "--log-opt", "max-file=2", "--network", ctx.project ++ "_default",
+        "-v", s!"{← ctx.configFile}:/etc/lean-cloud/config.json:ro"] ++ extra ++
+        #[image, command, "/etc/lean-cloud/config.json"])
+
+  discard <| ctx.execApp #["pool-health", "/etc/lean-cloud/config.json"]
+
 def Context.deploy (ctx : Context) (executable : Option String := none) (verbose := false) : Cli Unit := do
   Deployments.remember ctx
   request (.createDir ctx.home)
@@ -106,10 +183,22 @@ def Context.deploy (ctx : Context) (executable : Option String := none) (verbose
     let output ← docker #["run", "--rm", image, "programs"]
     let programs ← liftExcept (Json.parse output.stdout >>= fromJson? (α := Array ProgramInfo))
     unless !programs.isEmpty do throw "Application has no registered programs"
+    let previous ← if ← request (.exists (ctx.home / "deployment.json")) then
+        some <$> ctx.deployment else pure none
+    if previous.isSome then ctx.checkVolumes
+    -- down removes the network and compute containers, but retains the data.
+    -- Bring only the services back before reading results or changing images.
     ctx.startServices verbose
+    if let some previous := previous then
+      if previous.image != image then
+        for run in ← ctx.allRuns do
+          let outcome ← ctx.savedOutcome image run
+          unless outcome.isSome do
+            throw s!"Finish or kill {run.id} before deploying a different image. Use 'up' if the previous deployment is down."
     discard <| docker #["volume", "create", ctx.project ++ "_scheduler-data"]
     saveJson (ctx.home / "deployment.json") (Deployment.mk ctx.project image programs)
-    printStyled (Styled.text s!"Deployed {programs.size} programs. Use 'programs' to list them, then 'run NAME'." .green)
+    ctx.startNodes image
+    printStyled (Styled.text s!"Deployed {programs.size} programs on 1 scheduler and 3 workers. Use 'run NAME' to submit a workflow." .green)
     printStyled (Styled.text s!"Logs: {ctx.home / "logs"}" .muted)
 
 /-- Start existing services without rebuilding or silently replacing lost durable volumes. -/
@@ -121,16 +210,11 @@ def Context.up (ctx : Context) (verbose := false) : Cli Unit := do
     unless ← request (.exists (← ctx.composeFile)) do throw "Deployment configuration is missing; use 'doctor'"
     unless ← request (.exists (← ctx.configFile)) do throw "Runtime configuration is missing; use 'doctor'"
     discard <| docker #["image", "inspect", deployment.image, "--format", "{{.Id}}"]
-    for volume in deploymentVolumes do
-      let result ← docker #["volume", "inspect", ctx.project ++ "_" ++ volume] false
-      unless result.exitCode == 0 do
-        throw s!"Cannot verify volume {ctx.project}_{volume}. Use 'doctor'; restore missing data before resuming."
+    ctx.checkVolumes
     ctx.startServices verbose
-    printStyled (Styled.text "Services are up. Use 'resume RUN' for an unfinished run, or 'run NAME' for a new one." .green)
+    ctx.startNodes deployment.image
+    printStyled (Styled.text "Services and nodes are up. Active runs resume automatically. Use 'run NAME' to submit a workflow." .green)
     printStyled (Styled.text s!"Logs: {ctx.home / "logs"}" .muted)
-
-def Context.container (ctx : Context) (run : Run) (role : String) : String :=
-  s!"{ctx.project}-{run.id}-{role}"
 
 /-- Stop actors before their services. Preserve volumes, images, and the run catalog. -/
 def Context.down (ctx : Context) : Cli Unit := do
@@ -146,15 +230,7 @@ def Context.down (ctx : Context) : Cli Unit := do
       discard <| docker (#["stop"] ++ actors)
       discard <| docker (#["rm"] ++ actors)
     discard <| ctx.compose #["down", "--remove-orphans"]
-    printStyled (Styled.text "Deployment stopped. Data is preserved. Use 'up', then 'resume RUN' to continue a run." .yellow)
-
-def Context.mounts (ctx : Context) (run : Run) : Array String :=
-  #["--network", ctx.project ++ "_default", "-v", s!"{ctx.directory run.id / "config.json"}:/etc/lean-cloud/config.json:ro"]
-
-def Context.remote (ctx : Context) (run : Run) (command : String) : Cli String := do
-  let output ← docker (#["run", "--rm"] ++ ctx.mounts run ++
-    #[run.image, command, "/etc/lean-cloud/config.json", run.id])
-  return output.stdout.trimAscii.toString
+    printStyled (Styled.text "Deployment stopped. Data is preserved. Use 'up' to restart the nodes and continue active runs." .yellow)
 
 def Context.outcome (ctx : Context) (run : Run) : Cli (Option Exit) := do
   liftExcept (Json.parse (← ctx.remote run "outcome") >>= fromJson?)
@@ -162,32 +238,10 @@ def Context.outcome (ctx : Context) (run : Run) : Cli (Option Exit) := do
 def Context.scheduler (ctx : Context) (run : Run) : Cli Scheduler.State := do
   liftExcept (Json.parse (← ctx.remote run "status") >>= fromJson?)
 
-private def Context.startContainer (ctx : Context) (run : Run) (role : String) (args : Array String) : Cli Unit := do
-  let name := ctx.container run role
-  let existing ← docker #["container", "inspect", name] false
-  if existing.exitCode == 0 then
-    let rows ← liftExcept (Json.parse existing.stdout >>= Json.getArr?)
-    let row := rows[0]!
-    let labels ← liftExcept ((row.getObjVal? "Config") >>= (·.getObjVal? "Labels"))
-    unless (labels.getObjValAs? String "lean-cloud.run").toOption == some run.id &&
-        (labels.getObjValAs? String "lean-cloud.project").toOption == some ctx.project &&
-        (row.getObjValAs? String "Image").toOption == some run.image do
-      throw s!"Container {name} does not belong to this run/image"
-    discard <| docker #["update", "--restart", "on-failure", name]
-    discard <| docker #["start", name]
-  else
-    let extra := if role == "scheduler" then
-      #["-v", ctx.project ++ "_scheduler-data:/data"]
-      else #["-e", "CLOUD_WORKER_ID=" ++ role]
-    discard <| docker (#["run", "-d", "--name", name, "--restart", "on-failure",
-      "--label", "lean-cloud.project=" ++ ctx.project, "--label", "lean-cloud.run=" ++ run.id,
-      "--label", "lean-cloud.role=" ++ role, "--log-opt", "max-size=10m", "--log-opt", "max-file=2"] ++
-      ctx.mounts run ++ extra ++ #[run.image] ++ args)
-
 /-- Idempotent recovery after interrupted launch. Existing definitions must agree. -/
 def Context.resume (ctx : Context) (id : String) : Cli Unit := do
   let run ← ctx.loadRun id
-  -- Serialize container startup with deployment and shutdown across consoles.
+  -- Serialize submission/control with deployment changes across consoles.
   withLock (ctx.home / "deploy.lock") do
   withLock (ctx.directory id / "launch.lock") do
     let control ← ctx.control id
@@ -197,29 +251,16 @@ def Context.resume (ctx : Context) (id : String) : Cli Unit := do
     let savedInput ← readJson (α := Json) inputPath
     unless savedInput.compress == run.input.compress do
       throw "Saved input differs from the immutable launch manifest"
-    discard <| docker (#["run", "--rm"] ++ ctx.mounts run ++
-      #["-v", s!"{inputPath}:/input.json:ro", run.image, "submit-entry", "/etc/lean-cloud/config.json", run.id, run.program.entry, "/input.json"])
+    let deployment ← ctx.deployment
+    unless deployment.image == run.image do throw "This run belongs to a different deployed image"
+    discard <| ctx.execApp #["submit-entry", "/etc/lean-cloud/config.json", id, run.program.entry, "-"]
+      (some (run.input.compress ++ "\n"))
     if (← ctx.outcome run).isSome then
       printLine s!"{id} is already completed. Use 'result {id}'."
       return
-    -- Clear paused intent before any actor starts. An interrupted startup can
-    -- be repaired by resume, but must not still be presented as a stopped run.
+    discard <| ctx.remote run "resume"
     ctx.setControl id .active
-    ctx.startContainer run "scheduler" #["scheduler", "/etc/lean-cloud/config.json", id]
-    -- Consumer reconnects are handled by the ordinary process restart policy.
-    for worker in ["worker1", "worker2", "worker3"] do
-      ctx.startContainer run worker #["worker", "/etc/lean-cloud/config.json", id]
-    printStyled (Styled.text s!"Started {id}. Use 'watch {id}' or 'inspect {id}'." .green)
-
-/-- Stop only this run's actors. Restart is disabled before stopping any actor;
-the services, replay records, broker messages and scheduler database survive. -/
-private def Context.stopRun (ctx : Context) (run : Run) : Cli Unit := do
-  let output ← docker #["ps", "-aq", "--filter", "label=lean-cloud.project=" ++ ctx.project,
-    "--filter", "label=lean-cloud.run=" ++ run.id]
-  let actors := output.stdout.splitOn "\n" |>.map (·.trimAscii.toString) |>.filter (!·.isEmpty) |>.toArray
-  unless actors.isEmpty do
-    discard <| docker (#["update", "--restart", "no"] ++ actors)
-    discard <| docker (#["stop", "--time", "0"] ++ actors)
+    printStyled (Styled.text s!"Running {id} on the deployed pool. Use 'watch {id}' or 'inspect {id}'." .green)
 
 def Context.pause (ctx : Context) (id : String) : Cli Unit := do
   let run ← ctx.loadRun id
@@ -228,7 +269,7 @@ def Context.pause (ctx : Context) (id : String) : Cli Unit := do
     let control ← ctx.control id
     if control == .killed || control == .killing then throw "A killed run cannot be paused"
     ctx.setControl id .pausing
-    ctx.stopRun run
+    discard <| ctx.remote run "pause"
     ctx.setControl id .paused
     printStyled (Styled.text s!"Paused {id}. Use 'resume {id}' to continue from its replay records." .yellow)
 
@@ -237,7 +278,6 @@ def Context.kill (ctx : Context) (id : String) : Cli Unit := do
   withLock (ctx.home / "deploy.lock") do
   withLock (ctx.directory id / "launch.lock") do
     ctx.setControl id .killing
-    ctx.stopRun run
     let outcome : Exit ← liftExcept (Json.parse (← ctx.remote run "cancel") >>= fromJson?)
     match outcome with
     | .cancelled _ =>
@@ -263,20 +303,13 @@ def Context.launch (ctx : Context) (name : String) (file : Option String) (id : 
     | none, none => throw "This program needs --input FILE.json"
   let id := id.getD s!"run-{← request .pid}-{← request .now}"
   validateId id
-  discard <| docker #["run", "--rm", "-i", deployment.image, "validate", program.entry]
-    (input := some (input.compress ++ "\n"))
+  discard <| ctx.execApp #["validate", program.entry] (some (input.compress ++ "\n"))
   request (.createDir ctx.runs)
   withLock (ctx.home / "catalog.lock") do
     let directory := ctx.directory id
     if ← request (.exists (directory / "run.json")) then
       throw s!"Run {id} already exists; use 'resume {id}'"
     request (.createDir directory)
-    let configPath ← ctx.configFile
-    let config ← readJson (α := Json) configPath
-    let scheduler ← liftExcept (config.getObjVal? "scheduler")
-    let config := config.setObjVal! "scheduler"
-      (scheduler.setObjVal! "database" (toJson s!"/data/console-{id}.sqlite"))
-    saveJson (directory / "config.json") config
     saveJson (directory / "input.json") input
     saveJson (directory / "run.json") (Run.mk id deployment.image program input)
   ctx.resume id

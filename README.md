@@ -46,7 +46,8 @@ Run the [complete example](runtime/LeanCloudRuntime/Demo.lean) with three worker
 containers, one scheduler, a RabbitMQ broker per actor, and shared S3 blob storage:
 
 ```sh
-docker compose up --build -d
+docker compose up --build -d scheduler worker worker2 worker3
+docker compose exec scheduler cloud-app submit /etc/lean-cloud/config.json example-1
 docker compose logs -f scheduler worker worker2 worker3
 ```
 
@@ -72,7 +73,7 @@ See the [console guide](LeanCloud/Console.md) for inputs, registration, and reco
 Once the workers finish, read the saved report:
 
 ```sh
-docker compose run --rm --no-deps worker result /etc/lean-cloud/config.json demo
+docker compose exec scheduler cloud-app result /etc/lean-cloud/config.json demo
 # files=16, errors=24
 ```
 

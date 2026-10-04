@@ -3,10 +3,10 @@ import LeanCloudCli.Input
 
 namespace LeanCloudCli.Top
 
-/-- Run actors only. Mailbox brokers and blob services remain in `nodes`. -/
+/-- Compute nodes only. Mailbox brokers and blob services remain in `nodes`. -/
 def actors (nodes : Array Node) : Array Node :=
-  (nodes.filter (fun node => node.run.isSome &&
-    (node.role == "scheduler" || node.role.startsWith "worker"))).qsort fun a b =>
+  (nodes.filter (fun node =>
+    (#["scheduler", "worker1", "worker2", "worker3"].contains node.role))).qsort fun a b =>
       if (a.state == "running") != (b.state == "running") then a.state == "running"
       else a.name < b.name
 
@@ -25,7 +25,7 @@ private def panel (node : Node) (history : Array History) (disk : Option DiskUsa
     (width : Nat) : Array Styled.Line :=
   let points := history.find? (fun h => h.name == node.name && h.fresh &&
     h.points.back?.map (·.session) == some node.started)
-  #[Styled.text (pad width s!" {node.role} · {node.run.getD ""}") .selected,
+  #[Styled.text (pad width s!" {node.role} · {node.run.getD "shared pool"}") .selected,
     Styled.text (node.state ++ " ") (Styled.statusColor node.state) ++ Styled.text node.name .muted] ++
     (if node.state == "running" then metricLines (points.map (·.points) |>.getD #[]) width disk
      else #[Styled.text "No live samples; process is stopped" .muted])
@@ -43,7 +43,7 @@ def frame (project : String) (nodes : Array Node) (history : Array History)
   if width < 40 || height < 14 then
     lines := lines.push (Styled.text "Enlarge terminal to at least 40 × 14 for graphs." .yellow)
   else if nodes.isEmpty then
-    lines := lines.push (Styled.text "No workers or schedulers. Use 'run PROGRAM' to start a cloud process." .muted)
+    lines := lines.push (Styled.text "No workers or schedulers. Use 'deploy' or 'up' to start the nodes." .muted)
   else
     let cards := (visible nodes page width height).map fun node =>
       panel node history ((disks.find? (·.1 == node.name)).map (·.2)) cellWidth

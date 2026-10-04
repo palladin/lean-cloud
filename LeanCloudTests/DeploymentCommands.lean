@@ -24,7 +24,10 @@ private def process (call : Invocation) : Except String ProcessOutput := do
   | "inspect" :: _ => output healthyNodes.compress
   | "image" :: "inspect" :: _ => output "sha256:pinned"
   | ["volume", "inspect", _] => output
+  | "exec" :: _ => output
   | "compose" :: _ => output
+  | ["container", "inspect", _] => return { exitCode := 1 }
+  | "run" :: "-d" :: _ => output
   | _ => throw s!"Unexpected Docker request: {reprStr call.args}"
 
 private def base : World :=
@@ -48,6 +51,24 @@ def deploymentCommandCases : Array TestCase := #[
       assertEq (logs.map Prod.snd) #[noise]
       assertTrue (has world.stdout "Starting blob" && has world.stdout "— done") "No startup progress"
       assertTrue world.locks.isEmpty "Startup leaked lock"⟩,
+  ⟨"console.deployment.catalog-ownership-survives-discovery", do
+    let test : Context := ⟨"/work", "another"⟩
+    let catalog : Deployments.Catalog := {
+      entries := #[⟨ctx.project, "/work"⟩, ⟨test.project, "/work"⟩]
+      selected := some test.project }
+    let initial := base.json registry catalog
+      |>.json (test.home / "deployment.json") (Deployment.mk test.project "test-image" #[])
+      |>.json (test.home / "catalog-owner.json") ("/isolated" : String)
+    let (visible, world) ← checked (do Deployments.discover ctx; Deployments.load) initial
+    assertEq (visible.entries.map (·.project)) #[ctx.project]
+    assertEq visible.selected none "Selected a deployment owned by another catalog"
+    let (_, listed) ← checked (listDeployments ctx) world
+    assertTrue (!has listed.stdout test.project) "Retained test artifacts leaked into deployments"
+    let isolated := { initial with envs := #[("LEAN_CLOUD_HOME", "/isolated")] }
+    let (visible, _) ← checked (do Deployments.remember test; Deployments.load) isolated
+    assertEq (visible.entries.map (·.project)) #[test.project] "Isolation hid the test from its own catalog"
+    assertEq (world.file (test.home / "deployment.json")) (initial.file (test.home / "deployment.json"))
+      "Discovery altered retained test artifacts"⟩,
   ⟨"console.deployment.selection-persists", do
     let other : Context := ⟨"/other", "second"⟩
     let initial := { base with directories := base.directories.push "/other" }
@@ -88,7 +109,7 @@ def deploymentCommandCases : Array TestCase := #[
     assertTrue after.locks.isEmpty "Catalog error leaked lock"
     let (code, help) ← checked (application ["--help"]) initial
     assertEq code 0 "Corrupt selection blocked help"
-    assertTrue (has help.stderr "Use 'doctor'") "No catalog recovery hint"
+    assertTrue (help.stderr.isEmpty && !help.trace.contains "readFile") "Help consulted broken deployment state"
     assertEq help.files initial.files
     let (code, diagnosis) ← checked (application ["doctor"]) initial
     assertEq code 1

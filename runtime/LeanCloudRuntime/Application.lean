@@ -8,11 +8,16 @@ open Lean LeanCloud LeanEff LeanCloudCli
 /-- Runtime services used by the application protocol. User code stays in the registry. -/
 inductive Service : Type → Type where
   | submit (config : Config) (run entry : String) (input : Json) : Service Unit
+  | health (config : Config) : Service Unit
+  | serveScheduler (config : Config) : Service Unit
+  | serveWorker (config : Config) : Service Unit
+  | control (config : Config) (run : String) (mode : LeanCloud.Pool.Mode) : Service Unit
   | scheduler (config : Config) (run : String) : Service Unit
   | worker (config : Config) (run : String) : Service Unit
   | definition (config : Config) (run : String) : Service RunDefinition
   | outcome (config : Config) (run : String) : Service (Option Exit)
   | cancel (config : Config) (run : String) : Service Exit
+  | referenceStatus (config : Config) (run : String) : Service Scheduler.State
   | status (config : Config) (run : String) : Service Scheduler.State
   | readText (config : Config) (ref : BlobRef) : Service String
 
@@ -38,6 +43,15 @@ def run (registry : Registry) (args : List String) : App UInt32 := do
       let input ← liftExcept (Json.parse (← host .readLine))
       liftExcept (program.validate input)
       pure 0
+    | [command, path] =>
+      let config : Config ← liftExcept (Json.parse (← host (.readFile path)) >>= fromJson?)
+      liftExcept config.mailboxes.validate
+      unless config.scheduler.assignmentMs > 0 do throw "Assignment timeout must be positive"
+      match command with
+      | "pool-health" => service (.health config); pure 0
+      | "serve-scheduler" => service (.serveScheduler config); pure 0
+      | "serve-worker" => service (.serveWorker config); pure 0
+      | _ => throw "Expected serve-scheduler or serve-worker"
     | command :: path :: id :: rest =>
       unless LeanCloudCli.validId id do throw "Invalid run ID"
       let config : Config ← liftExcept (Json.parse (← host (.readFile path)) >>= fromJson?)
@@ -45,7 +59,8 @@ def run (registry : Registry) (args : List String) : App UInt32 := do
       unless config.scheduler.assignmentMs > 0 do throw "Assignment timeout must be positive"
       match command, rest with
       | "submit-entry", [entry, file] =>
-        let input ← liftExcept (Json.parse (← host (.readFile file)))
+        let text ← if file == "-" then host .readLine else host (.readFile file)
+        let input ← liftExcept (Json.parse text)
         let program ← liftExcept (registry.find entry)
         liftExcept (program.validate input)
         service (.submit config id entry input)
@@ -63,11 +78,14 @@ def run (registry : Registry) (args : List String) : App UInt32 := do
         service (.submit config id program.info.entry input)
         say s!"submitted {id}"
         pure 0
+      | "pause", [] => service (.control config id .paused); pure 0
+      | "resume", [] => service (.control config id .active); pure 0
       | "scheduler", [] => service (.scheduler config id); pure 0
       | "worker", [] =>
         service (.worker config id)
         say s!"completed {id}"
         pure 0
+      | "reference-status", [] => say (toJson (← service (.referenceStatus config id))).compress; pure 0
       | "status", [] => say (toJson (← service (.status config id))).compress; pure 0
       | "outcome", [] => say (toJson (← service (.outcome config id))).compress; pure 0
       | "cancel", [] => say (toJson (← service (.cancel config id))).compress; pure 0
@@ -85,7 +103,7 @@ def run (registry : Registry) (args : List String) : App UInt32 := do
           pure 0
       | _, _ => throw "Unknown application command or invalid arguments"
     | _ =>
-      say "Usage: APP programs | validate ENTRY | (submit-entry|worker|scheduler|status|outcome|result|cancel) CONFIG RUN [ARGS]"
+      say "Usage: APP programs | validate ENTRY | (serve-scheduler|serve-worker|pool-health) CONFIG | (submit-entry|submit|pause|resume|status|outcome|result|cancel) CONFIG RUN [ARGS]"
       pure 2
   catch error => host (.write (error ++ "\n") true); pure 1
 
@@ -108,12 +126,23 @@ private def handle (registry : Registry) (prepare : Config → String → Json �
     S3.initializeBucket config.blobs
     prepare config entry input
     registry.submit config id entry input
+    Pool.submit config id
+  | .health config => discard (Pool.request config .health)
+  | .serveScheduler config => Pool.scheduler config
+  | .serveWorker config => registry.serveWorker config
+  | .control config id mode => do
+    discard (Pool.request config (match mode with
+      | .active => .resume id | .paused => .pause id | .killed => .kill id))
   | .scheduler config id => runScheduler config id
   | .worker config id => registry.runWorker config id
   | .definition config id => loadRun config id
   | .outcome config id => completed config id
-  | .cancel config id => LeanCloudRuntime.cancel config id
-  | .status config id => LeanCloudRuntime.status config id
+  | .cancel config id => do
+    discard (Pool.request config (.kill id))
+    let some outcome ← completed config id | throw (IO.userError "Cancellation did not persist an outcome")
+    return outcome
+  | .referenceStatus config id => LeanCloudRuntime.status config id
+  | .status config id => Pool.status config id
   | .readText config ref => do
     let bytes ← match ← (S3.readBytes config.blobs ref).run with
       | .ok bytes => pure bytes
