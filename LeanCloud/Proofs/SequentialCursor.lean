@@ -38,7 +38,7 @@ theorem Cursor.delay {journal current encode} (next : ArrsF (Control M) Unit β)
 
 theorem Cursor.exec {journal current encode} (codec : Codec β) (label : String) (body : Unit → β)
     (next : ArrsF (Control M) β γ)
-    (cursor : Cursor blobs source journal current encode (.impure (.sequential codec (.exec label (fun _ => pure (body ())))) next))
+    (cursor : Cursor blobs source journal current encode (.impure (.command codec (.exec label (fun _ => pure (body ())))) next))
     (present : journal.lookup (ReplayStore.valueKey current) =
       some ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → M β)), .success (codec.encode (body ()))⟩)
     (roundtrip : codec.decode (codec.encode (body ())) = .ok (body ())) :

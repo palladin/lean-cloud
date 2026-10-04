@@ -33,7 +33,7 @@ inductive Evaluation {m : Type → Type u} [Monad m] :
       (next : ArrsF (Control m) α β)
       (roundtrip : codec.decode (codec.encode (body ())) = .ok (body ()))
       (rest : Evaluation (next.apply (body ())) outcome) :
-      Evaluation (.impure (.sequential codec (.exec label (fun _ => pure (body ())))) next) outcome
+      Evaluation (.impure (.command codec (.exec label (fun _ => pure (body ())))) next) outcome
   | parallelOk (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
       (next : ArrsF (Control m) (Array α) β) (outcomes : Fin count → Except CloudError α)
       (roundtrip : RoundTrips codec)

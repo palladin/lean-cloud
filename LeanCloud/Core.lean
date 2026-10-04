@@ -24,14 +24,10 @@ def decode [Codec α] (value : Json) : Cloud m α :=
   | .error error => send (.fail ⟨.codec, error⟩)
 
 def exec [Codec α] (body : Unit → m α) (label : String := "") : Cloud m α :=
-  send (.sequential inferInstance (.exec label body))
+  send (.command inferInstance (.exec label body))
 
 def parallel [Codec α] (branches : Array (Cloud m α)) : Cloud m (Array α) :=
   send (.parallel inferInstance branches.size (fun index => branches[index]))
-
-/-- Reserved for choice semantics; both current interpreters return `unsupported`. -/
-def choice [Codec α] (branches : Array (Cloud m (Option α))) : Cloud m (Option α) :=
-  send (.choice inferInstance branches.size (fun index => branches[index]))
 
 /-- Heterogeneous pairing uses the same collection-parallel primitive. -/
 def both [Codec α] [Codec β] (left : Cloud m α) (right : Cloud m β) : Cloud m (α × β) := do
@@ -50,11 +46,11 @@ end Cloud
 namespace CloudBlob
 
 def putBytes (bytes : ByteArray) : Cloud m BlobRef :=
-  Cloud.send (.sequential inferInstance (.putBlob bytes))
+  Cloud.send (.command inferInstance (.putBlob bytes))
 def readBytes (ref : BlobRef) : Cloud m ByteArray :=
-  Cloud.send (.sequential inferInstance (.readBlob ref))
+  Cloud.send (.command inferInstance (.readBlob ref))
 def resolve (name : String) : Cloud m BlobRef :=
-  Cloud.send (.sequential inferInstance (.resolveBlob name))
+  Cloud.send (.command inferInstance (.resolveBlob name))
 def putText (text : String) : Cloud m BlobRef := putBytes text.toUTF8
 def readText (ref : BlobRef) : Cloud m String := do
   let bytes ← readBytes ref

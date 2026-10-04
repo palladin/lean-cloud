@@ -57,8 +57,11 @@ processing-window assumption. Both are checked when building the test suite.
 
 - `Pure.Evaluation` covers pure values, delay, failure, delayed pure computations,
   and parallel groups, including nested and empty groups. It describes the
-  original Cloud program. Arbitrary IO actions, user blob effects, choice, and
-  cancellation are outside this correctness theorem.
+  original Cloud program. Arbitrary IO actions, user blob effects, and
+  administrative cancellation are outside this correctness theorem. Pause uses
+  the existing stop/restart behavior; eventual completion requires resuming and
+  satisfying the processing-window assumption. Kill deliberately terminates a
+  run with cancellation instead of evaluating it to the direct result.
 - Codecs preserve the values crossing replay boundaries. The root codec also
   round-trips so the final stored value can be decoded.
 - The model has one scheduler with a private durable database. Its local writes
@@ -182,7 +185,7 @@ than duplicating the interpreter proof.
 - [Parallel.lean](Parallel.lean), [ParallelContracts.lean](ParallelContracts.lean):
   joins preserve source order and the first error in that order, including empty
   groups. Actual interleaved reads retain the required child-record facts.
-- [Recording.lean](Recording.lean): sequential execution
+- [Recording.lean](Recording.lean): command execution
   may create new records from empty compatible storage; it need not start with
   all intermediate results cached. Completion is stored before `done` is reported.
 - [ReplayEvolution.lean](ReplayEvolution.lean),

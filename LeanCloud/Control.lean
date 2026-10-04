@@ -19,8 +19,6 @@ inductive Control (m : Type → Type u) : Type → Type (max 1 u) where
   | fail {α : Type} : CloudError → Control m α
   | parallel {α : Type} (codec : Codec α) (count : Nat) :
       (Fin count → EffF (Control m) α) → Control m (Array α)
-  | choice {α : Type} (codec : Codec α) (count : Nat) :
-      (Fin count → EffF (Control m) (Option α)) → Control m (Option α)
-  | sequential {α : Type} (codec : Codec α) (operation : Operation m α) : Control m α
+  | command {α : Type} (codec : Codec α) (operation : Operation m α) : Control m α
 
 end LeanCloud

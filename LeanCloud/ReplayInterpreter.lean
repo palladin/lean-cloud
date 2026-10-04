@@ -66,10 +66,10 @@ def result [Monad m] [codec : Codec α] (outcome : Exit) : ExceptT CloudError m 
   match outcome with
   | .success value => decode codec value
   | .failure error => throw error
-  | .cancelled _ => throw ⟨.unsupported, "Cancellation is not implemented yet"⟩
+  | .cancelled reason => throw ⟨.cancelled, reason⟩
 
 /-- `active` becomes true at the assigned location. Before that point only
-recorded values may be used; after it, missing sequential results may be executed.
+recorded values may be used; after it, missing command results may be executed.
 The program retains its result type. Its encoder is used only for completion;
 descending into a child selects that child's encoder. -/
 def walk [Monad m] (store : ReplayStore m) (blobs : BlobStorage m) (assignment : Assignment)
@@ -90,8 +90,7 @@ def walk [Monad m] (store : ReplayStore m) (blobs : BlobStorage m) (assignment :
       | .fail error, _ => do
         unless active do throw ⟨.divergence, "Computation failed before the assigned location"⟩
         finish store assignment.branch (.failure error)
-      | .choice .., _ => throw ⟨.unsupported, "Choice is not implemented yet"⟩
-      | .sequential codec operation, continuation => do
+      | .command codec operation, continuation => do
         let expected := request codec operation
         let outcome ← match ← store.read (ReplayStore.valueKey current) with
           | some record => check expected record

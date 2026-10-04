@@ -11,8 +11,16 @@ private def exitLabel : Exit → String
 private def inspectRun (ctx : Context) (id : String) : Cli Unit := do
   let run ← ctx.loadRun id
   printLine s!"{run.id}  {run.program.entry}"
-  if let some outcome ← ctx.outcome run then printLine s!"Outcome: {exitLabel outcome}"
-  let state ← ctx.scheduler run
+  let control ← ctx.control id
+  let outcome ← try ctx.outcome run catch error =>
+    if control != .active then pure none else throw error
+  if let some outcome := outcome then printLine s!"Outcome: {exitLabel outcome}"
+  if control != .active then
+    if outcome.isNone then printLine s!"Status: {control.label}"
+    return
+  let state ← try pure (some (← ctx.scheduler run)) catch error =>
+    if outcome.isSome then pure none else throw error
+  let some state := state | return
   printLine "LOCATION             STATUS       WORKER      ATTEMPT"
   for job in state.jobs do
     let (status, worker, attempt) := match job.status with
@@ -30,10 +38,14 @@ private def listRuns (ctx : Context) : Cli Unit := do
       match ← ctx.outcome run with
       | some outcome => pure (exitLabel outcome)
       | none =>
-        let state ← ctx.scheduler run
-        pure (if state.error.isSome then "scheduler error" else
-          s!"running ({(state.jobs.filter (·.status == .done)).size}/{state.jobs.size})")
-    catch _ => pure "unavailable / launch incomplete"
+        let control ← ctx.control run.id
+        if control != .active then pure control.label else do
+          let state ← ctx.scheduler run
+          pure (if state.error.isSome then "scheduler error" else
+            s!"running ({(state.jobs.filter (·.status == .done)).size}/{state.jobs.size})")
+    catch _ =>
+      let control ← ctx.control run.id
+      pure (if control != .active then control.label else "unavailable / launch incomplete")
     printLine s!"{pad 31 run.id}{pad 25 run.program.entry}{status}"
 
 private def showNodes (ctx : Context) : Cli Unit := do
@@ -130,9 +142,11 @@ private partial def watchLoop (ctx : Context) (run : Run) (interactive : Bool)
   let nodes := runNodes run (← ctx.nodes)
   let events ← ctx.events run nodes
   let history := remember history (← samples nodes)
+  let control ← ctx.control run.id
   let status ← try
-    pure ((← ctx.outcome run).map exitLabel |>.getD "result pending")
-    catch _ => pure "result unavailable"
+    pure ((← ctx.outcome run).map exitLabel |>.getD
+      (if control != .active then control.label else "result pending"))
+    catch _ => pure (if control != .active then control.label else "result unavailable")
   let diskNode := nav.selected % max 1 nodes.size
   let disk ← match nodes[diskNode]? with
     | some node => filesystem node
@@ -161,7 +175,7 @@ private def watch (ctx : Context) (id : String) (once := false) : Cli Unit := do
       request (.write "\x1b[?25h\x1b[?1049l")
       request .flush
 
-private def help : String := "Commands:\n  init DIRECTORY               Create and select a cloud application\n  open DIRECTORY               Select an existing application\n  deploy [EXECUTABLE]           Build this application's image and start shared services\n  deployments                  List known deployments, including stopped ones\n  use NAME                     Select and remember a deployment\n  status                       Show selected deployment health\n  up                           Start services without rebuilding\n  doctor                       Diagnose local configuration and Docker\n  down                         Stop this deployment, preserving its data\n  programs                     List compiled entry points\n  run PROGRAM [--input FILE] [--id ID]\n  ps                           List runs launched from this checkout\n  inspect RUN                  Inspect scheduler jobs and assignments\n  result RUN                   Read the durable result\n  watch RUN [--once]            Live source positions and container graphs\n  nodes                        Inspect workers, schedulers, brokers and blobs\n  logs RUN [worker1|worker2|worker3|scheduler]\n  resume RUN                   Repair an interrupted launch\n  help | quit"
+private def help : String := "Commands:\n  init DIRECTORY               Create and select a cloud application\n  open DIRECTORY               Select an existing application\n  deploy [EXECUTABLE]           Build this application's image and start shared services\n  deployments                  List known deployments, including stopped ones\n  use NAME                     Select and remember a deployment\n  status                       Show selected deployment health\n  up                           Start services without rebuilding\n  doctor                       Diagnose local configuration and Docker\n  down                         Stop this deployment, preserving its data\n  programs                     List compiled entry points\n  run PROGRAM [--input FILE] [--id ID]\n  ps                           List runs launched from this checkout\n  inspect RUN                  Inspect scheduler jobs and assignments\n  result RUN                   Read the durable result\n  watch RUN [--once]            Live source positions and container graphs\n  nodes                        Inspect workers, schedulers, brokers and blobs\n  logs RUN [worker1|worker2|worker3|scheduler]\n  pause RUN                    Stop a run and preserve replay state\n  kill RUN                     Permanently cancel a run\n  resume RUN                   Resume a paused run or repair a launch\n  help | quit"
 
 private def runOptions (args : List String) : Except String (Option String × Option String) := do
   let mut file := none
@@ -202,6 +216,8 @@ def command (ctx : Context) (args : List String) : Cli Bool := do
   | ["inspect", id] => inspectRun ctx id
   | ["nodes"] => showNodes ctx
   | ["resume", id] => ctx.resume id
+  | ["pause", id] => ctx.pause id
+  | ["kill", id] => ctx.kill id
   | ["watch", id] => watch ctx id
   | ["watch", id, "--once"] => watch ctx id true
   | ["result", id] =>

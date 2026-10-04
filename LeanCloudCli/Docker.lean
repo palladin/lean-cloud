@@ -37,6 +37,13 @@ def Context.loadRun (ctx : Context) (id : String) : Cli Run := do
   unless run.id == id do throw "Run manifest mismatch"
   return run
 
+def Context.control (ctx : Context) (id : String) : Cli RunControl := do
+  let path := ctx.directory id / "control.json"
+  if ← request (.exists path) then readJson path else pure .active
+
+private def Context.setControl (ctx : Context) (id : String) (state : RunControl) : Cli Unit :=
+  saveJson (ctx.directory id / "control.json") state
+
 def Context.allRuns (ctx : Context) : Cli (Array Run) := do
   unless ← request (.exists ctx.runs) do return #[]
   let mut runs := #[]
@@ -151,6 +158,7 @@ private def Context.startContainer (ctx : Context) (run : Run) (role : String) (
         (labels.getObjValAs? String "lean-cloud.project").toOption == some ctx.project &&
         (row.getObjValAs? String "Image").toOption == some run.image do
       throw s!"Container {name} does not belong to this run/image"
+    discard <| docker #["update", "--restart", "on-failure", name]
     discard <| docker #["start", name]
   else
     let extra := if role == "scheduler" then
@@ -167,6 +175,9 @@ def Context.resume (ctx : Context) (id : String) : Cli Unit := do
   -- Serialize container startup with deployment and shutdown across consoles.
   withLock (ctx.home / "deploy.lock") do
   withLock (ctx.directory id / "launch.lock") do
+    let control ← ctx.control id
+    if control == .killed || control == .killing then
+      throw s!"{id} was killed and cannot be resumed. Use 'kill {id}' to finish an interrupted cancellation."
     let inputPath := ctx.directory id / "input.json"
     let savedInput ← readJson (α := Json) inputPath
     unless savedInput.compress == run.input.compress do
@@ -176,11 +187,50 @@ def Context.resume (ctx : Context) (id : String) : Cli Unit := do
     if (← ctx.outcome run).isSome then
       printLine s!"{id} is already completed. Use 'result {id}'."
       return
+    -- Clear paused intent before any actor starts. An interrupted startup can
+    -- be repaired by resume, but must not still be presented as a stopped run.
+    ctx.setControl id .active
     ctx.startContainer run "scheduler" #["scheduler", "/etc/lean-cloud/config.json", id]
     -- Consumer reconnects are handled by the ordinary process restart policy.
     for worker in ["worker1", "worker2", "worker3"] do
       ctx.startContainer run worker #["worker", "/etc/lean-cloud/config.json", id]
     printLine s!"Started {id}. Use 'watch {id}' or 'inspect {id}'."
+
+/-- Stop only this run's actors. Restart is disabled before stopping any actor;
+the services, replay records, broker messages and scheduler database survive. -/
+private def Context.stopRun (ctx : Context) (run : Run) : Cli Unit := do
+  let output ← docker #["ps", "-aq", "--filter", "label=lean-cloud.project=" ++ ctx.project,
+    "--filter", "label=lean-cloud.run=" ++ run.id]
+  let actors := output.stdout.splitOn "\n" |>.map (·.trimAscii.toString) |>.filter (!·.isEmpty) |>.toArray
+  unless actors.isEmpty do
+    discard <| docker (#["update", "--restart", "no"] ++ actors)
+    discard <| docker (#["stop", "--time", "0"] ++ actors)
+
+def Context.pause (ctx : Context) (id : String) : Cli Unit := do
+  let run ← ctx.loadRun id
+  withLock (ctx.home / "deploy.lock") do
+  withLock (ctx.directory id / "launch.lock") do
+    let control ← ctx.control id
+    if control == .killed || control == .killing then throw "A killed run cannot be paused"
+    ctx.setControl id .pausing
+    ctx.stopRun run
+    ctx.setControl id .paused
+    printLine s!"Paused {id}. Use 'resume {id}' to continue from its replay records."
+
+def Context.kill (ctx : Context) (id : String) : Cli Unit := do
+  let run ← ctx.loadRun id
+  withLock (ctx.home / "deploy.lock") do
+  withLock (ctx.directory id / "launch.lock") do
+    ctx.setControl id .killing
+    ctx.stopRun run
+    let outcome : Exit ← liftExcept (Json.parse (← ctx.remote run "cancel") >>= fromJson?)
+    match outcome with
+    | .cancelled _ =>
+      ctx.setControl id .killed
+      printLine s!"Killed {id}. Its replay records are preserved; it cannot be resumed."
+    | _ =>
+      ctx.setControl id .active
+      printLine s!"{id} had already completed. Its result is unchanged; use 'result {id}'."
 
 private def chooseProgram (programs : Array ProgramInfo) (name : String) : Except String ProgramInfo :=
   let found := programs.filter fun p => p.entry == name || (p.entry.splitOn "/").head! == name

@@ -54,6 +54,20 @@ def completed (config : Config) (run : String) : IO (Option Exit) := do
   | .ok outcome => return outcome
   | .error error => throw (IO.userError (reprStr error))
 
+/-- Call after stopping every actor for the run. Atomic creation preserves a
+normal completion that won the race with the administrative cancellation. -/
+def cancel (config : Config) (run : String) : IO Exit := do
+  validateRun run
+  -- Also seal a locally registered run whose initial submission was interrupted.
+  S3.initializeBucket config.blobs
+  let store := S3.records config.blobs run
+  match ← (do
+    store.finish Location.root (.cancelled "Killed by user")
+    let some outcome ← store.outcome | throw ⟨.protocol, "Missing terminal result"⟩
+    pure outcome : ExceptT CloudError IO Exit).run with
+  | .ok outcome => return outcome
+  | .error error => throw (IO.userError error.message)
+
 /-- One durable scheduler mailbox and a private SQLite volume. The same actor
 turn as Sim saves state, confirms its outgoing messages, then acknowledges input.
 Broker/connection failures terminate the process; restart reopens the mailbox. -/
@@ -124,6 +138,7 @@ private def workerId : IO String := do
 assignments independently of either actor's process lifetime. -/
 def runWorker [Codec α] (config : Config) (run : String)
     (program : ι → Cloud IO α) (input : ι) : IO Unit := do
+  if (← completed config run).isSome then return
   let id ← workerId
   let broker ← IO.ofExcept (config.mailboxes.worker id)
   let handle ← RabbitMQ.openMailbox broker run ("worker." ++ id)

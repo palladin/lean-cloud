@@ -53,7 +53,7 @@ private def invalidReplayCases : Array TestCase :=
       [(valueKey, ⟨{ capturedRequest with schema := "nat/v2" }, .success (toJson (7 : Nat))⟩)] .divergence,
     rejectReplay "changed-label" captured root
       [(valueKey, ⟨{ capturedRequest with payload := toJson "other" }, .success (toJson (7 : Nat))⟩)] .divergence,
-    rejectReplay "invalid-sequential-value" captured root
+    rejectReplay "invalid-command-value" captured root
       [(valueKey, ⟨capturedRequest, .success (toJson "not a nat")⟩)] .codec,
     rejectReplay "invalid-return-record" captured root
       [(ReplayStore.returnKey Location.root, ⟨capturedRequest, .success (toJson (7 : Nat))⟩)] .divergence,
@@ -93,6 +93,18 @@ private def reverseCompletion (fails : Bool) : TestCase :=
     assertOutcome (ReplayInterpreter.result (m := Id) outcome).run expected⟩
 
 def replayCases : Array TestCase := invalidReplayCases ++ #[
+  ⟨"replay/cancelled-result-is-terminal", do
+    let saved ← IO.mkRef ([] : Records)
+    let store := memoryStore saved
+    let cancelled := Exit.cancelled "Killed by user"
+    assertOutcome (← (store.finish Location.root cancelled).run) (.ok ())
+    let source : Cloud IO Nat := Cloud.exec (fun _ => throw (IO.userError "Cancelled run executed user code"))
+    assertOutcome (← resume store source) (.ok .done)
+    assertOutcome (← (store.finish Location.root (.success (toJson (42 : Nat)))).run) (.ok ())
+    let .ok (some outcome) ← store.outcome.run | throw (IO.userError "Missing cancellation")
+    assertEq outcome cancelled
+    assertOutcome (ReplayInterpreter.result (m := Id) (α := Nat) outcome).run
+      (.error ⟨.cancelled, "Killed by user"⟩)⟩,
   reverseCompletion false,
   reverseCompletion true,
   ⟨"replay/recorded-exec-is-not-reexecuted", do

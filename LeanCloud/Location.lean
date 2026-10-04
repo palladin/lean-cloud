@@ -4,7 +4,7 @@ namespace LeanCloud
 
 /-- Each level records `(child index, command index)`. For example,
 `#[(0, 2), (1, 5)]` means root's fork at command 2, child 1, command 5.
-Delay is transparent; sequential effects and completed groups advance the command. -/
+Delay is transparent; commands and completed groups advance the command. -/
 abbrev Location := Array (Nat × Nat)
 
 namespace Location

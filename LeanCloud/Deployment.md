@@ -18,6 +18,12 @@ Use the same `RUN_ID` on subsequent Compose commands that recreate containers.
 A new run id creates a new execution; resubmitting an existing id with different
 input is rejected. The initial deployment serves one run per scheduler process.
 
+For individual process control, use the [CLI](Console.md): `pause RUN` stops a
+run's actors while retaining replay state, `resume RUN` restarts them, and
+`kill RUN` stops them and records permanent cancellation. These are deployment
+operations, not workflow effects. The CLI manages its own run containers;
+containers started directly by Compose are managed through Compose.
+
 ## Responsibilities
 
 ```mermaid
@@ -44,8 +50,8 @@ record keys. It never reads or writes replay values. It is the only writer of
 its local database. Typed lean-linq schemas generate its DDL and queries.
 
 Workers reconstruct captured variables from the root program, read recorded
-prefixes, and execute sequential effects until a parallel fork or completion.
-Each sequential result, completed join, and branch return has its own immutable
+prefixes, and execute commands until a parallel fork or completion.
+Each command result, completed join, and branch return has its own immutable
 blob key. The scheduler makes the parent runnable after every child has reported
 completion. A worker then reads those outcomes, assembles the ordered result,
 and continues. Partial joins exist only in scheduler metadata.

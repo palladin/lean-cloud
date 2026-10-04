@@ -12,6 +12,7 @@ inductive Service : Type → Type where
   | worker (config : Config) (run : String) : Service Unit
   | definition (config : Config) (run : String) : Service RunDefinition
   | outcome (config : Config) (run : String) : Service (Option Exit)
+  | cancel (config : Config) (run : String) : Service Exit
   | status (config : Config) (run : String) : Service Scheduler.State
   | readText (config : Config) (ref : BlobRef) : Service String
 
@@ -69,6 +70,7 @@ def run (registry : Registry) (args : List String) : App UInt32 := do
         pure 0
       | "status", [] => say (toJson (← service (.status config id))).compress; pure 0
       | "outcome", [] => say (toJson (← service (.outcome config id))).compress; pure 0
+      | "cancel", [] => say (toJson (← service (.cancel config id))).compress; pure 0
       | "result", [] =>
         match ← service (.outcome config id) with
         | none => say "pending"; pure 2
@@ -83,7 +85,7 @@ def run (registry : Registry) (args : List String) : App UInt32 := do
           pure 0
       | _, _ => throw "Unknown application command or invalid arguments"
     | _ =>
-      say "Usage: APP programs | validate ENTRY | (submit-entry|worker|scheduler|status|outcome|result) CONFIG RUN [ARGS]"
+      say "Usage: APP programs | validate ENTRY | (submit-entry|worker|scheduler|status|outcome|result|cancel) CONFIG RUN [ARGS]"
       pure 2
   catch error => host (.write (error ++ "\n") true); pure 1
 
@@ -110,6 +112,7 @@ private def handle (registry : Registry) (prepare : Config → String → Json �
   | .worker config id => registry.runWorker config id
   | .definition config id => loadRun config id
   | .outcome config id => completed config id
+  | .cancel config id => LeanCloudRuntime.cancel config id
   | .status config id => LeanCloudRuntime.status config id
   | .readText config ref => do
     let bytes ← match ← (S3.readBytes config.blobs ref).run with

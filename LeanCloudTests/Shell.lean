@@ -15,6 +15,10 @@ def shellCases : Array TestCase := #[
     assertEq (suggestions "wa") #["watch"]
     assertEq (suggestions "run sq") #["squares/v1"]
     assertEq (suggestions "inspect de") #["demo"]
+    assertEq (suggestions "pa") #["pause"]
+    assertEq (suggestions "ki") #["kill"]
+    for command in ["pause", "kill", "resume"] do
+      assertEq (suggestions (command ++ " de")) #["demo"]
     assertEq (suggestions "watch demo --") #["--once"]
     assertEq (suggestions "logs demo wo") #["worker1", "worker2", "worker3"]
     assertEq (suggestions "run squares/v1 --input file.json --") #["--id"]

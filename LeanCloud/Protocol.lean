@@ -73,7 +73,7 @@ def decodeBytes (j : Json) : Except String ByteArray := do
 instance : Codec ByteArray := ⟨"bytes/v1", encodeBytes, decodeBytes⟩
 
 inductive ErrorKind where
-  | application | codec | divergence | missingBlob | integrity | invalidUtf8 | protocol | unsupported
+  | application | codec | divergence | missingBlob | integrity | invalidUtf8 | protocol | unsupported | cancelled
   deriving Repr, BEq, DecidableEq, ToJson, FromJson
 
 structure CloudError where

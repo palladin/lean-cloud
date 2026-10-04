@@ -12,7 +12,7 @@ abbrev Protected (program : SimM World α) := SchedulerOwnership.Program false p
 abbrev CloudProgram (program : Cloud (SimM World) α) := CloudEffects.Program (fun action => Protected action) program
 
 private theorem execute (codec : Codec α) (operation : Operation (SimM World) α)
-    (valid : CloudEffects.Request (fun action => Protected action) (.sequential codec operation)) :
+    (valid : CloudEffects.Request (fun action => Protected action) (.command codec operation)) :
     Protected (blobs.execute operation).run := by
   cases operation with
   | exec label body => exact Effects.except_lift _ valid

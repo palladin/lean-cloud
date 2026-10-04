@@ -24,10 +24,9 @@ mutual
 
   def Request : Control m α → Prop
     | .parallel _ _ branches => ∀ index, Program (branches index)
-    | .choice _ _ branches => ∀ index, Program (branches index)
-    | .sequential _ (.exec _ body) => allowed (body ())
-    | .delay | .fail _ | .sequential _ (.putBlob _) |
-        .sequential _ (.readBlob _) | .sequential _ (.resolveBlob _) => True
+    | .command _ (.exec _ body) => allowed (body ())
+    | .delay | .fail _ | .command _ (.putBlob _) |
+        .command _ (.readBlob _) | .command _ (.resolveBlob _) => True
   termination_by structural request => request
 end
 

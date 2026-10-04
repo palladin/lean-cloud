@@ -18,7 +18,9 @@ def commands : Array Item := #[
   ⟨"run", "Launch a cloud program"⟩, ⟨"ps", "List cloud processes"⟩,
   ⟨"inspect", "Inspect jobs and workers"⟩, ⟨"result", "Read a completed result"⟩,
   ⟨"watch", "Live code and resource graphs"⟩, ⟨"nodes", "Inspect deployment nodes"⟩,
-  ⟨"logs", "Read actor logs"⟩, ⟨"resume", "Recover an interrupted launch"⟩,
+  ⟨"logs", "Read actor logs"⟩, ⟨"resume", "Resume a paused run or repair a launch"⟩,
+  ⟨"pause", "Stop a run; preserve replay state for resume"⟩,
+  ⟨"kill", "Permanently cancel a run"⟩,
   ⟨"help", "Show commands"⟩, ⟨"quit", "Exit the console"⟩]
 
 structure Catalog where
@@ -90,7 +92,7 @@ def candidates (catalog : Catalog) (ctx : Context) : Array Item :=
     | [] => commands
     | ["run"] => catalog.programs
     | ["use"] => catalog.deployments
-    | ["inspect"] | ["result"] | ["watch"] | ["logs"] | ["resume"] => catalog.runs
+    | ["inspect"] | ["result"] | ["watch"] | ["logs"] | ["resume"] | ["pause"] | ["kill"] => catalog.runs
     | ["logs", _] => #[⟨"worker1", ""⟩, ⟨"worker2", ""⟩, ⟨"worker3", ""⟩, ⟨"scheduler", ""⟩]
     | ["watch", _] => #[⟨"--once", "Print one frame"⟩]
     | "run" :: _ :: rest =>

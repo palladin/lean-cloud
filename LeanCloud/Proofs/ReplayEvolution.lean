@@ -50,7 +50,7 @@ private theorem observed_create (worker : WorkerId) (key : String) (record : Rep
   trivial
 
 private theorem execute (codec : Codec α) (operation : Operation (SimM World) α)
-    (valid : CloudEffects.Request (fun action => Program action) (.sequential codec operation)) :
+    (valid : CloudEffects.Request (fun action => Program action) (.command codec operation)) :
     Program (blobs.execute operation).run := by
   cases operation with
   | exec label body => exact Effects.except_lift _ valid

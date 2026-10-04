@@ -15,7 +15,7 @@ structure Ports (allowed : {β : Type} → e β → Prop)
   read : ∀ key, Effects.Program allowed (store.read key)
   create : ∀ key record, Effects.Program allowed (store.create key record)
   execute : ∀ {β : Type} (codec : Codec β) (operation : Operation (EffF e) β),
-    CloudEffects.Request (fun action => Effects.Program allowed action) (.sequential codec operation) →
+    CloudEffects.Request (fun action => Effects.Program allowed action) (.command codec operation) →
       Effects.Program allowed (blobs.execute operation).run
 
 variable {allowed : {β : Type} → e β → Prop}
@@ -108,8 +108,7 @@ theorem walk_preserves (ports : Ports allowed store blobs) (assignment : Assignm
         split
         · exact finish ports _ _
         · trivial
-      | choice codec count branches => trivial
-      | sequential codec operation =>
+      | command codec operation =>
         have resumed := resume ports assignment.branch (Internal.decode codec)
           (fun decoded => walk store blobs assignment fuel encode (next.apply decoded)
             current.next (active || current == assignment.location))

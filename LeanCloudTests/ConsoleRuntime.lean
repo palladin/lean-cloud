@@ -25,6 +25,12 @@ private def waitFor (ctx : Context) (run : Run) (expected : Nat) : Cli Unit := d
     require (actual == expected) "Console run returned a different result"
   | _ => throw "Console run failed"
 
+private def stopped (ctx : Context) (run : Run) : Cli Unit := do
+  let actors := #["scheduler", "worker1", "worker2", "worker3"].map (ctx.container run)
+  let states ← docker (#["inspect", "--format", "{{.State.Running}} {{.HostConfig.RestartPolicy.Name}}"] ++ actors)
+  require (states.stdout.trimAscii.toString.splitOn "\n" == List.replicate 4 "false no")
+    "Stopped run has a live actor or an enabled restart policy"
+
 private def cleanup (ctx : Context) : Cli Unit := do
   let nodes ← docker #["ps", "-aq", "--filter", "label=lean-cloud.project=" ++ ctx.project] false
   let ids := nodes.stdout.splitOn "\n" |>.filter (!·.isEmpty) |>.toArray
@@ -95,6 +101,30 @@ private def demo : Cli Unit := do
     ctx.resume "recover"
     discard <| awaitOutcome ctx recover ((← request .now) + 120000)
     require ((← ctx.remote recover "result") == "files=16, errors=24") "Recovery returned a different report"
+    -- Pause preserves execution records and disables restart, while other runs
+    -- still use the shared services. Kill is terminal and can be retried.
+    ctx.launch "log-summary" (some inputFile.toString) (some "paused")
+    let paused ← ctx.loadRun "paused"
+    require (← ctx.outcome paused).isNone "Pause test missed the active run"
+    discard (command ctx ["pause", "paused"])
+    ctx.pause "paused"
+    stopped ctx paused
+    require ((← ctx.control "paused") == .paused) "Pause intent was not saved"
+    require (← ctx.outcome paused).isNone "Pause published a terminal result"
+    ctx.launch "log-summary" (some inputFile.toString) (some "killed")
+    let killed ← ctx.loadRun "killed"
+    require (← ctx.outcome killed).isNone "Kill test missed the active run"
+    discard (command ctx ["kill", "killed"])
+    stopped ctx killed
+    require ((← ctx.outcome killed) == some (.cancelled "Killed by user")) "Kill did not publish cancellation"
+    ctx.kill "killed"
+    require (← observing (ctx.resume "killed")).toOption.isNone "Killed run resumed"
+    stopped ctx paused
+    ctx.resume "paused"
+    discard <| awaitOutcome ctx paused ((← request .now) + 120000)
+    require ((← ctx.remote paused "result") == "files=16, errors=24") "Pause/resume changed the result"
+    ctx.kill "first"
+    waitFor ctx first 29
     ctx.launch "log-summary" (some inputFile.toString) (some "shutdown")
     let interrupted ← ctx.loadRun "shutdown"
     require (← ctx.outcome interrupted).isNone "Shutdown test missed the active run"
@@ -105,10 +135,12 @@ private def demo : Cli Unit := do
     ctx.down
     ctx.up
     waitFor ctx first 29
+    require ((← ctx.outcome killed) == some (.cancelled "Killed by user")) "Shutdown lost cancellation"
+    require (← observing (ctx.resume "killed")).toOption.isNone "Killed run resumed after deployment restart"
     ctx.resume "shutdown"
     discard <| awaitOutcome ctx interrupted ((← request .now) + 120000)
     require ((← ctx.remote interrupted "result") == "files=16, errors=24") "Run failed to resume after shutdown"
-    printLine "Console tests passed: registry, validation, concurrent runs, image retention, typed results, source events, and completed recovery."
+    printLine "Console tests passed: registry, validation, concurrent runs, image retention, typed results, source events, crash recovery, pause/resume, and terminal kill."
   finally
     cleanup ctx
     printLine s!"Console test catalog retained: {ctx.home}"

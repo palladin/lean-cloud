@@ -116,7 +116,7 @@ private theorem checked_then (expected : Journal) (request : Request) (outcome :
   subst actual
   simpa only [Internal.check, beq_self_eq_true, ite_true] using! continued
 
-/-- The actual sequential case records its pure result before continuing.
+/-- The command case records its pure result before continuing.
 The continuation receives both the value and its durable presence assertion. -/
 theorem exec_then (expected : Journal) (worker : WorkerId) (current : Location)
     (codec : Codec α) (label : String) (body : Unit → α) (pre : World → Prop)
@@ -316,7 +316,7 @@ theorem active_bounded (expected : Journal)
       apply Rules.Program.weaken_post _ _ (ReplayContracts.preserve_record expected _ _
         (continued worker assignment encode (by simpa using branch) known fuel))
       intro result world invariant holds
-      exact ⟨holds.1.1.lift (fun _ path => path.sequential codec (.exec label (fun _ => pure (body ()))) next _ _ _
+      exact ⟨holds.1.1.lift (fun _ path => path.command codec (.exec label (fun _ => pure (body ()))) next _ _ _
         nonempty holds.2 (by simp) rfl roundtrip), holds.1.2.1.succ, holds.1.2.2.next nonempty⟩
   | parallelOk codec count branches next outcomes roundtrip children returned collected present rest ihChildren ih =>
     obtain ⟨bound, continued⟩ := ih (by simpa [LeanCloud.Location.next] using nonempty)

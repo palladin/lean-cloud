@@ -111,6 +111,44 @@ missing data before resuming. Use `deploy` when your application code changes.
 Resume each unfinished run explicitly. Completed results remain available after
 services restart. `quit` only closes the console.
 
+## Pause and kill a run
+
+```text
+cloud> pause logs-1
+cloud> ps
+cloud> resume logs-1
+cloud> kill logs-1
+cloud> result logs-1
+```
+
+`pause RUN` disables automatic restart and stops only that run's scheduler and
+workers. Shared services and other runs keep running. The broker messages,
+private scheduler database, and global replay records remain available.
+`resume RUN` restores the restart policy and reconstructs execution from those
+records. This stops containers and replays on resume; it does not freeze their
+in-memory continuations. An interrupted `Cloud.exec` may execute again if its
+result was not recorded, so external actions still need retry-safe behavior.
+
+`kill RUN` stops those same containers and creates a terminal cancellation in
+the run's global root record. It cannot overwrite an existing result: if normal
+completion won the race, that result is preserved. A killed run cannot be resumed
+or reuse its ID; use a new run ID to start again. Killing does not undo external
+actions or delete the run's data. Typed process handles report a `cancelled`
+`CloudError`.
+
+These commands use the deployment and per-run locks, and save their intent in
+the local catalog before changing containers. After an interrupted command,
+`ps` / `inspect` show `pausing` or `killing`; retry the same command. A pending
+kill blocks resume until cancellation is resolved. A kill needs blob storage to
+record its result, but stopping the actors happens first. The runtime's low-level
+`cancel` command only writes that result and must be called after all actors stop;
+use the console's `kill` command to perform the complete operation.
+
+The pinned application image must include the runtime's `cancel` command for
+kill to finish. Rebuild with this SDK before launching new runs. Existing runs
+retain their original image; an older image without that command can be paused,
+but kill will stop its actors and report the unsupported command.
+
 This first console preserves the existing per-run scheduler and worker algorithm.
 It does not introduce a shared worker pool or a scheduler that assigns across runs.
 Each scheduler remains the sole writer of its own SQLite state through lean-linq.
@@ -219,8 +257,8 @@ It uses typed Eff requests with an IO handler. Your application only supplies th
 registry; it does not implement command dispatch or connection setup.
 
 The runtime application exposes `programs`, `validate`, `submit-entry`, `worker`,
-`scheduler`, `status`, and `outcome`; the console discovers that registry from the
-built image. Register additional programs in the application and redeploy. There
+`scheduler`, `status`, `outcome`, `result`, and `cancel`; the console discovers that
+registry from the built image. Register additional programs in the application and redeploy. There
 is no closure serialization or runtime compilation of submitted source.
 
 A typed client can also call `program.submit config id input`, receiving a
@@ -301,10 +339,10 @@ live/stopped source markers at several terminal widths. Docker integration tests
 validate the typed registry and compare an instrumented workflow against direct
 evaluation, including durable typed results and conflicting submissions.
 
-Pure effect tests execute complete deployment, launch/resume, inspection and REPL
-commands, plus keyboard navigation and timed live-view refresh. They inject host
-failures throughout deployment, launch and watch to check lock and terminal
-cleanup, and separately check finalizer error propagation.
+Pure effect tests execute complete deployment, launch/resume, pause/kill,
+inspection and REPL commands, plus keyboard navigation and timed live-view refresh.
+They inject host failures throughout deployment, launch, pause, kill and watch
+to check lock and terminal cleanup, and separately check finalizer error propagation.
 Shell tests cover prompt placement, resizing, completion, file paths with spaces,
 history, UTF-8 input, bracketed paste and handing terminal ownership to `watch`.
 Deployment-command tests cover persistent selection, conflicting names, corrupt
@@ -319,6 +357,8 @@ SIGINT recovery, and cleanup of descendants, including when their parent exits f
 Run `lake exe cloud_console_tests` for the console's Docker smoke test. It checks
 input rejection before launch, concurrent runs, retained images after replacing
 the build tag, source events, and recovery after killing a worker and scheduler.
+It also checks pause/resume, disabled restart policies, terminal cancellation,
+preserved completed results, and cancellation after deployment restart.
 It cleans up its own containers, volumes, and image tags and retains its local
 catalog for diagnosis.
 

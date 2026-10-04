@@ -28,7 +28,7 @@ private theorem Resumable.continuation {m : Type → Type u} {journal current ta
     | .impure control next =>
       match control with
       | .delay => Resumable journal encode (next.apply ()) current target
-      | .sequential codec operation =>
+      | .command codec operation =>
         ∃ record wire value,
           journal.lookup (ReplayStore.valueKey current) = some record ∧
           (record.request == Internal.request codec operation) = true ∧
@@ -47,7 +47,7 @@ private theorem Resumable.continuation {m : Type → Type u} {journal current ta
   cases witness with
   | here => exact False.elim (before rfl)
   | delay _ _ rest => exact ⟨_, _, _, _, rest⟩
-  | sequential _ _ _ record wire value _ present checked success decoded rest =>
+  | command _ _ _ record wire value _ present checked success decoded rest =>
     exact ⟨record, wire, value, present, checked, success, decoded, _, _, _, _, rest⟩
   | joined _ _ _ _ record wire values _ skip present checked success decoded size rest =>
     exact Or.inr ⟨skip, record, wire, values, present, checked, success, decoded, size, _, _, _, _, rest⟩
@@ -68,7 +68,7 @@ theorem Prefix.in_snapshot {m : Type → Type u} {expected journal : Journal}
   | here encode program => exact .here encode program
   | delay next before rest ih =>
     exact .delay next before (ih (available.continuation before))
-  | sequential codec operation next record wire value before present checked success decoded rest ih =>
+  | command codec operation next record wire value before present checked success decoded rest ih =>
     obtain ⟨actual, actualWire, actualValue, found, _, succeeded, decodedActual, path⟩ := available.continuation before
     have same := Option.some.inj ((consistent _ _ found).symm.trans present)
     subst actual
@@ -76,7 +76,7 @@ theorem Prefix.in_snapshot {m : Type → Type u} {expected journal : Journal}
     subst actualWire
     have sameValue := Except.ok.inj (decodedActual.symm.trans decoded)
     subst actualValue
-    exact .sequential codec operation next record wire value before found checked success decoded (ih path)
+    exact .command codec operation next record wire value before found checked success decoded (ih path)
   | joined codec count branches next record wire values before skip present checked success decoded size rest ih =>
     rcases available.continuation before with ⟨_, enters, _, _⟩ | ⟨_, actual, actualWire, actualValues, found, _, succeeded, decodedActual, _, path⟩
     · simp [skip] at enters
@@ -129,19 +129,19 @@ theorem Resumable.delay {m : Type → Type u} {journal current target} {encode :
   · obtain ⟨β, remainingEncode, remaining, steps, witness⟩ := rest
     exact ⟨β, remainingEncode, remaining, steps + 1, .delay next same witness⟩
 
-theorem Resumable.sequential {m : Type → Type u} {journal current target} {encode : β → Json}
+theorem Resumable.command {m : Type → Type u} {journal current target} {encode : β → Json}
     (codec : Codec α) (operation : Operation m α) (next : ArrsF (Control m) α β)
     (record : ReplayRecord) (wire : Json) (value : α) (nonempty : 0 < current.size)
     (present : journal.lookup (ReplayStore.valueKey current) = some record)
     (checked : (record.request == Internal.request codec operation) = true)
     (success : record.outcome = .success wire) (decoded : codec.decode wire = .ok value)
     (rest : Resumable journal encode (next.apply value) current.next target) :
-    Resumable journal encode (.impure (.sequential codec operation) next) current target := by
+    Resumable journal encode (.impure (.command codec operation) next) current target := by
   obtain ⟨γ, remainingEncode, remaining, steps, witness⟩ := rest
   have edge := next_follows current nonempty
   have later := witness.follows (Nat.lt_of_lt_of_le nonempty edge.depth)
   exact ⟨γ, remainingEncode, remaining, steps + 1,
-    .sequential codec operation next record wire value (different_follows edge later (next_ne current nonempty))
+    .command codec operation next record wire value (different_follows edge later (next_ne current nonempty))
       present checked success decoded witness⟩
 
 theorem Resumable.joined {m : Type → Type u} {journal current target} {encode : β → Json}

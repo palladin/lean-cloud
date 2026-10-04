@@ -26,6 +26,8 @@ private def process (completed : Bool) (call : Invocation) : Except String Proce
     response (toJson (if completed then some (Exit.success (toJson (29 : Nat))) else none)).compress
   else if args.contains "status" then response (toJson ({} : Scheduler.State)).compress
   else if args.contains "result" then response "29"
+  else if args.contains "cancel" then
+    response (toJson (if completed then Exit.success (toJson (29 : Nat)) else .cancelled "Killed by user")).compress
   else if args[0]? == some "logs" then
     let worker := (args.back?.getD "").splitOn "-" |>.getLast!
     let event : ExecutionEvent := ⟨"boot", 1, 10, worker, some 1, "0:1", "execute", "square"⟩
@@ -45,7 +47,7 @@ private def process (completed : Bool) (call : Invocation) : Except String Proce
   else if args.toList.take 2 == ["container", "inspect"] then return { exitCode := 1 }
   else if args.toList.take 2 == ["image", "inspect"] then response "sha256:pinned\n"
   else if args[0]? == some "compose" || args[0]? == some "tag" ||
-      args[0]? == some "stop" || args[0]? == some "rm" ||
+      args[0]? == some "stop" || args[0]? == some "rm" || args[0]? == some "update" ||
       args.toList.take 2 == ["volume", "create"] || args.contains "submit-entry" ||
       args.toList.take 2 == ["run", "-d"] then response
   else throw s!"Unexpected Docker request: {reprStr args}"
@@ -67,6 +69,94 @@ private def checked (program : Cli α) (world : World) : IO (α × World) := do
   return (← unwrap result, world)
 
 def consoleEffectCases : Array TestCase := #[
+  ⟨"console.effects.pause-resume-and-kill", do
+    let initial := launched false
+    let (_, paused) ← checked (command ctx ["pause", "one"]) initial
+    let (control, _) ← checked (ctx.control "one") paused
+    assertTrue (control == .paused) "Pause was not persisted"
+    assertEq (paused.processes.map (·.args.toList)) #[
+      ["ps", "-aq", "--filter", "label=lean-cloud.project=" ++ ctx.project, "--filter", "label=lean-cloud.run=one"],
+      ["update", "--restart", "no", "node1"], ["stop", "--time", "0", "node1"]]
+    assertEq (paused.file (ctx.directory "one" / "run.json")) (initial.file (ctx.directory "one" / "run.json"))
+    let (_, resumed) ← checked (ctx.resume "one") paused
+    let (control, _) ← checked (ctx.control "one") resumed
+    assertTrue (control == .active) "Resume did not clear pause"
+    let (_, killed) ← checked (command ctx ["kill", "one"]) resumed
+    let (control, _) ← checked (ctx.control "one") killed
+    assertTrue (control == .killed) "Kill was not persisted"
+    let (result, blocked) := ConsoleModel.run (ctx.resume "one") killed
+    assertTrue result.toOption.isNone "Killed run could be resumed"
+    assertEq blocked.processes.size killed.processes.size "Killed run invoked Docker on resume"
+    let (_, retried) ← checked (ctx.kill "one") killed
+    assertTrue retried.locks.isEmpty "Kill leaked locks"⟩,
+  ⟨"console.effects.kill-keeps-completed-result", do
+    let (_, world) ← checked (ctx.kill "one") (launched true)
+    assertTrue (has world.stdout "already completed") "Kill overwrote normal completion"
+    let (control, _) ← checked (ctx.control "one") world
+    assertTrue (control == .active) "Completed result was mislabeled killed"
+    let (_, inspected) ← checked (command ctx ["inspect", "one"]) { world with
+      process := fun call => if call.args.contains "status" then .error "Scheduler stopped" else process true call }
+    assertTrue (has inspected.stdout "Outcome: completed") "Completed inspection needed a live scheduler"⟩,
+  ⟨"console.effects.interrupted-kill-remains-blocked-and-retryable", do
+    let initial := launched false
+    let (_, success) ← checked (ctx.kill "one") initial
+    for index in [:success.trace.size] do
+      if success.trace[index]! == "unlock" then continue
+      let (_, interrupted) := ConsoleModel.run (ctx.kill "one") { initial with failAt := some index }
+      assertTrue interrupted.locks.isEmpty s!"Kill leaked a lock at {index}"
+      let clean := { interrupted with failAt := none }
+      let (control, _) ← checked (ctx.control "one") clean
+      if control == .killing || control == .killed then
+        let (result, _) := ConsoleModel.run (ctx.resume "one") clean
+        assertTrue result.toOption.isNone "Interrupted kill allowed resume"
+      let (_, retried) ← checked (ctx.kill "one") clean
+      let (control, _) ← checked (ctx.control "one") retried
+      assertTrue (control == .killed) s!"Retry failed after interruption at {index}"⟩,
+  ⟨"console.effects.interrupted-pause-is-retryable", do
+    let initial := launched false
+    let (_, success) ← checked (ctx.pause "one") initial
+    for index in [:success.trace.size] do
+      if success.trace[index]! == "unlock" then continue
+      let (_, interrupted) := ConsoleModel.run (ctx.pause "one") { initial with failAt := some index }
+      assertTrue interrupted.locks.isEmpty s!"Pause leaked a lock at {index}"
+      let (_, retried) ← checked (ctx.pause "one") { interrupted with failAt := none }
+      let (control, _) ← checked (ctx.control "one") retried
+      assertTrue (control == .paused) s!"Pause retry failed at {index}"⟩,
+  ⟨"console.effects.control-status-with-unavailable-results", do
+    for control in [RunControl.pausing, .paused, .killing, .killed] do
+      let initial := (launched false).json (ctx.directory "one" / "control.json") control
+      let offline := { initial with
+        directories := initial.directories.push ctx.runs.toString
+        process := fun call =>
+          if call.args.contains "outcome" then .error "Blob service unavailable"
+          else if call.args.contains "status" then .error "Stopped scheduler must not be queried"
+          else process false call }
+      for args in [["ps"], ["inspect", "one"], ["watch", "one", "--once"]] do
+        let (_, world) ← checked (command ctx args) offline
+        assertTrue (has world.stdout control.label) s!"Missing status: {control.label}"
+        assertTrue (!world.processes.any (·.args.contains "status")) "Queried a stopped scheduler"⟩,
+  ⟨"console.effects.resume-restores-existing-container-policy", do
+    let initial := (launched false).json (ctx.directory "one" / "control.json") RunControl.paused
+    let handle (call : Invocation) :=
+      if call.args.toList.take 2 == ["container", "inspect"] then
+        response (toJson #[Json.mkObj [("Image", toJson savedRun.image),
+          ("Config", Json.mkObj [("Labels", Json.mkObj [("lean-cloud.project", toJson ctx.project),
+            ("lean-cloud.run", toJson savedRun.id)])])]]).compress
+      else if call.args[0]? == some "start" then response
+      else process false call
+    let (_, resumed) ← checked (ctx.resume "one") { initial with process := handle }
+    for role in ["scheduler", "worker1", "worker2", "worker3"] do
+      let name := ctx.container savedRun role
+      let updates := resumed.processes.filter (·.args.back? == some name)
+      assertEq (updates.map (·.args.toList)) #[["container", "inspect", name],
+        ["update", "--restart", "on-failure", name], ["start", name]]
+    let failing (call : Invocation) :=
+      if call.args[0]? == some "start" then .error "Interrupted startup" else handle call
+    let (result, interrupted) := ConsoleModel.run (ctx.resume "one") { initial with process := failing }
+    assertTrue result.toOption.isNone "Startup failure was swallowed"
+    let (control, _) ← checked (ctx.control "one") interrupted
+    assertTrue (control == .active) "Partially resumed run was still labeled paused"⟩,
+
   ⟨"console.effects.down-preserves-data", do
     let initial := launched
     let (_, world) ← checked (discard (command ctx ["down"])) initial

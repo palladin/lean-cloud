@@ -19,6 +19,18 @@ structure Run where
   input : Json
   deriving FromJson, ToJson
 
+/-- Intent is saved before changing containers, so interrupted commands can be retried. -/
+inductive RunControl where
+  | active | pausing | paused | killing | killed
+  deriving BEq, FromJson, ToJson
+
+def RunControl.label : RunControl → String
+  | .active => "running"
+  | .pausing => "pausing (retry pause)"
+  | .paused => "paused"
+  | .killing => "killing (retry kill)"
+  | .killed => "killed"
+
 structure Context where
   root : System.FilePath
   project : String := "lean-cloud-console"

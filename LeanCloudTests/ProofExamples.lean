@@ -31,7 +31,7 @@ private theorem nested_meaning [Monad m] (captured : Bool) : Pure.Evaluation (ne
   · simpa [ArrsF.apply, ArrsF.viewL] using Pure.Evaluation.pure (m := m) captured
 
 private def source [Monad m] (_ : Unit) : Cloud m Json :=
-  .impure (.sequential (inferInstance : Codec Bool) (.exec "captured" fun _ => pure true))
+  .impure (.command (inferInstance : Codec Bool) (.exec "captured" fun _ => pure true))
     (.one fun captured =>
       .impure (.parallel (inferInstance : Codec Bool) 2
         (fun index => if index.val = 0 then nested captured else child (!captured)))

@@ -28,8 +28,7 @@ mutual
     match request with
     | .delay => pure ()
     | .fail error => throw error
-    | .sequential _ operation => blobs.execute operation
-    | .choice .. => throw ⟨.unsupported, "Choice is not implemented yet"⟩
+    | .command _ operation => blobs.execute operation
     | .parallel _ _ branches => do
       let outcomes ← liftM (m := m)
         (Array.ofFnM fun index => (eval blobs (branches index)).run)

@@ -2,7 +2,6 @@
 
 [![CI](https://github.com/palladin/lean-cloud/actions/workflows/ci.yml/badge.svg)](https://github.com/palladin/lean-cloud/actions/workflows/ci.yml)
 [![Lean 4](https://img.shields.io/badge/Lean-v4.34.1-blue)](https://leanprover.github.io/)
-[![Runtime](https://img.shields.io/badge/Runtime-SQLite%20%7C%20RabbitMQ%20%7C%20S3-informational)](LeanCloud/Deployment.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
 Parallel and distributed programming for Lean.
@@ -67,6 +66,7 @@ inspect them, and `down` / `up` to stop and restart services while preserving da
 
 The CLI generates the deployment configuration and builds your executable in
 Docker. `ps` lists runs; `watch RUN` shows runtime activity and resource graphs.
+Use `pause RUN` / `resume RUN` to stop and continue a run, or `kill RUN` to cancel it permanently.
 See the [console guide](LeanCloud/Console.md) for inputs, registration, and recovery.
 
 Once the workers finish, read the saved report:
@@ -120,5 +120,5 @@ durable result equals direct evaluation, even after crashes and message redelive
 With sufficient interpreter fuel and recurring opportunities to execute an
 assignment and save its report before expiry, the workflow eventually finishes
 with that same result. These execution and delivery assumptions are explicit
-in the [proof guide](LeanCloud/Proofs/README.md). Choice, cancellation, and
-provider-specific deployment automation remain future work.
+in the [proof guide](LeanCloud/Proofs/README.md). Administrative pause/kill commands
+are tested separately; the theorems describe workflow evaluation and recovery.

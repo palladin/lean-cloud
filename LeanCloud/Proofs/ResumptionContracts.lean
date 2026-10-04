@@ -55,7 +55,7 @@ theorem replay (expected journal : Journal) (worker : WorkerId) (assignment : As
     | zero => exact exhausted (Nat.zero_lt_succ _)
     | succ fuel =>
       simpa only [walk, Bool.false_or, beq_eq_false_iff_ne.mpr before] using ih fuel (fun smaller => exhausted (by omega)) (fun remainingFuel same => continued remainingFuel (by omega))
-  | sequential codec operation next record wire value before present checked success decoded rest ih =>
+  | command codec operation next record wire value before present checked success decoded rest ih =>
     cases fuel with
     | zero => exact exhausted (Nat.zero_lt_succ _)
     | succ fuel =>

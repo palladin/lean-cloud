@@ -101,7 +101,7 @@ theorem exec_missing (journal : Journal) (blobs : BlobStorage M) (assignment : A
     (roundtrip : codec.decode (codec.encode (body ())) = .ok (body ())) :
     let operation : Operation M α := .exec label (fun _ => pure (body ()))
     let record : ReplayRecord := ⟨Internal.request codec operation, .success (codec.encode (body ()))⟩
-    (walk store blobs assignment (fuel + 1) encode (.impure (.sequential codec operation) next) current true).run journal =
+    (walk store blobs assignment (fuel + 1) encode (.impure (.command codec operation) next) current true).run journal =
       (walk store blobs assignment fuel encode (next.apply (body ())) current.next true).run
         ((ReplayStore.valueKey current, record) :: journal) := by
   dsimp only
@@ -122,7 +122,7 @@ theorem exec_present (journal : Journal) (blobs : BlobStorage M) (assignment : A
         .success (codec.encode (body ()))⟩)
     (roundtrip : codec.decode (codec.encode (body ())) = .ok (body ())) :
     (walk store blobs assignment (fuel + 1) encode
-      (.impure (.sequential codec (.exec label (fun _ => pure (body ())))) next) current true).run journal =
+      (.impure (.command codec (.exec label (fun _ => pure (body ())))) next) current true).run journal =
       (walk store blobs assignment fuel encode (next.apply (body ())) current.next true).run journal := by
   rw [walk]
   simp only [Bool.true_or]
@@ -143,7 +143,7 @@ theorem exec_within (journal expected : Journal) (blobs : BlobStorage M) (assign
     let record : ReplayRecord := ⟨Internal.request codec operation, .success (codec.encode (body ()))⟩
     ∃ after, Extends journal after ∧ Extends after expected ∧
       after.lookup (ReplayStore.valueKey current) = some record ∧
-      ∀ fuel, (walk store blobs assignment (fuel + 1) encode (.impure (.sequential codec operation) next) current true).run journal =
+      ∀ fuel, (walk store blobs assignment (fuel + 1) encode (.impure (.command codec operation) next) current true).run journal =
         (walk store blobs assignment fuel encode (next.apply (body ())) current.next true).run after := by
   dsimp only
   have accepted := create_within journal expected _ _ consistent known

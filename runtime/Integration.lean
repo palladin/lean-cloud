@@ -30,6 +30,17 @@ private def checkPrograms (config : Config) (runPrefix : String) : IO Unit := do
     pure false
   catch _ => pure true
   assertTrue conflict "Conflicting typed submission overwrote a run"
+  assertEq (← cancel config process.id) (.success (toJson (29 : Nat)))
+    "Administrative cancellation overwrote a completed result"
+  let killed ← sumSquares.submit config (runPrefix ++ "-killed") input
+  for _ in [:2] do
+    assertEq (← cancel config killed.id) (.cancelled "Killed by user")
+  assertOutcome (← killed.await) (.error ⟨.cancelled, "Killed by user"⟩)
+  -- Killing a locally registered run also works if submission never reached S3.
+  let unfinished := runPrefix ++ "-unfinished-launch"
+  assertEq (← cancel config unfinished) (.cancelled "Killed by user")
+  let late ← sumSquares.submit config unfinished input
+  assertOutcome (← late.await) (.error ⟨.cancelled, "Killed by user"⟩)
 
 private def checkAdapters (config : Config) (runPrefix : String) : IO Unit := do
   S3.initializeBucket config.blobs

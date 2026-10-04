@@ -70,6 +70,11 @@ Container tests exercise actual mailbox transport, multiple worker processes, an
 restarts. Chaos plans are generated before execution and recorded with logs; the
 seed reproduces the plan, not OS timing.
 
+Console tests cover pause/resume and permanent kill, including interrupted
+commands, restart policies, and isolation between runs. Real runtime tests check
+that typed process handles observe cancellation, repeated cancellation preserves
+the same root record, and a completed result cannot be overwritten by kill.
+
 Arbitrary interacting IO effects need not commute. Differential cases use pure
 computations and immutable blob operations; they do not claim that scheduling
 preserves the behavior of all user-provided IO actions.

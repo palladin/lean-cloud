@@ -22,7 +22,7 @@ inductive Prefix {m : Type → Type u} (journal : Journal) (target : Location) :
       (next : ArrsF (Control m) Unit α) (before : current ≠ target)
       (rest : Prefix journal target encode (next.apply ()) current steps remainingEncode remaining) :
       Prefix journal target encode (.impure .delay next) current (steps + 1) remainingEncode remaining
-  | sequential {encode : β → Json} {remainingEncode : γ → Json} {remaining : Cloud m γ} {current steps}
+  | command {encode : β → Json} {remainingEncode : γ → Json} {remaining : Cloud m γ} {current steps}
       (codec : Codec α) (operation : Operation m α) (next : ArrsF (Control m) α β)
       (record : ReplayRecord) (wire : Json) (value : α)
       (before : current ≠ target)
@@ -30,7 +30,7 @@ inductive Prefix {m : Type → Type u} (journal : Journal) (target : Location) :
       (checked : (record.request == Internal.request codec operation) = true)
       (success : record.outcome = .success wire) (decoded : codec.decode wire = .ok value)
       (rest : Prefix journal target encode (next.apply value) current.next steps remainingEncode remaining) :
-      Prefix journal target encode (.impure (.sequential codec operation) next) current (steps + 1)
+      Prefix journal target encode (.impure (.command codec operation) next) current (steps + 1)
         remainingEncode remaining
   | joined {encode : β → Json} {remainingEncode : γ → Json} {remaining : Cloud m γ} {current steps}
       (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
@@ -60,8 +60,8 @@ theorem Prefix.extend {m : Type → Type u} {before after : Journal}
   induction witness with
   | here encode program => exact .here encode program
   | delay next earlier rest ih => exact .delay next earlier ih
-  | sequential codec operation next record wire value earlier present checked success decoded rest ih =>
-    exact .sequential codec operation next record wire value earlier (extension _ _ present)
+  | command codec operation next record wire value earlier present checked success decoded rest ih =>
+    exact .command codec operation next record wire value earlier (extension _ _ present)
       checked success decoded ih
   | joined codec count branches next record wire values earlier skip present checked success decoded size rest ih =>
     exact .joined codec count branches next record wire values earlier skip (extension _ _ present)
@@ -79,7 +79,7 @@ theorem Prefix.follows {m : Type → Type u} {journal : Journal}
   induction witness with
   | here encode program => exact .refl _ nonempty
   | delay next before rest ih => exact ih nonempty
-  | sequential codec operation next record wire value before present checked success decoded rest ih =>
+  | command codec operation next record wire value before present checked success decoded rest ih =>
     exact (next_follows _ nonempty).trans (ih (by simpa [LeanCloud.Location.next] using nonempty))
   | joined codec count branches next record wire values before skip present checked success decoded size rest ih =>
     exact (next_follows _ nonempty).trans (ih (by simpa [LeanCloud.Location.next] using nonempty))
@@ -103,13 +103,13 @@ theorem Prefix.append {m : Type → Type u} {journal : Journal}
     have later := suffix.follows (Nat.lt_of_lt_of_le nonempty earlier.depth)
     simpa only [Nat.add_right_comm _ 1 tailSteps] using
       Prefix.delay next (different_follows earlier later before) (ih suffix nonempty)
-  | sequential codec operation next record wire value before present checked success decoded rest ih =>
+  | command codec operation next record wire value before present checked success decoded rest ih =>
     have edge := next_follows _ nonempty
     have nonemptyNext := Nat.lt_of_lt_of_le nonempty edge.depth
     have earlier := edge.trans (rest.follows nonemptyNext)
     have later := suffix.follows (Nat.lt_of_lt_of_le nonempty earlier.depth)
     simpa only [Nat.add_right_comm _ 1 tailSteps] using
-      Prefix.sequential codec operation next record wire value (different_follows earlier later before)
+      Prefix.command codec operation next record wire value (different_follows earlier later before)
         present checked success decoded (ih suffix nonemptyNext)
   | joined codec count branches next record wire values before skip present checked success decoded size rest ih =>
     have edge := next_follows _ nonempty
@@ -143,7 +143,7 @@ theorem replay_reaches_continuation (journal : Journal) (blobs : BlobStorage M)
   | delay next before rest ih =>
     rw [Nat.add_right_comm _ 1 fuel, walk]
     simpa [beq_eq_false_iff_ne.mpr before] using ih
-  | sequential codec operation next record wire value before present checked success decoded rest ih =>
+  | command codec operation next record wire value before present checked success decoded rest ih =>
     rw [Nat.add_right_comm _ 1 fuel, walk]
     simp [beq_eq_false_iff_ne.mpr before]
     erw [read_then]

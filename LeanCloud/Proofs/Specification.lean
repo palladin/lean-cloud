@@ -34,7 +34,7 @@ inductive Complete {m : Type → Type u} [Monad m] (journal : Journal) :
           .success (codec.encode (body ()))⟩)
       (rest : Complete journal current.next (next.apply (body ())) outcome) :
       Complete journal current
-        (.impure (.sequential codec (.exec label (fun _ => pure (body ())))) next) outcome
+        (.impure (.command codec (.exec label (fun _ => pure (body ())))) next) outcome
   | parallelOk (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
       (next : ArrsF (Control m) (Array α) β) (outcomes : Fin count → Except CloudError α)
       (roundtrip : Pure.RoundTrips codec)
@@ -101,7 +101,7 @@ private theorem continuation_meanings {m : Type → Type u} [Monad m] {α : Type
     | .impure control next =>
       match control with
       | .delay => Complete journal current (next.apply ()) outcome
-      | .sequential codec _ =>
+      | .command codec _ =>
         ∀ record wire value,
           journal.lookup (ReplayStore.valueKey current) = some record →
           record.outcome = .success wire → codec.decode wire = .ok value →
@@ -163,7 +163,7 @@ theorem Complete.resume {m : Type → Type u} [Monad m] {α β : Type}
   | here encode program => exact ⟨outcome, complete, returned⟩
   | delay next before rest ih =>
     exact ih (continuation_meanings complete) returned
-  | sequential codec operation next record wire value before present checked success decoded rest ih =>
+  | command codec operation next record wire value before present checked success decoded rest ih =>
     exact ih (continuation_meanings complete record wire value (consistent _ _ present) success decoded)
       (by simpa using returned)
   | joined codec count branches next record wire values before skip present checked success decoded size rest ih =>
