@@ -16,6 +16,49 @@ private def takeJob (state : Pool.State) (worker : String) : IO (Pool.State × S
 private def initial : Pool.State := { runs := #[⟨"first", .active, {}⟩, ⟨"second", .active, {}⟩] }
 
 def poolCases : Array TestCase := #[
+  ⟨"pool.legacy-state-defaults-to-unconfigured-membership", do
+    let state : Pool.State ← unwrap (fromJson? (Json.mkObj [
+      ("runs", toJson initial.runs), ("cursor", toJson initial.cursor)]))
+    assertTrue state.membership.active.isNone "Legacy state acquired an empty pool"
+    discard (takeJob state "worker1")⟩,
+  ⟨"pool.elastic-drain-preserves-running-work", do
+    let state ← change initial (.configureWorkers #["worker1", "worker2"])
+    let (state, id, job) ← takeJob state "worker2"
+    let smaller ← change state (.configureWorkers #["worker1"])
+    assertTrue (Pool.valid smaller id "worker2" job.attempt) "Scale-down revoked an executing assignment"
+    let (_, reply) := Pool.acquire 100 smaller "worker2"
+    let .drain generation := reply | throw (IO.userError "Retiring worker got more work")
+    let finished := Pool.report smaller id ⟨"worker2", job.attempt, .ok .done, #[]⟩
+    assertTrue (finished.runs.any (fun run => run.id == id && run.scheduler.finished)) "Drain lost current result"
+    let retired := Pool.drained finished "worker2" generation
+    assertTrue (retired.membership.drained.contains "worker2") "Drain acknowledgement lost"
+    assertEq (toJson (Pool.drained retired "worker2" generation)).compress (toJson retired).compress
+    let restored : Pool.State ← unwrap (fromJson? (toJson (Pool.recover retired)))
+    assertTrue (restored.membership.drained.contains "worker2") "Restart forgot retired worker"⟩,
+  ⟨"pool.elastic-stale-drain-cannot-retire-rejoined-worker", do
+    let old ← change initial (.configureWorkers #["worker1"])
+    let generation := old.membership.generation
+    let joined ← change old (.configureWorkers #["worker1", "worker2"])
+    let (joined, id, job) ← takeJob joined "worker2"
+    let stale := Pool.drained joined "worker2" generation
+    assertEq (toJson stale).compress (toJson joined).compress
+    assertTrue (Pool.valid stale id "worker2" job.attempt) "Stale acknowledgement revoked new work"
+    let smaller ← change stale (.configureWorkers #["worker1"])
+    let stale := Pool.drained smaller "worker2" generation
+    assertTrue (!stale.membership.drained.contains "worker2") "Old generation acknowledged a later drain"
+    assertTrue (Pool.valid stale id "worker2" job.attempt) "Old drain fenced active computation"⟩,
+  ⟨"pool.elastic-zero-retry-and-stopped-worker", do
+    let (busy, id, job) ← takeJob initial "worker1"
+    let empty ← change busy (.configureWorkers #[])
+    let retry ← change empty (.configureWorkers #[])
+    assertEq retry.membership.generation empty.membership.generation
+    let stopped ← change retry (.workerStopped "worker1" retry.membership.generation)
+    assertTrue (!Pool.valid stopped id "worker1" job.attempt) "Stopped worker retained an assignment"
+    let joined ← change stopped (.configureWorkers #["worker2"])
+    assertTrue (joined.membership.drained.contains "worker1") "Another resize forgot stopped worker"
+    let (joined, _, _) ← takeJob joined "worker2"
+    let (_, reply) := Pool.acquire 100 joined "worker1"
+    assertTrue (match reply with | .drain _ => true | _ => false) "Retired worker reacquired work"⟩,
   ⟨"pool.shared-workers-route-and-rotate", do
     let (state, run, first) ← takeJob initial "worker1"
     assertEq run "first"

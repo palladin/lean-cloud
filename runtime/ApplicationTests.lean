@@ -22,7 +22,9 @@ private def host : HostOp α → StateM World (Except String α)
 
 private def service : Application.Service α → StateM World (Except String α)
   | .submit _ _ entry _ => do modify (fun w => { w with services := w.services.push entry }); return .ok ()
-  | .health _ | .serveScheduler _ | .serveWorker _ | .control _ _ _ => return .ok ()
+  | .health _ | .serveScheduler _ | .serveWorker _ | .control _ _ _
+  | .configure _ _ | .workerStopped _ _ _ => return .ok ()
+  | .membership _ => return .ok {}
   | .scheduler _ _ => do modify (fun w => { w with services := w.services.push "scheduler" }); return .ok ()
   | .worker _ _ => do modify (fun w => { w with services := w.services.push "worker" }); return .ok ()
   | .definition _ _ => return .ok ⟨program.info.entry, Json.null, program.info.resultSchema⟩
@@ -33,8 +35,13 @@ private def service : Application.Service α → StateM World (Except String α)
 
 def run : IO Unit := do
   let registry : Registry := ⟨#[program.register]⟩
+  let saved : LeanCloudRuntime.Pool.Saved ← unwrap (fromJson? (Json.mkObj [
+    ("state", Json.mkObj [("runs", toJson (#[] : Array LeanCloud.Pool.Run)), ("cursor", toJson (0 : Nat))]),
+    ("replies", toJson (#[] : Array (String × Except String Json)))]))
+  assertTrue saved.routes.isNone "Legacy scheduler state fabricated routes"
   for (args, expected) in [(["programs"], 0), (["validate", "user-program/v1"], 0),
       (["serve-scheduler", "config"], 0), (["serve-worker", "config"], 0),
+      (["pool-workers", "config"], 0), (["pool-stopped", "config", "worker1", "2"], 0),
       (["pause", "config", "one"], 0), (["resume", "config", "one"], 0),
       (["submit-entry", "config", "one", "user-program/v1", "-"], 0),
       (["worker", "config", "one"], 0), (["scheduler", "config", "one"], 0),
@@ -51,5 +58,8 @@ def run : IO Unit := do
     { input := "\"bad input\"" }
   assertEq (← unwrap actual) 1
   assertTrue world.services.isEmpty "Invalid input reached a runtime service"
+  for input in ["[]", "[1]", "not JSON"] do
+    let (actual, _) := (Application.runWith host service (Application.run registry ["pool-configure", "config"])).run { input }
+    assertEq (← unwrap actual) (if input == "[]" then 0 else 1)
 
 end ApplicationTests

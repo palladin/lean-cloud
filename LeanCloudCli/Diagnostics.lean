@@ -9,9 +9,9 @@ def serviceState (nodes : Array Node) (service : String) : String :=
   | some node => if node.state == "running" then
       node.health.getD "running (health unknown)" else node.state
 
-def deploymentState (nodes : Array Node) : String :=
+def deploymentState (nodes : Array Node) (workers := defaultWorkerCount) : String :=
   if nodes.isEmpty then "down"
-  else if deploymentServices.all (fun name => serviceState nodes name == "healthy") then "up"
+  else if (deploymentServices workers).all (fun name => serviceState nodes name == "healthy") then "up"
   else if nodes.all (·.state != "running") then "stopped"
   else "partial / check status"
 
@@ -23,7 +23,7 @@ def listDeployments (ctx : Context) : Cli Unit := do
     let target := entry.context
     let state ← if !(← request (.isDir target.root)) then pure "directory missing"
       else if !(← request (.exists (target.home / "deployment.json"))) then pure "not deployed"
-      else try pure (deploymentState (← target.nodes)) catch _ => pure "Docker unavailable"
+      else try pure (deploymentState (← target.nodes) (← target.deployment).workers) catch _ => pure "Docker unavailable"
     let marker := if entry.project == ctx.project && entry.root == ctx.root.toString then "* " else "  "
     printStyled (Styled.text (marker ++ pad 30 entry.project) (if marker == "* " then .selected else .cyan) ++
       Styled.text (pad 26 state) (Styled.statusColor state) ++ Styled.text entry.root)
@@ -35,14 +35,15 @@ def Context.status (ctx : Context) : Cli Unit := do
   printLine s!"Directory:  {safe ctx.root.toString}"
   let deployment ← ctx.deployment
   printLine s!"Image:      {safe deployment.image}"
+  printLine s!"Workers:    {deployment.workers} desired; use 'scale N' to change capacity"
   printLine s!"Programs:   {deployment.programs.size}"
   printLine s!"Runs:       {(← ctx.allRuns).size} recorded; use 'ps' for workflow results"
   let nodes ← try ctx.nodes catch _ => throw "Docker unavailable; use 'doctor' to diagnose connectivity"
-  printStyled (Styled.text "Services:   " ++ Styled.text (deploymentState nodes) (Styled.statusColor (deploymentState nodes)))
-  for service in deploymentServices do
+  printStyled (Styled.text "Services:   " ++ Styled.text (deploymentState nodes deployment.workers) (Styled.statusColor (deploymentState nodes deployment.workers)))
+  for service in deploymentServices deployment.workers do
     printStyled (Styled.text ("  " ++ pad 22 service) .cyan ++
       Styled.text (serviceState nodes service) (Styled.statusColor (serviceState nodes service)))
-  let actors := nodes.filter (fun node => #["scheduler", "worker1", "worker2", "worker3"].contains node.role)
+  let actors := nodes.filter (fun node => isActor node.role)
   printLine s!"Actors:     {(actors.filter (·.state == "running")).size} running / {actors.size} containers"
   if nodes.isEmpty then printLine "Use 'up' to start the node pool and recover active runs."
 
@@ -93,19 +94,19 @@ def Context.doctor (ctx : Context) : Cli Unit := do
         failures := failures + record (← check s!"Image {safe image}" (checkProcess
           #["image", "inspect", image, "--format", "{{.Id}}"]
           "Saved image is unavailable; restore it before resuming existing runs"))
-      for volume in deploymentVolumes do
+      for volume in deploymentVolumes deployment.retainedCount do
         failures := failures + record (← check s!"Volume {volume}" (checkProcess
           #["volume", "inspect", ctx.project ++ "_" ++ volume]
           "Cannot access durable volume; verify Docker context and restore missing data"))
       let inventory ← observing ctx.nodes
       failures := failures + record (← check "Container inventory" (discard (liftExcept inventory)))
       if let .ok nodes := inventory then
-        for service in deploymentServices do
+        for service in deploymentServices deployment.workers do
           failures := failures + record (← check service do
             let state := serviceState nodes service
             unless state == "healthy" do
               throw s!"{state}; use 'up' for stopped services or inspect the service's Docker logs")
-        for node in nodes.filter (fun node => #["scheduler", "worker1", "worker2", "worker3"].contains node.role) do
+        for node in nodes.filter (fun node => isActor node.role) do
           if node.state != "running" then
             printStyled (Styled.text s!"[note] {safe node.name}: {safe node.state}; check 'ps' before resuming" .yellow)
   printLine "Checks cover local files, images, volumes and container health; runtime credentials and workflow execution are not probed."

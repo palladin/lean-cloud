@@ -6,18 +6,69 @@ import LeanCloud.Telemetry
 namespace LeanCloudCli
 open Lean LeanCloud
 
+def defaultWorkerCount : Nat := 3
+
+def workerNames (count : Nat) : Array String :=
+  (Array.range count).map fun i => s!"worker{i + 1}"
+
+def workerIndex? (role : String) : Option Nat := do
+  unless role.startsWith "worker" do none
+  let index ← (role.drop 6 |>.toString).toNat?
+  if index > 0 && role == s!"worker{index}" then some (index - 1) else none
+
+def isActor (role : String) : Bool := role == "scheduler" || (workerIndex? role).isSome
+
+def deploymentServices (workers := defaultWorkerCount) : Array String :=
+  #["blobs", "scheduler"] ++ workerNames workers
+
+def deploymentVolumes (workers := defaultWorkerCount) : Array String :=
+  #["scheduler-data", "blob-data", "scheduler-mailbox-data"] ++
+    (workerNames workers).map (· ++ "-mailbox-data")
+
+/-- Defaults apply to absent fields, never to malformed values. -/
+def jsonFieldD [FromJson α] (json : Json) (field : String) (fallback : α) : Except String α :=
+  match json.getObjVal? field with
+  | .ok value => fromJson? value
+  | .error _ => pure fallback
+
 structure Deployment where
   project : String
   image : String
   programs : Array ProgramInfo
-  deriving FromJson, ToJson
+  workers : Nat := defaultWorkerCount
+  /-- Retired mailbox volumes remain durable and may be reused on a later grow. -/
+  retainedWorkers : Nat := 0
+  deriving ToJson
+
+instance : FromJson Deployment where
+  fromJson? json := do
+    return {
+      project := ← json.getObjValAs? String "project"
+      image := ← json.getObjValAs? String "image"
+      programs := ← json.getObjValAs? _ "programs"
+      workers := ← jsonFieldD json "workers" defaultWorkerCount
+      retainedWorkers := ← jsonFieldD json "retainedWorkers" 0 }
+
+def Deployment.retainedCount (deployment : Deployment) : Nat :=
+  max deployment.workers deployment.retainedWorkers
 
 structure Run where
   id : String
   image : String
   program : ProgramInfo
   input : Json
-  deriving FromJson, ToJson
+  /-- Initial pool size; recorded events extend the roster when workers join. -/
+  workers : Nat := defaultWorkerCount
+  deriving ToJson
+
+instance : FromJson Run where
+  fromJson? json := do
+    return {
+      id := ← json.getObjValAs? String "id"
+      image := ← json.getObjValAs? String "image"
+      program := ← json.getObjValAs? _ "program"
+      input := ← json.getObjVal? "input"
+      workers := ← jsonFieldD json "workers" defaultWorkerCount }
 
 /-- Intent is saved before requesting scheduler controls, so interrupted commands can be retried. -/
 inductive RunControl where

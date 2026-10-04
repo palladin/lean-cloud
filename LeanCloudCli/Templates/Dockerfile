@@ -11,18 +11,25 @@ RUN set -eu; \
       | tar --zstd -x -C /opt; \
     ln -s "/opt/lean-${LEAN_VERSION}-${platform}" /opt/lean
 ENV PATH="/opt/lean/bin:${PATH}"
+COPY --from=node_assets node.c /tmp/node.c
+RUN cc -O2 -Wall -Wextra -Werror /tmp/node.c -o /usr/local/bin/cloud-node
 # SDK_CONTEXT
 WORKDIR /src
 COPY . .
 ARG APP_TARGET
 # BUILD_APP
 
-FROM ubuntu:24.04
+FROM rabbitmq:4.3
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl openssl libsqlite3-0 librabbitmq4 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 worker \
     && mkdir /data && chown worker:worker /data
 COPY --from=build /out/app /usr/local/bin/cloud-app
-USER worker
-ENTRYPOINT ["cloud-app"]
+ENV RABBITMQ_DEFAULT_USER=cloud RABBITMQ_DEFAULT_PASS=local-cloud \
+    RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS="+S 2:2 +sbwt none +sbwtdcpu none +sbwtdio none"
+COPY --from=node_assets rabbitmq.conf /etc/rabbitmq/rabbitmq.conf
+COPY --from=build /usr/local/bin/cloud-node /usr/local/bin/cloud-node
+LABEL lean-cloud.node="mailbox-v1"
+HEALTHCHECK --interval=3s --timeout=5s --start-period=10s --retries=40 CMD ["cloud-node", "health"]
+ENTRYPOINT ["cloud-node"]

@@ -9,6 +9,9 @@ open Lean LeanCloud LeanEff LeanCloudCli
 inductive Service : Type → Type where
   | submit (config : Config) (run entry : String) (input : Json) : Service Unit
   | health (config : Config) : Service Unit
+  | configure (config : Config) (routes : Array RabbitMQ.WorkerBroker) : Service Unit
+  | membership (config : Config) : Service LeanCloud.Pool.Membership
+  | workerStopped (config : Config) (worker : String) (generation : Nat) : Service Unit
   | serveScheduler (config : Config) : Service Unit
   | serveWorker (config : Config) : Service Unit
   | control (config : Config) (run : String) (mode : LeanCloud.Pool.Mode) : Service Unit
@@ -49,6 +52,12 @@ def run (registry : Registry) (args : List String) : App UInt32 := do
       unless config.scheduler.assignmentMs > 0 do throw "Assignment timeout must be positive"
       match command with
       | "pool-health" => service (.health config); pure 0
+      | "pool-configure" =>
+        let routes ← liftExcept (Json.parse (← host .readLine) >>= fromJson?)
+        liftExcept ({ config.mailboxes with workers := routes }.validate)
+        service (.configure config routes)
+        pure 0
+      | "pool-workers" => say (toJson (← service (.membership config))).compress; pure 0
       | "serve-scheduler" => service (.serveScheduler config); pure 0
       | "serve-worker" => service (.serveWorker config); pure 0
       | _ => throw "Expected serve-scheduler or serve-worker"
@@ -58,6 +67,10 @@ def run (registry : Registry) (args : List String) : App UInt32 := do
       liftExcept config.mailboxes.validate
       unless config.scheduler.assignmentMs > 0 do throw "Assignment timeout must be positive"
       match command, rest with
+      | "pool-stopped", [generation] =>
+        let some generation := generation.toNat? | throw "Expected membership generation"
+        service (.workerStopped config id generation)
+        pure 0
       | "submit-entry", [entry, file] =>
         let text ← if file == "-" then host .readLine else host (.readFile file)
         let input ← liftExcept (Json.parse text)
@@ -128,6 +141,9 @@ private def handle (registry : Registry) (prepare : Config → String → Json �
     registry.submit config id entry input
     Pool.submit config id
   | .health config => discard (Pool.request config .health)
+  | .configure config routes => discard (Pool.configure config routes)
+  | .membership config => do IO.ofExcept (fromJson? (← Pool.request config .workers))
+  | .workerStopped config worker generation => discard (Pool.request config (.workerStopped worker generation))
   | .serveScheduler config => Pool.scheduler config
   | .serveWorker config => registry.serveWorker config
   | .control config id mode => do

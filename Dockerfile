@@ -14,6 +14,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends librabbitmq-dev
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 
+FROM toolchain AS node-build
+COPY LeanCloudCli/Templates/node.c /tmp/node.c
+RUN cc -O2 -Wall -Wextra -Werror /tmp/node.c -o /usr/local/bin/cloud-node
+
 FROM toolchain AS build
 COPY . .
 WORKDIR /src/runtime
@@ -36,7 +40,18 @@ FROM runner AS integration
 COPY --from=integration-build /out/cloud_integration_tests /usr/local/bin/cloud-integration-tests
 ENTRYPOINT ["cloud-integration-tests"]
 
-FROM runner AS worker
+FROM rabbitmq:4.3 AS worker
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl openssl libsqlite3-0 librabbitmq4 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 worker \
+    && mkdir /data && chown worker:worker /data
+ENV RABBITMQ_DEFAULT_USER=cloud RABBITMQ_DEFAULT_PASS=local-cloud \
+    RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS="+S 2:2 +sbwt none +sbwtdcpu none +sbwtdio none"
+COPY deploy/rabbitmq.conf /etc/rabbitmq/rabbitmq.conf
+COPY --from=node-build /usr/local/bin/cloud-node /usr/local/bin/cloud-node
+LABEL lean-cloud.node="mailbox-v1"
+HEALTHCHECK --interval=3s --timeout=5s --start-period=10s --retries=40 CMD ["cloud-node", "health"]
 COPY --from=build /out/cloud_demo /usr/local/bin/cloud-demo
 COPY --from=build /out/cloud_demo /usr/local/bin/cloud-app
-ENTRYPOINT ["cloud-app"]
+ENTRYPOINT ["cloud-node"]

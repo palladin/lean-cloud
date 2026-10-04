@@ -5,6 +5,10 @@ namespace LeanCloudRuntime.Trace
 open Lean LeanCloud LeanEff
 
 @[extern "lc_trace_emit"] private opaque emitLine (line : @&String) : IO Unit
+@[extern "lc_trace_resources"] private opaque resourceCounters : IO String
+
+initialize incarnation : String ← do
+  return s!"{← IO.Process.getPID}-{← IO.monoNanosNow}"
 
 structure State where
   seq : Nat := 0
@@ -30,7 +34,10 @@ def Sink.emit (sink : Sink) (activity operation : String) : IO Unit := do
     sink.state.set { state with seq := state.seq + 1 }
     let event : ExecutionEvent := ⟨sink.session, state.seq, (← IO.monoMsNow) - sink.started,
       sink.worker, state.attempt, state.location, activity, operation, sink.run⟩
-    emitLine ("@lean-cloud " ++ (toJson event).compress ++ "\n")
+    let resources ← try pure ((Json.parse (← resourceCounters)).toOption) catch _ => pure none
+    let resources := resources.map fun json => json.setObjVal! "incarnation" (toJson incarnation)
+    let json := (toJson event).setObjVal! "resources" (resources.getD Json.null)
+    emitLine ("@lean-cloud " ++ json.compress ++ "\n")
   catch _ => pure ()
 
 def Sink.assign (sink : Sink) (assignment : Assignment) : IO Unit := do

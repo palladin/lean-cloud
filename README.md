@@ -43,7 +43,7 @@ the other contains the third. `Cloud.parallel` returns one count per batch. The
 workflow sums the counts, saves the report, and returns its `BlobRef`.
 
 Run the [complete example](runtime/LeanCloudRuntime/Demo.lean) with three worker
-containers, one scheduler, a RabbitMQ broker per actor, and shared S3 blob storage:
+containers, one scheduler container, and shared S3 blob storage. Each node includes\nits own RabbitMQ mailbox:
 
 ```sh
 docker compose up --build -d scheduler worker worker2 worker3
@@ -62,11 +62,13 @@ cloud> init my-app
 ```
 
 Edit `my-app/Main.lean`, then run `deploy` and `run my-app` in the same console.
+Use `deploy --workers 4` to choose capacity and `scale N` to resize a running pool.
 Use `deployments` and `use NAME` to switch applications, `status` or `doctor` to
 inspect them, and `down` / `up` to stop and restart services while preserving data.
 
 The CLI generates the deployment configuration and builds your executable in
-Docker. `ps` lists runs; `watch RUN` shows runtime activity and resource graphs.
+Docker. `ps` lists runs; `watch RUN` lets you browse execution steps across all
+workers or focus one worker, including completed, paused, and killed runs.
 Use `pause RUN` / `resume RUN` to stop and continue a run, or `kill RUN` to cancel it permanently.
 See the [console guide](LeanCloud/Console.md) for inputs, registration, and recovery.
 
@@ -89,7 +91,7 @@ during replay; an external action may run again if interrupted before its result
 is recorded.
 
 One scheduler organizes assignments and parallel joins through durable mailbox
-messages. Each worker and the scheduler has its own independent RabbitMQ broker
+messages. Each worker and the scheduler includes its own independent RabbitMQ broker
 and persistent mailbox volume. Workers execute the workflow and write immutable replay records directly
 to shared blob storage. The scheduler keeps only coordination metadata in its own
 local SQLite database. Global blob storage holds replay values and user files.

@@ -80,8 +80,8 @@ def Context.nodes (ctx : Context) : Cli (Array Node) := do
       health := (state.getObjVal? "Health" >>= (·.getObjValAs? String "Status")).toOption }
 
 def runNodes (run : Run) (nodes : Array Node) : Array Node :=
-  let order (node : Node) : Nat := match node.role with
-    | "worker1" => 0 | "worker2" => 1 | "worker3" => 2 | "scheduler" => 3 | _ => 4
+  let order (node : Node) : Nat := if node.role == "scheduler" then 0
+    else (workerIndex? node.role).map (· + 1) |>.getD (nodes.size + 1)
   (nodes.filter (fun n => n.run.isNone || n.run == some run.id)).qsort fun a b =>
     order a < order b || (order a == order b && a.name < b.name)
 
@@ -120,19 +120,12 @@ def samples (nodes : Array Node) : Cli (Array (String × Sample)) := do
         if sample.limit > 0 then values := values.push (name, sample)
   return values
 
-def Context.events (ctx : Context) (run : Run) (knownNodes : Array Node := #[]) : Cli (Array (String × Array ExecutionEvent)) := do
-  let nodes ← if knownNodes.isEmpty then ctx.nodes else pure knownNodes
-  let mut result := #[]
-  for worker in ["worker1", "worker2", "worker3"] do
-    let name := ctx.node worker
-    let since := match nodes.find? (·.name == name) with
-      | some node => if node.started.isEmpty then #[] else #["--since", node.started]
-      | none => #[]
-    let output ← docker (#["logs", "--tail", "80"] ++ since ++ #[name]) false
-    let events := output.stdout.splitOn "\n" |>.filterMap event? |>.toArray
-    result := result.push (worker, if events.back?.any (fun event => event.run == run.id) then
-      events.filter (·.run == run.id) else #[])
-  return result
+def Context.events (ctx : Context) (run : Run) : Cli (Array (String × Array ExecutionEvent)) := do
+  let snapshot ← Trace.load ctx run
+  let count := snapshot.steps.foldl (fun count step =>
+    max count ((workerIndex? step.event.worker).map (· + 1) |>.getD 0)) run.workers
+  return (workerNames count).map fun worker =>
+    (worker, (snapshot.steps.filter (·.event.worker == worker)).map (·.event))
 
 def humanBytes (value : Nat) : String :=
   if value ≥ 1073741824 then s!"{value / 1073741824}.{value % 1073741824 * 10 / 1073741824} GiB"

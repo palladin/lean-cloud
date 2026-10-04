@@ -90,16 +90,20 @@ private def Context.prepare (ctx : Context) : IO Unit := do
     ("broker", broker.setObjVal! "host" (toJson s!"worker{i + 1}-mailbox"))]
   let config := config.setObjVal! "mailboxes" (mailboxes.setObjVal! "workers" (toJson workers))
   IO.FS.writeFile (ctx.artifacts / "config.json") config.pretty
-  -- Use the actual Compose broker definition, including its image and settings.
-  let base ← ctx.docker #["compose", "-f", (ctx.root / "compose.yaml").toString, "config", "--format", "json"]
-  let base ← IO.ofExcept (Json.parse base.stdout)
-  let template ← IO.ofExcept ((base.getObjVal? "services") >>= (·.getObjVal? "worker1-mailbox"))
+  -- Component/chaos tests deliberately separate brokers to inject independent
+  -- transport faults. ConsoleRuntime exercises the production combined nodes.
+  let template := Json.mkObj [
+    ("image", toJson "rabbitmq:4.3"),
+    ("environment", Json.mkObj [("RABBITMQ_DEFAULT_USER", toJson "cloud"),
+      ("RABBITMQ_DEFAULT_PASS", toJson "local-cloud"),
+      ("RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS", toJson "+S 2:2 +sbwt none +sbwtdcpu none +sbwtdio none")]),
+    ("healthcheck", Json.mkObj [("test", toJson #["CMD", "gosu", "rabbitmq", "rabbitmq-diagnostics", "-q", "ping"]),
+      ("interval", toJson "3s"), ("timeout", toJson "5s"), ("retries", toJson (30 : Nat))])]
   let configVolume := toJson #[s!"{ctx.artifacts / "config.json"}:{configPath}:ro"]
   let mut services := ["worker", "worker2", "worker3", "submit", "scheduler", "checks"].map fun name =>
     (name, Json.mkObj [("volumes", configVolume)])
   let mut volumes := []
-  for i in [3:ctx.workerCount] do
-    let name := s!"worker{i + 1}-mailbox"
+  for name in ctx.brokers do
     let volume := name ++ "-data"
     let node := (template.setObjVal! "hostname" (toJson name)).setObjVal! "volumes" (toJson #[
       s!"{volume}:/var/lib/rabbitmq", s!"{ctx.root / "deploy/rabbitmq.conf"}:/etc/rabbitmq/rabbitmq.conf:ro"])
@@ -132,7 +136,7 @@ def Context.createWorker (ctx : Context) (name run : String) : IO String := do
   ctx.nextWorker.set (index + 1)
   let worker := ctx.project ++ "-" ++ name
   ctx.workers.modify (·.push worker)
-  discard <| ctx.docker #["create", "--network", ctx.project ++ "_default", "--name", worker,
+  discard <| ctx.docker #["create", "--no-healthcheck", "--network", ctx.project ++ "_default", "--name", worker,
     "-e", s!"CLOUD_WORKER_ID=worker{index + 1}",
     "-v", s!"{ctx.artifacts / "config.json"}:{configPath}:ro",
     "lean-cloud-worker:dev", "worker", configPath, run]
@@ -141,7 +145,7 @@ def Context.createWorker (ctx : Context) (name run : String) : IO String := do
 def Context.createScheduler (ctx : Context) (name run : String) : IO String := do
   let scheduler := ctx.project ++ "-" ++ name
   ctx.workers.modify (·.push scheduler)
-  discard <| ctx.docker #["create", "--network", ctx.project ++ "_default", "--network-alias", "scheduler",
+  discard <| ctx.docker #["create", "--no-healthcheck", "--network", ctx.project ++ "_default", "--network-alias", "scheduler",
     "--name", scheduler, "-v", s!"{ctx.artifacts / "config.json"}:{configPath}:ro",
     "-v", ctx.project ++ "_scheduler-data:/data", "lean-cloud-worker:dev", "scheduler", configPath, run]
   discard <| ctx.docker #["start", scheduler]

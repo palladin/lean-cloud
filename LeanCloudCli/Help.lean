@@ -24,11 +24,15 @@ def commands : Array Command := #[
   { name := "open", arguments := "DIRECTORY", summary := "Select an existing application directory."
     details := "Subsequent commands use that application's deployment."
     examples := #["open my-app", "open '/path/with spaces/my-app'"] },
-  { name := "deploy", arguments := "[EXECUTABLE] [-v|--verbose]"
+  { name := "deploy", arguments := "[EXECUTABLE] [--workers N] [-v|--verbose]"
     summary := "Build the application and start its persistent node pool."
     details := "EXECUTABLE selects and remembers a Lake executable target. Omit it to reuse the saved target.\nBuild/startup output is saved under .lean-cloud/PROJECT/logs/; quiet failures show an error tail."
-    options := #[("-v, --verbose", "Stream full build and startup output.")]
+    options := #[("--workers N", "Worker count, saved for future deployments (default 3)."),
+      ("-v, --verbose", "Stream full build and startup output.")]
     examples := #["deploy", "deploy my_app --verbose"] },
+  { name := "scale", arguments := "N", summary := "Change worker capacity while workflows run."
+    details := "Adds workers without rebuilding or restarting the scheduler. Removed workers finish their current assignment before stopping. Zero drains all workers; pending workflows wait for capacity.\nIf drainage takes more than a minute, retry the same command later. Retired mailbox volumes and replay history are preserved."
+    examples := #["scale 6", "scale 2", "scale 0"] },
   { name := "programs", summary := "List entry points compiled into the deployed image."
     examples := #["programs"] },
   { name := "down", summary := "Stop this deployment and preserve its data."
@@ -64,18 +68,18 @@ def commands : Array Command := #[
   { name := "result", arguments := "RUN", summary := "Read a run's durable result."
     details := "Prints pending, a completed value, or the failure/cancellation reason. Blob results are read as text."
     examples := #["result example-1"] },
-  { name := "watch", arguments := "RUN [--once]", summary := "Show live source positions and resource graphs for a run."
-    details := "Keys: q returns; Tab cycles nodes; 1/2/3 select workers; j/k scroll source; a follows source.\nSource markers show the last observed operation."
+  { name := "watch", arguments := "RUN [--once]", summary := "Browse execution steps and source for any run."
+    details := "Global pages show every worker: its observed location, code, and resource graphs. The visible tabs switch between Global and individual workers: g/0 for Global, 1/2/3 for a Worker, or Tab/Shift-Tab to cycle through all workers. Use [/] for worker pages.\nArrows move through observations; PgUp/PgDn jump; Home selects the first step; End/f follows the latest. j/k scroll local code; a follows the selected step; q returns. Browsing never resumes execution.\nHistory uses resource samples recorded with the trace, never current Docker usage. Missing historical data shows 'not recorded'. Redeploy the updated runtime to record metrics for future runs. Retained logs can have gaps."
     options := #[("--once", "Print one plain-text frame and return.")]
     examples := #["watch example-1", "watch example-1 --once"] },
-  { name := "nodes", summary := "Show workers, schedulers, brokers, and blobs."
+  { name := "nodes", summary := "Show workers, schedulers, and blobs."
     details := "Prints container states and CPU/memory meters. Use 'top' for live actor graphs."
     examples := #["nodes"] },
   { name := "top", arguments := "[--once]", summary := "Show live worker and scheduler graphs across all runs."
     details := "Shows CPU, memory, filesystem, network, and I/O metrics for the selected deployment.\nKeys: q returns; PgUp/PgDn or left/right arrows change pages. Rates need two samples."
     options := #[("--once", "Print a plain-text snapshot of every page and return.")]
     examples := #["top", "top --once"] },
-  { name := "logs", arguments := "RUN [worker1|worker2|worker3|scheduler]"
+  { name := "logs", arguments := "RUN [NODE]"
     summary := "Print recent events for a run."
     details := "Defaults to worker1. Filters the node's last 100 log lines by run ID without following new output."
     examples := #["logs example-1", "logs example-1 scheduler"] },

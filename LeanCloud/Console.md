@@ -23,7 +23,7 @@ cloud> result first
 
 `init` generates a complete Lean application and selects it in the console.
 The included parallel example returns `55`. `deploy` builds the executable in
-Docker and starts the scheduler, three workers, their mailbox brokers, scheduler storage, and global blobs.
+Docker and by default starts five containers: the scheduler, three workers, and global blobs. Each node includes its own RabbitMQ mailbox.
 The CLI generates Docker and service configuration under `.lean-cloud/`; users
 only maintain their Lean code and package metadata.
 
@@ -120,9 +120,9 @@ cloud> nodes
 cloud> quit
 ```
 
-The example results are `55` and `files=16, errors=24`. `deploy` starts one
-scheduler, three persistent workers, their four RabbitMQ brokers, and global
-blob storage: nine long-lived containers. Every compute node contains the same
+The example results are `55` and `files=16, errors=24`. By default, `deploy` starts one
+scheduler, three persistent workers, and global blob storage: five long-lived
+containers. Each scheduler/worker container includes its own RabbitMQ broker. Every compute node contains the same
 application executable and complete registered-program registry.
 
 `run PROGRAM` submits a logical cloud process to this existing pool. It does
@@ -133,7 +133,7 @@ with the existing replay interpreter. Results remain isolated by run ID.
 After completing an assignment, the worker asks for more work; nodes remain
 running even when every workflow has finished. Closing the console leaves the
 pool running. `ps` lists workflows; `top` shows the deployed compute nodes,
-including idle nodes; `nodes` also includes brokers and blobs.
+including idle nodes; `nodes` also includes blob storage.
 
 Use `down` to stop and remove the deployment's containers while preserving blobs,
 mailboxes, scheduler state, images, and the local catalog. `up` starts the saved
@@ -143,6 +143,39 @@ Use `deploy` when application code changes. Changing the image requires completi
 or killing unfinished runs first: replay must use the same application code.
 Redeploying after `down` starts the retained services before checking saved
 results. Missing durable volumes are reported instead of silently recreated.
+
+## Elastic worker capacity
+
+```text
+cloud> deploy --workers 2
+cloud> run log-summary --id logs-1
+cloud> scale 6
+cloud> scale 2
+cloud> scale 0
+```
+
+`deploy --workers N` chooses the initial count (default three). `scale N` changes
+capacity on the running deployment, using the same image and scheduler. Each added
+worker starts with its own RabbitMQ mailbox. Scaling does not rebuild the image or
+restart retained nodes. A pool of N workers uses N + 2 containers, including the
+scheduler and blob storage.
+
+On scale-down, the scheduler stops giving retiring workers new assignments. They
+finish their current assignments and confirm drainage before their containers stop.
+An unresponsive live worker is never forcibly removed by scaling. After one minute,
+the command reports any workers still draining; retry `scale N` to finish removal.
+A crashed, stopped worker's outstanding attempt is fenced and becomes pending.
+
+`scale 0` drains all workers while preserving the scheduler, blobs, and pending
+workflows. Scale above zero to resume processing. This controls capacity explicitly;
+there is no CPU- or backlog-driven autoscaler yet.
+
+The count is saved in the deployment and, for generated applications, in
+`lean-cloud.json` as `"workers": N`. `up` and subsequent deployments reuse it.
+Mailbox volumes and replay traces are retained after scale-down; growing the pool
+reuses stable worker names and their volumes. Repeating a scale command is safe,
+including after an interrupted command. Use `status`, `nodes`, or `top` to inspect
+the resulting pool.
 
 ## Pause and kill a run
 
@@ -316,7 +349,7 @@ re-executed. A per-run launch lock prevents two consoles from changing the same
 run concurrently. Preserve the local catalog, broker volumes, scheduler volume,
 blob volume, and application images for recovery.
 
-The console currently targets local Docker deployments with three workers per deployment. It does not provision remote hosts or cloud accounts.
+The console currently targets local Docker deployments with a configurable, elastic worker pool. It does not provision remote hosts or cloud accounts.
 
 ## Live view
 
@@ -331,21 +364,49 @@ Each node gets a panel with CPU, memory, filesystem usage, network RX/TX, and
 disk read/write rates. Panels resize with the terminal. Use PgUp/PgDn or the
 left/right arrows to change pages, and `q` to return to the console. Running
 actors appear first; stopped actors remain visible with their status.
-Mailbox brokers and blob services are listed separately by `nodes`.
+Each node includes its mailbox broker. `nodes` also lists blob storage.
 
 `top --once` (or piped `top`) prints a plain-text snapshot of every page. Rates
 need two samples, so that first snapshot shows `—` for network and I/O rates.
 
-`watch RUN` displays real runtime observations. Press `1`, `2`, or `3` to select a
-worker, Tab to cycle through the shared compute and service containers,
-`j`/`k` to scroll source, `a` to resume automatic source following, and `q` to
-return to the prompt. A noninteractive terminal
-or `--once` prints one frame without terminal control sequences.
+`watch RUN` browses execution steps for running, completed, paused, failed, and
+killed processes. It opens at the latest observation and follows new events.
 
-The source gutter contains worker numbers. These identify the **last observed
-operation**, including replay, execution, and record persistence. Stopped workers
-have no active source marker. Ordinary pure code and arbitrary lines inside an IO
-body are not instrumented; the view does not claim an instruction-level position.
+The **Global view** shows workers in pages of three panels, each with
+its observed location, code window, and resource graphs. The **Worker view**
+expands that worker's code and metrics and filters the step list to that worker.
+The visible `[Global] [Worker 1] [Worker 2] [Worker 3]` tabs identify the current view.
+Use `[` and `]` to page through workers. Small terminals show compact panels; select one for full details.
+When browsing history, switching workers
+selects that worker's nearest preceding observation (or its first, if none precedes
+the cursor). The banner distinguishes following live activity from browsing history.
+
+- **Arrow keys:** select the previous or next step; browsing freezes the cursor.
+- **PgUp / PgDn:** move a page of steps; **Home:** select the first step.
+- **End / f:** return to the latest step and follow new observations.
+- **g / 0:** Global view; **1 / 2 / 3:** select a worker on the visible page.
+- **[ / ]:** previous or next page of workers.
+- **Tab / Shift-Tab:** cycle through Global and every Worker view, including retired workers in history.
+- **j / k:** scroll source; **a:** follow the selected step's source line.
+- **q:** return to the prompt.
+
+The trace shows the actor, location, activity, and operation. Selecting a mapped
+step highlights its source line even if the worker has stopped. Each worker's
+panel shows its last observation at that point in the trace. `>` identifies a mapped
+step; `~` identifies the last mapped line at the same location and attempt when the
+latest observation has no source mapping. Navigation never resumes or re-executes
+the process. **Historical graphs use recorded samples at or before the cursor.**
+They never fall back to current Docker stats. Missing samples say `not recorded`.
+A noninteractive terminal or `--once` prints one frame without control sequences.
+
+The console reads all retained Docker logs, including earlier worker incarnations,
+and saves observations in each run's local `trace.json`. `down` and image replacement
+collect logs after stopping actors and before removing their containers. Saved
+steps remain browsable when Docker or the deployment is unavailable. Log rotation,
+a dropped event, or containers removed outside the CLI can leave gaps; the cache
+cannot reconstruct observations that were never collected. The display uses Docker
+log timestamps, which do not establish causal order between concurrent workers.
+Ordinary pure code and arbitrary lines inside an IO body are not instrumented.
 
 Source files are bundled when the application compiles. Programs explicitly map
 operation labels to source markers; missing or ambiguous markers are rejected.
@@ -358,7 +419,24 @@ assignments, commit results, or acknowledge workflow messages. The event format
 includes a run ID, worker incarnation, sequence number, attempt, location, and activity;
 sequence numbers are local to each incarnation, not a global execution order.
 
-Resource graphs use live Docker container statistics:
+While following an active run, resource graphs use live Docker container statistics.
+While browsing history, or inspecting a completed, paused, or killed run, they use
+resource counters attached to the worker's trace events. Collection happens in the
+runtime even when no console is connected. Rebuild with `deploy` once to enable it
+for future runs; already missing samples cannot be recovered.
+
+The Linux container runtime samples cgroup v2 CPU, memory, and I/O counters,
+network-interface counters, and root-filesystem usage at trace boundaries.
+CPU and transfer rates use adjacent samples from the same process incarnation;
+they are unavailable until two usable samples exist. Sampling is event-based,
+so a long computation need not produce intermediate samples. A panel identifies
+the last recorded sample's time. These are container-wide measurements, including
+the node's RabbitMQ broker and other workflows sharing that worker. Unsupported
+counters remain missing.
+The [kernel's cgroup documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html)
+defines the CPU, memory, and I/O counters.
+
+Both modes display:
 
 - CPU utilization and memory usage/limit;
 - network receive/send rates;
@@ -376,18 +454,20 @@ Graphs use `_` for measured zero and `·` for an unavailable rate; the first cou
 sample has no rate yet. CPU and memory histories appear when the panel is wide
 enough, scaled to one core and the reported memory limit respectively.
 
-Actor and broker containers are measured separately. CPU can exceed 100% on
+Node statistics include both Lean and its RabbitMQ broker. CPU can exceed 100% on
 multiple cores. Filesystem capacity can be shared between containers; it is not
 space attributed exclusively to the selected container. Missing samples are not
 zero utilization. Rate series restart when a container restarts or counters reset.
-Graphs retain up to 30 samples while the view is open. Rate graphs scale independently;
-there is no persistent resource-metric history yet.
+Graphs display up to 30 samples from the chosen incarnation, ending at the selected
+moment. Historical samples are retained with the trace cache and survive console
+restart and deployment shutdown. Rate graphs scale independently.
 
 ## Validation
 
 `lake test` includes shell parsing, input identifiers, source-map ambiguity,
 terminal escape sanitization, metric units, counter resets, bounded history, and
-live/stopped source markers at several terminal widths. Docker integration tests
+historical source markers, trace deduplication, stable cursor selection during refresh,
+and navigation at several terminal widths. Docker integration tests
 validate the typed registry and compare an instrumented workflow against direct
 evaluation, including durable typed results and conflicting submissions.
 Theme tests check styled wrapping/clipping, missing samples, meter saturation,

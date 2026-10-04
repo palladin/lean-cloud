@@ -27,7 +27,8 @@ input_file cliToolchain where
   text := true
 
 lean_lib LeanCloudCli where
-  extraDepTargets := #[`cliTemplates, `deploymentDefaults, `cliToolchain]
+  needs := #[.mk (.packageTarget .anonymous `cliTemplates),
+    .mk (.packageTarget .anonymous `deploymentDefaults), .mk (.packageTarget .anonymous `cliToolchain)]
 
 lean_exe lean_cloud where
   root := `LeanCloudCli.Main

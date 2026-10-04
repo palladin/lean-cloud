@@ -16,13 +16,32 @@ structure Run where
   scheduler : Scheduler.State := {}
   deriving Repr, ToJson, FromJson
 
+/-- A generation fences delayed drain acknowledgements after a worker rejoins.
+`none` is the unrestricted, pre-configuration pool. -/
+structure Membership where
+  active : Option (Array String) := none
+  generation : Nat := 0
+  drained : Array String := #[]
+  deriving Repr, ToJson, FromJson
+
 structure State where
   runs : Array Run := #[]
   cursor : Nat := 0
-  deriving Repr, ToJson, FromJson
+  membership : Membership := {}
+  deriving Repr, ToJson
+
+instance : FromJson State where
+  fromJson? json := do
+    let membership ← match json.getObjVal? "membership" with
+      | .ok value => fromJson? value
+      | .error _ => pure {}
+    return { runs := ← json.getObjValAs? _ "runs", cursor := ← json.getObjValAs? Nat "cursor", membership }
 
 inductive Command where
   | health
+  | configureWorkers (workers : Array String)
+  | workers
+  | workerStopped (worker : String) (generation : Nat)
   | submit (run : String)
   | pause (run : String)
   | resume (run : String)
@@ -34,6 +53,7 @@ inductive Command where
 inductive Message where
   | submit (run : String)
   | ready (worker : String)
+  | drained (worker : String) (generation : Nat)
   | report (run : String) (report : Report)
   | request (replyTo : String) (command : Command)
   deriving Repr, ToJson, FromJson
@@ -42,6 +62,7 @@ inductive Reply where
   | execute (run : String) (assignment : Assignment)
   | idle
   | acknowledged
+  | drain (generation : Nat)
   deriving Repr, ToJson, FromJson
 
 def release (state : Scheduler.State) : Scheduler.State :=
@@ -61,7 +82,7 @@ def Run.accepts (run : Run) : Bool :=
   run.mode == .active && !run.scheduler.finished && run.scheduler.error.isNone
 
 def valid (state : State) (id worker : String) (attempt : Nat) : Bool :=
-  state.runs.any fun run => run.id == id && run.accepts &&
+  !state.membership.drained.contains worker && state.runs.any fun run => run.id == id && run.accepts &&
     run.scheduler.jobs.any fun job => match job.status with
       | .running owner current _ => owner == worker && current == attempt
       | _ => false
@@ -69,6 +90,8 @@ def valid (state : State) (id worker : String) (attempt : Nat) : Bool :=
 /-- Repeated readiness returns the existing assignment before allocating work
 in another run. Run selection rotates; result order stays the program's order. -/
 def acquire (duration : Nat) (state : State) (worker : String) : State × Reply := Id.run do
+  if let some active := state.membership.active then
+    unless active.contains worker do return (state, .drain state.membership.generation)
   for run in state.runs do
     if run.accepts then
       if let some assignment := run.scheduler.jobs.findSome? (Scheduler.Internal.assignedTo worker) then
@@ -83,6 +106,21 @@ def acquire (duration : Nat) (state : State) (worker : String) : State × Reply 
           runs := state.runs.set! index { run with scheduler }
           cursor := index + 1 }, .execute run.id assignment)
   return (state, .idle)
+
+/-- Sent by a serial worker only between assignments. Retiring does not revoke
+its running work; this acknowledgement fences any queued duplicate assignments. -/
+def drained (state : State) (worker : String) (generation : Nat) : State :=
+  if generation != state.membership.generation ||
+      state.membership.active.any (·.contains worker) || state.membership.active.isNone then state
+  else
+    let workers := if state.membership.drained.contains worker then state.membership.drained
+      else state.membership.drained.push worker
+    { state with
+    membership := { state.membership with drained := workers },
+    runs := state.runs.map fun run => { run with scheduler := { run.scheduler with
+      jobs := run.scheduler.jobs.map fun job => match job.status with
+        | .running owner _ _ => if owner == worker then { job with status := .pending } else job
+        | _ => job } } }
 
 def report (state : State) (id : String) (value : Report) : State :=
   { state with runs := state.runs.map fun run =>
@@ -103,6 +141,13 @@ private def setMode (state : State) (id : String) (mode : Mode) : Except String 
 Pausing revokes attempts; resuming never reuses an attempt number. -/
 def command (state : State) : Command → Except String (State × Json)
   | .health => .ok (state, Json.null)
+  | .workers => .ok (state, toJson state.membership)
+  | .workerStopped worker generation => .ok (drained state worker generation, Json.null)
+  | .configureWorkers workers =>
+    let membership := if state.membership.active == some workers then state.membership else
+      { active := some workers, generation := state.membership.generation + 1,
+        drained := state.membership.drained.filter (!workers.contains ·) }
+    .ok ({ state with membership }, toJson membership)
   | .check id worker attempt => .ok (state, toJson (valid state id worker attempt))
   | .submit id =>
     let state := if state.runs.any (·.id == id) then state

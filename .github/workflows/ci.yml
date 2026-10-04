@@ -36,7 +36,9 @@ jobs:
         run: lake build
 
       - name: Build the console and native process tests
-        run: lake build lean_cloud cloud_process_tests
+        run: |
+          lake build lean_cloud cloud_process_tests
+          cc -std=c11 -O2 -Wall -Wextra -Werror LeanCloudCli/Templates/node.c -o /tmp/cloud-node
 
       - name: Run tests
         run: lake test

@@ -16,6 +16,7 @@ structure Catalog where
   runs : Array Item := #[]
   files : Array Item := #[]
   deployments : Array Item := #[]
+  actors : Array Item := (#["scheduler"] ++ workerNames defaultWorkerCount).map (fun name => ⟨name, ""⟩)
 
 /-- Completion reads the local catalog, never polling Docker while typing. -/
 def load (ctx : Context) : Cli Catalog := do
@@ -28,7 +29,9 @@ def load (ctx : Context) : Cli Catalog := do
   let deployments ← try
     pure ((← Deployments.load).entries.map fun e => Item.mk e.project e.root)
     catch _ => pure #[]
-  return { programs, runs, deployments }
+  let count ← try pure (← ctx.deployment).retainedCount catch _ => pure defaultWorkerCount
+  let actors := (#["scheduler"] ++ workerNames count).map fun name => Item.mk name "Node logs"
+  return { programs, runs, deployments, actors }
 
 structure Token where
   value : String
@@ -83,10 +86,15 @@ def candidates (catalog : Catalog) (ctx : Context) : Array Item :=
     | ["run"] => catalog.programs
     | ["use"] => catalog.deployments
     | ["inspect"] | ["result"] | ["watch"] | ["logs"] | ["resume"] | ["pause"] | ["kill"] => catalog.runs
-    | ["logs", _] => #[⟨"worker1", ""⟩, ⟨"worker2", ""⟩, ⟨"worker3", ""⟩, ⟨"scheduler", ""⟩]
+    | ["logs", _] => catalog.actors
     | ["watch", _] => #[⟨"--once", "Print one frame"⟩]
     | ["top"] => #[⟨"--once", "Print a snapshot of all workers and schedulers"⟩]
-    | "deploy" :: rest | "up" :: rest =>
+    | "deploy" :: rest =>
+      if rest.getLast? == some "--workers" then #[] else
+      (if rest.contains "--workers" then #[] else #[⟨"--workers", "Initial worker count"⟩]) ++
+      (if rest.contains "-v" || rest.contains "--verbose" then #[] else
+        #[⟨"--verbose", "Stream full build/startup output (-v)"⟩, ⟨"-v", "Stream full build/startup output"⟩])
+    | "up" :: rest =>
       if rest.contains "-v" || rest.contains "--verbose" then #[]
       else #[⟨"--verbose", "Stream full build/startup output (-v)"⟩, ⟨"-v", "Stream full build/startup output"⟩]
     | "run" :: _ :: rest =>
@@ -95,7 +103,7 @@ def candidates (catalog : Catalog) (ctx : Context) : Array Item :=
       else (#[⟨"--input", "Read input from a JSON file"⟩, ⟨"--id", "Choose a run ID"⟩] : Array Item).filter
         (fun item => !rest.contains item.value)
     | _ => #[]
-  let expectsValue := [some "--input", some "--id", some "--sdk"].contains ctx.before.back?
+  let expectsValue := [some "--input", some "--id", some "--sdk", some "--workers"].contains ctx.before.back?
   let help := if ctx.fragment.startsWith "-" && !expectsValue &&
       (ctx.before[0]? >>= Help.find?).isSome && !ctx.before.any Help.isFlag then
     #[Item.mk "--help" "Show usage, options, and examples", Item.mk "-h" "Show command help"] else #[]

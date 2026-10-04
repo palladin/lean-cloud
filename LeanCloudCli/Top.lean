@@ -6,8 +6,12 @@ namespace LeanCloudCli.Top
 /-- Compute nodes only. Mailbox brokers and blob services remain in `nodes`. -/
 def actors (nodes : Array Node) : Array Node :=
   (nodes.filter (fun node =>
-    (#["scheduler", "worker1", "worker2", "worker3"].contains node.role))).qsort fun a b =>
+    (isActor node.role))).qsort fun a b =>
       if (a.state == "running") != (b.state == "running") then a.state == "running"
+      else if a.role == "scheduler" || b.role == "scheduler" then
+        if a.role == b.role then a.name < b.name else a.role == "scheduler"
+      else if workerIndex? a.role != workerIndex? b.role then
+        (workerIndex? a.role).getD 0 < (workerIndex? b.role).getD 0
       else a.name < b.name
 
 private def columnCount (width : Nat) : Nat := max 1 (min 3 ((width - 1) / 55))

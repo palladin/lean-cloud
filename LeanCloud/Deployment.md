@@ -11,9 +11,10 @@ cloud> top
 cloud> ps
 ```
 
-There is one scheduler, three workers, four independent RabbitMQ brokers and one
-S3-compatible blob service. Runs share these nine containers. Submission records
-the immutable program and input, then publishes a durable registration message.
+By default there are five containers: one scheduler, three workers, and one S3-compatible
+blob service. Each scheduler/worker container runs both its Lean executable and
+its own independent RabbitMQ broker. All runs share the deployed pool. Use `deploy --workers N` or live `scale N` in the console; N workers use N + 2 containers.
+Submission records the immutable program and input, then publishes a durable registration message.
 Workers request assignments; the scheduler routes them across registered runs.
 
 For direct Compose use:
@@ -73,9 +74,13 @@ The scheduler connects to RabbitMQ and owns its local database. Administrative c
 Matching worker images must support the submitted
 entry point and codecs.
 
-The example explicitly deploys `worker`, `worker2`, and `worker3`, with identities
-`worker1`, `worker2`, and `worker3`. To add a worker, add its broker and persistent
-volume, add its route in `mailboxes.workers`, and set its `CLOUD_WORKER_ID`.
+The static Compose example explicitly deploys `worker`, `worker2`, and `worker3`, with identities
+`worker1`, `worker2`, and `worker3`. The console generates these identities, routes,
+and volumes for any count: use `deploy --workers N` and `scale N` for live changes.
+The scheduler stores membership and routing in its local database. Scale-down
+waits for generation-tagged drain acknowledgements before stopping nodes; stale
+acknowledgements cannot retire workers that have rejoined. Each node keeps a fixed
+startup configuration, while membership updates travel through the scheduler mailbox.
 Do not use `--scale worker=N`: that would duplicate the same worker identity and
 broker instead of creating independent nodes. An unknown or duplicate configured
 worker identity is rejected. Broker credentials and ports can differ per node.
@@ -93,9 +98,13 @@ Publications are persistent, mandatory-routed, and confirmed by the broker.
 Consumers use manual acknowledgements and prefetch one. The queues have a single
 active consumer, no auto-delete or TTL, and no finite delivery limit that could
 discard work during repeated crashes. Duplicate delivery remains possible.
-Every broker has a stable hostname and its own persistent volume. An actor can
-stop while its broker continues accepting mail. If a destination broker is down,
-a publication cannot be confirmed; the actor fails and is restarted by Compose.
+Every broker has a stable hostname and its own persistent volume. A small native
+entry point starts RabbitMQ, waits for its listener, then starts Lean as an
+unprivileged process. If Lean exits, it restarts inside the same container while
+RabbitMQ keeps accepting mail. If RabbitMQ exits, the node stops and Docker
+restarts the container. Shutdown stops Lean before RabbitMQ. Health checks cover
+both processes. If a destination broker is down, a publication cannot be
+confirmed; the sending actor fails and its node entry point restarts it.
 Its unacknowledged input remains available for recovery. Retain the broker routes
 and volumes until pending deliveries have been handled, including for retired workers.
 Recovery assumes failed brokers eventually restart with their data. The deployment
@@ -118,6 +127,15 @@ The deployment assumes a trusted private network. TLS, automatic scheduler
 failover, provider-specific provisioning, and mailbox retirement automation remain
 future work. Azure/AWS deployment adapters must preserve these durable mailbox,
 private scheduler storage, and immutable global blob contracts.
+
+### Updating an existing deployment
+
+Restart the console and use `deploy` once to replace the old separate actor and
+mailbox containers. Existing unfinished runs must first finish or be killed, as
+for any image change. Deployment stops the old actors and brokers before
+attaching the mailbox volumes to the combined nodes. RabbitMQ hostnames, mailbox
+volumes, scheduler storage, and blob data are preserved. The existing
+`*-mailbox` addresses become network aliases of the combined containers.
 
 ## Failure and recovery
 
@@ -149,12 +167,16 @@ results from being overwritten; they do not roll back external actions.
 
 ```sh
 lake test
+lake exe cloud_console_tests
 lake exe cloud_runtime_tests
 lake exe cloud_chaos --seed 1 --crashes 8 --workers 3
 ```
 
-Runtime tests use an isolated Compose project with a broker per actor, including
-the fresh worker used after completion. They check SQLite persistence,
+Console tests exercise the default five-container deployment and elastic grow/drain/zero/rejoin, unchanged node identities
+across submissions, Lean-only and broker crashes, graceful shutdown, mailbox
+migration, and generated user applications. Runtime component tests deliberately
+use separate brokers in an isolated Compose project to inject transport faults,
+including a broker for the fresh worker used after completion. They check SQLite persistence,
 durable redelivery on every broker, isolation of identically named queues,
 concurrent conditional creation, generated programs over real services, and multiple
 worker processes. Each broker is killed independently: its confirmed messages

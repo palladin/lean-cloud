@@ -20,9 +20,9 @@ private def process (call : Invocation) : Except String ProcessOutput := do
   unless call.command == "docker" do throw "Unexpected executable"
   match call.args.toList with
   | ["--version"] | ["compose", "version"] | ["info", "--format", _] => output "version"
-  | "ps" :: _ => output "node\n"
-  | "inspect" :: _ => output healthyNodes.compress
-  | "image" :: "inspect" :: _ => output "sha256:pinned"
+  | "ps" :: _ => output (if call.args.any (·.startsWith "label=com.docker.compose.service=") then "" else "node\n")
+  | "inspect" :: _ => output (if call.args.contains "--format" then "healthy\nhealthy\nhealthy\nhealthy\n" else healthyNodes.compress)
+  | "image" :: "inspect" :: _ => output (if call.args.contains "{{index .Config.Labels \"lean-cloud.node\"}}" then "mailbox-v1" else "sha256:pinned")
   | ["volume", "inspect", _] => output
   | "exec" :: _ => output
   | "compose" :: _ => output
@@ -33,8 +33,8 @@ private def process (call : Invocation) : Except String ProcessOutput := do
 private def base : World :=
   ({ process, directories := #["/work", "/work/.lean-cloud", ctx.home.toString] } : World)
     |>.save "/work/compose.yaml" "services: {}"
-    |>.json "/work/deploy/config.json" (Json.mkObj (["scheduler", "mailboxes", "blobs"].map (·, Json.mkObj [])))
-    |>.json (ctx.home / "deployment.json") (Deployment.mk ctx.project "sha256:pinned" #[])
+    |>.json "/work/deploy/config.json" Project.defaultConfig
+    |>.json (ctx.home / "deployment.json") (Deployment.mk ctx.project "sha256:pinned" #[] defaultWorkerCount 0)
 
 private def checked (program : Cli α) (world : World := base) : IO (α × World) := do
   let (result, world) := ConsoleModel.run program world
@@ -57,7 +57,7 @@ def deploymentCommandCases : Array TestCase := #[
       entries := #[⟨ctx.project, "/work"⟩, ⟨test.project, "/work"⟩]
       selected := some test.project }
     let initial := base.json registry catalog
-      |>.json (test.home / "deployment.json") (Deployment.mk test.project "test-image" #[])
+      |>.json (test.home / "deployment.json") (Deployment.mk test.project "test-image" #[] defaultWorkerCount 0)
       |>.json (test.home / "catalog-owner.json") ("/isolated" : String)
     let (visible, world) ← checked (do Deployments.discover ctx; Deployments.load) initial
     assertEq (visible.entries.map (·.project)) #[ctx.project]
@@ -135,7 +135,7 @@ def deploymentCommandCases : Array TestCase := #[
       "up rebuilt the app or created scheduler storage"
     assertTrue (after.processes.any (fun call => call.args.contains "sha256:pinned")) "up lost pinned image"
     assertEq ((after.processes.filter (·.args.contains "up")).map (·.args.toList.drop 5))
-      #[(#["--ansi", "never", "up", "-d", "--wait", "--no-build"] ++ deploymentServices).toList]
+      #[["--ansi", "never", "up", "-d", "--wait", "--no-build", "blobs"]]
     assertTrue after.locks.isEmpty "up leaked lock"⟩,
   ⟨"console.deployment.up-refuses-missing-storage", do
     let handler (call : Invocation) :=
@@ -145,9 +145,18 @@ def deploymentCommandCases : Array TestCase := #[
     assertTrue result.toOption.isNone "up silently replaced missing durable storage"
     assertTrue (!after.processes.any (·.args.contains "up")) "Services started despite lost data"
     assertTrue after.locks.isEmpty "up failure leaked lock"⟩,
+  ⟨"console.deployment.up-requires-combined-image", do
+    let handler (call : Invocation) :=
+      if call.args.contains "{{index .Config.Labels \"lean-cloud.node\"}}" then output "<no value>"
+      else process call
+    let (result, after) := ConsoleModel.run ctx.up { base with process := handler }
+    let .error message := result | throw (IO.userError "Old image started as a combined node")
+    assertTrue (has message "Use 'deploy'") "Missing image migration guidance"
+    assertTrue (!after.processes.any (fun call => [some "run", some "stop", some "rm"].contains call.args[0]?))
+      "Old image check modified actors or mailbox volumes"⟩,
   ⟨"console.deployment.status-health", do
     let (_, after) ← checked (command ctx ["status"])
-    assertTrue (has after.stdout "Services:   up" && has after.stdout "Actors:     0 running") "Incorrect deployment summary"
+    assertTrue (has after.stdout "Services:   up" && has after.stdout "Actors:     4 running") "Incorrect deployment summary"
     assertEq after.files base.files
     let partialNodes : Array Node := #[{ name := "broker", role := "worker1-mailbox", state := "running", started := "", health := some "unhealthy" }]
     assertEq (deploymentState partialNodes) "partial / check status"

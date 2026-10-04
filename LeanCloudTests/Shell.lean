@@ -24,11 +24,14 @@ def shellCases : Array TestCase := #[
     assertEq (suggestions "run squares/v1 --input file.json --") #["--id", "--help"]
     assertEq (suggestions "run squares/v1 --id ") #[]⟩,
   ⟨"console.shell.verbose-completion", do
-    for line in ["deploy --", "deploy my_app --", "up --"] do
-      assertEq (suggestions line) #["--verbose", "--help"]
+    for line in ["deploy --", "deploy my_app --"] do
+      assertEq (suggestions line) #["--workers", "--verbose", "--help"]
+    assertEq (suggestions "up --") #["--verbose", "--help"]
     assertEq (suggestions "deploy -v") #["-v"]
-    for line in ["deploy -v ", "deploy --verbose my_app ", "up --verbose "] do
-      assertEq (suggestions line) #[]⟩,
+    for line in ["deploy -v ", "deploy --verbose my_app "] do
+      assertEq (suggestions line) #["--workers"]
+    assertEq (suggestions "deploy --workers ") #[]
+    assertEq (suggestions "up --verbose ") #[]⟩,
   ⟨"console.shell.completion-cycles", do
     let start : Shell.State := { line := "r", cursor := 1 }
     let first := Shell.complete {} start

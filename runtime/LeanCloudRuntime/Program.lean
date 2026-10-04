@@ -70,7 +70,7 @@ def Registry.serveWorker (registry : Registry) (config : Config) : IO Unit := do
   try
     let inbox : Mailbox IO LeanCloud.Pool.Reply := RabbitMQ.inbox handle
     let send (message : LeanCloud.Pool.Message) :=
-      RabbitMQ.send config.mailboxes.scheduler Pool.address "scheduler" message
+      Pool.send config message
     let mut nextReady := 0
     IO.println s!"worker {id} ready for deployed programs"
     (← IO.getStdout).flush
@@ -111,6 +111,7 @@ def Registry.serveWorker (registry : Registry) (config : Config) : IO Unit := do
         -- coordinator and immutable records tolerate that redelivery.
         send (.ready id)
         nextReady := (← IO.monoMsNow) + 2000
+      | .drain generation => send (.drained id generation)
       | .idle | .acknowledged => pure ()
       inbox.acknowledge delivery.receipt
   finally handle.close

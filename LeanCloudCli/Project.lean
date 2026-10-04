@@ -6,7 +6,15 @@ open Lean
 structure App where
   name : String
   executable : String := "cloud_app"
-  deriving FromJson, ToJson
+  workers : Nat := defaultWorkerCount
+  deriving ToJson
+
+instance : FromJson App where
+  fromJson? json := do
+    return {
+      name := ← json.getObjValAs? String "name"
+      executable := ← jsonFieldD json "executable" "cloud_app"
+      workers := ← jsonFieldD json "workers" defaultWorkerCount }
 
 def manifest (root : System.FilePath) := root / "lean-cloud.json"
 def localConfig (root : System.FilePath) := root / "lean-cloud.local.json"
@@ -66,6 +74,20 @@ def init (ctx : Context) (directory : String) (localSdk : Option String := none)
 
 def defaultConfig : Json := Json.parse (include_str "../deploy/config.json") |>.toOption.getD Json.null
 
+/-- Preserve existing routes and credentials; instantiate new mailbox routes
+from the first worker's broker configuration. -/
+def runtimeConfig (config : Json) (workers : Nat) : Except String Json := do
+  let mailboxes ← config.getObjVal? "mailboxes"
+  let existing ← mailboxes.getObjValAs? (Array Json) "workers"
+  let prototype ← match existing[0]? with
+    | some route => route.getObjVal? "broker"
+    | none => mailboxes.getObjVal? "scheduler"
+  let routes := (workerNames workers).map fun name =>
+    (existing.find? (fun route => (route.getObjValAs? String "worker").toOption == some name)).getD
+      (Json.mkObj [("worker", toJson name),
+        ("broker", prototype.setObjVal! "host" (toJson (name ++ "-mailbox")))])
+  return config.setObjVal! "mailboxes" (mailboxes.setObjVal! "workers" (toJson routes))
+
 private def sdkCopy : String := "COPY --from=sdk lean-toolchain lakefile.lean lake-manifest.json LeanCloud.lean /opt/lean-cloud/\n" ++
   "COPY --from=sdk LeanCloud /opt/lean-cloud/LeanCloud\n" ++
   "COPY --from=sdk LeanCloudCli /opt/lean-cloud/LeanCloudCli\n" ++
@@ -90,15 +112,8 @@ def compose (ctx : Context) (app : App) (version : String) (localSdk : Option St
   let home := assets ctx
   let mut services := []
   let mut volumes := [("scheduler-data", Json.mkObj []), ("blob-data", Json.mkObj [])]
-  for name in ["scheduler-mailbox", "worker1-mailbox", "worker2-mailbox", "worker3-mailbox"] do
-    volumes := volumes ++ [(name ++ "-data", Json.mkObj [])]
-    services := services ++ [(name, Json.mkObj [
-      ("image", toJson "rabbitmq:4.3"), ("restart", toJson "unless-stopped"), ("hostname", toJson name),
-      ("environment", Json.mkObj [("RABBITMQ_DEFAULT_USER", toJson "cloud"), ("RABBITMQ_DEFAULT_PASS", toJson "local-cloud"),
-        ("RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS", toJson "+S 2:2 +sbwt none +sbwtdcpu none +sbwtdio none")]),
-      ("volumes", toJson #[toJson (name ++ "-data:/var/lib/rabbitmq"), volume (home / "rabbitmq.conf").toString "/etc/rabbitmq/rabbitmq.conf"]),
-      ("healthcheck", Json.mkObj [("test", toJson #["CMD", "gosu", "rabbitmq", "rabbitmq-diagnostics", "-q", "ping"]),
-        ("interval", toJson "3s"), ("timeout", toJson "5s"), ("retries", toJson (30 : Nat))])])]
+  for name in #["scheduler"] ++ workerNames app.workers do
+    volumes := volumes ++ [(name ++ "-mailbox-data", Json.mkObj [])]
   services := services ++ [("blobs", Json.mkObj [
     ("image", toJson "chrislusf/seaweedfs:4.48"), ("restart", toJson "unless-stopped"),
     ("command", toJson #["server", "-ip=blobs", "-ip.bind=0.0.0.0", "-dir=/data", "-volume.max=20", "-master.volumeSizeLimitMB=100", "-filer", "-s3", "-s3.config=/etc/seaweedfs/s3.json"]),
@@ -108,13 +123,15 @@ def compose (ctx : Context) (app : App) (version : String) (localSdk : Option St
       ("interval", toJson "2s"), ("timeout", toJson "3s"), ("retries", toJson (30 : Nat))])])]
   let build := Json.mkObj ([("context", toJson ctx.root.toString), ("dockerfile", toJson (home / "Dockerfile").toString),
     ("args", Json.mkObj [("APP_TARGET", toJson app.executable), ("LEAN_VERSION", toJson version)])] ++
-    (localSdk.toList.map fun path => ("additional_contexts", Json.mkObj [("sdk", toJson path)])))
+    [("additional_contexts", Json.mkObj ([("node_assets", toJson home.toString)] ++
+      localSdk.toList.map (fun path => ("sdk", toJson path))))])
   services := services ++ [("worker", Json.mkObj [("build", build), ("image", toJson (ctx.project ++ "-app:build"))])]
   return Json.mkObj [("services", Json.mkObj services), ("volumes", Json.mkObj volumes)]
 
 /-- All generated infrastructure lives in the ignored deployment directory. -/
-def prepare (ctx : Context) : Cli Unit := do
+def prepare (ctx : Context) (workers : Option Nat := none) (writeConfig := true) : Cli Unit := do
   let app ← load ctx.root
+  let app := { app with workers := workers.getD app.workers }
   let toolchain := (← request (.readFile (ctx.root / "lean-toolchain"))).trimAscii.toString
   unless toolchain.startsWith "leanprover/lean4:v" do throw "Deployment needs a versioned Lean release in lean-toolchain"
   let version := toolchain.drop "leanprover/lean4:v".length |>.toString
@@ -126,9 +143,11 @@ def prepare (ctx : Context) : Cli Unit := do
   request (.createDir home)
   for (name, text) in [("Dockerfile", dockerfile localSdk.isSome),
       ("Dockerfile.dockerignore", ignore ++ "\n.git\n**/.lake\n**/.lean-cloud\nlean-cloud.local.json\n**/.DS_Store\n"),
-      ("rabbitmq.conf", include_str "../deploy/rabbitmq.conf"), ("s3.json", include_str "../deploy/s3.json"),
-      ("filer.toml", include_str "../deploy/filer.toml"), ("config.json", defaultConfig.pretty),
+      ("node.c", include_str "Templates/node.c"), ("rabbitmq.conf", include_str "../deploy/rabbitmq.conf"), ("s3.json", include_str "../deploy/s3.json"),
+      ("filer.toml", include_str "../deploy/filer.toml"),
       ("compose.json", (compose ctx app version localSdk).pretty)] do
     request (.writeFile (home / name) text)
+  if writeConfig then
+    saveJson (home / "config.json") (← liftExcept (runtimeConfig defaultConfig app.workers))
 
 end LeanCloudCli.Project

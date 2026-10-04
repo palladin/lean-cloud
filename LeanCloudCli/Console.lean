@@ -1,6 +1,7 @@
 import LeanCloudCli.Diagnostics
 import LeanCloudCli.Top
 import LeanCloudCli.Help
+import LeanCloudCli.Watch
 
 namespace LeanCloudCli
 open Lean LeanCloud
@@ -67,147 +68,32 @@ private def showNodes (ctx : Context) : Cli Unit := do
       Styled.text (pad 11 node.state) (Styled.statusColor node.state) ++ cpuBar ++
       Styled.text (" " ++ pad 10 cpu) ++ memBar ++ Styled.text (" " ++ memory))
 
-private def lastEvent (events : Array ExecutionEvent) : Option ExecutionEvent := events.back?
-
-private def sourceStart (run : Run) (events : Array (String × Array ExecutionEvent)) : Nat :=
-  match run.program.source with
-  | none => 1
-  | some source =>
-    let observed := events.findSome? fun (_, trace) => do
-      let event ← lastEvent trace
-      let site ← source.sites.find? (·.operation == event.operation)
-      return site.line
-    max 1 (observed.getD ((source.sites[0]?.map (·.line)).getD 1) - 1)
-
-/-- A compact terminal frame. Source markers are observations, not a debugger PC. -/
-def frame (ctx : Context) (run : Run) (nodes : Array Node)
-    (events : Array (String × Array ExecutionEvent)) (histories : Array History)
-    (selected sourceOffset width height : Nat) (status := "") (disk : Option DiskUsage := none)
-    (color := false) : Array String := Id.run do
-  let selectedNode := nodes[selected % max 1 nodes.size]?
-  let mut lines := #[Styled.text (pad width s!" lean-cloud  {run.id}  {run.program.entry}  {status}") .header,
-    Styled.text "q: back · Tab: node · 1/2/3: worker · j/k: source · a: auto" .cyan]
-  for (worker, trace) in events do
-    let node := nodes.find? (·.name == ctx.node worker)
-    let state := node.map (·.state) |>.getD "absent"
-    let detail := match lastEvent trace with
-      | none => "no execution event"
-      | some e => s!"a{e.attempt.getD 0}  {e.location}  {e.activity} {e.operation}"
-    lines := lines.push (Styled.text worker .cyan ++ Styled.text s!" [{state}] " (Styled.statusColor state) ++ Styled.text detail)
-  let graphWidth := if width ≥ 110 then width - width / 2 - 3 else width
-  let graph := match selectedNode with
-    | none => #[Styled.text "No nodes" .muted]
-    | some node =>
-      let history := histories.find? (fun h => h.name == node.name && h.fresh && h.points.back?.map (·.session) == some node.started)
-      #[Styled.text (pad graphWidth s!" Node: {node.name}") .selected,
-        Styled.text s!"State: {node.state}" (Styled.statusColor node.state)] ++
-        (if node.state == "running" then metricLines (history.map (·.points) |>.getD #[]) graphWidth disk
-         else #[Styled.text "No live samples; process is stopped" .muted])
-  let available := max 4 (height - lines.size - 3)
-  let codeRows := if width ≥ 110 then available else max 4 (available - graph.size - 1)
-  let mut code : Array Styled.Line := #[]
-  if let some source := run.program.source then
-    code := code.push (Styled.text s!"Source: {source.file} (bundled with deployed image)" .cyan)
-    let sourceLines := source.text.splitOn "\n" |>.toArray
-    let start := min (sourceLines.size - 1) ((if sourceOffset == 0 then sourceStart run events else sourceOffset) - 1)
-    for index in [start:min sourceLines.size (start + codeRows - 1)] do
-      let markers := events.foldl (fun text (worker, trace) =>
-        match lastEvent trace with
-        | none => text
-        | some e =>
-          let alive := nodes.any (fun n => n.name == ctx.node worker && n.state == "running")
-          if alive && e.activity != "returned" && e.activity != "idle" && e.activity != "revoked" && (source.sites.any fun site => site.operation == e.operation && site.line == index + 1) then
-            text ++ (worker.drop 6 |>.toString)
-          else text) ""
-      code := code.push (Styled.text s!"{pad 3 (toString (index + 1))} " .muted ++
-        Styled.text (pad 3 markers) (if markers.isEmpty then .muted else .selected) ++
-        Styled.text (" " ++ sourceLines[index]!))
-  else code := #[Styled.text "This program has no bundled source locations." .muted]
-  if width ≥ 110 then
-    let left := width / 2
-    for i in [:max code.size graph.size] do
-      let source := code[i]?.getD #[]
-      let source := Styled.slice source 0 left ++ Styled.text (String.ofList (List.replicate (left - Styled.length source) ' '))
-      lines := lines.push (source ++ Styled.text " │ " .muted ++ (graph[i]?.getD #[]))
-  else lines := lines ++ code ++ #[#[]] ++ graph
-  lines := lines.push (Styled.text "CPU 100%=1 core (+ overflow); rates auto-scale; _ zero; · missing." .muted)
-  return (lines.extract 0 (height - 1)).map (fun line => Styled.render line width color)
-
-private structure Navigation where
-  selected : Nat := 0
-  offset : Nat := 0
-
-/-- Redraw from the cached snapshot while reading keys; return for a refresh or quit. -/
-private partial def watchKeys (draw : Navigation → Cli Unit) (autoOffset refresh : Nat)
-    (nav : Navigation) (redraw := true) : Cli (Option Navigation) := do
-  if redraw then draw nav
-  let key ← request (.key 100)
-  if key == 113 || key == 3 || key == 4 || key == 27 then return none
-  let offset := if nav.offset == 0 then autoOffset else nav.offset
-  let nav := match key.toNat with
-    | 9 => { nav with selected := nav.selected + 1 }
-    | 49 | 50 | 51 => { nav with selected := key.toNat - 49 }
-    | 106 => { nav with offset := offset + 3 }
-    | 107 => { nav with offset := max 1 (offset - 3) }
-    | 97 => { nav with offset := 0 }
-    | _ => nav
-  if key == 0 && (← request .now) ≥ refresh then return some nav
-  watchKeys draw autoOffset refresh nav (key != 0)
-
-private partial def watchLoop (ctx : Context) (run : Run) (interactive color : Bool)
-    (history : Array History := #[]) (nav : Navigation := {}) : Cli Unit := do
-  let nodes := runNodes run (← ctx.nodes)
-  let events ← ctx.events run nodes
-  let history := remember history (← samples nodes)
-  let control ← ctx.control run.id
-  let status ← try
-    pure ((← ctx.outcome run).map exitLabel |>.getD
-      (if control != .active then control.label else "result pending"))
-    catch _ => pure (if control != .active then control.label else "result unavailable")
-  let diskNode := nav.selected % max 1 nodes.size
-  let disk ← match nodes[diskNode]? with
-    | some node => filesystem node
-    | none => pure none
-  let (width, height) ← if interactive then request .dimensions else pure (120, 35)
-  let draw (nav : Navigation) : Cli Unit := do
-    let disk := if nav.selected % max 1 nodes.size == diskNode then disk else none
-    let lines := frame ctx run nodes events history nav.selected nav.offset width height status disk color
-    if interactive then request (.write "\x1b[H\x1b[2J")
-    request (.write (String.intercalate "\n" lines.toList ++ "\n"))
-    request .flush
-  if !interactive then draw nav; return
-  let refresh := (← request .now) + 1000
-  let some nav ← watchKeys draw (sourceStart run events) refresh nav | return
-  watchLoop ctx run interactive color history nav
-
-private def watch (ctx : Context) (id : String) (once := false) : Cli Unit := do
-  let run ← ctx.loadRun id
-  let interactive ← if once then pure false else request .enterTerminal
-  try
-    if interactive then request (.write "\x1b[?1049h\x1b[?25l")
-    watchLoop ctx run interactive (interactive && (← colorsEnabled))
-  finally
-    if interactive then
-      request .leaveTerminal
-      request (.write "\x1b[?25h\x1b[?1049l")
-      request .flush
-
-
 /-- Reject malformed flags before deployment changes any files or services. -/
 private def deploymentOptions (args : List String) (allowExecutable : Bool)
-    : Except String (Option String × Bool) := do
-  let usage := if allowExecutable then "Usage: deploy [EXECUTABLE] [-v|--verbose]"
+  : Except String (Option String × Bool × Option Nat) := do
+  let usage := if allowExecutable then "Usage: deploy [EXECUTABLE] [--workers N] [-v|--verbose]"
     else "Usage: up [-v|--verbose]"
   let mut executable := none
   let mut verbose := false
-  for arg in args do
-    if arg == "-v" || arg == "--verbose" then
-      if verbose then throw "Duplicate verbose flag (-v/--verbose)"
-      verbose := true
-    else if allowExecutable && executable.isNone && !arg.startsWith "-" then
-      executable := some arg
-    else throw usage
-  return (executable, verbose)
+  let mut workers := none
+  let mut rest := args
+  while !rest.isEmpty do
+    match rest with
+    | "--workers" :: value :: tail =>
+      unless allowExecutable do throw usage
+      if workers.isSome then throw "Duplicate --workers"
+      let some count := value.toNat? | throw "Worker count must be a nonnegative integer"
+      workers := some count; rest := tail
+    | arg :: tail =>
+      if arg == "-v" || arg == "--verbose" then
+        if verbose then throw "Duplicate verbose flag (-v/--verbose)"
+        verbose := true
+      else if allowExecutable && executable.isNone && !arg.startsWith "-" then
+        executable := some arg
+      else throw usage
+      rest := tail
+    | [] => pure ()
+  return (executable, verbose, workers)
 
 private def runOptions (args : List String) : Except String (Option String × Option String) := do
   let mut file := none
@@ -232,11 +118,14 @@ def command (ctx : Context) (args : List String) : Cli Bool := do
   | [] => return true
   | ["quit"] | ["exit"] => return false
   | "deploy" :: options =>
-    let (executable, verbose) ← liftExcept (deploymentOptions options true)
-    ctx.deploy executable verbose
+    let (executable, verbose, workers) ← liftExcept (deploymentOptions options true)
+    ctx.deploy executable verbose workers
+  | ["scale", value] =>
+    let some count := value.toNat? | throw "Usage: scale N (a nonnegative integer)"
+    ctx.scale count
   | ["down"] => ctx.down
   | "up" :: options =>
-    let (_, verbose) ← liftExcept (deploymentOptions options false)
+    let (_, verbose, _) ← liftExcept (deploymentOptions options false)
     ctx.up verbose
   | ["deployments"] => listDeployments ctx
   | ["status"] => ctx.status
@@ -258,8 +147,8 @@ def command (ctx : Context) (args : List String) : Cli Bool := do
   | ["resume", id] => ctx.resume id
   | ["pause", id] => ctx.pause id
   | ["kill", id] => ctx.kill id
-  | ["watch", id] => watch ctx id
-  | ["watch", id, "--once"] => watch ctx id true
+  | ["watch", id] => Watch.run ctx id
+  | ["watch", id, "--once"] => Watch.run ctx id true
   | ["result", id] =>
     let run ← ctx.loadRun id
     let some outcome ← ctx.outcome run | printLine "pending"; return true
@@ -272,7 +161,7 @@ def command (ctx : Context) (args : List String) : Cli Bool := do
     | .cancelled reason => printLine s!"cancelled: {safe reason}"
   | ["logs", id] | ["logs", id, _] =>
     let role := args[2]?.getD "worker1"
-    unless ["worker1", "worker2", "worker3", "scheduler"].contains role do throw "Unknown actor"
+    unless isActor role do throw "Unknown actor"
     let run ← ctx.loadRun id
     let output ← docker #["logs", "--tail", "100", ctx.node role]
     for line in (output.stdout ++ output.stderr).splitOn "\n" do
