@@ -3,7 +3,7 @@ import LeanCloudCli.Input
 
 namespace LeanCloudCli.Top
 
-/-- Compute nodes only. Mailbox brokers and blob services remain in `nodes`. -/
+/-- Compute nodes only. Blob services remain in `nodes`. -/
 def actors (nodes : Array Node) : Array Node :=
   (nodes.filter (fun node =>
     (isActor node.role))).qsort fun a b =>

@@ -1,5 +1,6 @@
 import LeanCloudCli.Effects
 import LeanCloudCli.Native
+import LeanCloudCli.Http
 
 namespace LeanCloudCli
 
@@ -10,6 +11,7 @@ private structure Resources where
 
 /-- Only this handler touches the host. Process arguments remain separate argv entries. -/
 private def handle (resources : IO.Ref Resources) : HostOp α → IO α
+  | .httpPost url token body => Http.post url token body
   | .process command args input => do
     let output ← IO.Process.output { cmd := command, args } input
     return ⟨output.exitCode, output.stdout, output.stderr⟩

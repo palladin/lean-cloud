@@ -5,6 +5,14 @@ namespace LeanCloudTests
 open Lean LeanCloudCli
 
 def projectCases : Array TestCase := #[
+  ⟨"console.project.reject-old-mailbox-configuration", do
+    let mailboxes ← unwrap (Project.defaultConfig.getObjVal? "mailboxes")
+    let routes ← unwrap (mailboxes.getObjValAs? (Array Json) "workers")
+    let oldRoutes := routes.map fun route => Json.mkObj [
+      ("worker", (route.getObjVal? "worker").toOption.getD Json.null),
+      ("broker", (route.getObjVal? "endpoint").toOption.getD Json.null)]
+    let config := Project.defaultConfig.setObjVal! "mailboxes" (mailboxes.setObjVal! "workers" (toJson oldRoutes))
+    assertTrue (Project.runtimeConfig config 3).toOption.isNone "Old queues were silently reused"⟩,
   ⟨"console.project.worker-count-templates", do
     for count in [0, 1, 5, 12] do
       let config ← unwrap (Project.runtimeConfig Project.defaultConfig count)
@@ -12,7 +20,7 @@ def projectCases : Array TestCase := #[
       assertEq routes.size count
       for i in [:count] do
         assertEq (routes[i]!.getObjValAs? String "worker").toOption (some s!"worker{i + 1}")
-        assertEq (routes[i]!.getObjVal? "broker" >>= (·.getObjValAs? String "host")).toOption
+        assertEq (routes[i]!.getObjVal? "endpoint" >>= (·.getObjValAs? String "host")).toOption
           (some s!"worker{i + 1}-mailbox")
       let resized ← unwrap (Project.runtimeConfig config (count + 2))
       assertEq ((← unwrap (resized.getObjVal? "blobs")).compress) ((← unwrap (config.getObjVal? "blobs")).compress)

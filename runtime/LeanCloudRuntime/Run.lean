@@ -1,5 +1,5 @@
 import LeanCloudRuntime.LocalDb
-import LeanCloudRuntime.RabbitMQ
+import LeanCloudRuntime.HttpMailbox
 import LeanCloudRuntime.ProcessLock
 import LeanCloudRuntime.S3
 import LeanCloudRuntime.Trace
@@ -13,7 +13,7 @@ structure SchedulerConfig where
   deriving FromJson, ToJson
 
 structure Config where
-  mailboxes : RabbitMQ.Mailboxes
+  mailboxes : HttpMailbox.Mailboxes
   scheduler : SchedulerConfig
   blobs : S3.Config
   deriving FromJson, ToJson
@@ -76,10 +76,10 @@ def runScheduler (config : Config) (run : String) : IO Unit := do
     let conn ← LeanLinq.Sqlite.connect config.scheduler.database
     try
       LocalDb.initializeSchema conn
-      let handle ← RabbitMQ.openMailbox config.mailboxes.scheduler run "scheduler"
+      let handle ← HttpMailbox.openMailbox config.mailboxes.scheduler run "scheduler" (waitMs := 20000)
       try
         let store := LocalDb.store conn run
-        let inbox : Mailbox IO SchedulerMessage := RabbitMQ.inbox handle
+        let inbox : Mailbox IO SchedulerMessage := HttpMailbox.inbox handle
         let lastTime ← IO.mkRef (← IO.monoMsNow)
         let ports : SchedulerPorts IO := {
           localDb := store
@@ -97,7 +97,7 @@ def runScheduler (config : Config) (run : String) : IO Unit := do
             acknowledge := fun receipt => if receipt == 0 then pure () else inbox.acknowledge receipt }
           send := config.mailboxes.sendWorker run }
         Scheduler.recover store
-        IO.println s!"scheduler ready for {run} using RabbitMQ"
+        IO.println s!"scheduler ready for {run} using HttpMailbox"
         (← IO.getStdout).flush
         repeat Scheduler.turn ports config.scheduler.assignmentMs
       finally handle.close
@@ -119,7 +119,7 @@ def observe (records : ReplayStore IO) : IO (Worker.ObservedStore IO) := do
         return value }
     confirmed := keys.get }
 
-/-- Stable across container restarts so RabbitMQ redelivers into the same inbox.
+/-- Stable across container restarts so HttpMailbox redelivers into the same inbox.
 On a host running several processes, provide a distinct CLOUD_WORKER_ID for each. -/
 def workerId : IO String := do
   let id ← match ← IO.getEnv "CLOUD_WORKER_ID" with
@@ -133,17 +133,17 @@ def workerId : IO String := do
     throw (IO.userError "Worker id must contain 1–64 ASCII letters, digits, '-' or '_'")
   return id
 
-/-- Workers consume their own durable mailbox. RabbitMQ retains reports and
+/-- Workers consume their own durable mailbox. HttpMailbox retains reports and
 assignments independently of either actor's process lifetime. -/
 def runWorker [Codec α] (config : Config) (run : String)
     (program : ι → Cloud IO α) (input : ι) : IO Unit := do
   if (← completed config run).isSome then return
   let id ← workerId
-  let broker ← IO.ofExcept (config.mailboxes.worker id)
-  let handle ← RabbitMQ.openMailbox broker run ("worker." ++ id)
+  let endpoint ← IO.ofExcept (config.mailboxes.worker id)
+  let handle ← HttpMailbox.openMailbox endpoint run ("worker." ++ id) (waitMs := 20000)
   try
     let trace ← Trace.create id
-    let inbox : Mailbox IO WorkerMessage := RabbitMQ.inbox handle
+    let inbox : Mailbox IO WorkerMessage := HttpMailbox.inbox handle
     let failure ← IO.mkRef (none : Option CloudError)
     let ports : Worker.Ports IO := {
       id
@@ -166,10 +166,10 @@ def runWorker [Codec α] (config : Config) (run : String)
           | .ok (.fork _ _) => trace.emit "suspended" "parallel"
           | .ok .done => trace.emit "returned" "return"
           | .error _ => trace.emit "failed" ""
-        RabbitMQ.send config.mailboxes.scheduler run "scheduler" message
+        HttpMailbox.send config.mailboxes.scheduler run "scheduler" message
       observe := ← observe (trace.records (S3.records config.blobs run))
       blobs := trace.blobs (S3.storage config.blobs) }
-    IO.println s!"worker {id} joined {run} via RabbitMQ"
+    IO.println s!"worker {id} joined {run} via HttpMailbox"
     (← IO.getStdout).flush
     let mut state : Worker.State := {}
     repeat
@@ -184,10 +184,10 @@ def status (config : Config) (run : String) : IO Scheduler.State := do
   let random ← IO.Process.output { cmd := "openssl", args := #["rand", "-hex", "16"] }
   unless random.exitCode == 0 do throw (IO.userError "Cannot allocate status reply address")
   let id := "status-" ++ random.stdout.trimAscii.toString
-  let handle ← RabbitMQ.openMailbox config.mailboxes.scheduler run ("worker." ++ id)
+  let handle ← HttpMailbox.openMailbox config.mailboxes.scheduler run ("worker." ++ id)
   try
-    let inbox : Mailbox IO WorkerMessage := RabbitMQ.inbox handle
-    RabbitMQ.send config.mailboxes.scheduler run "scheduler" (SchedulerMessage.inspect id)
+    let inbox : Mailbox IO WorkerMessage := HttpMailbox.inbox handle
+    HttpMailbox.send config.mailboxes.scheduler run "scheduler" (SchedulerMessage.inspect id)
     let deadline := (← IO.monoMsNow) + 5000
     repeat
       if (← IO.monoMsNow) > deadline then throw (IO.userError "Scheduler status timed out")

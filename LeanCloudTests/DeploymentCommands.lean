@@ -17,12 +17,14 @@ private def healthyNodes : Json := toJson (deploymentServices.map fun service =>
   ("Config", Json.mkObj [("Labels", Json.mkObj [("com.docker.compose.service", toJson service)])])])
 
 private def process (call : Invocation) : Except String ProcessOutput := do
-  unless call.command == "docker" do throw "Unexpected executable"
+  unless call.command == "docker" || call.command == "http" do throw "Unexpected executable"
+  if call.command == "http" then return {}
   match call.args.toList with
+  | "port" :: _ => output "127.0.0.1:18080"
   | ["--version"] | ["compose", "version"] | ["info", "--format", _] => output "version"
   | "ps" :: _ => output (if call.args.any (·.startsWith "label=com.docker.compose.service=") then "" else "node\n")
   | "inspect" :: _ => output (if call.args.contains "--format" then "healthy\nhealthy\nhealthy\nhealthy\n" else healthyNodes.compress)
-  | "image" :: "inspect" :: _ => output (if call.args.contains "{{index .Config.Labels \"lean-cloud.node\"}}" then "mailbox-v1" else "sha256:pinned")
+  | "image" :: "inspect" :: _ => output (if call.args.contains "{{index .Config.Labels \"lean-cloud.node\"}}" then "http-inbox-v1" else "sha256:pinned")
   | ["volume", "inspect", _] => output
   | "exec" :: _ => output
   | "compose" :: _ => output
@@ -34,6 +36,7 @@ private def base : World :=
   ({ process, directories := #["/work", "/work/.lean-cloud", ctx.home.toString] } : World)
     |>.save "/work/compose.yaml" "services: {}"
     |>.json "/work/deploy/config.json" Project.defaultConfig
+    |>.json (ctx.home / "api.json") (Json.mkObj [("url", toJson "http://127.0.0.1:18080"), ("token", toJson "local-cloud")])
     |>.json (ctx.home / "deployment.json") (Deployment.mk ctx.project "sha256:pinned" #[] defaultWorkerCount 0)
 
 private def checked (program : Cli α) (world : World := base) : IO (α × World) := do

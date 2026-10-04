@@ -43,7 +43,7 @@ the other contains the third. `Cloud.parallel` returns one count per batch. The
 workflow sums the counts, saves the report, and returns its `BlobRef`.
 
 Run the [complete example](runtime/LeanCloudRuntime/Demo.lean) with three worker
-containers, one scheduler container, and shared S3 blob storage. Each node includes\nits own RabbitMQ mailbox:
+containers, one scheduler container, and shared S3 blob storage. Each node runs its HTTP API, SQLite inbox, and actor in one Lean process:
 
 ```sh
 docker compose up --build -d scheduler worker worker2 worker3
@@ -91,7 +91,7 @@ during replay; an external action may run again if interrupted before its result
 is recorded.
 
 One scheduler organizes assignments and parallel joins through durable mailbox
-messages. Each worker and the scheduler includes its own independent RabbitMQ broker
+messages. Each worker and the scheduler runs its HTTP API and embedded SQLite inbox in the same Lean process
 and persistent mailbox volume. Workers execute the workflow and write immutable replay records directly
 to shared blob storage. The scheduler keeps only coordination metadata in its own
 local SQLite database. Global blob storage holds replay values and user files.

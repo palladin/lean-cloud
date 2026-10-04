@@ -11,6 +11,16 @@ structure ProcessOutput where
   stderr : String := ""
   deriving Inhabited, BEq, Repr
 
+instance : Lean.ToJson ProcessOutput where
+  toJson out := Lean.Json.mkObj [("exitCode", Lean.toJson out.exitCode.toNat),
+    ("stdout", Lean.toJson out.stdout), ("stderr", Lean.toJson out.stderr)]
+
+instance : Lean.FromJson ProcessOutput where
+  fromJson? json := do
+    let code ← json.getObjValAs? Nat "exitCode"
+    unless code ≤ 4294967295 do throw "Invalid process exit code"
+    return ⟨code.toUInt32, ← json.getObjValAs? String "stdout", ← json.getObjValAs? String "stderr"⟩
+
 /-- A handle owned by the host handler, not an IO value in the CLI program. -/
 structure LockId where
   value : Nat
@@ -29,6 +39,7 @@ structure ProcessChunk where
 
 /-- The CLI's host boundary. Requests contain data, never arbitrary IO actions. -/
 inductive HostOp : Type → Type where
+  | httpPost (url token body : String) : HostOp String
   | process (command : String) (args : Array String) (input : Option String) : HostOp ProcessOutput
   | startProcess (command : String) (args : Array String) : HostOp ProcessId
   | pollProcess (id : ProcessId) (timeoutMs : UInt32) : HostOp ProcessChunk

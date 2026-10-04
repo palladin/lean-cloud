@@ -32,7 +32,7 @@ structure Report where
   recorded : Array String := #[]
   deriving Repr, ToJson, FromJson
 
-/-- RabbitMQ retains confirmed requests and reports until acknowledged. Expiry
+/-- Durable inboxes retain confirmed requests and reports until acknowledged. Expiry
 makes abandoned assignments available again; stale attempts cannot change jobs. -/
 inductive SchedulerMessage where
   | ready (worker : WorkerId)

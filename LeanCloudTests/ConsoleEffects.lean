@@ -15,9 +15,10 @@ private def response (text : String := "") : Except String ProcessOutput := .ok 
 
 /-- Protocol fixtures; unrecognized host processes fail instead of running anything. -/
 private def process (completed : Bool) (call : Invocation) : Except String ProcessOutput := do
-  unless call.command == "docker" do throw "Unexpected executable"
+  unless call.command == "docker" || call.command == "http" do throw "Unexpected executable"
   let args := call.args
-  if args.contains "validate" then
+  if args[0]? == some "port" then response "127.0.0.1:18080"
+  else if args.contains "validate" then
     match Json.parse (call.input.getD "") >>= fromJson? (α := Array Nat) with
     | .ok _ => response
     | .error _ => return { exitCode := 2, stderr := "Invalid numbers" }
@@ -46,10 +47,11 @@ private def process (completed : Bool) (call : Invocation) : Except String Proce
         ("State", Json.mkObj [("Status", toJson "running"), ("StartedAt", toJson "boot")]),
         ("Config", Json.mkObj [("Labels", Json.mkObj [("lean-cloud.run", toJson savedRun.id),
           ("lean-cloud.role", toJson role)])])])).compress
+  else if call.command == "http" then response
   else if args[0]? == some "exec" then response "Filesystem 1024-blocks Used Available Capacity Mounted\ndisk 2048 1024 1024 50% /\n"
   else if args.toList.take 2 == ["container", "inspect"] then return { exitCode := 1 }
   else if args.toList.take 2 == ["image", "inspect"] then
-    response (if args.contains "{{index .Config.Labels \"lean-cloud.node\"}}" then "mailbox-v1" else "sha256:pinned\n")
+    response (if args.contains "{{index .Config.Labels \"lean-cloud.node\"}}" then "http-inbox-v1" else "sha256:pinned\n")
   else if args[0]? == some "compose" || args[0]? == some "tag" ||
       args[0]? == some "stop" || args[0]? == some "rm" || args[0]? == some "update" ||
       args.toList.take 2 == ["volume", "create"] || args.toList.take 2 == ["volume", "inspect"] || args.contains "submit-entry" ||
@@ -59,6 +61,7 @@ private def process (completed : Bool) (call : Invocation) : Except String Proce
 private def base (completed := true) : World :=
   ({ process := process completed : World }.save (ctx.root / "compose.yaml") "services: {}")
     |>.json (ctx.root / "deploy/config.json") Project.defaultConfig
+    |>.json (ctx.home / "api.json") (Json.mkObj [("url", toJson "http://127.0.0.1:18080"), ("token", toJson "local-cloud")])
 
 private def deployed (completed := true) : World :=
   (base completed).json (ctx.home / "deployment.json") (Deployment.mk ctx.project savedRun.image #[info] defaultWorkerCount 0)
@@ -93,6 +96,14 @@ private def scaleProcess (drained : Bool) (call : Invocation) : Except String Pr
   else process false call
 
 def consoleEffectCases : Array TestCase := #[
+  ⟨"console.http.rediscovers-port-before-send", do
+    let world := (base).json (ctx.home / "api.json") (Json.mkObj [
+      ("url", toJson "http://127.0.0.1:19090"), ("token", toJson "local-cloud")])
+    let (_, after) ← checked (ctx.execApp #["pool-health", "/etc/lean-cloud/config.json"]) world
+    let endpoint ← unwrap (Json.parse ((after.file (ctx.home / "api.json")).getD ""))
+    assertEq (endpoint.getObjValAs? String "url").toOption (some "http://127.0.0.1:18080")
+    assertEq (after.processes.filter (·.command == "http")).size 1
+    assertEq (after.processes[0]?.map (·.args[0]?)) (some (some "port"))⟩,
   ⟨"console.effects.elastic-grow-reuses-existing-nodes", do
     let initial := { (launched false) with process := scaleProcess true, directories := #[ctx.runs.toString] }
     let (_, after) ← checked (command ctx ["scale", "5"]) initial
@@ -221,8 +232,9 @@ def consoleEffectCases : Array TestCase := #[
     let (_, paused) ← checked (command ctx ["pause", "one"]) initial
     let (control, _) ← checked (ctx.control "one") paused
     assertTrue (control == .paused) "Pause was not persisted"
-    assertEq (paused.processes.map (·.args.toList)) #[
-      ["exec", "--user", "worker", ctx.node "scheduler", "cloud-app", "pause", "/etc/lean-cloud/config.json", "one"]]
+    assertEq (paused.processes.filter (·.command == "http") |>.map (·.args.toList)) #[
+      ["pause", "/etc/lean-cloud/config.json", "one"]]
+    assertTrue (paused.processes.all (fun p => p.command == "http" || p.args[0]? == some "port")) "Pause bypassed HTTP"
     assertEq (paused.file (ctx.directory "one" / "run.json")) (initial.file (ctx.directory "one" / "run.json"))
     let (_, resumed) ← checked (ctx.resume "one") paused
     let (control, _) ← checked (ctx.control "one") resumed
@@ -284,7 +296,7 @@ def consoleEffectCases : Array TestCase := #[
   ⟨"console.effects.resume-uses-existing-pool", do
     let initial := (launched false).json (ctx.directory "one" / "control.json") RunControl.paused
     let (_, resumed) ← checked (ctx.resume "one") initial
-    assertTrue (resumed.processes.all (·.args[0]? == some "exec")) "Resume changed deployment containers"
+    assertTrue (resumed.processes.all (fun p => p.command == "http" || p.args[0]? == some "port")) "Resume changed deployment containers"
     assertTrue (resumed.processes.any (·.args.contains "resume")) "No scheduler resume request"
     let failing (call : Invocation) :=
       if call.args.contains "resume" then .error "Scheduler unavailable" else process false call
@@ -326,11 +338,11 @@ def consoleEffectCases : Array TestCase := #[
       let some node := actors.find? (·.args.contains (ctx.node role))
         | throw (IO.userError "Missing combined node")
       assertTrue (node.args.contains (role ++ "-mailbox") &&
-        node.args.contains (ctx.project ++ "_" ++ role ++ "-mailbox-data:/var/lib/rabbitmq"))
-        "Node lost its durable mailbox or stable broker identity"
+        node.args.contains (ctx.project ++ "_" ++ role ++ "-mailbox-data:/mailbox"))
+        "Node lost its durable inbox or stable endpoint identity"
     assertTrue (world.processes.any (·.args.contains "lean-cloud-console-app:pinned")) "No retained image tag"
     assertTrue (!world.files.any (fun (path, _) => path.endsWith ".tmp")) "Atomic manifest replacement incomplete"⟩,
-  ⟨"console.effects.migration-stops-old-nodes-before-moving-mailboxes", do
+  ⟨"console.effects.upgrade-stops-old-nodes-before-reusing-storage", do
     let handler (call : Invocation) := do
       if call.args.toList.take 2 == ["container", "inspect"] then
         let role := (call.args.back?.getD "").splitOn "-" |>.getLast!
@@ -348,14 +360,6 @@ def consoleEffectCases : Array TestCase := #[
     let some created := world.processes.findIdx? (fun call => call.args.toList.take 2 == ["run", "-d"])
       | throw (IO.userError "Combined actors were not started")
     assertTrue (stopped < removed && removed < created) "Migration overlapped actor ownership"
-    for role in #["scheduler", "worker1", "worker2", "worker3"] do
-      let old := "old-label=com.docker.compose.service=" ++ role ++ "-mailbox"
-      let some stoppedBroker := world.processes.findIdx? (fun call => call.args.toList == ["stop", old])
-        | throw (IO.userError "Old broker was not stopped")
-      let some removedBroker := world.processes.findIdx? (fun call => call.args.toList == ["rm", old])
-        | throw (IO.userError "Old broker was not removed")
-      assertTrue (removed < stoppedBroker && stoppedBroker < removedBroker && removedBroker < created)
-        "Two RabbitMQ processes could open the same volume"
     assertTrue (!world.processes.any (fun call => call.args.toList.take 2 == ["volume", "rm"]))
       "Migration removed durable storage"⟩,
   ⟨"console.effects.node-readiness-is-required-and-bounded", do
@@ -373,8 +377,9 @@ def consoleEffectCases : Array TestCase := #[
       ((deployed).json input (toJson "invalid"))
     assertTrue result.toOption.isNone "Invalid input accepted"
     assertTrue (world.file (ctx.directory "one" / "run.json")).isNone "Invalid input persisted a run"
-    assertEq world.processes.size 1
-    assertEq world.processes[0]!.input (some "\"invalid\"\n")
+    let requests := world.processes.filter (·.command == "http")
+    assertEq requests.size 1
+    assertEq requests[0]!.input (some "\"invalid\"\n")
     assertTrue world.locks.isEmpty "Input rejection acquired/leaked a lock"⟩,
   ⟨"console.effects.launch-identity-and-resume", do
     let (result, duplicate) := ConsoleModel.run (ctx.launch "squares" none (some "one")) (launched)
@@ -424,7 +429,7 @@ def consoleEffectCases : Array TestCase := #[
       assertTrue (has world.stdout label && has world.stdout "square" && has world.stdout "HISTORY")
         "Offline history lost its status, steps, or cursor"
       assertTrue (world.processes.all fun call => call.args[0]? == some "logs" ||
-        call.args[0]? == some "ps" || call.args.contains "outcome") "Browsing mutated execution"
+        call.args[0]? == some "ps" || call.args[0]? == some "port" || call.args.contains "outcome") "Browsing mutated execution"
       assertEq (world.file (ctx.directory savedRun.id / "control.json"))
         (initial.file (ctx.directory savedRun.id / "control.json"))⟩,
   ⟨"console.effects.trace-cache-retains-restarts-and-older-runs", do

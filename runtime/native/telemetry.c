@@ -132,7 +132,7 @@ static int output = -1;
 static pthread_once_t once = PTHREAD_ONCE_INIT;
 static void open_output(void) {
     /* Combined nodes open this description before dropping privileges. Unlike
-       dup(stdout), it does not set ordinary Lean/RabbitMQ logging nonblocking. */
+       dup(stdout), it does not set ordinary Lean logging nonblocking. */
     const char *inherited = getenv("LEAN_CLOUD_TRACE_FD");
     if (inherited && *inherited) {
         char *end;

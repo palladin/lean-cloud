@@ -23,7 +23,7 @@ jobs:
       - name: Install native build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential
+          sudo apt-get install -y build-essential pkg-config tzdata libcurl4-openssl-dev libsqlite3-dev libpq-dev freetds-dev default-libmysqlclient-dev
 
       - name: Install elan
         run: |
@@ -45,3 +45,7 @@ jobs:
 
       - name: Check native process streaming and cleanup
         run: lake exe cloud_process_tests
+
+      - name: Check HTTP inbox durability and model agreement
+        working-directory: runtime
+        run: lake exe cloud_inbox_tests

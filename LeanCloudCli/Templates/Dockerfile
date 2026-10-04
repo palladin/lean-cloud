@@ -1,6 +1,6 @@
 FROM ubuntu:24.04 AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl git zstd build-essential pkg-config librabbitmq-dev \
+    ca-certificates curl git zstd build-essential pkg-config libcurl4-openssl-dev \
     libpq-dev libsqlite3-dev freetds-dev default-libmysqlclient-dev \
     && rm -rf /var/lib/apt/lists/*
 ARG TARGETARCH
@@ -19,17 +19,14 @@ COPY . .
 ARG APP_TARGET
 # BUILD_APP
 
-FROM rabbitmq:4.3
+FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl openssl libsqlite3-0 librabbitmq4 \
+    ca-certificates curl openssl tzdata libsqlite3-0 libcurl4t64 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 worker \
-    && mkdir /data && chown worker:worker /data
+    && mkdir /data /mailbox && chown worker:worker /data /mailbox
 COPY --from=build /out/app /usr/local/bin/cloud-app
-ENV RABBITMQ_DEFAULT_USER=cloud RABBITMQ_DEFAULT_PASS=local-cloud \
-    RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS="+S 2:2 +sbwt none +sbwtdcpu none +sbwtdio none"
-COPY --from=node_assets rabbitmq.conf /etc/rabbitmq/rabbitmq.conf
 COPY --from=build /usr/local/bin/cloud-node /usr/local/bin/cloud-node
-LABEL lean-cloud.node="mailbox-v1"
+LABEL lean-cloud.node="http-inbox-v1"
 HEALTHCHECK --interval=3s --timeout=5s --start-period=10s --retries=40 CMD ["cloud-node", "health"]
 ENTRYPOINT ["cloud-node"]

@@ -62,14 +62,14 @@ def Registry.runWorker (registry : Registry) (config : Config) (run : String) : 
   program.worker config run definition
 
 /-- A persistent worker executes one assignment at a time, selecting the entry
-from the deployed registry. IO failures escape CloudError and trigger broker
+from the deployed registry. IO failures escape CloudError and trigger inbox
 redelivery. Administrative revocation is cooperative at record boundaries. -/
 def Registry.serveWorker (registry : Registry) (config : Config) : IO Unit := do
   let id ← workerId
-  let broker ← IO.ofExcept (config.mailboxes.worker id)
-  let handle ← RabbitMQ.openMailbox broker Pool.address ("worker." ++ id)
+  let endpoint ← IO.ofExcept (config.mailboxes.worker id)
+  let handle ← HttpMailbox.openMailbox endpoint Pool.address ("worker." ++ id)
   try
-    let inbox : Mailbox IO LeanCloud.Pool.Reply := RabbitMQ.inbox handle
+    let inbox : Mailbox IO LeanCloud.Pool.Reply := HttpMailbox.inbox handle
     let send (message : LeanCloud.Pool.Message) :=
       Pool.send config message
     let mut nextReady := 0

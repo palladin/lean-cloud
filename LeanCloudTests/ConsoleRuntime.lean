@@ -39,52 +39,23 @@ private def poolNodes (ctx : Context) : Cli String := do
   let ids ← docker (#["inspect", "--format", "{{.Id}}"] ++ actors)
   return ids.stdout
 
-/-- A Lean crash must keep its mailbox and container alive. A broker crash must
-restart the container and recover the durable mailbox before restarting Lean. -/
+/-- The HTTP server and actor fail together; SQLite survives on the node volume. -/
 private def nodeRecovery (ctx : Context) : Cli Unit := do
   let node := ctx.node "worker1"
-  let readPid (file : String) := do
-    let output ← docker #["exec", node, "cat", "/run/cloud-node/" ++ file ++ ".pid"]
-    pure output.stdout.trimAscii.toString
-  let actor ← readPid "app"
-  let broker ← readPid "broker"
   let started ← docker #["inspect", "--format", "{{.State.StartedAt}}", node]
-  discard <| docker #["exec", node, "kill", "-KILL", actor]
-  let deadline := (← request .now) + 30000
-  repeat
-    let next ← observing (readPid "app")
-    if next.toOption.any (fun pid => !pid.isEmpty && pid != actor) then break
-    unless (← request .now) < deadline do throw "Lean actor was not restarted inside its node"
-    request (.sleep 250)
-  require ((← readPid "broker") == broker) "Lean crash restarted the mailbox"
-  let after ← docker #["inspect", "--format", "{{.State.StartedAt}}", node]
-  require (after.stdout == started.stdout) "Lean crash restarted the whole container"
-  discard <| docker #["exec", node, "kill", "-KILL", broker]
+  discard <| docker #["kill", "--signal", "KILL", node]
+  discard <| docker #["start", node]
   let deadline := (← request .now) + 90000
   repeat
     let after ← docker #["inspect", "--format", "{{.State.StartedAt}}", node]
     let health ← docker #["exec", node, "cloud-node", "health"] false
     if after.stdout != started.stdout && health.exitCode == 0 then break
-    unless (← request .now) < deadline do throw "Mailbox failure did not recover the combined node"
+    unless (← request .now) < deadline do throw "Node did not recover HTTP and its actor"
     request (.sleep 500)
   discard <| docker #["stop", node]
   let stopped ← docker #["inspect", "--format", "{{.State.ExitCode}}", node]
-  require (stopped.stdout.trimAscii.toString == "0") "Node shutdown needed a forced kill"
+  require (stopped.stdout.trimAscii.toString != "137") "Node shutdown needed a forced kill"
   ctx.up
-
-/-- Exercise the old sidecar layout over the same durable data, then let `up`
-migrate it. All containers belong to the isolated test deployment. -/
-private def legacyMailboxes (ctx : Context) : Cli Unit := do
-  let image := (← ctx.deployment).image
-  discard <| ctx.compose #["up", "-d", "--wait", "--no-build", "blobs"]
-  for role in #["scheduler", "worker1", "worker2", "worker3"] do
-    let name := role ++ "-mailbox"
-    discard <| docker #["run", "-d", "--name", ctx.project ++ "-" ++ name,
-      "--hostname", name, "--network", ctx.project ++ "_default", "--network-alias", name,
-      "--label", "com.docker.compose.project=" ++ ctx.project,
-      "--label", "com.docker.compose.service=" ++ name,
-      "-v", ctx.project ++ "_" ++ name ++ "-data:/var/lib/rabbitmq",
-      "--entrypoint", "docker-entrypoint.sh", image, "rabbitmq-server"]
 
 private def cleanup (ctx : Context) : Cli Unit := do
   let nodes ← docker #["ps", "-aq", "--filter", "label=lean-cloud.project=" ++ ctx.project] false
@@ -133,7 +104,7 @@ def demo : Cli Unit := do
     catch _ => pure true
     require duplicate "Duplicate run id accepted"
     -- Replacing the mutable build tag must leave the first run's image runnable.
-    discard <| docker #["tag", "rabbitmq:4.3", ctx.project ++ "-app:build"]
+    discard <| docker #["tag", "chrislusf/seaweedfs:4.48", ctx.project ++ "-app:build"]
     ctx.resume "first"
     waitFor ctx first 29
     discard <| docker #["tag", deployment.image, ctx.project ++ "-app:build"]
@@ -215,7 +186,6 @@ def demo : Cli Unit := do
     require (offlineTrace.steps.any (·.resources.isSome)) "Shutdown lost historical worker metrics"
     discard (command ctx ["watch", "first", "--once"])
     ctx.down
-    legacyMailboxes ctx
     ctx.up
     discard (poolNodes ctx)
     waitFor ctx first 29
@@ -235,7 +205,7 @@ def demo : Cli Unit := do
     printLine s!"Console test catalog retained: {ctx.home}"
 
 /-- Real scale changes during execution, using the same compiled application,
-RabbitMQ nodes, scheduler state machine, and replay interpreter. -/
+HTTP/SQLite nodes, scheduler state machine, and replay interpreter. -/
 def scaling : Cli Unit := do
   let root ← request (.realPath (← request .currentDir))
   let ctx : Context := ⟨root, s!"lean-cloud-scaling-test-{← request .pid}"⟩

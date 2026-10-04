@@ -100,7 +100,7 @@ def decodeFilesystem (path output : String) : Option DiskUsage := do
 def filesystem (node : Node) : Cli (Option DiskUsage) := do
   if node.state != "running" then return none
   let path := if node.role == "scheduler" || node.role == "blobs" then "/data"
-    else if (node.role.splitOn "mailbox").length > 1 then "/var/lib/rabbitmq" else "/"
+    else if isActor node.role then "/mailbox" else "/"
   let output ← docker #["exec", node.name, "df", "-Pk", path] false
   if output.exitCode != 0 then return none
   return decodeFilesystem path output.stdout

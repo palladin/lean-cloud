@@ -22,13 +22,13 @@ def run (build : Bool) : IO Unit := withContext "test" fun ctx => do
   require (participants ≥ 2) s!"Expected multiple workers; observed {participants}"
   say s!"Parallel demo: {participants} worker containers processed locations."
   require (← ctx.crash scheduler) "Scheduler was not running"
-  for index in [:ctx.brokers.size] do
-    let node := ctx.brokers[index]!
+  for index in [:ctx.mailboxNodes.size] do
+    let node := ctx.mailboxNodes[index]!
     let run := s!"persistence-{index}"
     discard <| ctx.compose #["run", "--rm", "--no-deps", "checks", configPath, "mailbox-seed", run, toString index]
     discard <| ctx.compose #["kill", "-s", "SIGKILL", node]
-    -- A different actor's broker must still accept and deliver confirmed mail.
-    let other := (index + 1) % ctx.brokers.size
+    -- A different actor's inbox must still accept and deliver confirmed mail.
+    let other := (index + 1) % ctx.mailboxNodes.size
     discard <| ctx.compose #["run", "--rm", "--no-deps", "checks", configPath, "mailbox-seed", run, toString other]
     discard <| ctx.compose #["run", "--rm", "--no-deps", "checks", configPath, "mailbox-check", run, toString other]
     discard <| ctx.compose #["up", "-d", "--wait", node] (timeout := 120)
@@ -45,7 +45,7 @@ def run (build : Bool) : IO Unit := withContext "test" fun ctx => do
   require (lines.contains "completed normal" &&
     !lines.any (fun line => (line.splitOn " location=").length > 1))
     "A fresh worker must confirm completion without processing new work"
-  say "Persistence: scheduler state and blob results survived restart; fresh worker used its own broker."
+  say "Persistence: scheduler state and blob results survived restart; fresh worker used its own inbox."
   say "All real runtime checks passed."
 
 end LeanCloudTests.Runtime

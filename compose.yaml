@@ -35,6 +35,7 @@ services:
 
   scheduler:
     <<: *worker
+    ports: ["127.0.0.1::8080"]
     hostname: scheduler-mailbox
     networks:
       default: {aliases: [scheduler-mailbox]}
@@ -42,7 +43,7 @@ services:
     volumes:
       - ./deploy/config.json:/etc/lean-cloud/config.json:ro
       - scheduler-data:/data
-      - scheduler-mailbox-data:/var/lib/rabbitmq
+      - scheduler-mailbox-data:/mailbox
     depends_on:
       blobs: {condition: service_healthy}
 
@@ -55,7 +56,7 @@ services:
       CLOUD_WORKER_ID: worker1
     volumes:
       - ./deploy/config.json:/etc/lean-cloud/config.json:ro
-      - worker1-mailbox-data:/var/lib/rabbitmq
+      - worker1-mailbox-data:/mailbox
     depends_on:
       scheduler: {condition: service_healthy}
 
@@ -68,7 +69,7 @@ services:
       CLOUD_WORKER_ID: worker2
     volumes:
       - ./deploy/config.json:/etc/lean-cloud/config.json:ro
-      - worker2-mailbox-data:/var/lib/rabbitmq
+      - worker2-mailbox-data:/mailbox
     depends_on:
       scheduler: {condition: service_healthy}
 
@@ -81,7 +82,7 @@ services:
       CLOUD_WORKER_ID: worker3
     volumes:
       - ./deploy/config.json:/etc/lean-cloud/config.json:ro
-      - worker3-mailbox-data:/var/lib/rabbitmq
+      - worker3-mailbox-data:/mailbox
     depends_on:
       scheduler: {condition: service_healthy}
 

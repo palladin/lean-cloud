@@ -10,7 +10,8 @@ private def table : Table "scheduler" Row := ⟨⟩
 
 /-- This database belongs exclusively to one scheduler process and its persistent
 volume. It contains coordination metadata; replay values live in shared blobs. -/
-def initializeSchema (conn : Sqlite.Conn) : IO Unit :=
+def initializeSchema (conn : Sqlite.Conn) : IO Unit := do
+  conn.execRaw "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;"
   conn.createTable table (primaryKey := [.column "run"])
 
 def loadValue [FromJson α] (conn : Sqlite.Conn) (run : String) (initial : α) : IO α := do

@@ -81,8 +81,8 @@ private def checkAdapters (config : Config) (runPrefix : String) : IO Unit := do
 
 /-- A confirmed publication can still take time to reach a consumer. Require
 the expected payload within a bounded wait instead of assuming immediate delivery. -/
-private def receiveAcknowledged (handle : RabbitMQ.Handle) (expected : Nat) : IO Nat := do
-  let inbox : Mailbox IO WorkerMessage := RabbitMQ.inbox handle
+private def receiveAcknowledged (handle : HttpMailbox.Handle) (expected : Nat) : IO Nat := do
+  let inbox : Mailbox IO WorkerMessage := HttpMailbox.inbox handle
   for _ in [:40] do
     if let some delivery ← inbox.receive then
       assertEq (toJson delivery.message) (toJson (WorkerMessage.acknowledged expected))
@@ -90,59 +90,59 @@ private def receiveAcknowledged (handle : RabbitMQ.Handle) (expected : Nat) : IO
       return delivery.receipt
   throw (IO.userError s!"Missing confirmed message {expected}")
 
-private def checkMailboxes (broker : RabbitMQ.Config) (run : String) : IO Unit := do
-  let first ← RabbitMQ.openMailbox broker run "durability"
+private def checkMailboxes (endpoint : HttpMailbox.Config) (run : String) : IO Unit := do
+  let first ← HttpMailbox.openMailbox endpoint run "durability"
   try
     first.send (WorkerMessage.acknowledged 42)
     discard <| receiveAcknowledged first 42
   finally first.close
   -- Closing without ack must retain the delivery through repeated crashes.
-  -- The reference classic queues have no finite delivery limit.
+  -- Durable inboxes have no finite delivery limit.
   for _ in [:24] do
-    let handle ← RabbitMQ.openMailbox broker run "durability"
+    let handle ← HttpMailbox.openMailbox endpoint run "durability"
     try discard <| receiveAcknowledged handle 42
     finally handle.close
-  let handle ← RabbitMQ.openMailbox broker run "durability"
+  let handle ← HttpMailbox.openMailbox endpoint run "durability"
   try
-    let inbox : Mailbox IO WorkerMessage := RabbitMQ.inbox handle
+    let inbox : Mailbox IO WorkerMessage := HttpMailbox.inbox handle
     inbox.acknowledge (← receiveAcknowledged handle 42)
   finally handle.close
   -- A receive on the old consumer can time out while 42 is still in flight.
   -- Reopen it and require the next confirmed message, rather than an empty poll.
-  let reopened ← RabbitMQ.openMailbox broker run "durability"
+  let reopened ← HttpMailbox.openMailbox endpoint run "durability"
   try
     reopened.send (WorkerMessage.acknowledged 99)
-    let inbox : Mailbox IO WorkerMessage := RabbitMQ.inbox reopened
+    let inbox : Mailbox IO WorkerMessage := HttpMailbox.inbox reopened
     inbox.acknowledge (← receiveAcknowledged reopened 99)
     reopened.delete
   finally reopened.close
 
-/-- Identically named queues on different brokers must retain different values.
+/-- Identically named queues on different inbox services must retain different values.
 Publish while consumers are offline, then read each destination independently. -/
 private def checkIsolation (config : Config) (run : String) : IO Unit := do
-  let brokers := #[config.mailboxes.scheduler] ++ config.mailboxes.workers.map (·.broker)
-  assertTrue (brokers.size ≥ 4) "Integration tests require a scheduler broker and three worker brokers"
-  for i in [:brokers.size] do
+  let endpoints := #[config.mailboxes.scheduler] ++ config.mailboxes.workers.map (·.endpoint)
+  assertTrue (endpoints.size ≥ 4) "Integration tests require a scheduler inbox service and three worker inbox services"
+  for i in [:endpoints.size] do
     for j in [:i] do
-      assertTrue (brokers[i]!.host != brokers[j]!.host || brokers[i]!.port != brokers[j]!.port)
-        "Integration tests require independent broker endpoints"
-    RabbitMQ.send brokers[i]! run "same-name" (WorkerMessage.acknowledged (100 + i))
-  for i in [:brokers.size] do
-    let handle ← RabbitMQ.openMailbox brokers[i]! run "same-name"
+      assertTrue (endpoints[i]!.host != endpoints[j]!.host || endpoints[i]!.port != endpoints[j]!.port)
+        "Integration tests require independent inbox service endpoints"
+    HttpMailbox.send endpoints[i]! run "same-name" (WorkerMessage.acknowledged (100 + i))
+  for i in [:endpoints.size] do
+    let handle ← HttpMailbox.openMailbox endpoints[i]! run "same-name"
     try
-      (RabbitMQ.inbox (α := WorkerMessage) handle).acknowledge (← receiveAcknowledged handle (100 + i))
+      (HttpMailbox.inbox (α := WorkerMessage) handle).acknowledge (← receiveAcknowledged handle (100 + i))
       handle.delete
     finally handle.close
   assertTrue (match config.mailboxes.worker "unconfigured-worker" with | .error _ => true | .ok _ => false)
-    "Unknown worker must not use a fallback broker"
+    "Unknown worker must not use a fallback inbox service"
   let duplicate := { config.mailboxes with workers := config.mailboxes.workers.push config.mailboxes.workers[0]! }
   assertTrue (match duplicate.validate with | .error _ => true | .ok _ => false)
     "Duplicate worker routes must be rejected"
   let invalid := { config.mailboxes with scheduler := { config.mailboxes.scheduler with port := 0 } }
   assertTrue (match invalid.validate with | .error _ => true | .ok _ => false)
-    "Invalid broker ports must be rejected"
+    "Invalid inbox service ports must be rejected"
 
-/-- Separate RabbitMQ brokers, SQLite, and S3 run the same actor turns as Sim. -/
+/-- Separate HttpMailbox inbox services, SQLite, and S3 run the same actor turns as Sim. -/
 private def compareProgram (config : Config) (run : String) (tree : Tree) (input : Nat) : IO Unit := do
   let program (_ : Unit) : Cloud IO Nat := lower tree input
   let expected ← (DirectInterpreter.interpret (S3.storage config.blobs) program ()).run
@@ -150,19 +150,19 @@ private def compareProgram (config : Config) (run : String) (tree : Tree) (input
     let conn ← LeanLinq.Sqlite.connect path.toString
     try
       LocalDb.initializeSchema conn
-      let schedulerHandle ← RabbitMQ.openMailbox config.mailboxes.scheduler run "scheduler"
+      let schedulerHandle ← HttpMailbox.openMailbox config.mailboxes.scheduler run "scheduler"
       let nodes := config.mailboxes.workers.extract 0 3
       let handles ← nodes.mapM fun node =>
-        RabbitMQ.openMailbox node.broker run ("worker." ++ node.worker)
+        HttpMailbox.openMailbox node.endpoint run ("worker." ++ node.worker)
       let records := S3.records config.blobs run
       let workers := handles.mapIdx fun index handle => {
         id := nodes[index]!.worker
-        inbox := RabbitMQ.inbox handle
-        send := fun message => RabbitMQ.send config.mailboxes.scheduler run "scheduler" message
+        inbox := HttpMailbox.inbox handle
+        send := fun message => HttpMailbox.send config.mailboxes.scheduler run "scheduler" message
         observe := ⟨records, pure #[]⟩
         blobs := S3.storage config.blobs : Worker.Ports IO }
       let scheduler : SchedulerPorts IO := {
-        inbox := RabbitMQ.inbox schedulerHandle
+        inbox := HttpMailbox.inbox schedulerHandle
         localDb := LocalDb.store conn run
         send := config.mailboxes.sendWorker run }
       try
@@ -188,13 +188,13 @@ private def compareProgram (config : Config) (run : String) (tree : Tree) (input
     finally conn.close
 
 private def stagedMailbox (config : Config) (run : String) (index : Nat) (publish : Bool) : IO Unit := do
-  let brokers := #[config.mailboxes.scheduler] ++ config.mailboxes.workers.map (·.broker)
-  let some broker := brokers[index]? | throw (IO.userError "Invalid broker index")
-  let handle ← RabbitMQ.openMailbox broker run "broker-restart" (!publish)
+  let endpoints := #[config.mailboxes.scheduler] ++ config.mailboxes.workers.map (·.endpoint)
+  let some endpoint := endpoints[index]? | throw (IO.userError "Invalid inbox service index")
+  let handle ← HttpMailbox.openMailbox endpoint run "inbox-restart" (!publish)
   try
     if publish then handle.send (WorkerMessage.acknowledged 73)
     else
-      let inbox : Mailbox IO WorkerMessage := RabbitMQ.inbox handle
+      let inbox : Mailbox IO WorkerMessage := HttpMailbox.inbox handle
       inbox.acknowledge (← receiveAcknowledged handle 73)
       handle.delete
   finally handle.close
@@ -205,11 +205,11 @@ def main (args : List String) : IO UInt32 := do
     let config ← Config.load path
     match args.drop 1 with
     | ["mailbox-seed", run, index] =>
-      let some index := index.toNat? | throw (IO.userError "Invalid broker index")
+      let some index := index.toNat? | throw (IO.userError "Invalid inbox service index")
       stagedMailbox config run index true
       return 0
     | ["mailbox-check", run, index] =>
-      let some index := index.toNat? | throw (IO.userError "Invalid broker index")
+      let some index := index.toNat? | throw (IO.userError "Invalid inbox service index")
       stagedMailbox config run index false
       return 0
     | [] => pure ()
@@ -218,12 +218,12 @@ def main (args : List String) : IO UInt32 := do
     checkAdapters config runPrefix
     checkPrograms config runPrefix
     checkIsolation config runPrefix
-    for broker in #[config.mailboxes.scheduler] ++ config.mailboxes.workers.map (·.broker) do
-      checkMailboxes broker runPrefix
+    for endpoint in #[config.mailboxes.scheduler] ++ config.mailboxes.workers.map (·.endpoint) do
+      checkMailboxes endpoint runPrefix
     for seed in [:16] do
       let tree := (generate 3 seed).1
       try compareProgram config s!"{runPrefix}-{seed}" tree (seed % 7)
       catch error => throw (IO.userError s!"seed={seed}, program={reprStr tree}\n{error}")
-    IO.println "Real adapters: independent broker isolation, durable redelivery on every broker, immutable writes, concurrent creation, blob integrity, SQLite recovery, and 16 differential programs passed."
+    IO.println "Real adapters: independent inbox service isolation, durable redelivery on every inbox service, immutable writes, concurrent creation, blob integrity, SQLite recovery, and 16 differential programs passed."
     return 0
   catch error => IO.eprintln error.toString; return 1

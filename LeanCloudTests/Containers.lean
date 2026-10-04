@@ -73,40 +73,38 @@ def Context.compose (ctx : Context) (args : Array String) (check := true)
   ctx.docker (#["compose", "-p", ctx.project, "-f", (ctx.root / "compose.yaml").toString,
     "-f", (ctx.artifacts / "compose.json").toString] ++ args) check timeout
 
-def Context.brokers (ctx : Context) : Array String :=
+def Context.mailboxNodes (ctx : Context) : Array String :=
   #["scheduler-mailbox"] ++ (Array.range ctx.workerCount).map (fun i => s!"worker{i + 1}-mailbox")
 
 def Context.startServices (ctx : Context) : IO Unit := do
-  discard <| ctx.compose (#["up", "-d", "--wait", "blobs"] ++ ctx.brokers) (timeout := 240)
+  discard <| ctx.compose (#["up", "-d", "--wait", "blobs"] ++ ctx.mailboxNodes) (timeout := 240)
 
-/-- Extend the ordinary deployment with one independent broker per test worker,
+/-- Extend the ordinary deployment with one independent inbox service per test worker,
 including a fresh worker after completion. All resources belong to this project. -/
 private def Context.prepare (ctx : Context) : IO Unit := do
   let config ← IO.ofExcept (Json.parse (← IO.FS.readFile (ctx.root / "deploy/config.json")))
   let mailboxes ← IO.ofExcept (config.getObjVal? "mailboxes")
-  let broker ← IO.ofExcept (mailboxes.getObjVal? "scheduler")
+  let endpoint ← IO.ofExcept (mailboxes.getObjVal? "scheduler")
   let workers := (Array.range ctx.workerCount).map fun i => Json.mkObj [
     ("worker", toJson s!"worker{i + 1}"),
-    ("broker", broker.setObjVal! "host" (toJson s!"worker{i + 1}-mailbox"))]
+    ("endpoint", endpoint.setObjVal! "host" (toJson s!"worker{i + 1}-mailbox"))]
   let config := config.setObjVal! "mailboxes" (mailboxes.setObjVal! "workers" (toJson workers))
   IO.FS.writeFile (ctx.artifacts / "config.json") config.pretty
-  -- Component/chaos tests deliberately separate brokers to inject independent
+  -- Component/chaos tests deliberately separate inbox services to inject independent
   -- transport faults. ConsoleRuntime exercises the production combined nodes.
   let template := Json.mkObj [
-    ("image", toJson "rabbitmq:4.3"),
-    ("environment", Json.mkObj [("RABBITMQ_DEFAULT_USER", toJson "cloud"),
-      ("RABBITMQ_DEFAULT_PASS", toJson "local-cloud"),
-      ("RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS", toJson "+S 2:2 +sbwt none +sbwtdcpu none +sbwtdio none")]),
-    ("healthcheck", Json.mkObj [("test", toJson #["CMD", "gosu", "rabbitmq", "rabbitmq-diagnostics", "-q", "ping"]),
-      ("interval", toJson "3s"), ("timeout", toJson "5s"), ("retries", toJson (30 : Nat))])]
+    ("image", toJson "lean-cloud-worker:dev"),
+    ("command", toJson #["serve-mailbox", configPath]),
+    ("healthcheck", Json.mkObj [("test", toJson #["CMD", "cloud-node", "health"]),
+      ("interval", toJson "2s"), ("timeout", toJson "5s"), ("retries", toJson (30 : Nat))])]
   let configVolume := toJson #[s!"{ctx.artifacts / "config.json"}:{configPath}:ro"]
   let mut services := ["worker", "worker2", "worker3", "submit", "scheduler", "checks"].map fun name =>
     (name, Json.mkObj [("volumes", configVolume)])
   let mut volumes := []
-  for name in ctx.brokers do
+  for name in ctx.mailboxNodes do
     let volume := name ++ "-data"
     let node := (template.setObjVal! "hostname" (toJson name)).setObjVal! "volumes" (toJson #[
-      s!"{volume}:/var/lib/rabbitmq", s!"{ctx.root / "deploy/rabbitmq.conf"}:/etc/rabbitmq/rabbitmq.conf:ro"])
+      s!"{volume}:/mailbox", s!"{ctx.artifacts / "config.json"}:{configPath}:ro"])
     services := services ++ [(name, node)]
     volumes := volumes ++ [(volume, Json.mkObj [])]
   IO.FS.writeFile (ctx.artifacts / "compose.json") (Json.mkObj [
@@ -132,7 +130,7 @@ def checkExit (worker : String) (status : Status) : IO Unit :=
 
 def Context.createWorker (ctx : Context) (name run : String) : IO String := do
   let index ← ctx.nextWorker.get
-  require (index < ctx.workerCount) "No independent broker reserved for this worker"
+  require (index < ctx.workerCount) "No independent inbox service reserved for this worker"
   ctx.nextWorker.set (index + 1)
   let worker := ctx.project ++ "-" ++ name
   ctx.workers.modify (·.push worker)

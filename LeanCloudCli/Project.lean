@@ -75,17 +75,19 @@ def init (ctx : Context) (directory : String) (localSdk : Option String := none)
 def defaultConfig : Json := Json.parse (include_str "../deploy/config.json") |>.toOption.getD Json.null
 
 /-- Preserve existing routes and credentials; instantiate new mailbox routes
-from the first worker's broker configuration. -/
+from the first worker's HTTP endpoint configuration. -/
 def runtimeConfig (config : Json) (workers : Nat) : Except String Json := do
   let mailboxes ← config.getObjVal? "mailboxes"
   let existing ← mailboxes.getObjValAs? (Array Json) "workers"
+  if existing.any (fun route => (route.getObjVal? "broker").isOk) then
+    throw "This deployment uses the old RabbitMQ configuration. Create a new HTTP/SQLite deployment; existing queues are not migrated."
   let prototype ← match existing[0]? with
-    | some route => route.getObjVal? "broker"
+    | some route => route.getObjVal? "endpoint"
     | none => mailboxes.getObjVal? "scheduler"
   let routes := (workerNames workers).map fun name =>
     (existing.find? (fun route => (route.getObjValAs? String "worker").toOption == some name)).getD
       (Json.mkObj [("worker", toJson name),
-        ("broker", prototype.setObjVal! "host" (toJson (name ++ "-mailbox")))])
+        ("endpoint", prototype.setObjVal! "host" (toJson (name ++ "-mailbox")))])
   return config.setObjVal! "mailboxes" (mailboxes.setObjVal! "workers" (toJson routes))
 
 private def sdkCopy : String := "COPY --from=sdk lean-toolchain lakefile.lean lake-manifest.json LeanCloud.lean /opt/lean-cloud/\n" ++
@@ -143,7 +145,7 @@ def prepare (ctx : Context) (workers : Option Nat := none) (writeConfig := true)
   request (.createDir home)
   for (name, text) in [("Dockerfile", dockerfile localSdk.isSome),
       ("Dockerfile.dockerignore", ignore ++ "\n.git\n**/.lake\n**/.lean-cloud\nlean-cloud.local.json\n**/.DS_Store\n"),
-      ("node.c", include_str "Templates/node.c"), ("rabbitmq.conf", include_str "../deploy/rabbitmq.conf"), ("s3.json", include_str "../deploy/s3.json"),
+      ("node.c", include_str "Templates/node.c"), ("s3.json", include_str "../deploy/s3.json"),
       ("filer.toml", include_str "../deploy/filer.toml"),
       ("compose.json", (compose ctx app version localSdk).pretty)] do
     request (.writeFile (home / name) text)

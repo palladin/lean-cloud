@@ -23,7 +23,7 @@ cloud> result first
 
 `init` generates a complete Lean application and selects it in the console.
 The included parallel example returns `55`. `deploy` builds the executable in
-Docker and by default starts five containers: the scheduler, three workers, and global blobs. Each node includes its own RabbitMQ mailbox.
+Docker and by default starts five containers: the scheduler, three workers, and global blobs. Each node runs its HTTP API, embedded SQLite inbox, and actor in one Lean process.
 The CLI generates Docker and service configuration under `.lean-cloud/`; users
 only maintain their Lean code and package metadata.
 
@@ -122,7 +122,7 @@ cloud> quit
 
 The example results are `55` and `files=16, errors=24`. By default, `deploy` starts one
 scheduler, three persistent workers, and global blob storage: five long-lived
-containers. Each scheduler/worker container includes its own RabbitMQ broker. Every compute node contains the same
+containers. Each scheduler/worker container includes its own in-process HTTP server and SQLite inbox. Every compute node contains the same
 application executable and complete registered-program registry.
 
 `run PROGRAM` submits a logical cloud process to this existing pool. It does
@@ -156,7 +156,7 @@ cloud> scale 0
 
 `deploy --workers N` chooses the initial count (default three). `scale N` changes
 capacity on the running deployment, using the same image and scheduler. Each added
-worker starts with its own RabbitMQ mailbox. Scaling does not rebuild the image or
+worker starts with its own SQLite inbox. Scaling does not rebuild the image or
 restart retained nodes. A pool of N workers uses N + 2 containers, including the
 scheduler and blob storage.
 
@@ -204,8 +204,8 @@ The scheduler alone writes its SQLite state through lean-linq. It saves control
 changes before confirming replies. The console also saves pending control intent:
 if `ps` shows `pausing` or `killing`, retry that command. A pending kill blocks
 resume. Process controls need the deployment scheduler; use `up` if it is down.
-The console executes short application commands inside the existing scheduler
-container, including validation, submission and result queries.
+The console sends validation, submission, control, and result requests to the
+scheduler's HTTP API. Docker is used for deployment, container metrics and logs.
 
 Use a JSON file for other input:
 
@@ -346,7 +346,7 @@ database. `ps` queries those services and reports unavailable state explicitly.
 `resume RUN` repairs an interrupted launch. Submission is idempotent, existing
 the deployment image must match the saved run image, and completed runs are not
 re-executed. A per-run launch lock prevents two consoles from changing the same
-run concurrently. Preserve the local catalog, broker volumes, scheduler volume,
+run concurrently. Preserve the local catalog, inbox volumes, scheduler volume,
 blob volume, and application images for recovery.
 
 The console currently targets local Docker deployments with a configurable, elastic worker pool. It does not provision remote hosts or cloud accounts.
@@ -364,7 +364,7 @@ Each node gets a panel with CPU, memory, filesystem usage, network RX/TX, and
 disk read/write rates. Panels resize with the terminal. Use PgUp/PgDn or the
 left/right arrows to change pages, and `q` to return to the console. Running
 actors appear first; stopped actors remain visible with their status.
-Each node includes its mailbox broker. `nodes` also lists blob storage.
+Each node includes its mailbox service. `nodes` also lists blob storage.
 
 `top --once` (or piped `top`) prints a plain-text snapshot of every page. Rates
 need two samples, so that first snapshot shows `—` for network and I/O rates.
@@ -439,7 +439,7 @@ CPU and transfer rates use adjacent samples from the same process incarnation;
 they are unavailable until two usable samples exist. Sampling is event-based,
 so a long computation need not produce intermediate samples. A panel identifies
 the last recorded sample's time. These are container-wide measurements, including
-the node's RabbitMQ broker and other workflows sharing that worker. Unsupported
+the HTTP service, SQLite, and other workflows sharing that worker. Unsupported
 counters remain missing.
 The [kernel's cgroup documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html)
 defines the CPU, memory, and I/O counters.
@@ -462,7 +462,7 @@ Graphs use `_` for measured zero and `·` for an unavailable rate; the first cou
 sample has no rate yet. CPU and memory histories appear when the panel is wide
 enough, scaled to one core and the reported memory limit respectively.
 
-Node statistics include both Lean and its RabbitMQ broker. CPU can exceed 100% on
+Node statistics cover the Lean process, including HTTP and SQLite. CPU can exceed 100% on
 multiple cores. Filesystem capacity can be shared between containers; it is not
 space attributed exclusively to the selected container. Missing samples are not
 zero utilization. Rate series restart when a container restarts or counters reset.

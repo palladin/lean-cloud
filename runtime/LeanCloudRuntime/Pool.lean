@@ -9,13 +9,13 @@ def address := "pool-v1"
 
 structure Saved where
   state : LeanCloud.Pool.State := {}
-  routes : Option (Array RabbitMQ.WorkerBroker) := none
+  routes : Option (Array HttpMailbox.WorkerEndpoint) := none
   replies : Array (String × Except String Json) := #[]
   deriving ToJson, FromJson
 
 inductive Envelope where
   | event (message : LeanCloud.Pool.Message)
-  | configure (replyTo : String) (routes : Array RabbitMQ.WorkerBroker)
+  | configure (replyTo : String) (routes : Array HttpMailbox.WorkerEndpoint)
   deriving ToJson, FromJson
 
 -- Accept queued messages from the previous wire format during an upgrade.
@@ -29,7 +29,7 @@ private instance : FromJson Incoming where
     | .error _ => return ⟨.event (← fromJson? json)⟩
 
 def send (config : Config) (message : LeanCloud.Pool.Message) : IO Unit :=
-  RabbitMQ.send config.mailboxes.scheduler address "scheduler" (Envelope.event message)
+  HttpMailbox.send config.mailboxes.scheduler address "scheduler" (Envelope.event message)
 
 /-- One request/reply exchange. Each call owns a unique reply address. The
 scheduler caches administrative replies before acknowledging requests. -/
@@ -37,10 +37,10 @@ private def exchange (config : Config) (message : String → Envelope) : IO Json
   let random ← IO.Process.output { cmd := "openssl", args := #["rand", "-hex", "16"] }
   unless random.exitCode == 0 do throw (IO.userError "Cannot allocate reply address")
   let replyTo := "reply-" ++ random.stdout.trimAscii.toString
-  let handle ← RabbitMQ.openMailbox config.mailboxes.scheduler address replyTo
+  let handle ← HttpMailbox.openMailbox config.mailboxes.scheduler address replyTo
   try
-    let inbox : Mailbox IO (Except String Json) := RabbitMQ.inbox handle
-    RabbitMQ.send config.mailboxes.scheduler address "scheduler"
+    let inbox : Mailbox IO (Except String Json) := HttpMailbox.inbox handle
+    HttpMailbox.send config.mailboxes.scheduler address "scheduler"
       (message replyTo)
     let deadline := (← IO.monoMsNow) + 30000
     repeat
@@ -54,13 +54,13 @@ private def exchange (config : Config) (message : String → Envelope) : IO Json
 def request (config : Config) (command : LeanCloud.Pool.Command) : IO Json :=
   exchange config (fun replyTo => .event (.request replyTo command))
 
-def configure (config : Config) (routes : Array RabbitMQ.WorkerBroker) : IO Json := do
+def configure (config : Config) (routes : Array HttpMailbox.WorkerEndpoint) : IO Json := do
   IO.ofExcept ({ config.mailboxes with workers := routes }.validate)
   exchange config (fun replyTo => .configure replyTo routes)
 
 private def reconfigure (config : Config) (saved : Saved)
-    (routes : Array RabbitMQ.WorkerBroker) : Except String Saved := do
-  ({ config.mailboxes with workers := routes } : RabbitMQ.Mailboxes).validate
+    (routes : Array HttpMailbox.WorkerEndpoint) : Except String Saved := do
+  ({ config.mailboxes with workers := routes } : HttpMailbox.Mailboxes).validate
   let (state, _) ← LeanCloud.Pool.command saved.state (.configureWorkers (routes.map (·.worker)))
   let retained := saved.routes.getD config.mailboxes.workers
   let retained := routes.foldl (fun all route =>
@@ -73,8 +73,8 @@ private def settle (config : Config) (command : LeanCloud.Pool.Command) : IO Uni
 /-- An offline worker must not block pool administration. Its assignment/report
 is already durable. Workers repeat readiness and recover the same assignment;
 report acknowledgements carry no state needed by the worker. -/
-private def reply (broker : RabbitMQ.Config) (worker : String) (message : LeanCloud.Pool.Reply) : IO Unit := do
-  try RabbitMQ.send broker address ("worker." ++ worker) message
+private def reply (endpoint : HttpMailbox.Config) (worker : String) (message : LeanCloud.Pool.Reply) : IO Unit := do
+  try HttpMailbox.send endpoint address ("worker." ++ worker) message
   catch _ => IO.eprintln s!"Mailbox for {worker} unavailable; waiting for worker readiness."
 
 /-- Sole owner of the deployment's SQLite database. State is durable before
@@ -93,9 +93,9 @@ def scheduler (config : Config) : IO Unit := do
       LocalDb.saveValue conn "pool-v1" saved
       for run in saved.state.runs do
         if run.mode == .killed then discard (LeanCloudRuntime.cancel config run.id)
-      let handle ← RabbitMQ.openMailbox config.mailboxes.scheduler address "scheduler"
+      let handle ← HttpMailbox.openMailbox config.mailboxes.scheduler address "scheduler"
       try
-        let inbox : Mailbox IO Incoming := RabbitMQ.inbox handle
+        let inbox : Mailbox IO Incoming := HttpMailbox.inbox handle
         let mut lastTime ← IO.monoMsNow
         IO.println "deployment scheduler ready"
         (← IO.getStdout).flush
@@ -116,7 +116,7 @@ def scheduler (config : Config) : IO Unit := do
             if cached.isNone then
               saved := { saved with replies := saved.replies.push (replyTo, response) }
               LocalDb.saveValue conn "pool-v1" saved
-            RabbitMQ.send config.mailboxes.scheduler address replyTo response
+            HttpMailbox.send config.mailboxes.scheduler address replyTo response
           | .event message =>
             let mailboxes := { config.mailboxes with workers := saved.routes.getD config.mailboxes.workers }
             match message with
@@ -126,11 +126,11 @@ def scheduler (config : Config) : IO Unit := do
               LocalDb.saveValue conn "pool-v1" saved
             | .ready worker =>
               unless saved.state.membership.drained.contains worker do
-              if let .ok broker := mailboxes.worker worker then
+              if let .ok endpoint := mailboxes.worker worker then
                 let (state, reply) := LeanCloud.Pool.acquire config.scheduler.assignmentMs saved.state worker
                 saved := { saved with state }
                 LocalDb.saveValue conn "pool-v1" saved
-                LeanCloudRuntime.Pool.reply broker worker reply
+                LeanCloudRuntime.Pool.reply endpoint worker reply
                 if let .execute run assignment := reply then
                   let trace ← Trace.create "scheduler" run
                   trace.assign assignment
@@ -140,10 +140,10 @@ def scheduler (config : Config) : IO Unit := do
               LocalDb.saveValue conn "pool-v1" saved
             | .report run report =>
               unless saved.state.membership.drained.contains report.worker do
-              if let .ok broker := mailboxes.worker report.worker then
+              if let .ok endpoint := mailboxes.worker report.worker then
                 saved := { saved with state := LeanCloud.Pool.report saved.state run report }
                 LocalDb.saveValue conn "pool-v1" saved
-                reply broker report.worker .acknowledged
+                reply endpoint report.worker .acknowledged
                 (← Trace.create "scheduler" run).emit "report" report.worker
             | .request replyTo command =>
               let cached := saved.replies.find? (·.1 == replyTo)
@@ -164,7 +164,7 @@ def scheduler (config : Config) : IO Unit := do
                 | .resume run => (← Trace.create "scheduler" run).emit "resumed" ""
                 | .kill run => (← Trace.create "scheduler" run).emit "sealed" ""
                 | _ => pure ()
-              RabbitMQ.send config.mailboxes.scheduler address replyTo response
+              HttpMailbox.send config.mailboxes.scheduler address replyTo response
           inbox.acknowledge delivery.receipt
       finally handle.close
     finally conn.close

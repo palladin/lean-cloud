@@ -52,7 +52,7 @@ def topCases : Array TestCase := #[
   ⟨"console.top.all-runs-without-workflow-files", do
     let (_, world) ← checked (command ctx ["top", "--once"])
     for node in actors do assertTrue (has world.stdout node.name) s!"Missing node {node.name}"
-    assertTrue (!has world.stdout "mailbox" && !has world.stdout "demo-blobs") "Infrastructure mixed with actors"
+    assertTrue (!has world.stdout "demo-worker1-mailbox" && !has world.stdout "demo-blobs") "Infrastructure mixed with actors"
     for metric in ["CPU", "Mem", "Disk", "Net RX", "Net TX", "I/O R", "I/O W"] do
       assertTrue (has world.stdout metric) s!"Missing graph {metric}"
     assertTrue (!world.trace.contains "readFile" && !world.trace.contains "enterTerminal" &&

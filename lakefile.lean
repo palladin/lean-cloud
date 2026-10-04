@@ -41,7 +41,9 @@ extern_lib cloud_console_native pkg := do
   let lockObj ← buildO (pkg.buildDir / "native" / "process_lock.o") lock includeArgs #["-O2", "-Wall", "-Wextra"] "cc"
   let process ← inputTextFile (pkg.dir / "native" / "process.c")
   let processObj ← buildO (pkg.buildDir / "native" / "process.o") process includeArgs #["-O2", "-Wall", "-Wextra"] "cc"
-  buildStaticLib (pkg.staticLibDir / nameToStaticLib "cloud_console_native") #[terminalObj, lockObj, processObj]
+  let http ← inputTextFile (pkg.dir / "native" / "http.c")
+  let httpObj ← buildO (pkg.buildDir / "native" / "http.o") http includeArgs #["-O2", "-Wall", "-Wextra"] "cc"
+  buildStaticLib (pkg.staticLibDir / nameToStaticLib "cloud_console_native") #[terminalObj, lockObj, processObj, httpObj]
 
 @[test_driver]
 lean_exe lean_cloud_tests where

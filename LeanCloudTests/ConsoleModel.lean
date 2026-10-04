@@ -45,6 +45,7 @@ def World.json [ToJson α] (world : World) (path : System.FilePath) (value : α)
   world.save path (toJson value).compress
 
 private def label : HostOp α → String
+  | .httpPost .. => "httpPost"
   | .process .. => "process" | .readFile .. => "readFile" | .writeFile .. => "writeFile"
   | .appendFile .. => "appendFile"
   | .startProcess .. => "startProcess" | .pollProcess .. => "pollProcess" | .closeProcess .. => "closeProcess"
@@ -57,6 +58,14 @@ private def label : HostOp α → String
   | .key .. => "key" | .dimensions => "dimensions" | .lock .. => "lock" | .unlock .. => "unlock"
 
 private def operation : HostOp α → ExceptT String (StateM World) α
+  | .httpPost _ _ body => do
+    let json ← liftExcept (Json.parse body)
+    let args ← liftExcept (json.getObjValAs? (Array String) "args")
+    let input ← liftExcept (json.getObjValAs? (Option String) "input")
+    let call := Invocation.mk "http" args input
+    modify fun w => { w with processes := w.processes.push call }
+    let output ← liftExcept ((← get).process call)
+    return (toJson (Except.ok (toJson output) : Except String Json)).compress
   | .process command args input => do
     let call := Invocation.mk command args input
     modify fun w => { w with processes := w.processes.push call }

@@ -111,8 +111,22 @@ private def Context.savedOutcome (ctx : Context) (image : String) (run : Run) : 
 def Context.node (ctx : Context) (role : String) : String := s!"{ctx.project}-{role}"
 
 def Context.execApp (ctx : Context) (args : Array String) (input : Option String := none) : Cli String := do
-  let output ← docker (#["exec", "--user", "worker"] ++ (if input.isSome then #["-i"] else #[]) ++
-    #[ctx.node "scheduler", "cloud-app"] ++ args) (input := input)
+  let endpoint ← readJson (α := Json) (ctx.home / "api.json")
+  -- Docker may reassign an ephemeral published port when the same container
+  -- restarts. Resolve it before sending, so a stale address never needs a POST retry.
+  let port ← docker #["port", ctx.node "scheduler", "8080/tcp"]
+  let address := port.stdout.trimAscii.toString
+  unless address.startsWith "127.0.0.1:" && (address.drop 10 |>.toString).toNat?.isSome do
+    throw "Scheduler HTTP port is not published on localhost"
+  let url := "http://" ++ address
+  if (endpoint.getObjValAs? String "url").toOption != some url then
+    saveJson (ctx.home / "api.json") (endpoint.setObjVal! "url" (toJson url))
+  let token ← liftExcept (endpoint.getObjValAs? String "token")
+  let body := Json.mkObj [("args", toJson args), ("input", toJson input)]
+  let response ← request (.httpPost (url ++ "/app") token body.compress)
+  let result : Except String Json ← liftExcept (Json.parse response >>= fromJson?)
+  let output : ProcessOutput ← liftExcept (result >>= fromJson?)
+  unless output.exitCode == 0 do throw (safe (output.stderr ++ output.stdout))
   return output.stdout.trimAscii.toString
 
 def Context.remote (ctx : Context) (run : Run) (command : String) : Cli String :=
@@ -123,8 +137,8 @@ private def Context.startNodes (ctx : Context) (deployment : Deployment) : Cli U
   let roles := #["scheduler"] ++ workerNames deployment.workers
   let retained := #["scheduler"] ++ workerNames deployment.retainedCount
   let layout ← docker #["image", "inspect", image, "--format", "{{index .Config.Labels \"lean-cloud.node\"}}"]
-  unless layout.stdout.trimAscii.toString == "mailbox-v1" do
-    throw "This image uses separate mailbox containers. Use 'deploy' to build the combined nodes."
+  unless layout.stdout.trimAscii.toString == "http-inbox-v1" do
+    throw "This image predates HTTP inboxes. Use 'deploy' to rebuild the application."
   printStyled (Styled.text "… Starting scheduler and workers with their mailboxes" .yellow)
   request .flush
   let mut existingNodes : Array String := #[]
@@ -146,15 +160,6 @@ private def Context.startNodes (ctx : Context) (deployment : Deployment) : Cli U
     discard <| docker (#["stop"] ++ existingNodes)
     Trace.archive ctx (← ctx.allRuns)
     discard <| docker (#["rm"] ++ existingNodes)
-  -- Migrate the old sidecars only after the old Lean actors have stopped. Keep
-  -- their durable volumes and RabbitMQ node names; never mount one live twice.
-  for role in retained do
-    let legacy ← docker #["ps", "-aq", "--filter", "label=com.docker.compose.project=" ++ ctx.project,
-      "--filter", "label=com.docker.compose.service=" ++ role ++ "-mailbox"]
-    let ids := legacy.stdout.splitOn "\n" |>.filter (!·.isEmpty) |>.toArray
-    if !ids.isEmpty then
-      discard <| docker (#["stop"] ++ ids)
-      discard <| docker (#["rm"] ++ ids)
   for role in roles do
     let name := ctx.node role
     if !replacing && existingNodes.contains name then
@@ -166,14 +171,15 @@ private def Context.startNodes (ctx : Context) (deployment : Deployment) : Cli U
       let config := Project.assets ctx / s!"node-{role}.json"
       saveJson config (← readJson (α := Json) (← ctx.configFile))
       let extra := if role == "scheduler" then
-        #["-v", ctx.project ++ "_scheduler-data:/data"] else #["-e", "CLOUD_WORKER_ID=" ++ role]
+        #["-v", ctx.project ++ "_scheduler-data:/data", "-p", "127.0.0.1::8080"]
+        else #["-e", "CLOUD_WORKER_ID=" ++ role]
       let command := if role == "scheduler" then "serve-scheduler" else "serve-worker"
       discard <| docker (#["run", "-d", "--name", name, "--restart", "unless-stopped",
         "--stop-timeout", "20", "--hostname", role ++ "-mailbox",
         "--network-alias", role ++ "-mailbox",
         "--label", "lean-cloud.project=" ++ ctx.project, "--label", "lean-cloud.role=" ++ role,
         "--log-opt", "max-size=10m", "--log-opt", "max-file=2", "--network", ctx.project ++ "_default",
-        "-v", ctx.project ++ "_" ++ role ++ "-mailbox-data:/var/lib/rabbitmq",
+        "-v", ctx.project ++ "_" ++ role ++ "-mailbox-data:/mailbox",
         "-v", s!"{config}:/etc/lean-cloud/config.json:ro"] ++ extra ++
         #[image, command, "/etc/lean-cloud/config.json"])
   let deadline := (← request .now) + 150000
@@ -182,6 +188,13 @@ private def Context.startNodes (ctx : Context) (deployment : Deployment) : Cli U
     if health.stdout.trimAscii.toString.splitOn "\n" == List.replicate roles.size "healthy" then break
     unless (← request .now) < deadline do throw "Nodes did not become healthy; use 'status' and Docker logs to diagnose startup."
     request (.sleep 500)
+  let port ← docker #["port", ctx.node "scheduler", "8080/tcp"]
+  let address := port.stdout.trimAscii.toString
+  unless address.startsWith "127.0.0.1:" && (address.drop 10 |>.toString).toNat?.isSome do
+    throw "Scheduler HTTP port is not published on localhost"
+  let config ← readJson (α := Json) (← ctx.configFile)
+  let token ← liftExcept (config.getObjVal? "mailboxes" >>= (·.getObjVal? "scheduler") >>= (·.getObjValAs? String "token"))
+  saveJson (ctx.home / "api.json") (Json.mkObj [("url", toJson ("http://" ++ address)), ("token", toJson token)])
   discard <| ctx.execApp #["pool-health", "/etc/lean-cloud/config.json"]
   printStyled (Styled.text s!"✓ Scheduler and {deployment.workers} worker{if deployment.workers == 1 then "" else "s"} — ready" .green)
 

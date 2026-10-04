@@ -75,7 +75,7 @@ processing-window assumption. Both are checked when building the test suite.
 
 These are ideal service semantics. The theorem checks the existing interpreter
 and actor code against Sim's ports. Real adapter and chaos tests provide evidence
-for the implementations; they are not formal proofs of RabbitMQ, SQLite, or S3.
+for the implementations; they are not formal proofs of HTTP, SQLite, or S3.
 
 The safety theorem does not need fair scheduling or sufficient fuel: an
 execution that never finishes still cannot publish a wrong pure result.
@@ -99,13 +99,13 @@ premise. `WorkerFuel.execute` proves the report succeeds with sufficient fuel.
 `window_productive` then proves that saving it advances coordination. The finite
 work bound rules out an unfinished run with infinitely many such windows.
 
-This assumption is stronger than weak fairness and RabbitMQ durable delivery.
+This assumption is stronger than weak fairness and durable inbox delivery.
 It excludes endless crashes, expiry before every report, and exhausted actor-loop
 budgets that prevent further processing. It permits arbitrary finite failures
 and delays between windows. Sampling boundaries must admit the required future
 windows; this is a sufficient completion contract, not a characterization of
-every schedule that happens to finish. RabbitMQ supplies message durability and
-redelivery, not the execution and timely acceptance opportunities.
+every schedule that happens to finish. Durable inboxes supply message retention
+and redelivery, not the execution and timely acceptance opportunities.
 
 The following progress guarantees are checked:
 

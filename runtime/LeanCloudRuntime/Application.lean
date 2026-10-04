@@ -9,7 +9,7 @@ open Lean LeanCloud LeanEff LeanCloudCli
 inductive Service : Type → Type where
   | submit (config : Config) (run entry : String) (input : Json) : Service Unit
   | health (config : Config) : Service Unit
-  | configure (config : Config) (routes : Array RabbitMQ.WorkerBroker) : Service Unit
+  | configure (config : Config) (routes : Array HttpMailbox.WorkerEndpoint) : Service Unit
   | membership (config : Config) : Service LeanCloud.Pool.Membership
   | workerStopped (config : Config) (worker : String) (generation : Nat) : Service Unit
   | serveScheduler (config : Config) : Service Unit
@@ -166,13 +166,63 @@ private def handle (registry : Registry) (prepare : Config → String → Json �
     let some text := String.fromUTF8? bytes | throw (IO.userError "Result blob is not UTF-8 text")
     pure text
 
-/-- Users only supply their registry and delegate their executable's entry point. -/
+private def handleService (registry : Registry) (prepare : Config → String → Json → IO Unit)
+    (op : Service α) : IO (Except String α) := do
+  try return .ok (← handle registry prepare op)
+  catch error => return .error error.toString
+
+/-- HTTP exposes the same effect program as the executable, with a restricted
+host interpreter: no filesystem paths or executable commands from the caller. -/
+def api (registry : Registry) (config : Config) (prepare : Config → String → Json → IO Unit)
+    (json : Json) : IO Json := do
+  let args ← IO.ofExcept (json.getObjValAs? (Array String) "args")
+  let input ← IO.ofExcept (json.getObjValAs? (Option String) "input")
+  let allowed := match args.toList with
+    | ["programs"] | ["validate", _] => true
+    | [command, _] => ["pool-health", "pool-configure", "pool-workers"].contains command
+    | [command, _, _] => ["pause", "resume", "status", "outcome", "result", "cancel"].contains command
+    | ["pool-stopped", _, _, _] | ["submit-entry", _, _, _, "-"] => true
+    | _ => false
+  unless allowed do throw (IO.userError "Unsupported HTTP application command")
+  let args := if args.size ≥ 2 && args[0]? != some "validate" then
+    args.set! 1 "/etc/lean-cloud/config.json" else args
+  let output ← IO.mkRef ({} : ProcessOutput)
+  let host : {α : Type} → HostOp α → IO (Except String α) := fun {α} op =>
+    match op with
+    | .readFile path => do
+      if path.toString == "/etc/lean-cloud/config.json" then return .ok (toJson config).compress
+      else return .error "HTTP commands cannot read host files"
+    | .readLine => pure (.ok (input.getD ""))
+    | .write text stderr => do
+      output.modify fun out => if stderr then { out with stderr := out.stderr ++ text }
+        else { out with stdout := out.stdout ++ text }
+      return .ok ()
+    | _ => pure (.error "Unsupported HTTP host operation")
+  let result ← runWith host (handleService registry prepare) (run registry args.toList)
+  return toJson { (← output.get) with exitCode := result.toOption.getD 1 }
+
+/-- Users only supply their registry. A node runs its HTTP API, embedded SQLite
+inbox, and actor concurrently in this process; Docker restarts the whole node. -/
 def main (registry : Registry) (args : List String)
-    (prepare : Config → String → Json → IO Unit := fun _ _ _ => pure ()) : IO UInt32 :=
-  withHostIO fun handleHost => do
-    let result ← runWith handleHost (fun op => do
-      try return .ok (← handle registry prepare op)
-      catch error => return .error error.toString) (run registry args)
+    (prepare : Config → String → Json → IO Unit := fun _ _ _ => pure ()) : IO UInt32 := do
+  let execute := withHostIO fun handleHost => do
+    let result ← runWith handleHost (handleService registry prepare) (run registry args)
     return result.toOption.getD 1
+  match args with
+  | [command, path] =>
+    if command == "serve-scheduler" || command == "serve-worker" || command == "serve-mailbox" then
+      let config ← Config.load path
+      let endpoint ← if command == "serve-worker" then IO.ofExcept (config.mailboxes.worker (← workerId))
+        else pure config.mailboxes.scheduler
+      let api := if command == "serve-scheduler" then api registry config prepare
+        else fun _ => throw (IO.userError "Application commands belong to the scheduler")
+      let database := (← IO.getEnv "CLOUD_INBOX_DATABASE").getD "/mailbox/inbox.sqlite"
+      let actor := if command == "serve-mailbox" then do
+          repeat IO.sleep 1000
+          pure (0 : UInt32)
+        else execute
+      HttpMailbox.withServer endpoint database api actor (handleSignals := true)
+    else execute
+  | _ => execute
 
 end LeanCloudRuntime.Application

@@ -13,44 +13,32 @@
   "mailboxes": {
     "scheduler": {
       "host": "scheduler-mailbox",
-      "port": 5672,
-      "vhost": "/",
-      "user": "cloud",
-      "password": "local-cloud",
-      "queuePrefix": "lean-cloud.mailbox."
+      "port": 8080,
+      "token": "local-cloud"
     },
     "workers": [
       {
         "worker": "worker1",
-        "broker": {
+        "endpoint": {
           "host": "worker1-mailbox",
-          "port": 5672,
-          "vhost": "/",
-          "user": "cloud",
-          "password": "local-cloud",
-          "queuePrefix": "lean-cloud.mailbox."
+          "port": 8080,
+          "token": "local-cloud"
         }
       },
       {
         "worker": "worker2",
-        "broker": {
+        "endpoint": {
           "host": "worker2-mailbox",
-          "port": 5672,
-          "vhost": "/",
-          "user": "cloud",
-          "password": "local-cloud",
-          "queuePrefix": "lean-cloud.mailbox."
+          "port": 8080,
+          "token": "local-cloud"
         }
       },
       {
         "worker": "worker3",
-        "broker": {
+        "endpoint": {
           "host": "worker3-mailbox",
-          "port": 5672,
-          "vhost": "/",
-          "user": "cloud",
-          "password": "local-cloud",
-          "queuePrefix": "lean-cloud.mailbox."
+          "port": 8080,
+          "token": "local-cloud"
         }
       }
     ]
