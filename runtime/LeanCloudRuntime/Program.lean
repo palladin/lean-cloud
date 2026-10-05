@@ -105,7 +105,10 @@ def Registry.serveWorker (registry : Registry) (config : Config) : IO Unit := do
                 create := fun key value => do check; records.create key value }
               let observed ← observe guarded
               program.execute definition id observed (trace.blobs (S3.storage config.blobs)) trace assignment
-          trace.emit (match report.progress with | .ok (.fork ..) => "suspended" | .ok .done => "returned" | .error _ => "failed") ""
+          match report.progress with
+          | .ok (.fork ..) => trace.emit "suspended" ""
+          | .ok .done => trace.emit "returned" ""
+          | .error error => trace.emit "failed" error.message
           send (.report run report)
         catch error =>
           if ← revoked.get then trace.emit "revoked" "" else throw error

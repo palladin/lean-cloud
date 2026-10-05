@@ -1,6 +1,7 @@
 import LeanCloudRuntime
 import LeanCloudRuntime.Programs
 import LeanCloudTests.Generated
+import PoolTests
 
 open Lean LeanCloud LeanCloudRuntime LeanCloudTests
 
@@ -203,6 +204,9 @@ def main (args : List String) : IO UInt32 := do
     let path := args.headD "/etc/lean-cloud/config.json"
     let config ← Config.load path
     match args.drop 1 with
+    | ["pool-scheduler"] =>
+      LeanCloudRuntime.Pool.scheduler config
+      return 0
     | ["mailbox-seed", run, index] =>
       let some index := index.toNat? | throw (IO.userError "Invalid inbox service index")
       stagedMailbox config run index true
@@ -215,6 +219,7 @@ def main (args : List String) : IO UInt32 := do
     | _ => throw (IO.userError "Invalid integration test arguments")
     let runPrefix := s!"properties-{← IO.Process.getPID}-{← IO.monoMsNow}"
     checkAdapters config runPrefix
+    PoolTests.run config runPrefix
     checkPrograms config runPrefix
     checkIsolation config runPrefix
     for endpoint in #[config.mailboxes.scheduler] ++ config.mailboxes.workers.map (·.endpoint) do
@@ -223,6 +228,6 @@ def main (args : List String) : IO UInt32 := do
       let tree := (generate 3 seed).1
       try compareProgram config s!"{runPrefix}-{seed}" tree (seed % 7)
       catch error => throw (IO.userError s!"seed={seed}, program={reprStr tree}\n{error}")
-    IO.println "Real adapters: independent inbox service isolation, durable redelivery on every inbox service, immutable writes, concurrent creation, blob integrity, SQLite recovery, and 16 differential programs passed."
+    IO.println "Real adapters: pool terminal failure/recovery and retryable IO, independent inbox services, durable redelivery, immutable writes, blob integrity, SQLite recovery, and 16 differential programs passed."
     return 0
   catch error => IO.eprintln error.toString; return 1

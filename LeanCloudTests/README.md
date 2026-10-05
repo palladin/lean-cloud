@@ -47,6 +47,9 @@ writes. Checks after each transition cover run isolation, attempt ownership,
 immutable records, and agreement with direct evaluation. Surviving workflows
 must finish once faults stop. Scheduler transitions are atomic in these tests;
 HTTP delivery and SQLite durability are checked separately by the adapter tests.
+Targeted failure cases exhaust the actual replay interpreter's fuel inside a
+parallel child, then check sibling revocation, stale reports, restart, terminal
+controls, and continued use of shared workers by another run.
 
 Protocol tests check repeated assignment requests, duplicate and stale reports,
 empty and partial joins, immutable record creation, JSON codecs, and the different
@@ -76,6 +79,11 @@ and stale heartbeats cannot renew replacement attempts.
 
 Real adapter properties compare 16 generated programs using HTTP/SQLite inboxes,
 private scheduler SQLite, and S3 with direct evaluation.
+They also run the real Pool scheduler from durable snapshots before and after
+failure publication, preserve an earlier root result, and exercise a live child
+failure through the worker interpreter, typed process handles, and application
+API. Duplicate/late reports and kill must preserve the failure; an IO exception
+must remain retryable and another run must still complete on the same worker.
 Concurrent blob writers must receive the same canonical record;
 invalid blob references, missing names, and invalid UTF-8 must be rejected. Mailbox tests
 close consumers without acknowledging and verify 24 successive redeliveries on

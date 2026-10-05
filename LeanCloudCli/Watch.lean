@@ -225,7 +225,9 @@ def frame (ctx : Context) (run : Run) (nodes : Array Node) (steps : Array Trace.
   return (lines.extract 0 (height - 1)).map (fun line => Styled.render line width color)
 
 private def exitLabel : Exit → String
-  | .success _ => "completed" | .failure _ => "failed" | .cancelled _ => "cancelled"
+  | .success _ => "completed"
+  | .failure error => s!"failed: {safe error.message}"
+  | .cancelled _ => "cancelled"
 
 private def status (ctx : Context) (run : Run) : Cli String := do
   let control ← ctx.control run.id
@@ -235,10 +237,12 @@ private def status (ctx : Context) (run : Run) : Cli String := do
     let label := exitLabel outcome
     saveJson path label
     return label
+  -- Root outcomes are immutable. A later local pause/kill intent cannot replace
+  -- a confirmed terminal result when the deployment is temporarily offline.
+  if !outcome.isOk && (← request (.exists path)) then
+    return (← readJson (α := String) path) ++ " (saved)"
   if control != .active then return control.label
   if outcome.isOk then return "result pending"
-  if ← request (.exists path) then
-    return (← readJson (α := String) path) ++ " (saved)"
   return "result unavailable"
 
 private partial def wait (draw : Navigation → Nat → Nat → Cli Unit)

@@ -400,6 +400,29 @@ def consoleEffectCases : Array TestCase := #[
     for text in ["squares/v1", "completed", "LOCATION", "29", "CPU", "Source:"] do
       assertTrue (has world.stdout text) s!"Missing command output: {text}"
     assertTrue (!world.stdout.contains '\x1b' && !world.trace.contains "enterTerminal") "--once entered raw terminal"⟩,
+  ⟨"console.effects.terminal-failure-in-every-view-and-offline-history", do
+    let error : CloudError := ⟨.protocol, "Interpreter fuel exhausted"⟩
+    let initial := { (launched false) with
+      directories := #[ctx.runs.toString]
+      process := fun call =>
+        if call.args.contains "outcome" then response (toJson (some (Exit.failure error))).compress
+        else if call.args.contains "status" then response (toJson ({ error := some error } : Scheduler.State)).compress
+        else process false call }
+    for args in [["ps"], ["inspect", "one"], ["result", "one"], ["watch", "one", "--once"]] do
+      let (_, world) ← checked (command ctx args) initial
+      assertTrue (has world.stdout "failed" && !has world.stdout "result pending") "Terminal error was shown as pending"
+      if args != ["ps"] then assertTrue (has world.stdout error.message) "Failure reason missing"
+      assertTrue (!world.processes.any (·.args[0]? == some "stats")) "Failed workflow used live worker metrics"
+      if args[0]? == some "watch" then
+        assertTrue (has world.stdout "HISTORY") "Failed workflow still follows live execution"
+        for control in [RunControl.active, .pausing, .paused, .killing, .killed] do
+          let saved := world.json (ctx.directory "one" / "control.json") control
+          let (_, offline) ← checked (command ctx args) { saved with stdout := "", process := fun _ => .error "Offline" }
+          assertTrue (has offline.stdout s!"failed: {error.message} (saved)") "Local intent hid the confirmed failure"
+    let (result, world) := ConsoleModel.run (ctx.resume "one") initial
+    let .error message := result | throw (IO.userError "Resumed a terminal failure")
+    assertTrue (has message error.message && has message "new run") "Resume omitted failure guidance"
+    assertTrue (!world.processes.any (·.args.contains "resume")) "Resume reached the failed run"⟩,
   ⟨"console.effects.shared-node-traces-stay-with-the-run", do
     let event : ExecutionEvent := ⟨"shared", 1, 1, "worker1", some 0, "0:0", "execute", "other-work", "another", none⟩
     let handle (call : Invocation) := do
@@ -425,8 +448,7 @@ def consoleEffectCases : Array TestCase := #[
         keys := keys
         process := fun _ => .error "Docker unavailable" }
       assertTrue (world.keys.isEmpty && !world.terminal && world.locks.isEmpty) "Arrow input exited early or leaked terminal/locks"
-      let label := if control == .active then "completed (saved)" else control.label
-      assertTrue (has world.stdout label && has world.stdout "square" && has world.stdout "HISTORY")
+      assertTrue (has world.stdout "completed (saved)" && has world.stdout "square" && has world.stdout "HISTORY")
         "Offline history lost its status, steps, or cursor"
       assertTrue (world.processes.all fun call => call.args[0]? == some "logs" ||
         call.args[0]? == some "ps" || call.args[0]? == some "port" || call.args.contains "outcome") "Browsing mutated execution"

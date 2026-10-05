@@ -19,6 +19,7 @@ private def inspectRun (ctx : Context) (id : String) : Cli Unit := do
     if control != .active then pure none else throw error
   if let some outcome := outcome then
     printStyled (Styled.text "Outcome: " ++ Styled.text (exitLabel outcome) (Styled.statusColor (exitLabel outcome)))
+    if let .failure error := outcome then printLine s!"Error: {safe error.message}"
   if control != .active then
     if outcome.isNone then printStyled (Styled.text "Status: " ++ Styled.text control.label (Styled.statusColor control.label))
     return

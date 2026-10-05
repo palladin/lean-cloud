@@ -80,8 +80,11 @@ private def reconfigure (config : Config) (saved : Saved)
     (all.filter (·.worker != route.worker)).push route) retained
   return { saved with state, routes := some retained }
 
-private def settle (config : Config) (command : LeanCloud.Pool.Command) : IO Unit := do
-  if let .kill run := command then discard (LeanCloudRuntime.cancel config run)
+/-- Call only after saving coordination state. Repeating the publication after
+a crash cannot replace the canonical root or reactivate this run. -/
+private def settle (config : Config) (run : LeanCloud.Pool.Run) : IO Unit := do
+  if let some outcome := run.terminalOutcome then
+    discard (recordOutcome config run.id outcome)
 
 /-- An offline worker must not block pool administration. Its assignment/report
 is already durable. Workers repeat readiness and recover the same assignment;
@@ -105,7 +108,7 @@ def scheduler (config : Config) : IO Unit := do
       saved := { saved with state := LeanCloud.Pool.recover saved.state }
       LocalDb.saveValue conn "pool-v1" saved
       for run in saved.state.runs do
-        if run.mode == .killed then discard (LeanCloudRuntime.cancel config run.id)
+        settle config run
       let handle ← HttpMailbox.openMailbox config.mailboxes.scheduler address "scheduler"
       try
         let inbox : Mailbox IO Envelope := HttpMailbox.inbox handle
@@ -160,6 +163,10 @@ def scheduler (config : Config) : IO Unit := do
               if let .ok endpoint := mailboxes.worker report.worker then
                 saved := { saved with state := LeanCloud.Pool.report saved.state run report }
                 LocalDb.saveValue conn "pool-v1" saved
+                if let some state := saved.state.runs.find? (·.id == run) then
+                  settle config state
+                  if let some error := state.scheduler.error then
+                    (← Trace.create "scheduler" run).emit "failed" error.message
                 reply endpoint report.worker .acknowledged
                 (← Trace.create "scheduler" run).emit "report" report.worker
             | .request replyTo command =>
@@ -175,7 +182,8 @@ def scheduler (config : Config) : IO Unit := do
                 saved := { saved with replies := saved.replies.push (replyTo, response) }
               if cache then LocalDb.saveValue conn "pool-v1" saved
               if response.isOk then
-                settle config command
+                if let .kill run := command then
+                  if let some state := saved.state.runs.find? (·.id == run) then settle config state
                 match command with
                 | .pause run => (← Trace.create "scheduler" run).emit "paused" ""
                 | .resume run => (← Trace.create "scheduler" run).emit "resumed" ""

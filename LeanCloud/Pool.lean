@@ -82,6 +82,14 @@ def tick (elapsed : Nat) (state : State) : State :=
 def Run.accepts (run : Run) : Bool :=
   run.mode == .active && !run.scheduler.finished && run.scheduler.error.isNone
 
+/-- Terminal outcomes requested by coordination. Workers publish ordinary
+results; these intents are retried after restart until the root is sealed.
+An accepted failure precedes a later kill. An earlier root result always wins. -/
+def Run.terminalOutcome (run : Run) : Option Exit :=
+  match run.scheduler.error with
+  | some error => some (.failure error)
+  | none => if run.mode == .killed then some (.cancelled "Killed by user") else none
+
 def valid (state : State) (id worker : String) (attempt : Nat) : Bool :=
   !state.membership.drained.contains worker && state.runs.any fun run => run.id == id && run.accepts &&
     run.scheduler.jobs.any fun job => match job.status with
@@ -140,7 +148,9 @@ def drained (state : State) (worker : String) (generation : Nat) : State :=
 def report (state : State) (id : String) (value : Report) : State :=
   { state with runs := state.runs.map fun run =>
       if run.id == id && run.accepts then
-        { run with scheduler := Scheduler.Internal.accept run.scheduler value }
+        let scheduler := Scheduler.Internal.accept run.scheduler value
+        -- Revoke every sibling before publishing a terminal failure.
+        { run with scheduler := if scheduler.error.isSome then release scheduler else scheduler }
       else run }
 
 private def setMode (state : State) (id : String) (mode : Mode) : Except String State := do
@@ -149,6 +159,8 @@ private def setMode (state : State) (id : String) (mode : Mode) : Except String 
       else throw s!"Unknown run: {id}"
   let some run := state.runs[index]? | throw "Missing run"
   if run.mode == .killed && mode != .killed then throw "Killed runs cannot be resumed or paused"
+  if run.scheduler.error.isSome && mode != .killed then
+    throw "Failed runs cannot be resumed or paused; submit a new run"
   let scheduler := if mode == .active then run.scheduler else release run.scheduler
   return { state with runs := state.runs.set! index { run with mode, scheduler } }
 

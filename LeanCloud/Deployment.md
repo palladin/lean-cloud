@@ -133,6 +133,19 @@ Pause/kill are cooperative at record boundaries; in-flight user IO may finish.
 Reference workers use 100,000 interpreter steps per assignment; the completion
 proof assumes sufficient fuel rather than proving that this default always suffices.
 
+An accepted interpreter error, such as fuel exhaustion or a replay protocol
+error, terminates that run. The pool revokes its other attempts and saves the
+error in SQLite before publishing a failure in the ordinary immutable root
+record. Restart retries an interrupted publication. An existing root result
+is preserved; duplicate reports and a later kill cannot replace it. Failed runs
+cannot resume: fix the cause and submit a new run.
+
+`CloudProcess.poll`/`await` and the console read that same root outcome.
+`result` and `inspect` show the reason; `ps` shows `failed`, and `watch` displays
+recorded history with the failure reason, including from its offline cache.
+Worker crashes and IO/transport exceptions remain retryable and do not create
+terminal failure records. Recovery still requires available durable storage.
+
 TLS termination, cloud provisioning, and scheduler failover remain future work.
 The current local endpoint is HTTP on localhost; do not expose it publicly as-is.
 Existing deployments using the old broker format require a fresh deployment:

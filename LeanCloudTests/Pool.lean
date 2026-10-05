@@ -1,5 +1,6 @@
 import LeanCloud.Pool
 import LeanCloudTests.Support
+import LeanCloudTests.Generated
 
 namespace LeanCloudTests
 open Lean LeanCloud
@@ -16,6 +17,55 @@ private def takeJob (state : Pool.State) (worker : String) : IO (Pool.State × S
 private def initial : Pool.State := { runs := #[⟨"first", .active, {}⟩, ⟨"second", .active, {}⟩] }
 
 def poolCases : Array TestCase := #[
+  ⟨"pool.failure-in-child-revokes-siblings-and-survives-recovery", do
+    let source := lower (.parallel [.value 7, .value 9]) (m := SimM SimulationBackend.World)
+    let runJob (world : SimulationBackend.World) (worker : String) (fuel : Nat) (job : Assignment) :=
+      unwrap (evaluate 10000 (Worker.execute worker (SimulationBackend.observed worker)
+        SimulationBackend.blobs fuel source 0 job) world)
+    let state ← change {} (.submit "failed")
+    let (state, id, root) ← takeJob state "worker1"
+    let (fork, world) ← runJob {} "worker1" 1000 root
+    let state := Pool.report state id fork
+    let (state, _, left) ← takeJob state "worker1"
+    let (state, _, right) ← takeJob state "worker2"
+    let (failure, _) ← runJob world "worker1" 0 left
+    let .error error := failure.progress | throw (IO.userError "Expected interpreter fuel exhaustion")
+    let state := Pool.report state id failure
+    assertEq (state.runs[0]?.bind Pool.Run.terminalOutcome) (some (.failure error))
+    assertTrue (!Pool.valid state id "worker1" left.attempt && !Pool.valid state id "worker2" right.attempt)
+      "Failed run retained an active sibling"
+    assertTrue (state.runs[0]?.all fun run => run.scheduler.jobs.all fun job =>
+      match job.status with | .running .. => false | _ => true) "Failed run displays running jobs"
+    for report in [failure, ⟨"worker2", right.attempt, .ok .done, #[]⟩,
+        ⟨"worker2", right.attempt, .error ⟨.protocol, "Later failure"⟩, #[]⟩] do
+      assertEq (toJson (Pool.report state id report)) (toJson state)
+    let saved : Pool.State ← unwrap (Json.parse (toJson state).compress >>= fromJson?)
+    let recovered := Pool.recover saved
+    assertEq (recovered.runs[0]?.bind Pool.Run.terminalOutcome) (some (.failure error))
+    assertTrue (Pool.command recovered (.resume id)).toOption.isNone "Failure resumed"
+    assertTrue (Pool.command recovered (.pause id)).toOption.isNone "Failure became paused"
+    let killed ← change recovered (.kill id)
+    assertEq (killed.runs[0]?.bind Pool.Run.terminalOutcome) (some (.failure error))
+    let next ← change recovered (.submit "healthy")
+    let (next, other, job) ← takeJob next "worker1"
+    assertEq other "healthy"
+    assertTrue (Pool.valid next other "worker1" job.attempt) "Failure prevented another run from using the worker"
+    assertEq (toJson next.runs[0]?) (toJson recovered.runs[0]?)⟩,
+  ⟨"pool.stale-failure-cannot-terminate-replacement-or-killed-run", do
+    let (state, id, old) ← takeJob initial "worker1"
+    let resumed ← change (← change state (.pause id)) (.resume id)
+    let (resumed, _, _) ← takeJob resumed "worker2"
+    let (resumed, replacementRun, current) ← takeJob resumed "worker1"
+    assertEq replacementRun id
+    assertTrue (current.attempt > old.attempt) "Expected a replacement attempt"
+    let stale : Report := ⟨"worker1", old.attempt, .error ⟨.protocol, "Stale failure"⟩, #[]⟩
+    -- Stale reports may add observation hints; they must not install a failure.
+    let after := Pool.report resumed id stale
+    assertTrue (after.runs.all (·.scheduler.error.isNone)) "Stale attempt installed a failure"
+    assertTrue (Pool.valid after id "worker1" current.attempt) "Stale failure revoked replacement work"
+    let killed ← change state (.kill id)
+    assertEq (toJson (Pool.report killed id stale)) (toJson killed)
+    assertEq (killed.runs[0]?.bind Pool.Run.terminalOutcome) (some (.cancelled "Killed by user"))⟩,
   ⟨"pool.legacy-state-defaults-to-unconfigured-membership", do
     let state : Pool.State ← unwrap (fromJson? (Json.mkObj [
       ("runs", toJson initial.runs), ("cursor", toJson initial.cursor)]))

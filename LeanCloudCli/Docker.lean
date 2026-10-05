@@ -386,7 +386,9 @@ private def Context.resumeLocked (ctx : Context) (id : String) : Cli Unit := do
     unless deployment.image == run.image do throw "This run belongs to a different deployed image"
     discard <| ctx.execApp #["submit-entry", "/etc/lean-cloud/config.json", id, run.program.entry, "-"]
       (some (run.input.compress ++ "\n"))
-    if (← ctx.outcome run).isSome then
+    if let some outcome ← ctx.outcome run then
+      if let .failure error := outcome then
+        throw s!"{id} failed: {safe error.message}. Submit a new run."
       printLine s!"{id} is already completed. Use 'result {id}'."
       return
     discard <| ctx.remote run "resume"
