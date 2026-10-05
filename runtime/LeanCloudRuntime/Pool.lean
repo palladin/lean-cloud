@@ -21,6 +21,29 @@ inductive Envelope where
 def send (config : Config) (message : LeanCloud.Pool.Message) : IO Unit :=
   HttpMailbox.send config.mailboxes.scheduler address "scheduler" (Envelope.event message)
 
+/-- Keep the work lease alive independently of user computation. The action
+checks transport failure at record boundaries; closing always joins the task.
+The scheduler still checks the attempt before accepting renewals or reports. -/
+def withHeartbeat (config : Config) (run worker : String) (attempt : Nat)
+    (action : IO Unit → IO α) : IO α := do
+  let stopped ← IO.mkRef false
+  let failure ← IO.mkRef (none : Option IO.Error)
+  let interval := max 1 (config.scheduler.assignmentMs / 3)
+  let heartbeat ← IO.asTask (do
+    let mut next ← IO.monoMsNow
+    while !(← stopped.get) do
+      if (← IO.monoMsNow) ≥ next then
+        try
+          send config (.renew run worker attempt)
+          next := (← IO.monoMsNow) + interval
+        catch error => failure.set (some error); return
+      IO.sleep (min 50 interval).toUInt32) .dedicated
+  try
+    action (do if let some error ← failure.get then throw error)
+  finally
+    stopped.set true
+    discard <| IO.ofExcept heartbeat.get
+
 /-- One request/reply exchange. Each call owns a unique reply address. The
 scheduler caches administrative replies before acknowledging requests. -/
 private def exchange (config : Config) (message : String → Envelope) : IO Json := do
@@ -127,6 +150,10 @@ def scheduler (config : Config) : IO Unit := do
                   trace.emit "dispatch" worker
             | .drained worker generation =>
               saved := { saved with state := LeanCloud.Pool.drained saved.state worker generation }
+              LocalDb.saveValue conn "pool-v1" saved
+            | .renew run worker attempt =>
+              let state := LeanCloud.Pool.renew config.scheduler.assignmentMs saved.state run worker attempt
+              saved := { saved with state }
               LocalDb.saveValue conn "pool-v1" saved
             | .report run report =>
               unless saved.state.membership.drained.contains report.worker do

@@ -6,6 +6,7 @@ lake exe lean_cloud_tests --list
 lake exe lean_cloud_tests generated/chaos
 lake exe lean_cloud_tests crash/
 lake exe lean_cloud_tests sequential/
+lake exe lean_cloud_tests pool
 (cd runtime && lake exe cloud_inbox_tests)
 lake exe cloud_console_tests
 lake exe cloud_runtime_tests
@@ -37,6 +38,16 @@ fair scheduling. On completion it commits remaining orphan requests and checks
 that existing records survive unchanged; every scheduled branch must be done.
 Error messages retain the generation seed and program tree.
 
+Shared-pool tests run three generated workflows on three workers, using the
+actual `Worker.execute` interpreter and `Sim` to interleave record operations.
+Across 64 seeds, each trace starts with real parallel suspensions, then performs
+400 operations mixing progress, pause/resume/kill, worker membership changes,
+assignment expiry and renewal, restarts, delayed/duplicate reports, and orphaned
+writes. Checks after each transition cover run isolation, attempt ownership,
+immutable records, and agreement with direct evaluation. Surviving workflows
+must finish once faults stop. Scheduler transitions are atomic in these tests;
+HTTP delivery and SQLite durability are checked separately by the adapter tests.
+
 Protocol tests check repeated assignment requests, duplicate and stale reports,
 empty and partial joins, immutable record creation, JSON codecs, and the different
 lifetimes of local database operations and remote requests.
@@ -59,6 +70,9 @@ operations, so the witness also checks interference inside a processing window.
 Inbox properties compare real SQLite with `MailboxModel` over 32 generated traces
 of 200 operations. They also check SIGKILL recovery, termination signals, HTTP
 authentication, lease expiry and renewal, and rejection of stale consumers.
+The native suite also runs the real Pool scheduler over HTTP and SQLite: busy
+work retains its assignment, pause revokes it, failed computations stop renewing,
+and stale heartbeats cannot renew replacement attempts.
 
 Real adapter properties compare 16 generated programs using HTTP/SQLite inboxes,
 private scheduler SQLite, and S3 with direct evaluation.
@@ -78,6 +92,8 @@ seed reproduces the plan, not OS timing.
 
 Console tests cover pause/resume and permanent kill, including interrupted
 commands, restart policies, and isolation between runs. Real runtime tests check
+that a 35-second computation completes once despite the default 30-second
+assignment lease. They also check
 that typed process handles observe cancellation, repeated cancellation preserves
 the same root record, and a completed result cannot be overwritten by kill.
 

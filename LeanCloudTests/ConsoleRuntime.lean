@@ -140,6 +140,19 @@ def demo : Cli Unit := do
     request (.sleep 2000)
     discard <| awaitOutcome ctx recover ((← request .now) + 120000)
     require ((← ctx.remote recover "result") == "files=16, errors=24") "Recovery returned a different report"
+    -- A single user effect runs longer than the default 30-second assignment
+    -- timeout. The persistent worker must renew without reaching a record boundary.
+    let longInput := sampleInput.setObjVal! "pauseMs" (toJson (35000 : Nat))
+    saveJson inputFile (longInput.setObjVal! "batchSize" (toJson (16 : Nat)))
+    ctx.launch "log-summary" (some inputFile.toString) (some "long-computation")
+    let longRun ← ctx.loadRun "long-computation"
+    discard <| awaitOutcome ctx longRun ((← request .now) + 90000)
+    require ((← ctx.remote longRun "result") == "files=16, errors=24") "Long computation failed to commit"
+    let events ← ctx.events longRun
+    let executions := events.foldl (fun count (_, events) => count +
+      (events.filter fun event => event.activity == "execute" && event.operation == "analyze-batch").size) 0
+    require (executions == 1) "Healthy long computation was retried"
+    saveJson inputFile (sampleInput.setObjVal! "pauseMs" (toJson (7000 : Nat)))
     -- Pause preserves records and withholds new assignments; shared nodes and
     -- other runs keep working. Kill is terminal and can be retried.
     ctx.launch "log-summary" (some inputFile.toString) (some "paused")

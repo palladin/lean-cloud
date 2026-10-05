@@ -110,6 +110,14 @@ acknowledging input. Workers persist replay records, confirm their reports, and
 then acknowledge assignments. Failure between these steps causes retry or
 redelivery. Attempt numbers fence reports from superseded assignments.
 
+Busy pool workers also send assignment heartbeats every third of
+`scheduler.assignmentMs` (30 seconds by default). This lease is separate from
+the inbox consumer lease: long user computations retain their work without
+reaching a replay boundary. Only the current run/worker/attempt can renew; pause,
+kill, expiry, and scheduler recovery revoke that attempt. Retiring workers keep
+renewing until their current assignment finishes. Heartbeats stop when execution
+returns or throws; crashed workers stop sending them and their work expires.
+
 A process crash stops both HTTP and the actor. Docker restarts the same node
 against its persistent volumes. During downtime, senders cannot obtain acceptance;
 failed actor operations restart and recover their unacknowledged inputs. The
@@ -146,7 +154,11 @@ The native inbox suite also runs the application-command and registry unit tests
 It checks real SQLite against the simulator's mailbox model over generated
 operation traces, plus session expiry, renewal, duplicate publication,
 stale acknowledgements, HTTP authentication, registry access, and committed mail
-surviving a SIGKILL. Console tests cover the production layout, shared processes,
+surviving a SIGKILL. It also checks Pool assignment renewal and revocation using
+the real HTTP scheduler and private SQLite. Generated Pool model tests interleave
+multiple workflows, restarts, controls, scaling, and delayed worker operations,
+then compare durable results with direct evaluation.
+Console tests cover the production layout, shared processes,
 controls, scaling, generated applications, and node restarts. Component tests run
 HTTP inboxes separately to inject transport faults and compare generated cloud
 programs with the direct interpreter. These standalone inboxes are test fixtures;

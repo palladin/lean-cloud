@@ -120,6 +120,28 @@ def poolCases : Array TestCase := #[
     assertEq run "second"
     let (_, run, _) ← takeJob state "worker2"
     assertEq run "first"⟩,
+  ⟨"pool.heartbeats-renew-only-the-current-attempt", do
+    let (state, id, job) ← takeJob initial "worker1"
+    let (state, other, second) ← takeJob state "worker2"
+    let state := Pool.tick 50 state
+    -- The run, worker, and attempt all matter: attempt numbers repeat across runs.
+    for (run, worker, attempt) in [(other, "worker1", job.attempt),
+        (id, "worker2", job.attempt), (id, "worker1", job.attempt + 1)] do
+      assertEq (toJson (Pool.renew 100 state run worker attempt)) (toJson state)
+    let renewed := Pool.renew 100 state id "worker1" job.attempt
+    assertEq (toJson (Pool.renew 100 renewed id "worker1" job.attempt)) (toJson renewed)
+    let elapsed := Pool.tick 75 renewed
+    assertTrue (Pool.valid elapsed id "worker1" job.attempt) "Busy worker lost its renewed lease"
+    assertTrue (!Pool.valid elapsed other "worker2" second.attempt) "Renewal crossed run namespaces"
+    let expired := Pool.tick 25 elapsed
+    assertEq (toJson (Pool.renew 100 expired id "worker1" job.attempt)) (toJson expired)
+    for revoked in [Pool.recover renewed, ← change renewed (.pause id), ← change renewed (.kill id)] do
+      assertEq (toJson (Pool.renew 100 revoked id "worker1" job.attempt)) (toJson revoked)
+    let retiring ← change state (.configureWorkers #["worker2"])
+    let retiring := Pool.tick 75 (Pool.renew 100 retiring id "worker1" job.attempt)
+    assertTrue (Pool.valid retiring id "worker1" job.attempt) "Drain prevented current work from renewing"
+    let drained := Pool.drained retiring "worker1" retiring.membership.generation
+    assertEq (toJson (Pool.renew 100 drained id "worker1" job.attempt)) (toJson drained)⟩,
   ⟨"pool.interleaved-forks-join-without-crossing-runs", do
     for seed in [:24] do
       let mut state := initial

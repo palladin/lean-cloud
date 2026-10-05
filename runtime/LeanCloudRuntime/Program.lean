@@ -83,13 +83,15 @@ def Registry.serveWorker (registry : Registry) (config : Config) : IO Unit := do
       match delivery.message with
       | .execute run assignment =>
         let revoked ← IO.mkRef false
-        let check : IO Unit := do
-          let allowed : Bool ← IO.ofExcept (fromJson? (← Pool.request config (.check run id assignment.attempt)))
-          unless allowed do
-            revoked.set true
-            throw (IO.userError "Assignment revoked")
         let trace ← Trace.create id run
         try
+          Pool.withHeartbeat config run id assignment.attempt fun healthy => do
+          let check : IO Unit := do
+            healthy
+            let allowed : Bool ← IO.ofExcept (fromJson? (← Pool.request config (.check run id assignment.attempt)))
+            unless allowed do
+              revoked.set true
+              throw (IO.userError "Assignment revoked")
           check
           trace.assign assignment
           let report ← if (← completed config run).isSome then

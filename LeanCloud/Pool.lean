@@ -53,6 +53,7 @@ inductive Command where
 inductive Message where
   | submit (run : String)
   | ready (worker : String)
+  | renew (run worker : String) (attempt : Nat)
   | drained (worker : String) (generation : Nat)
   | report (run : String) (report : Report)
   | request (replyTo : String) (command : Command)
@@ -86,6 +87,20 @@ def valid (state : State) (id worker : String) (attempt : Nat) : Bool :=
     run.scheduler.jobs.any fun job => match job.status with
       | .running owner current _ => owner == worker && current == attempt
       | _ => false
+
+/-- A heartbeat extends only an existing attempt. It cannot revive expired or
+revoked work. Retiring workers can finish their current assignment before drain. -/
+def renew (duration : Nat) (state : State) (id worker : String) (attempt : Nat) : State :=
+  if !valid state id worker attempt then state
+  else { state with runs := state.runs.map fun run =>
+    if run.id != id then run else
+    { run with scheduler := { run.scheduler with jobs := run.scheduler.jobs.map fun job =>
+      match job.status with
+      | .running owner current deadline =>
+        if owner == worker && current == attempt then
+          { job with status := .running owner current (max deadline (run.scheduler.now + max 1 duration)) }
+        else job
+      | _ => job } } }
 
 /-- Repeated readiness returns the existing assignment before allocating work
 in another run. Run selection rotates; result order stays the program's order. -/

@@ -181,6 +181,73 @@ private def signalWorker : IO Unit := do
   (← IO.getStdout).flush
   repeat IO.sleep 1000
 
+/-- The real Pool scheduler, SQLite persistence, and HTTP transport. No blob
+service is needed to test work ownership while a computation is busy. -/
+private def poolLeases : IO Unit := IO.FS.withTempFile fun _ inboxPath =>
+    IO.FS.withTempFile fun _ schedulerPath => IO.FS.withTempFile fun _ configPath => do
+  let conn ← LeanLinq.Sqlite.connect inboxPath.toString
+  try
+    let handler : HttpMailbox.ServerHandler := ⟨← Inbox.create conn, "lease-test", fun _ => pure Json.null⟩
+    let server ← (HttpServer.start (.v4 ⟨.ofParts 127 0 0 1, 0⟩) handler).block
+    try
+      let some (.v4 bound) := server.localAddr | throw (IO.userError "No pool HTTP address")
+      let endpoint : HttpMailbox.Config := ⟨"127.0.0.1", bound.port.toNat, "lease-test"⟩
+      let defaults : Config ← IO.ofExcept (Json.parse (include_str "../deploy/config.json") >>= fromJson?)
+      let config := { defaults with
+        mailboxes := ⟨endpoint, #[⟨"worker1", endpoint⟩]⟩
+        scheduler := ⟨schedulerPath.toString, 1500⟩ }
+      IO.FS.writeFile configPath (toJson config).compress
+      let child ← IO.Process.spawn {
+        cmd := (← IO.appPath).toString
+        args := #["pool-scheduler", configPath.toString], stdout := .piped }
+      try
+        assertEq (← child.stdout.getLine).trimAscii.toString "deployment scheduler ready"
+        let handle ← HttpMailbox.openMailbox endpoint LeanCloudRuntime.Pool.address "worker.worker1"
+        try
+          let inbox : Mailbox IO LeanCloud.Pool.Reply := HttpMailbox.inbox handle
+          let acquire : IO Assignment := do
+            LeanCloudRuntime.Pool.send config (.ready "worker1")
+            let deadline := (← IO.monoMsNow) + 5000
+            repeat
+              unless (← IO.monoMsNow) < deadline do throw (IO.userError "Pool did not assign work")
+              let some item ← inbox.receive | continue
+              inbox.acknowledge item.receipt
+              if let .execute "lease-test" assignment := item.message then return assignment
+          let valid (assignment : Assignment) : IO Bool := do
+            IO.ofExcept (fromJson? (← LeanCloudRuntime.Pool.request config
+              (.check "lease-test" "worker1" assignment.attempt)))
+          discard <| LeanCloudRuntime.Pool.request config (.submit "lease-test")
+          let first ← acquire
+          LeanCloudRuntime.Pool.withHeartbeat config "lease-test" "worker1" first.attempt fun healthy => do
+            -- No record boundaries or validity requests during the computation.
+            IO.sleep 4000
+            healthy
+            assertTrue (← valid first) "Healthy long-running work expired"
+            discard <| LeanCloudRuntime.Pool.request config (.pause "lease-test")
+            IO.sleep 600
+            assertTrue (!(← valid first)) "Heartbeat resurrected paused work"
+          discard <| LeanCloudRuntime.Pool.request config (.resume "lease-test")
+          let second ← acquire
+          assertTrue (second.attempt > first.attempt) "Resume reused the old attempt"
+          rejects (LeanCloudRuntime.Pool.withHeartbeat config "lease-test" "worker1" second.attempt fun _ => do
+            IO.sleep 700
+            throw (IO.userError "Interrupted computation") : IO Unit)
+            "Computation failure was swallowed"
+          IO.sleep 2000
+          assertTrue (!(← valid second)) "Heartbeat outlived a failed computation"
+          -- A delayed heartbeat from the previous attempt must not renew its replacement.
+          let third ← acquire
+          assertTrue (third.attempt > second.attempt) "Expiry reused an attempt"
+          LeanCloudRuntime.Pool.withHeartbeat config "lease-test" "worker1" second.attempt fun _ => do
+            IO.sleep 2000
+            assertTrue (!(← valid third)) "Stale heartbeat renewed replacement work"
+        finally handle.close
+      finally
+        try child.kill catch _ => pure ()
+        discard child.wait
+    finally server.shutdownAndWait.block
+  finally conn.close
+
 private def processSignals : IO Unit := do
   for signal in ["TERM", "INT"] do
     for _ in [:4] do
@@ -234,6 +301,8 @@ private def processCrash : IO Unit := IO.FS.withTempFile fun _ path => do
 def main (args : List String) : IO UInt32 := do
   if args == ["signal-worker"] then signalWorker; return 0
   if let ["crash-writer", path] := args then crashWriter path; return 0
+  if let ["pool-scheduler", path] := args then
+    LeanCloudRuntime.Pool.scheduler (← Config.load path); return 0
   try
     ApplicationTests.run
     IO.println "Application commands and registry passed"
@@ -244,6 +313,8 @@ def main (args : List String) : IO UInt32 := do
     IO.println "SIGKILL recovery passed"
     processSignals
     http
+    poolLeases
+    IO.println "Pool assignment renewal, pause fencing, expiry, and heartbeat cleanup passed"
     IO.println "SQLite inbox laws, 32 × 200 model operations, SIGKILL recovery, termination signals, HTTP transport, renewal, fencing, and registry API passed."
     return 0
   catch error => IO.eprintln error.toString; return 1
