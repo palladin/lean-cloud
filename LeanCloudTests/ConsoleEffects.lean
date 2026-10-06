@@ -45,7 +45,7 @@ private def process (completed : Bool) (call : Invocation) : Except String Proce
     response (toJson (#["worker1", "worker2", "worker3", "scheduler"].map fun role =>
       Json.mkObj [("Name", toJson ("/" ++ ctx.node role)),
         ("State", Json.mkObj [("Status", toJson "running"), ("StartedAt", toJson "boot")]),
-        ("Config", Json.mkObj [("Labels", Json.mkObj [("lean-cloud.run", toJson savedRun.id),
+        ("Config", Json.mkObj [("Labels", Json.mkObj [
           ("lean-cloud.role", toJson role)])])])).compress
   else if call.command == "http" then response
   else if args[0]? == some "exec" then response "Filesystem 1024-blocks Used Available Capacity Mounted\ndisk 2048 1024 1024 50% /\n"
@@ -96,6 +96,53 @@ private def scaleProcess (drained : Bool) (call : Invocation) : Except String Pr
   else process false call
 
 def consoleEffectCases : Array TestCase := #[
+  ⟨"console.effects.ps-timestamps-and-offline-timing-snapshot", do
+    let timing : LeanCloud.Timing.Run := {
+      span := some ⟨86400000, some 86401234⟩, observedMs := 86490000 }
+    let initial := { (launched) with
+      directories := (launched).directories.push ctx.runs.toString
+      process := fun call =>
+        if call.args.contains "status" then
+          response (toJson ({ timing := some timing } : LeanCloud.Timing.Status)).compress
+        else process true call }
+    let (_, saved) ← checked (command ctx ["ps"]) initial
+    assertTrue (has saved.stdout "STARTED (UTC)" && has saved.stdout "FINISHED (UTC)" &&
+      has saved.stdout "1970-01-02 00:00:00" && has saved.stdout "1970-01-02 00:00:01" &&
+      has saved.stdout "1.234s") "ps omitted timestamps or used observation time as completion"
+    let offline := { saved with stdout := "", process := fun _ => .error "offline" }
+    let (_, cached) ← checked (command ctx ["ps"]) offline
+    assertTrue (has cached.stdout "1.234s" && has cached.stdout "unavailable")
+      "Offline ps discarded its saved times or claimed to be live"⟩,
+  ⟨"console.effects.ps-shares-one-status-query-with-timing", do
+    let initial := { (launched false) with directories := (launched false).directories.push ctx.runs.toString }
+    let (_, world) ← checked (command ctx ["ps"]) initial
+    assertEq (world.processes.filter (·.args.contains "status")).size 1
+      "ps fetched the same scheduler state twice"
+    assertTrue (has world.stdout "running (0/1)") "Missing current scheduler status"⟩,
+  ⟨"console.effects.legacy-clean-deploy-command-sequence", do
+    let legacy := Project.defaultConfig.setObjVal! "mailboxes" (Json.mkObj [
+      ("scheduler", Json.mkObj [("host", toJson "scheduler-mailbox"), ("port", toJson (5672 : Nat))]),
+      ("workers", toJson #[Json.mkObj [("worker", toJson "worker1"), ("broker", Json.mkObj [])]])])
+    let original := (launched).json (Project.assets ctx / "config.json") legacy
+    let (rejected, untouched) := ConsoleModel.run (command ctx ["deploy"]) original
+    let .error error := rejected | throw (IO.userError "Silently reused RabbitMQ state")
+    assertTrue (has error "'clean', then 'deploy'" && has error "permanently deletes") "Missing actionable reset guidance"
+    assertTrue untouched.processes.isEmpty "Legacy rejection changed Docker resources"
+    assertEq (untouched.file (Project.assets ctx / "config.json")) (original.file (Project.assets ctx / "config.json"))
+    let cleanProcess (call : Invocation) :=
+      if call.args.contains "ls" || call.args[0]? == some "ps" then response else process true call
+    let (_, cleaned) ← checked (command ctx ["clean"]) { untouched with process := cleanProcess }
+    assertTrue (cleaned.file (Project.assets ctx / "config.json")).isNone "Clean retained RabbitMQ configuration"
+    assertTrue (cleaned.file (ctx.directory "one" / "run.json")).isNone "Clean retained old runs"
+    let (_, fresh) ← checked (command ctx ["deploy", "--workers", "1"])
+      { cleaned with process := process true, processes := #[] }
+    let (config, _) ← checked (readJson (α := Json) (Project.assets ctx / "config.json")) fresh
+    assertEq config (← unwrap (Project.runtimeConfig Project.defaultConfig 1))
+    assertEq (fresh.file (ctx.root / "deploy/config.json")) (original.file (ctx.root / "deploy/config.json"))
+    assertTrue (!fresh.processes.any (·.args.contains "outcome")) "Fresh deployment attempted to recover deleted runs"
+    let (_, running) ← checked (command ctx ["run", "squares", "--id", "new"]) fresh
+    let (_, finished) ← checked (command ctx ["result", "new"]) running
+    assertTrue (has finished.stdout "29") "Fresh deployment could not run a workflow"⟩,
   ⟨"console.http.rediscovers-port-before-send", do
     let world := (base).json (ctx.home / "api.json") (Json.mkObj [
       ("url", toJson "http://127.0.0.1:19090"), ("token", toJson "local-cloud")])
@@ -192,6 +239,23 @@ def consoleEffectCases : Array TestCase := #[
         | throw (IO.userError "Did not start the new nodes")
       assertTrue (outcome < start) "Started new code before validating unfinished runs"
       assertEq (world.file (ctx.directory "one" / "run.json")) (initial.file (ctx.directory "one" / "run.json"))⟩,
+  ⟨"console.effects.redeploy-with-legacy-program-metadata", do
+    let legacy := Json.mkObj [("entry", toJson info.entry), ("inputSchema", toJson info.inputSchema),
+      ("resultSchema", toJson info.resultSchema), ("description", toJson info.description),
+      ("sampleInput", toJson info.sampleInput), ("source", Json.mkObj [
+        ("file", toJson "Old.lean"), ("text", toJson "cloud { return 29 }"),
+        ("sites", toJson #[Json.mkObj [("operation", toJson "exec"), ("line", toJson (1 : Nat))]])])]
+    let deployment := (toJson (Deployment.mk ctx.project "sha256:previous" #[info] defaultWorkerCount 0))
+      |>.setObjVal! "programs" (toJson #[legacy])
+    let initial := (launched).json (ctx.home / "deployment.json") deployment
+      |>.json (ctx.directory "one" / "run.json") ((toJson savedRun).setObjVal! "program" legacy)
+    let (_, world) ← checked ctx.deploy { initial with directories := initial.directories.push ctx.runs.toString }
+    assertTrue (world.processes.any (·.args.contains "outcome")) "Legacy run metadata blocked checking saved results"
+    assertTrue (world.processes.any (·.args.contains "serve-scheduler")) "Legacy deployment blocked redeploy"
+    let (updated, _) ← checked ctx.deployment world
+    assertEq (toJson updated.programs) (toJson #[info]) "Deploy did not save the new program metadata"
+    assertEq (world.file (ctx.directory "one" / "run.json")) (initial.file (ctx.directory "one" / "run.json"))
+      "Redeploy rewrote historical run metadata"⟩,
   ⟨"console.effects.redeploy-bounds-storage-retries", do
     let old := (launched).json (ctx.home / "deployment.json") (Deployment.mk ctx.project "sha256:previous" #[info] defaultWorkerCount 0)
     let initial := { old with directories := old.directories.push ctx.runs.toString }
@@ -287,12 +351,13 @@ def consoleEffectCases : Array TestCase := #[
         directories := initial.directories.push ctx.runs.toString
         process := fun call =>
           if call.args.contains "outcome" then .error "Blob service unavailable"
-          else if call.args.contains "status" then .error "Stopped scheduler must not be queried"
+          else if call.args.contains "status" then .error "Scheduler unavailable"
           else process false call }
       for args in [["ps"], ["inspect", "one"], ["watch", "one", "--once"]] do
         let (_, world) ← checked (command ctx args) offline
         assertTrue (has world.stdout control.label) s!"Missing status: {control.label}"
-        assertTrue (!world.processes.any (·.args.contains "status")) "Queried a stopped scheduler"⟩,
+        assertTrue (!world.processes.any (fun call => call.args.contains "resume" || call.args.contains "submit-entry"))
+          "Observing control state resumed execution"⟩,
   ⟨"console.effects.resume-uses-existing-pool", do
     let initial := (launched false).json (ctx.directory "one" / "control.json") RunControl.paused
     let (_, resumed) ← checked (ctx.resume "one") initial
@@ -395,12 +460,12 @@ def consoleEffectCases : Array TestCase := #[
     let initial := { (launched) with directories := (launched).directories.push ctx.runs.toString }
     let (_, world) ← checked (do
       for args in [["programs"], ["ps"], ["inspect", "one"], ["result", "one"],
-          ["nodes"], ["logs", "one", "worker2"], ["watch", "one", "--once"]] do
+          ["top", "--once"], ["logs", "one", "worker2"], ["watch", "one", "--once"]] do
         discard (command ctx args)) initial
     for text in ["squares/v1", "completed", "LOCATION", "29", "CPU", "Source:"] do
       assertTrue (has world.stdout text) s!"Missing command output: {text}"
     assertTrue (!world.stdout.contains '\x1b' && !world.trace.contains "enterTerminal") "--once entered raw terminal"⟩,
-  ⟨"console.effects.terminal-failure-in-every-view-and-offline-history", do
+  ⟨"console.effects.terminal-failure-in-every-view-and-offline-last-view", do
     let error : CloudError := ⟨.protocol, "Interpreter fuel exhausted"⟩
     let initial := { (launched false) with
       directories := #[ctx.runs.toString]
@@ -414,7 +479,7 @@ def consoleEffectCases : Array TestCase := #[
       if args != ["ps"] then assertTrue (has world.stdout error.message) "Failure reason missing"
       assertTrue (!world.processes.any (·.args[0]? == some "stats")) "Failed workflow used live worker metrics"
       if args[0]? == some "watch" then
-        assertTrue (has world.stdout "HISTORY") "Failed workflow still follows live execution"
+        assertTrue (has world.stdout "LAST VIEW") "Failed workflow still follows live execution"
         for control in [RunControl.active, .pausing, .paused, .killing, .killed] do
           let saved := world.json (ctx.directory "one" / "control.json") control
           let (_, offline) ← checked (command ctx args) { saved with stdout := "", process := fun _ => .error "Offline" }
@@ -433,13 +498,13 @@ def consoleEffectCases : Array TestCase := #[
     let initial := { launched with process := handle }
     let (_, world) ← checked (command ctx ["logs", "one"]) initial
     assertTrue (has world.stdout "square" && !has world.stdout "other-work") "Logs crossed workflow boundaries"
-    let (events, _) ← checked (ctx.events savedRun) initial
-    assertTrue (events.all (fun (_, trace) => trace.size == 1 && trace.all (·.run == savedRun.id)))
-      "Moving to another run discarded historical activity"⟩,
-  ⟨"console.effects.watch-history-offline-and-all-states", do
+    let (snapshot, _) ← checked (LeanCloudCli.Trace.load ctx savedRun) initial
+    assertTrue (!snapshot.steps.isEmpty && snapshot.steps.all (·.event.run == savedRun.id))
+      "Watch snapshot crossed workflow boundaries"⟩,
+  ⟨"console.effects.watch-last-view-offline-and-all-states", do
     for control in [RunControl.active, .paused, .killed] do
       let step : LeanCloudCli.Trace.Step := ⟨"2026-01-01T00:00:00.000000000Z",
-        ⟨"boot", 1, 10, "worker1", some 1, "0:1", "execute", "square", savedRun.id, some "square"⟩, none⟩
+        ⟨"boot", 1, 10, "worker1", some 1, "0:1", "execute", "square", savedRun.id, some "square"⟩, none, none, none⟩
       let initial := (launched).json (ctx.directory savedRun.id / "trace.json") #[step]
         |>.json (ctx.directory savedRun.id / "watch-status.json") "completed"
         |>.json (ctx.directory savedRun.id / "control.json") control
@@ -448,13 +513,16 @@ def consoleEffectCases : Array TestCase := #[
         keys := keys
         process := fun _ => .error "Docker unavailable" }
       assertTrue (world.keys.isEmpty && !world.terminal && world.locks.isEmpty) "Arrow input exited early or leaked terminal/locks"
-      assertTrue (has world.stdout "completed (saved)" && has world.stdout "square" && has world.stdout "HISTORY")
-        "Offline history lost its status, steps, or cursor"
+      assertTrue (has world.stdout "completed (saved)" && has world.stdout "square" && has world.stdout "LAST VIEW")
+        "Offline last view lost its status or source"
+      assertTrue (world.file (ctx.directory savedRun.id / "trace.json")).isNone "Old execution history was retained"
+      assertTrue (world.file (ctx.directory savedRun.id / "watch.json")).isSome "Last view was not saved"
+      assertEq (world.processes.filter (·.args[0]? == some "logs")).size 4 "Completed watch kept polling logs"
       assertTrue (world.processes.all fun call => call.args[0]? == some "logs" ||
         call.args[0]? == some "ps" || call.args[0]? == some "port" || call.args.contains "outcome") "Browsing mutated execution"
       assertEq (world.file (ctx.directory savedRun.id / "control.json"))
         (initial.file (ctx.directory savedRun.id / "control.json"))⟩,
-  ⟨"console.effects.trace-cache-retains-restarts-and-older-runs", do
+  ⟨"console.effects.watch-snapshot-replaces-old-observations", do
     let handler (call : Invocation) := do
       let out ← process true call
       if call.args[0]? != some "logs" then return out
@@ -462,16 +530,17 @@ def consoleEffectCases : Array TestCase := #[
       let lines := (Array.range 120).map fun i =>
         let event : ExecutionEvent := ⟨if i < 50 then "old" else "new", i, i, worker, some 1,
           s!"0:{i}", "execute", "square", if i < 110 then savedRun.id else "other", some "square"⟩
-        "@lean-cloud " ++ (toJson event).compress
+        s!"{i + 1000} @lean-cloud " ++ (toJson event).compress
       return { out with stdout := String.intercalate "\n" lines.toList }
     let (snapshot, saved) ← checked (LeanCloudCli.Trace.load ctx savedRun) { launched with process := handler }
-    assertEq snapshot.steps.size 440
+    assertEq snapshot.steps.size 1 "The latest branch snapshot retained execution history"
+    assertEq (snapshot.steps.back?.map (·.event.seq)) (some 109) "Last observation is from another run or an older attempt"
     assertTrue (saved.processes.all (fun call => !call.args.contains "--tail" && !call.args.contains "--since"))
-      "Trace collection truncated history to the latest run or incarnation"
+      "Initial collection lost completed runs or earlier worker incarnations"
     let (again, saved) ← checked (LeanCloudCli.Trace.load ctx savedRun) saved
-    assertEq again.steps.size 440 "Refreshing duplicated history"
+    assertEq (again.steps.map (·.id)) (snapshot.steps.map (·.id)) "Refresh changed the last snapshot"
     let (offline, _) ← checked (LeanCloudCli.Trace.load ctx savedRun) { saved with process := fun _ => .error "offline" }
-    assertEq offline.steps.size 440 "Unavailable containers discarded cached steps"
+    assertEq (offline.steps.map (·.id)) (snapshot.steps.map (·.id)) "Offline view lost its snapshot"
     assertTrue (!offline.warning.isEmpty) "Unavailable observations were not reported"⟩,
   ⟨"console.effects.interactive-repl", do
     let lines := ["unknown\n", "run 'unfinished\n", "help\n", "quit\n", "deploy\n"]
@@ -490,10 +559,10 @@ def consoleEffectCases : Array TestCase := #[
     assertEq code 0 "Help requires a checkout"⟩,
   ⟨"console.effects.live-navigation-and-refresh", do
     let (_, world) ← checked (command ctx ["watch", "one"])
-      { (launched false) with keys := [9, 51, 106, 107, 97] ++ List.replicate 10 0 ++ [113] }
+      { (launched false) with keys := [91, 93, 102, 106, 107, 97] ++ List.replicate 10 0 ++ [113] }
     assertTrue (!world.terminal && world.keys.isEmpty) "Watch did not restore terminal or consume keys"
-    assertTrue (has world.stdout "1 Worker 1") "Tab did not select the first worker view"
-    assertTrue (has world.stdout "3 Worker 3") "Worker shortcut did not redraw"
+    assertTrue (has world.stdout "BRANCHES") "Branch tree was not rendered"
+    assertTrue (has world.stdout "Source:") "Selected branch source was not rendered"
     assertTrue ((world.processes.filter (·.args[0]? == some "stats")).size == 2) "Timed refresh did not resample"
     assertTrue (world.stdout.endsWith "\x1b[?25h\x1b[?1049l") "Watch did not restore display"
     let (_, world) ← checked (command ctx ["watch", "one"]) { (launched) with terminalAvailable := false }

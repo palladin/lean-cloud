@@ -20,16 +20,15 @@ structure Catalog where
 
 /-- Completion reads the local catalog, never polling Docker while typing. -/
 def load (ctx : Context) : Cli Catalog := do
-  let programs ← try
-    pure ((← ctx.deployment).programs.map fun p => Item.mk p.entry p.description)
-    catch _ => pure #[]
+  let deployment ← try some <$> ctx.deployment catch _ => pure none
+  let programs := (deployment.map (·.programs) |>.getD #[]).map fun p => Item.mk p.entry p.description
   let runs ← try
     pure ((← ctx.allRuns).map fun r => Item.mk r.id r.program.entry)
     catch _ => pure #[]
   let deployments ← try
     pure ((← Deployments.load).entries.map fun e => Item.mk e.project e.root)
     catch _ => pure #[]
-  let count ← try pure (← ctx.deployment).retainedCount catch _ => pure defaultWorkerCount
+  let count := deployment.map (·.retainedCount) |>.getD defaultWorkerCount
   let actors := (#["scheduler"] ++ workerNames count).map fun name => Item.mk name "Node logs"
   return { programs, runs, deployments, actors }
 

@@ -2,6 +2,8 @@ import LeanCloudCli.Diagnostics
 import LeanCloudCli.Top
 import LeanCloudCli.Help
 import LeanCloudCli.Watch
+import LeanCloudCli.Clean
+import LeanCloudCli.Time
 
 namespace LeanCloudCli
 open Lean LeanCloud
@@ -38,36 +40,31 @@ private def inspectRun (ctx : Context) (id : String) : Cli Unit := do
   if let some error := state.error then printLine s!"Scheduler error: {safe error.message}"
 
 private def listRuns (ctx : Context) : Cli Unit := do
-  printHeading "RUN                            PROGRAM                  STATUS"
+  printHeading s!"{pad 31 "RUN"}{pad 25 "PROGRAM"}{pad 22 "STATUS"}{pad 21 "STARTED (UTC)"}{pad 21 "FINISHED (UTC)"}ELAPSED"
   for run in ← ctx.allRuns do
+    let observed ← observing (ctx.observation run)
+    let timing ← match observed with
+      | .ok state => pure state.timing
+      | .error _ => ctx.savedTiming run
     let status ← try
       match ← ctx.outcome run with
       | some outcome => pure (exitLabel outcome)
       | none =>
         let control ← ctx.control run.id
         if control != .active then pure control.label else do
-          let state ← ctx.scheduler run
+          let state ← liftExcept observed
           pure (if state.error.isSome then "scheduler error" else
             s!"running ({(state.jobs.filter (·.status == .done)).size}/{state.jobs.size})")
     catch _ =>
       let control ← ctx.control run.id
       pure (if control != .active then control.label else "unavailable / launch incomplete")
+    let span := timing >>= (·.span)
+    let started := span.map (Time.stamp ∘ Timing.Span.startedMs) |>.getD "—"
+    let finished := (span >>= (·.finishedMs)).map Time.stamp |>.getD "—"
+    let elapsed := Time.elapsed span (timing.map (·.observedMs) |>.getD 0)
     printStyled (Styled.text (pad 31 run.id) .cyan ++ Styled.text (pad 25 run.program.entry) ++
-      Styled.text status (Styled.statusColor status))
-
-private def showNodes (ctx : Context) : Cli Unit := do
-  let nodes ← ctx.nodes
-  let values ← samples nodes
-  printHeading "NODE                                STATE      CPU                     MEMORY"
-  for node in nodes do
-    let value := values.find? (·.1 == node.name)
-    let cpu := value.map (fun (_, s) => percent s.cpu) |>.getD "—"
-    let memory := value.map (fun (_, s) => humanBytes s.memory) |>.getD "—"
-    let cpuBar := value.map (fun (_, s) => meter s.cpu 100000 10) |>.getD (Styled.text "[unavailable]" .muted)
-    let memBar := value.map (fun (_, s) => meter s.memory s.limit 10) |>.getD (Styled.text "[unavailable]" .muted)
-    printStyled (Styled.text (pad 36 node.name) .cyan ++
-      Styled.text (pad 11 node.state) (Styled.statusColor node.state) ++ cpuBar ++
-      Styled.text (" " ++ pad 10 cpu) ++ memBar ++ Styled.text (" " ++ memory))
+      Styled.text (pad 22 status) (Styled.statusColor status) ++
+      Styled.text s!"{pad 21 started}{pad 21 finished}" .muted ++ Styled.text elapsed .cyan)
 
 /-- Reject malformed flags before deployment changes any files or services. -/
 private def deploymentOptions (args : List String) (allowExecutable : Bool)
@@ -125,6 +122,7 @@ def command (ctx : Context) (args : List String) : Cli Bool := do
     let some count := value.toNat? | throw "Usage: scale N (a nonnegative integer)"
     ctx.scale count
   | ["down"] => ctx.down
+  | ["clean"] => ctx.clean
   | "up" :: options =>
     let (_, verbose, _) ← liftExcept (deploymentOptions options false)
     ctx.up verbose
@@ -142,7 +140,6 @@ def command (ctx : Context) (args : List String) : Cli Bool := do
     ctx.launch name file id
   | ["ps"] => listRuns ctx
   | ["inspect", id] => inspectRun ctx id
-  | ["nodes"] => showNodes ctx
   | ["top"] => Top.run ctx
   | ["top", "--once"] => Top.run ctx true
   | ["resume", id] => ctx.resume id

@@ -64,7 +64,30 @@ def child (mode : String) (marker : String) : IO UInt32 := do
     return 0
   | _ => throw (IO.userError "Unknown fixture")
 
+private def removeTree : IO Unit := IO.FS.withTempDir fun directory => do
+  let outside := directory / "keep"
+  let tree := directory / "deployment"
+  IO.FS.createDirAll outside
+  IO.FS.writeFile (outside / "source.lean") "keep this source"
+  IO.FS.createDirAll (tree / "nested")
+  IO.FS.writeFile (tree / "nested" / "trace.json") "old history"
+  for link in [tree / "link", directory / "linked-deployment"] do
+    let output ← IO.Process.output { cmd := "ln", args := #["-s", outside.toString, link.toString] }
+    unless output.exitCode == 0 do throw (IO.userError output.stderr)
+  let cleanup : Cli Unit := do
+    request (.removeTree tree)
+    request (.removeTree tree) -- Retrying an already removed directory succeeds.
+    request (.removeTree (directory / "linked-deployment"))
+  match ← Cli.runIO cleanup with
+  | .error error => throw (IO.userError error)
+  | .ok () => pure ()
+  if (← tree.pathExists) || (← (directory / "linked-deployment").pathExists) then
+    throw (IO.userError "Deployment files remain after cleanup")
+  unless (← IO.FS.readFile (outside / "source.lean")) == "keep this source" do
+    throw (IO.userError "Cleanup followed a symlink outside its directory")
+
 def run : IO Unit := do
+  removeTree
   let self := (← IO.appPath).toString
   let tests : Cli Unit := do
     checkOutput self "stream" "first λ🙂\nlast".toUTF8 "warning\n".toUTF8 0

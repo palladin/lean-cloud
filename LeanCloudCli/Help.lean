@@ -38,6 +38,9 @@ def commands : Array Command := #[
   { name := "down", summary := "Stop this deployment and preserve its data."
     details := "Stops actors and shared services. Use 'up' to recover active runs; paused runs stay paused."
     examples := #["down"] },
+  { name := "clean", summary := "Permanently remove the selected deployment and its data."
+    details := "Stops and removes its containers, networks, storage volumes, application image tags, local history, generated deployment files, and catalog entry. This deletes all workflows, results, replay records, and locally hosted blobs.\nYour Lean project and shared Docker images/build cache remain. External storage services are not deleted. Retired worker volumes are included. Failed cleanup can be retried with the same command; no readable deployment manifest is required."
+    examples := #["use my-app", "clean"] },
   { name := "deployments", summary := "List known deployments, including stopped ones."
     details := "Shows the selected deployment, directories, and observed service state."
     examples := #["deployments"] },
@@ -59,8 +62,8 @@ def commands : Array Command := #[
     options := #[("--input FILE", "Read and validate input from a JSON file."),
       ("--id ID", "Choose a unique run ID; otherwise one is generated.")]
     examples := #["run squares/v1", "run squares/v1 --input numbers.json --id example-1"] },
-  { name := "ps", summary := "List cloud runs and their current status."
-    details := "Lists runs recorded for the selected application, including completed and stopped runs."
+  { name := "ps", summary := "List cloud runs, status, and elapsed time."
+    details := "Shows start and finish timestamps in UTC and elapsed wall time, including waiting, pauses and retries. Completed durations stay fixed. Older runs without timing metadata show —."
     examples := #["ps"] },
   { name := "inspect", arguments := "RUN", summary := "Inspect a run's jobs and worker assignments."
     details := "Shows its outcome or control status and, for an active run, scheduler locations and attempts."
@@ -68,13 +71,10 @@ def commands : Array Command := #[
   { name := "result", arguments := "RUN", summary := "Read a run's durable result."
     details := "Prints pending, a completed value, or the failure/cancellation reason. Blob results are read as text."
     examples := #["result example-1"] },
-  { name := "watch", arguments := "RUN [--once]", summary := "Browse execution steps and source for any run."
-    details := "Global pages show every worker: its observed location, code, and resource graphs. The visible tabs switch between Global and individual workers: g/0 for Global, 1/2/3 for a Worker, or Tab/Shift-Tab to cycle through all workers. Use [/] for worker pages.\nArrows move through observations; PgUp/PgDn jump; Home selects the first step; End/f follows the latest. j/k scroll local code; a follows the selected step; q returns. Browsing never resumes execution.\nHistory uses resource samples recorded with the trace, never current Docker usage. Missing historical data shows 'not recorded'. Redeploy the updated runtime to record metrics for future runs. Retained logs can have gaps."
+  { name := "watch", arguments := "RUN [--once]", summary := "Watch live branches, source, and workers; keep the final view."
+    details := "Select a parallel group to see all workers and their code; select a branch to see its executing worker. Up/down select branches; left/right collapse or expand groups. PgUp/PgDn page workers when space is limited. j/k scroll code; a follows its source line; q returns.\nCompleted runs show the last view with frozen statistics. Only the latest snapshot is saved; there is no execution history or timeline. Watching never resumes execution."
     options := #[("--once", "Print one plain-text frame and return.")]
     examples := #["watch example-1", "watch example-1 --once"] },
-  { name := "nodes", summary := "Show workers, schedulers, and blobs."
-    details := "Prints container states and CPU/memory meters. Use 'top' for live actor graphs."
-    examples := #["nodes"] },
   { name := "top", arguments := "[--once]", summary := "Show live worker and scheduler graphs across all runs."
     details := "Shows CPU, memory, filesystem, network, and I/O metrics for the selected deployment.\nKeys: q returns; PgUp/PgDn or left/right arrows change pages. Rates need two samples."
     options := #[("--once", "Print a plain-text snapshot of every page and return.")]

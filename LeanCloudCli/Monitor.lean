@@ -8,7 +8,6 @@ structure Node where
   name : String
   state : String
   started : String
-  run : Option String := none
   role : String := ""
   health : Option String := none
   deriving Inhabited
@@ -75,15 +74,8 @@ def Context.nodes (ctx : Context) : Cli (Array Node) := do
     let labels := ((row.getObjVal? "Config") >>= (·.getObjVal? "Labels")).toOption.getD Json.null
     { name := (field row "Name").drop 1 |>.toString
       state := field state "Status", started := field state "StartedAt"
-      run := (labels.getObjValAs? String "lean-cloud.run").toOption
       role := (labels.getObjValAs? String "lean-cloud.role").toOption.getD (field labels "com.docker.compose.service")
       health := (state.getObjVal? "Health" >>= (·.getObjValAs? String "Status")).toOption }
-
-def runNodes (run : Run) (nodes : Array Node) : Array Node :=
-  let order (node : Node) : Nat := if node.role == "scheduler" then 0
-    else (workerIndex? node.role).map (· + 1) |>.getD (nodes.size + 1)
-  (nodes.filter (fun n => n.run.isNone || n.run == some run.id)).qsort fun a b =>
-    order a < order b || (order a == order b && a.name < b.name)
 
 structure DiskUsage where
   path : String
@@ -119,13 +111,6 @@ def samples (nodes : Array Node) : Cli (Array (String × Sample)) := do
         -- Docker can race with container exit and return an all-zero row.
         if sample.limit > 0 then values := values.push (name, sample)
   return values
-
-def Context.events (ctx : Context) (run : Run) : Cli (Array (String × Array ExecutionEvent)) := do
-  let snapshot ← Trace.load ctx run
-  let count := snapshot.steps.foldl (fun count step =>
-    max count ((workerIndex? step.event.worker).map (· + 1) |>.getD 0)) run.workers
-  return (workerNames count).map fun worker =>
-    (worker, (snapshot.steps.filter (·.event.worker == worker)).map (·.event))
 
 def humanBytes (value : Nat) : String :=
   if value ≥ 1073741824 then s!"{value / 1073741824}.{value % 1073741824 * 10 / 1073741824} GiB"

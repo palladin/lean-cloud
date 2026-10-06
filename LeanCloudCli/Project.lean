@@ -80,7 +80,7 @@ def runtimeConfig (config : Json) (workers : Nat) : Except String Json := do
   let mailboxes ← config.getObjVal? "mailboxes"
   let existing ← mailboxes.getObjValAs? (Array Json) "workers"
   if existing.any (fun route => (route.getObjVal? "broker").isOk) then
-    throw "This deployment uses the old RabbitMQ configuration. Create a new HTTP/SQLite deployment; existing queues are not migrated."
+    throw "This deployment still has saved RabbitMQ configuration. Run 'clean', then 'deploy' to create an HTTP/SQLite deployment. 'clean' permanently deletes this deployment's workflows, results, and locally hosted blobs. Existing queues are not migrated."
   let prototype ← match existing[0]? with
     | some route => route.getObjVal? "endpoint"
     | none => mailboxes.getObjVal? "scheduler"

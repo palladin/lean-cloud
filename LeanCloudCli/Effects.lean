@@ -48,6 +48,7 @@ inductive HostOp : Type → Type where
   | writeFile (path : System.FilePath) (text : String) : HostOp Unit
   | appendFile (path : System.FilePath) (text : String) : HostOp Unit
   | rename (source target : System.FilePath) : HostOp Unit
+  | removeTree (path : System.FilePath) : HostOp Unit
   | exists (path : System.FilePath) : HostOp Bool
   | readDir (path : System.FilePath) : HostOp (Array String)
   | isDir (path : System.FilePath) : HostOp Bool

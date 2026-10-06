@@ -97,6 +97,14 @@ def validId (id : String) : Bool :=
 def validateId (id : String) : Cli Unit :=
   unless validId id do throw "IDs require 1–80 ASCII letters, digits, '-' or '_'"
 
+/-- Keep the lock outside the removable deployment directory. Unlinking a held
+lock would allow another console to create a new lock and enter concurrently. -/
+def Context.withDeploymentLock (ctx : Context) (action : Cli α) : Cli α := do
+  validateId ctx.project
+  let directory := ctx.root / ".lean-cloud"
+  request (.createDir directory)
+  withLock (directory / s!".{ctx.project}.lock") action
+
 /-- Escape all terminal controls in remote labels, code, and diagnostics. -/
 def safe (value : String) : String := Styled.sanitize value
 

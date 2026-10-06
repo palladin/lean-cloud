@@ -1,4 +1,5 @@
 import LeanCloud.Worker
+import LeanCloud.Scheduler
 import LeanCloud.Telemetry
 
 namespace LeanCloudRuntime.Trace
@@ -15,6 +16,7 @@ structure State where
   attempt : Option Nat := none
   location : String := ""
   source : Option SourceSiteId := none
+  branch : Option Location := none
 
 structure Sink where
   worker : String
@@ -25,11 +27,11 @@ structure Sink where
 
 def create (worker : String) (run : String := "") : IO Sink := do
   let started ← IO.monoMsNow
-  return ⟨worker, s!"{← IO.Process.getPID}-{started}", started, ← IO.mkRef {}, run⟩
+  return ⟨worker, s!"{← IO.Process.getPID}-{← IO.monoNanosNow}", started, ← IO.mkRef {}, run⟩
 
 /-- Diagnostics never turn a successful operation into a workflow error.
 Docker's bounded log driver retains recent events; gaps are allowed. -/
-def Sink.emit (sink : Sink) (activity operation : String) : IO Unit := do
+def Sink.emit (sink : Sink) (activity operation : String) (job : Option BranchObservation := none) : IO Unit := do
   try
     let state ← sink.state.get
     sink.state.set { state with seq := state.seq + 1 }
@@ -38,12 +40,30 @@ def Sink.emit (sink : Sink) (activity operation : String) : IO Unit := do
     let resources ← try pure ((Json.parse (← resourceCounters)).toOption) catch _ => pure none
     let resources := resources.map fun json => json.setObjVal! "incarnation" (toJson incarnation)
     let json := (toJson event).setObjVal! "resources" (resources.getD Json.null)
+    let json := json.setObjVal! "branch" (toJson state.branch)
+    let json := json.setObjVal! "job" (toJson job)
     emitLine ("@lean-cloud " ++ json.compress ++ "\n")
   catch _ => pure ()
 
 def Sink.assign (sink : Sink) (assignment : Assignment) : IO Unit := do
-  sink.state.modify fun state => { state with attempt := some assignment.attempt, location := assignment.location.key, source := none }
+  sink.state.modify fun state => { state with attempt := some assignment.attempt, location := assignment.location.key, source := none, branch := some assignment.branch }
   sink.emit "assigned" ""
+
+/-- Lease renewal changes no visible branch state. Emit deltas, not the entire
+job table on every heartbeat. These diagnostics never drive scheduling. -/
+def Sink.branches (sink : Sink) (before after : Array Scheduler.Job) : IO Unit := do
+  let previous := before.foldl (fun (found : Std.HashMap String BranchObservation) job =>
+    found.insert job.branch.key (BranchObservation.ofJob job)) {}
+  for job in after do
+    let observation := BranchObservation.ofJob job
+    if previous[job.branch.key]? == some observation then continue
+    let (attempt, label) := match job.status with
+      | .pending => (none, if job.joining then "joining" else "pending")
+      | .running worker attempt _ => (some attempt, s!"running · {worker}")
+      | .waiting children => (none, s!"waiting · {children.size} branches")
+      | .done => (none, "completed")
+    sink.state.modify fun state => { state with attempt, location := job.location.key, source := none, branch := some job.branch }
+    sink.emit "branch-state" label (some observation)
 
 /-- Set context before the interpreter touches a record, including replay hits. -/
 def Sink.visit (sink : Sink) (location : Location) (source : Option SourceSiteId) : IO Unit :=

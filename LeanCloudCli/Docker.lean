@@ -3,6 +3,7 @@ import LeanCloudCli.Deployments
 import LeanCloudCli.Process
 import LeanCloudCli.Trace
 import LeanCloud.Pool
+import LeanCloud.Timing
 
 namespace LeanCloudCli
 open Lean LeanCloud
@@ -135,6 +136,29 @@ def Context.execApp (ctx : Context) (args : Array String) (input : Option String
 def Context.remote (ctx : Context) (run : Run) (command : String) : Cli String :=
   ctx.execApp #[command, "/etc/lean-cloud/config.json", run.id]
 
+def Context.observation (ctx : Context) (run : Run) : Cli Timing.Status := do
+  let status ← liftExcept (Json.parse (← ctx.remote run "status") >>= fromJson? (α := Timing.Status))
+  if let some timing := status.timing then
+    saveJson (ctx.directory run.id / "timing.json") timing
+  return status
+
+def Context.savedTiming (ctx : Context) (run : Run) : Cli (Option Timing.Run) := do
+  try
+    let path := ctx.directory run.id / "timing.json"
+    if ← request (.exists path) then pure (some (← readJson path)) else pure none
+  catch _ => pure none
+
+/-- An unavailable scheduler leaves the saved clock fixed, not ticking locally. -/
+def Context.timingSnapshot (ctx : Context) (run : Run) : Cli (Option Timing.Run × Bool) := do
+  try pure ((← ctx.observation run).timing, true)
+  catch _ => pure (← ctx.savedTiming run, false)
+
+def Context.timing (ctx : Context) (run : Run) : Cli (Option Timing.Run) :=
+  Prod.fst <$> ctx.timingSnapshot run
+
+private def Context.saveTimings (ctx : Context) : Cli Unit := do
+  for run in ← ctx.allRuns do discard (ctx.timing run)
+
 private def Context.startNodes (ctx : Context) (deployment : Deployment) : Cli Unit := do
   let image := deployment.image
   let roles := #["scheduler"] ++ workerNames deployment.workers
@@ -160,6 +184,7 @@ private def Context.startNodes (ctx : Context) (deployment : Deployment) : Cli U
       replacing := replacing || (row.getObjValAs? String "Image").toOption != some image
   -- Never leave workers with the old code consuming the new pool's assignments.
   if replacing && !existingNodes.isEmpty then
+    ctx.saveTimings
     discard <| docker (#["stop"] ++ existingNodes)
     Trace.archive ctx (← ctx.allRuns)
     discard <| docker (#["rm"] ++ existingNodes)
@@ -245,7 +270,7 @@ private def Context.resizePool (ctx : Context) (deployment : Deployment) (config
 /-- Elastic capacity change: reuse the image, scheduler, run definitions, and
 immutable replay records. Persist intent first so interrupted scaling is retryable. -/
 def Context.scale (ctx : Context) (count : Nat) : Cli Unit := do
-  withLock (ctx.home / "deploy.lock") do
+  ctx.withDeploymentLock do
     let previous ← ctx.deployment
     -- Check scaling support before writing intent or creating capacity.
     let _ : Pool.Membership ← liftExcept (Json.parse
@@ -271,7 +296,7 @@ def Context.deploy (ctx : Context) (executable : Option String := none) (verbose
     (workers : Option Nat := none) : Cli Unit := do
   Deployments.remember ctx
   request (.createDir ctx.home)
-  withLock (ctx.home / "deploy.lock") do
+  ctx.withDeploymentLock do
     let previous ← if ← request (.exists (ctx.home / "deployment.json")) then
         some <$> ctx.deployment else pure none
     let app ← if ← request (.exists (Project.manifest ctx.root)) then
@@ -333,7 +358,7 @@ def Context.deploy (ctx : Context) (executable : Option String := none) (verbose
 def Context.up (ctx : Context) (verbose := false) : Cli Unit := do
   discard ctx.deployment
   Deployments.remember ctx
-  withLock (ctx.home / "deploy.lock") do
+  ctx.withDeploymentLock do
     let deployment ← ctx.deployment
     unless ← request (.exists (← ctx.composeFile)) do throw "Deployment configuration is missing; use 'doctor'"
     unless ← request (.exists (← ctx.configFile)) do throw "Runtime configuration is missing; use 'doctor'"
@@ -351,7 +376,7 @@ def Context.up (ctx : Context) (verbose := false) : Cli Unit := do
 /-- Stop actors before their services. Preserve volumes, images, and the run catalog. -/
 def Context.down (ctx : Context) : Cli Unit := do
   request (.createDir ctx.home)
-  withLock (ctx.home / "deploy.lock") do
+  ctx.withDeploymentLock do
     unless ← request (.exists (← ctx.composeFile)) do
       printLine "No deployment found."
       return
@@ -359,6 +384,7 @@ def Context.down (ctx : Context) : Cli Unit := do
     let output ← docker #["ps", "-aq", "--filter", "label=lean-cloud.project=" ++ ctx.project]
     let actors := output.stdout.splitOn "\n" |>.map (·.trimAscii.toString) |>.filter (!·.isEmpty) |>.toArray
     if !actors.isEmpty then
+      ctx.saveTimings
       discard <| docker (#["stop"] ++ actors)
       Trace.archive ctx (← ctx.allRuns)
       discard <| docker (#["rm"] ++ actors)
@@ -369,7 +395,7 @@ def Context.outcome (ctx : Context) (run : Run) : Cli (Option Exit) := do
   liftExcept (Json.parse (← ctx.remote run "outcome") >>= fromJson?)
 
 def Context.scheduler (ctx : Context) (run : Run) : Cli Scheduler.State := do
-  liftExcept (Json.parse (← ctx.remote run "status") >>= fromJson?)
+  return (← ctx.observation run).toState
 
 /-- Idempotent recovery after interrupted launch. Existing definitions must agree. -/
 private def Context.resumeLocked (ctx : Context) (id : String) : Cli Unit := do
@@ -396,11 +422,11 @@ private def Context.resumeLocked (ctx : Context) (id : String) : Cli Unit := do
     printStyled (Styled.text s!"Running {id} on the deployed pool. Use 'watch {id}' or 'inspect {id}'." .green)
 
 def Context.resume (ctx : Context) (id : String) : Cli Unit :=
-  withLock (ctx.home / "deploy.lock") (ctx.resumeLocked id)
+  ctx.withDeploymentLock (ctx.resumeLocked id)
 
 def Context.pause (ctx : Context) (id : String) : Cli Unit := do
   let run ← ctx.loadRun id
-  withLock (ctx.home / "deploy.lock") do
+  ctx.withDeploymentLock do
   withLock (ctx.directory id / "launch.lock") do
     let control ← ctx.control id
     if control == .killed || control == .killing then throw "A killed run cannot be paused"
@@ -411,7 +437,7 @@ def Context.pause (ctx : Context) (id : String) : Cli Unit := do
 
 def Context.kill (ctx : Context) (id : String) : Cli Unit := do
   let run ← ctx.loadRun id
-  withLock (ctx.home / "deploy.lock") do
+  ctx.withDeploymentLock do
   withLock (ctx.directory id / "launch.lock") do
     ctx.setControl id .killing
     let outcome : Exit ← liftExcept (Json.parse (← ctx.remote run "cancel") >>= fromJson?)
@@ -431,7 +457,7 @@ private def chooseProgram (programs : Array ProgramInfo) (name : String) : Excep
   | _ => .error "Specify the program version (name/version)"
 
 def Context.launch (ctx : Context) (name : String) (file : Option String) (id : Option String) : Cli Unit := do
-  withLock (ctx.home / "deploy.lock") do
+  ctx.withDeploymentLock do
   let deployment ← ctx.deployment
   let program ← liftExcept (chooseProgram deployment.programs name)
   let input ← match file, program.sampleInput with

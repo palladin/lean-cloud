@@ -10,6 +10,14 @@ private def suggestions (line : String) : Array String :=
   (Completion.candidates {} (Completion.context line line.length)).map (·.value)
 
 def helpCases : Array TestCase := #[
+  ⟨"console.help.removed-command-is-not-advertised", do
+    assertTrue (Help.find? "nodes").isNone "Obsolete nodes command is still advertised"
+    assertEq (suggestions "nod") #[]
+    let (result, world) := ConsoleModel.run (command ctx ["nodes"]) {}
+    assertTrue result.toOption.isNone "Removed nodes command still executes"
+    assertTrue world.trace.isEmpty "Unknown command performed host operations"
+    for topic in ["status", "top", "inspect", "watch"] do
+      assertTrue (Help.find? topic).isSome s!"Missing supported inspection command: {topic}"⟩,
   ⟨"console.help.every-command-and-alias-is-read-only", do
     for topic in Help.commands do
       let mut canonical := none

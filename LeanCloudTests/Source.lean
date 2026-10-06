@@ -96,13 +96,13 @@ def cases : Array TestCase := #[
       timestamp := "1", event := ⟨"boot", 0, 0, "worker1", some 0, "0:0", "execute", "readBlob", "run", some "a"⟩ }
     let second := { first with timestamp := "2", event := { first.event with worker := "worker2", source := some "b" } }
     assertEq (LeanCloudCli.Watch.sourcePosition run first |>.map (·.1.file)) (some "A.lean")
-    assertEq (LeanCloudCli.Watch.sourceLine run second) (some 1)
-    assertTrue (LeanCloudCli.Watch.sourceLine run { first with event := { first.event with source := none } }).isNone
+    assertEq (LeanCloudCli.Watch.sourcePosition run second |>.map (·.2.line)) (some 1)
+    assertTrue (LeanCloudCli.Watch.sourcePosition run { first with event := { first.event with source := none } }).isNone
       "An operation label was used as a source position"
-    assertTrue (LeanCloudCli.Watch.sourceLine run { first with event := { first.event with source := some "unknown" } }).isNone
+    assertTrue (LeanCloudCli.Watch.sourcePosition run { first with event := { first.event with source := some "unknown" } }).isNone
       "Unknown source site was guessed"
-    let view := LeanCloudCli.Watch.frame ⟨"/work", "test"⟩ run #[] #[first, second] #[] {} 160 40 "completed"
-    assertTrue (view.any (has · "A.lean:2") && view.any (has · "B.lean:1")) "Global view lost per-worker source files"⟩,
+    let view := LeanCloudCli.Watch.frame ⟨"/work", "test"⟩ run #[first, second] #[] {} 160 40 "completed"
+    assertTrue (view.any (has · "B.lean:1") && !view.any (has · "A.lean:2")) "Last view did not follow the latest source file"⟩,
   ⟨"source.repeated-operations-and-return", do
     let first := skipDelay (repeated (m := Id))
     let second := nextExec first

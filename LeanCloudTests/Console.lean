@@ -9,16 +9,6 @@ private def basicSample (time : Nat) (session := "boot-1") (rx := 0) : Sample :=
   ⟨time, session, 12500, 1048576, 2097152, rx, 0, 0, 0⟩
 
 def consoleCases : Array TestCase := #[
-  ⟨"console.watch.elastic-worker-pages", do
-    let page := Watch.navigate #[] 1 2 {} (.text "]") 12
-    assertEq page.workerPage 1
-    let fourth := Watch.navigate #[] 1 2 page (.text "1") 12
-    assertEq fourth.worker (some "worker4")
-    let last := Watch.navigate #[] 1 2 {} .backTab 12
-    assertEq last.worker (some "worker12")
-    assertEq last.workerPage 3
-    assertTrue (Watch.navigate #[] 1 2 last .tab 12).worker.isNone "Tab did not return to Global"
-    assertTrue (Watch.navigate #[] 1 2 {} .tab 0).worker.isNone "Zero-worker pool selected a nonexistent worker"⟩,
   ⟨"console.quoted-input", do
     assertEq (words "run logs --input 'files with spaces.json' --id \"example-1\"").toOption
       (some ["run", "logs", "--input", "files with spaces.json", "--id", "example-1"])
@@ -62,114 +52,77 @@ def consoleCases : Array TestCase := #[
     let parsed := event? ("@lean-cloud " ++ (toJson event).compress)
     assertEq (parsed.map (·.location)) (some "0:1/0:2")
     assertTrue (event? "ordinary log line").isNone "Ordinary log interpreted as event"⟩,
-  ⟨"console.watch-historical-source", do
+  ⟨"console.watch-final-source", do
     let ctx : Context := ⟨"/work", "test"⟩
     let source : ProgramSource := ⟨"Example.lean", "cloud {\n  Cloud.exec work\n}", #[⟨"work", 2, 0, 2, 0⟩]⟩
     let info : ProgramInfo := ⟨"example/v1", "unit/v1", "nat/v1", "", none, #[source]⟩
     let run : Run := ⟨"run-1", "image", info, Json.null, defaultWorkerCount⟩
     let event : ExecutionEvent := ⟨"boot", 1, 20, "worker1", some 2, "0:1", "execute", "work", run.id, some "work"⟩
-    let step : LeanCloudCli.Trace.Step := ⟨"2026-01-01T00:00:00.000000000Z", event, none⟩
-    let node : Node := { name := ctx.node "worker1", state := "exited", started := "boot", role := "worker1" }
+    let step : LeanCloudCli.Trace.Step := ⟨"2026-01-01T00:00:00.000000000Z", event, none, none, none⟩
     for status in ["completed", "paused", "cancelled", "result pending"] do
-      let lines := Watch.frame ctx run #[node] #[step] #[] {} 120 35 status
-      assertTrue (lines.any (fun l => (l.splitOn "2   > ").length > 1)) "Historical source marker absent"
+      let lines := Watch.frame ctx run #[step] #[] {} 120 35 status
+      assertTrue (lines.any (fun l => (l.splitOn "2   > ").length > 1)) "Final source marker absent"
       assertTrue (lines.any (fun l => (l.splitOn status).length > 1)) "Run status absent"
-      let label := if status == "result pending" then "LIVE stats" else "Stats: not recorded"
+      let label := if status == "result pending" then "No worker executing this branch" else "unavailable in last view"
       assertTrue (lines.any (fun l => (l.splitOn label).length > 1)) "Metric mode was not labeled"
     for width in [20, 40, 80, 120, 220] do
       for height in [8, 16, 24, 45] do
-        let lines := Watch.frame ctx run #[node] #[step] #[] {} width height
+        let lines := Watch.frame ctx run #[step] #[] {} width height
         assertTrue (lines.size < height && lines.all (·.length < width)) "Watch exceeds terminal dimensions"⟩,
-  ⟨"console.watch-cursor-survives-refresh", do
-    let steps := (Array.range 5).map fun n =>
-      ({ timestamp := toString (n + 1), event := ⟨"boot", n, n, "worker1", some 0, "0:1", "execute", "work", "run", some "work"⟩ } : LeanCloudCli.Trace.Step)
-    let back := Watch.navigate steps 1 2 {} .left
-    assertEq (Watch.index steps back) 3
-    let first := Watch.navigate steps 1 2 back .home
-    assertEq (Watch.index steps first) 0
-    let page := Watch.navigate steps 1 2 first .pageDown
-    assertEq (Watch.index steps page) 2
-    let late := { steps[0]! with timestamp := "0" }
-    let refreshed := LeanCloudCli.Trace.merge steps #[late, { steps[4]! with timestamp := "6" }]
-    assertEq (Watch.index refreshed back) 4 "Inserted observations moved the selected event"
-    let follow := Watch.navigate refreshed 1 2 back .end
-    assertTrue follow.cursor.isNone "End did not follow"
-    assertEq (Watch.index refreshed follow) 6
-    assertEq (Watch.index #[] (Watch.navigate #[] 1 5 {} .left)) 0⟩,
+  ⟨"console.watch-live-navigation-has-no-timeline", do
+    let nav : Watch.Navigation := {}
+    for key in [Input.Key.text "[", .text "]", .end, .text "f"] do
+      assertTrue (Watch.navigate #[] 1 nav key == nav) "Timeline navigation is still active"
+    assertEq (Watch.navigate #[] 1 nav .pageDown 2).workers 1
+    assertEq (Watch.navigate #[] 1 { workers := 2 } .pageDown 2).workers 2
+    assertEq (Watch.navigate #[] 1 { workers := 2 } .pageUp 2).workers 1
+    assertEq (Watch.navigate #[] 1 { workers := 3 } .home).workers 0⟩,
   ⟨"console.trace-order-and-dedup", do
     let event : ExecutionEvent := ⟨"old", 90, 9999, "worker1", some 2, "0:1", "execute", "work", "run", some "work"⟩
-    let old : LeanCloudCli.Trace.Step := ⟨"2026-01-01T00:00:01.000000000Z", event, none⟩
-    let new : LeanCloudCli.Trace.Step := ⟨"2026-01-01T00:00:02.000000000Z", { event with session := "new", seq := 0, elapsedMs := 0 }, none⟩
+    let old : LeanCloudCli.Trace.Step := ⟨"2026-01-01T00:00:01.000000000Z", event, none, none, none⟩
+    let new : LeanCloudCli.Trace.Step := ⟨"2026-01-01T00:00:02.000000000Z", { event with session := "new", seq := 0, elapsedMs := 0 }, none, none, none⟩
     let parsed := LeanCloudCli.Trace.parse (old.timestamp ++ " @lean-cloud " ++ (toJson event).compress)
     assertEq (parsed.map (·.id)) (some old.id)
     assertEq ((LeanCloudCli.Trace.merge #[new] #[old, new]).map (·.id)) #[old.id, new.id]
     assertTrue (LeanCloudCli.Trace.parse "ordinary output").isNone "Ordinary log became a step"⟩,
-  ⟨"console.watch-global-and-worker-views", do
-    let steps := (Array.range 6).map fun n =>
-      ({ timestamp := toString n, event := ⟨"boot", n, n, if n % 2 == 0 then "worker1" else "worker2",
-        some 0, s!"0:{n}", "execute", "work", "run", some "work"⟩ } : LeanCloudCli.Trace.Step)
-    let browsing := Watch.navigate steps 1 2 {} .left
-    let focused := Watch.navigate steps 1 2 browsing (.text "2")
-    assertEq focused.worker (some "worker2")
-    assertEq ((Watch.visible steps focused).map (·.event.seq)) #[1, 3, 5]
-    assertEq focused.cursor (some steps[3]!.id) "Focusing a worker jumped out of historical context"
-    let previous := Watch.navigate steps 1 2 focused .left
-    assertEq previous.cursor (some steps[1]!.id) "Worker navigation crossed into another worker"
-    let global := Watch.navigate steps 1 2 previous (.text "g")
-    assertTrue global.worker.isNone "g did not return to all workers"
-    assertEq global.cursor previous.cursor "Returning to overview moved the cursor"
-    assertEq (Watch.visible steps global).size 6
-    let latest := Watch.navigate steps 1 2 focused .end
-    assertEq (Watch.index (Watch.visible steps latest) latest) 2
-    assertTrue latest.cursor.isNone "Local follow did not follow the chosen worker"
-    let tab1 := Watch.navigate steps 1 2 {} .tab
-    assertEq tab1.worker (some "worker1")
-    let tab2 := Watch.navigate steps 1 2 tab1 .tab
-    assertEq tab2.worker (some "worker2")
-    let tab3 := Watch.navigate steps 1 2 tab2 .tab
-    assertEq tab3.worker (some "worker3")
-    assertTrue (Watch.navigate steps 1 2 tab3 .tab).worker.isNone "Tab did not cycle back to Global"
-    ⟩,
   ⟨"console.recorded-metric-rates-and-restarts", do
     let before : ResourceSample := {
       incarnation := "boot", timeNs := 1000000000,
       cpuNs := some 100000000, rx := some 100 }
     let after := { before with timeNs := 2000000000, cpuNs := some 600000000, rx := some 1100 }
-    assertEq (RecordedMetrics.rate before after (·.cpuNs) 100000) (some 50000)
-    assertEq (RecordedMetrics.rate before after (·.rx)) (some 1000)
-    assertEq (RecordedMetrics.rate before { after with incarnation := "restarted" } (·.cpuNs)) none
-    assertEq (RecordedMetrics.rate before { after with rx := some 0 } (·.rx)) none
-    assertEq (RecordedMetrics.rate before { after with rx := none } (·.rx)) none
-    assertEq (RecordedMetrics.rate before before (·.cpuNs)) none⟩,
-  ⟨"console.history-global-panels-never-use-future-or-live-stats", do
+    assertEq (SnapshotMetrics.rate before after (·.cpuNs) 100000) (some 50000)
+    assertEq (SnapshotMetrics.rate before after (·.rx)) (some 1000)
+    assertEq (SnapshotMetrics.rate before { after with incarnation := "restarted" } (·.cpuNs)) none
+    assertEq (SnapshotMetrics.rate before { after with rx := some 0 } (·.rx)) none
+    assertEq (SnapshotMetrics.rate before { after with rx := none } (·.rx)) none
+    assertEq (SnapshotMetrics.rate before before (·.cpuNs)) none⟩,
+  ⟨"console.watch-final-view-never-uses-live-stats", do
     let ctx : Context := ⟨"/work", "test"⟩
-    let source : ProgramSource := ⟨"Code.lean", "first\ndo_worker_one\nsecond\ndo_worker_two\nthird\ndo_worker_three",
-      #[⟨"one", 2, 0, 2, 0⟩, ⟨"two", 4, 0, 4, 0⟩, ⟨"three", 6, 0, 6, 0⟩]⟩
-    let run : Run := ⟨"run", "image", ⟨"app/v1", "unit", "nat", "", none, #[source]⟩, Json.null, defaultWorkerCount⟩
-    let steps := (Array.range 3).map fun i =>
-      ({ timestamp := s!"2026-01-01T00:00:0{i}.000000000Z"
-         event := ⟨"session", i, i, s!"worker{i + 1}", some 0, s!"0:{i}", "execute", #["one", "two", "three"][i]!, run.id, some #["one", "two", "three"][i]!⟩
-         resources := some {
-           incarnation := s!"boot{i}", timeNs := (i + 1) * 1000000000,
-           memory := some ((i + 1) * 1048576), memoryLimit := some 4194304 } } : LeanCloudCli.Trace.Step)
-    let future := { steps[0]! with
-      timestamp := "2026-01-01T00:00:09.000000000Z",
-      resources := some { incarnation := "new", timeNs := 9000000000, memory := some 9663676416 } }
+    let run : Run := ⟨"run", "image", ⟨"app/v1", "unit", "nat", "", none, #[]⟩, Json.null, 1⟩
+    let step : Trace.Step := {
+      timestamp := "1"
+      event := ⟨"session", 1, 1, "worker1", some 0, "0:0", "execute", "", run.id, none⟩
+      resources := some {
+        incarnation := "boot", timeNs := 1000000000,
+        memory := some 1048576, memoryLimit := some 4194304 } }
     let live : History := ⟨ctx.node "worker1", #[⟨10, "now", 999000, 9663676416, 99999999999, 0, 0, 0, 0⟩], true⟩
-    let nav : Watch.Navigation := { cursor := some steps[2]!.id }
-    let view := Watch.frame ctx run #[] (steps.push future) #[live] nav 207 45 "result pending"
-    let text := String.intercalate "\n" view.toList
-    for label in ["worker1", "worker2", "worker3", "do_worker_one", "do_worker_two", "do_worker_three",
-        "1.0 MiB", "2.0 MiB", "3.0 MiB", "HISTORY"] do
-      assertTrue ((text.splitOn label).length > 1) s!"Global view lost {label}"
-    for label in ["9.0 GiB", "999.00%", "LIVE stats"] do
-      assertTrue ((text.splitOn label).length == 1) s!"History leaked future/live data: {label}"
-    let oldSteps := steps.map fun step => { step with resources := none }
-    let text := String.intercalate "\n" (Watch.frame ctx run #[] oldSteps #[live] {} 207 45 "completed").toList
-    assertTrue ((text.splitOn "Stats: not recorded").length > 1) "Old logs fabricated metrics"
-    assertTrue ((text.splitOn "999.00%").length == 1) "Old logs fell back to live stats"
-    let restarted := steps.push { future with event := { future.event with worker := "worker1" } }
-    assertEq (RecordedMetrics.history restarted "worker1").size 1 "History crossed a container restart"⟩,
+    let text := String.intercalate "\n" (Watch.frame ctx run #[step] #[live] {} 180 40 "completed").toList
+    assertTrue ((text.splitOn "1.0 MiB").length > 1 && (text.splitOn "LAST VIEW").length > 1) "Final snapshot lost its sample"
+    for label in ["9.0 GiB", "999.00%", "HISTORY", "Step ", "report worker"] do
+      assertTrue ((text.splitOn label).length == 1) s!"Final view contains live stats or timeline: {label}"
+    let restarted := { step with
+      event := { step.event with seq := 2 },
+      resources := some { incarnation := "new", timeNs := 2 } }
+    assertEq (SnapshotMetrics.samples #[step, restarted] "worker1").size 1 "Meter window crossed a restart"⟩,
+  ⟨"console.watch-snapshot-is-bounded-by-branches-and-workers", do
+    let steps := (Array.range 500).map fun i => ({
+      timestamp := toString i
+      event := ⟨"boot", i, i, "worker1", some 1, s!"0:{i}", "execute", "work", "run", some "site"⟩
+      resources := some { incarnation := "boot", timeNs := i + 1 } } : Trace.Step)
+    let latest := Trace.latest steps
+    assertEq latest.size 30 "The last view grew into an execution history"
+    assertEq (latest.back?.map (·.event.seq)) (some 499)
+    assertEq ((Trace.latest latest).map (·.id)) (latest.map (·.id)) "Compacting a snapshot changed it"⟩,
   ⟨"console.trace-legacy-cache-and-resource-roundtrip", do
     let event : ExecutionEvent := ⟨"boot", 1, 10, "worker1", some 0, "0:0", "execute", "work", "run", some "work"⟩
     let legacy := Json.mkObj [("timestamp", toJson "stamp"), ("event", toJson event)]

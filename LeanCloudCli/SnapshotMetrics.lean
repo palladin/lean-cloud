@@ -1,10 +1,10 @@
 import LeanCloudCli.Monitor
 
-namespace LeanCloudCli.RecordedMetrics
+namespace LeanCloudCli.SnapshotMetrics
 open LeanCloud
 
-/-- Only observations already reached by the cursor may supply a sample. -/
-def history (observed : Array Trace.Step) (worker : String) : Array ResourceSample :=
+/-- The last meter window in the saved view; no execution-history cursor. -/
+def samples (observed : Array Trace.Step) (worker : String) : Array ResourceSample :=
   let values := observed.filterMap fun step =>
     if step.event.worker == worker then step.resources else none
   match values.back? with
@@ -26,7 +26,7 @@ def rates (points : Array ResourceSample) (counter : ResourceSample → Option N
     if i == 0 then none else rate points[i - 1]! points[i]! counter scale
 
 private def value (format : Nat → String) (n : Option Nat) : String :=
-  n.map format |>.getD "not recorded"
+  n.map format |>.getD "unavailable"
 
 private def usage (label : String) (amount capacity : Option Nat) (detail : String) (width : Nat)
     (history : Array (Option Nat)) : Styled.Line :=
@@ -41,12 +41,10 @@ private def usage (label : String) (amount capacity : Option Nat) (detail : Stri
 
 /-- Raw container counters retain missing values. CPU and rates require two
 samples in the same incarnation; a restart never turns them into false zeros. -/
-def lines (points : Array ResourceSample) (width : Nat) (compact := false) : Array Styled.Line := Id.run do
-  let some current := points.back? | return #[Styled.text "Stats: not recorded at this step" .muted]
+def lines (points : Array ResourceSample) (width : Nat) : Array Styled.Line := Id.run do
+  let some current := points.back? | return #[Styled.text "Stats: unavailable in last view" .muted]
   let cpu := rates points (·.cpuNs) 100000
   let cpuValue := cpu.back? >>= id
-  if compact then
-    return #[Styled.text ("CPU " ++ value percent cpuValue ++ " · Mem " ++ value humanBytes current.memory) .green]
   let counter (label : String) (get : ResourceSample → Option Nat) :=
     let values := rates points get
     let detail := value (fun n => humanBytes n ++ "/s") (values.back? >>= id)
@@ -61,4 +59,4 @@ def lines (points : Array ResourceSample) (width : Nat) (compact := false) : Arr
     counter "Net RX" (·.rx), counter "Net TX" (·.tx),
     counter "I/O R" (·.readBytes), counter "I/O W" (·.writeBytes)]
 
-end LeanCloudCli.RecordedMetrics
+end LeanCloudCli.SnapshotMetrics

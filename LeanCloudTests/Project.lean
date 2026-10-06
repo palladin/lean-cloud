@@ -5,6 +5,29 @@ namespace LeanCloudTests
 open Lean LeanCloudCli
 
 def projectCases : Array TestCase := #[
+  ⟨"console.project.program-source-metadata-compatibility", do
+    let legacySource := Json.mkObj [("file", toJson "Old.lean"), ("text", toJson "cloud { return 1 }"),
+      ("sites", toJson #[Json.mkObj [("operation", toJson "exec"), ("line", toJson (1 : Nat))]])]
+    let metadata := Json.mkObj [("entry", toJson "app/v1"), ("inputSchema", toJson "unit"),
+      ("resultSchema", toJson "nat"), ("description", toJson "old app"), ("source", legacySource)]
+    for value in [metadata, metadata.setObjVal! "sources" Json.null] do
+      let info : LeanCloud.ProgramInfo ← unwrap (fromJson? value)
+      assertEq (info.sources.map (·.file)) #["Old.lean"]
+      assertEq (info.sources.map (·.text)) #["cloud { return 1 }"]
+      assertTrue (info.sources.all (·.sites.isEmpty)) "Legacy operation labels became precise source identities"
+      assertTrue info.sampleInput.isNone "Missing sample input was not optional"
+      let roundtrip : LeanCloud.ProgramInfo ← unwrap (fromJson? (toJson info))
+      assertEq (toJson roundtrip) (toJson info)
+    let absent : LeanCloud.ProgramInfo ← unwrap (fromJson? (metadata.setObjVal! "source" Json.null))
+    assertTrue absent.sources.isEmpty "Absent source metadata was not optional"
+    let modern : LeanCloud.ProgramSource := ⟨"New.lean", "cloud { return 2 }", #[⟨"precise", 1, 0, 1, 18⟩]⟩
+    let updated : LeanCloud.ProgramInfo ← unwrap (fromJson? (metadata.setObjVal! "sources" (toJson #[modern])))
+    assertEq (toJson updated.sources) (toJson #[modern]) "Modern metadata did not take precedence"
+    let empty : LeanCloud.ProgramInfo ← unwrap (fromJson? (metadata.setObjVal! "sources" (toJson (#[] : Array Json))))
+    assertTrue empty.sources.isEmpty "An explicit empty array revived obsolete mappings"
+    for invalid in [toJson "bad", toJson #[Json.mkObj []]] do
+      assertTrue (fromJson? (α := LeanCloud.ProgramInfo) (metadata.setObjVal! "sources" invalid)).toOption.isNone
+        "Malformed modern source metadata was silently accepted"⟩,
   ⟨"console.project.reject-old-mailbox-configuration", do
     let mailboxes ← unwrap (Project.defaultConfig.getObjVal? "mailboxes")
     let routes ← unwrap (mailboxes.getObjValAs? (Array Json) "workers")

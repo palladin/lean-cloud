@@ -4,7 +4,7 @@ namespace LeanCloudCli
 open Lean
 
 def serviceState (nodes : Array Node) (service : String) : String :=
-  match nodes.find? (fun node => node.run.isNone && node.role == service) with
+  match nodes.find? (·.role == service) with
   | none => "absent"
   | some node => if node.state == "running" then
       node.health.getD "running (health unknown)" else node.state

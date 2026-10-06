@@ -21,7 +21,7 @@ inductive Service : Type → Type where
   | outcome (config : Config) (run : String) : Service (Option Exit)
   | cancel (config : Config) (run : String) : Service Exit
   | referenceStatus (config : Config) (run : String) : Service Scheduler.State
-  | status (config : Config) (run : String) : Service Scheduler.State
+  | status (config : Config) (run : String) : Service Timing.Status
   | readText (config : Config) (ref : BlobRef) : Service String
 
 inductive Runtime : Effect where
@@ -158,7 +158,7 @@ private def handle (registry : Registry) (prepare : Config → String → Json �
     let some outcome ← completed config id | throw (IO.userError "Cancellation did not persist an outcome")
     return outcome
   | .referenceStatus config id => LeanCloudRuntime.status config id
-  | .status config id => Pool.status config id
+  | .status config id => Pool.observation config id
   | .readText config ref => do
     let bytes ← match ← (S3.readBytes config.blobs ref).run with
       | .ok bytes => pure bytes

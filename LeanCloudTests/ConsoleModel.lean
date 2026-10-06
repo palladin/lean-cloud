@@ -50,6 +50,7 @@ private def label : HostOp α → String
   | .appendFile .. => "appendFile"
   | .startProcess .. => "startProcess" | .pollProcess .. => "pollProcess" | .closeProcess .. => "closeProcess"
   | .rename .. => "rename" | .exists .. => "exists" | .readDir .. => "readDir"
+  | .removeTree .. => "removeTree"
   | .isDir .. => "isDir"
   | .createDir .. => "createDir" | .realPath .. => "realPath" | .currentDir => "currentDir"
   | .getEnv .. => "getEnv" | .pid => "pid" | .now => "now" | .sleep .. => "sleep"
@@ -94,6 +95,9 @@ private def operation : HostOp α → ExceptT String (StateM World) α
   | .readFile path => do
     let some text := (← get).file path | throw s!"Missing file: {path}"
     return text
+  | .removeTree path => modify fun world =>
+    let retained (name : String) := name != path.toString && !name.startsWith (path.toString ++ "/")
+    { world with files := world.files.filter (retained ∘ Prod.fst), directories := world.directories.filter retained }
   | .writeFile path text => modify (·.save path text)
   | .appendFile path text => modify fun world => world.save path ((world.file path).getD "" ++ text)
   | .rename source target => do

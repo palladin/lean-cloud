@@ -4,6 +4,16 @@ import LeanCloudCli.IO
 namespace LeanCloudTests.ConsoleRuntime
 open Lean LeanCloud LeanCloudCli
 
+/-- Retained test artifacts must not be discovered by the user's catalog. -/
+private def isolate (ctx : Context) : Cli Unit := do
+  request (.createDir ctx.home)
+  saveJson (ctx.home / "catalog-owner.json") (← Deployments.home).toString
+
+/-- Execution counts need raw observations, not the compact watch snapshot. -/
+private def events (ctx : Context) (run : Run) : Cli (Array ExecutionEvent) := do
+  return (LeanCloudCli.Trace.merge #[] (← LeanCloudCli.Trace.collect ctx).steps).filterMap fun step =>
+    if step.event.run == run.id && (workerIndex? step.event.worker).isSome then some step.event else none
+
 private def require (condition : Bool) (message : String) : Cli Unit :=
   unless condition do throw message
 
@@ -72,7 +82,7 @@ private def cleanup (ctx : Context) : Cli Unit := do
 def demo : Cli Unit := do
   let root ← request (.realPath (← request .currentDir))
   let ctx : Context := ⟨root, s!"lean-cloud-console-test-{← request .pid}"⟩
-  Deployments.isolate ctx
+  isolate ctx
   printLine s!"Console test project: {ctx.project}"
   try
     ctx.deploy
@@ -108,15 +118,14 @@ def demo : Cli Unit := do
     ctx.resume "first"
     waitFor ctx first 29
     discard <| docker #["tag", deployment.image, ctx.project ++ "-app:build"]
-    let histories ← ctx.events second
-    require (histories.any (fun (_, events) => !events.isEmpty)) "Workers emitted no execution observations"
-    require (histories.all (fun (_, events) => events.all (·.run == second.id))) "Watch crossed run traces"
+    let observed ← events ctx second
+    require (!observed.isEmpty) "Workers emitted no execution observations"
+    require (observed.all (·.run == second.id)) "Watch crossed run traces"
     let recorded ← LeanCloudCli.Trace.load ctx second
     require (recorded.steps.any fun step => step.resources.any fun sample =>
       sample.cpuNs.isSome && sample.memory.any (· > 0) && sample.memoryLimit.any (· > 0))
       "Worker resource metrics were not recorded with the trace"
-    let nodes := runNodes first (← ctx.nodes)
-    require (nodes.all (fun n => n.run.isNone || n.run == some "first")) "Watch included another run's actors"
+    let nodes ← ctx.nodes
     require (nodes.toList.Pairwise (fun a b => a.name != b.name)) "Node inventory contains duplicate containers"
     let some source := first.program.sources.find? (·.file.endsWith "Demo.lean") | throw "Missing bundled source"
     require (!source.sites.isEmpty) "No source locations bundled"
@@ -148,9 +157,8 @@ def demo : Cli Unit := do
     let longRun ← ctx.loadRun "long-computation"
     discard <| awaitOutcome ctx longRun ((← request .now) + 90000)
     require ((← ctx.remote longRun "result") == "files=16, errors=24") "Long computation failed to commit"
-    let events ← ctx.events longRun
-    let executions := events.foldl (fun count (_, events) => count +
-      (events.filter fun event => event.activity == "execute" && event.operation == "analyze-batch").size) 0
+    let observed ← events ctx longRun
+    let executions := (observed.filter fun event => event.activity == "execute" && event.operation == "analyze-batch").size
     require (executions == 1) "Healthy long computation was retried"
     saveJson inputFile (sampleInput.setObjVal! "pauseMs" (toJson (7000 : Nat)))
     -- Pause preserves records and withholds new assignments; shared nodes and
@@ -194,9 +202,9 @@ def demo : Cli Unit := do
     let services ← docker #["ps", "-aq", "--filter", "label=com.docker.compose.project=" ++ ctx.project]
     require (actors.stdout.trimAscii.isEmpty && services.stdout.trimAscii.isEmpty) "Shutdown left containers behind"
     let offlineTrace ← LeanCloudCli.Trace.load ctx killed
-    require (offlineTrace.steps.size ≥ killedTrace.steps.size && !offlineTrace.warning.isEmpty)
-      "Shutdown discarded observed execution steps"
-    require (offlineTrace.steps.any (·.resources.isSome)) "Shutdown lost historical worker metrics"
+    require (offlineTrace.steps.any (·.event.activity == "sealed") && !offlineTrace.warning.isEmpty)
+      "Shutdown discarded the last cancellation view"
+    require (offlineTrace.steps.any (·.resources.isSome)) "Shutdown lost the last worker metrics"
     discard (command ctx ["watch", "first", "--once"])
     ctx.down
     ctx.up
@@ -222,7 +230,7 @@ HTTP/SQLite nodes, scheduler state machine, and replay interpreter. -/
 def scaling : Cli Unit := do
   let root ← request (.realPath (← request .currentDir))
   let ctx : Context := ⟨root, s!"lean-cloud-scaling-test-{← request .pid}"⟩
-  Deployments.isolate ctx
+  isolate ctx
   printLine s!"Scaling test project: {ctx.project}"
   try
     ctx.deploy (workers := some 1)
@@ -285,7 +293,7 @@ def generatedApp : Cli Unit := do
   let directory := owner.home / "application-test"
   Project.init owner directory.toString (some root.toString)
   let ctx : Context := ⟨directory, owner.project⟩
-  Deployments.isolate ctx
+  isolate ctx
   try
     -- Exercise an ordinary executable target, not the SDK's demonstration binary.
     let lakefile ← request (.readFile (directory / "lakefile.lean"))
@@ -346,7 +354,120 @@ def generatedApp : Cli Unit := do
     cleanup ctx
     printLine s!"Standalone app retained: {directory}"
 
+/-- Invoke the shipped executable through its entry point and argument parser.
+Only the environment is isolated; Docker, HTTP, SQLite, and blob storage are real. -/
+private def cliCommand (ctx : Context) (args : Array String) (check := true) : Cli ProcessOutput := do
+  let executable := ctx.root / ".lake/build/bin/lean_cloud"
+  require (← request (.exists executable)) "Build lean_cloud before running the CLI lifecycle test"
+  let logs := ctx.root / ".lean-cloud" / s!"cli-command-logs-{← request .pid}"
+  request (.createDir logs)
+  let log := logs / s!"{← request .now}-{args[0]?.getD "command"}.log"
+  printLine s!"CLI: {String.intercalate " " args.toList}"
+  let output ← request (.process "env" (#[
+    "LEAN_CLOUD_PROJECT=" ++ ctx.project,
+    "LEAN_CLOUD_HOME=" ++ (← Deployments.home).toString,
+    "NO_COLOR=1", executable.toString] ++ args) none)
+  request (.writeFile log (output.stdout ++ output.stderr))
+  require (!check || output.exitCode == 0)
+    s!"CLI failed (exit {output.exitCode}): {output.stdout}{output.stderr}\nLog: {log}"
+  return output
+
+/-- Reproduce the user's command sequence from a saved, stopped RabbitMQ
+deployment, then execute and restart a workflow on a fresh HTTP/SQLite pool. -/
+def commandLifecycle : Cli Unit := do
+  let root ← request (.realPath (← request .currentDir))
+  let ctx : Context := ⟨root, s!"lean-cloud-command-test-{← request .pid}"⟩
+  isolate ctx
+  let source ← request (.readFile (root / "LeanCloud.lean"))
+  let defaults ← request (.readFile (root / "deploy/config.json"))
+  let retired := ctx.project ++ "_worker7-mailbox-data"
+  try
+    -- Persist the schema used by old deployments, including history and a
+    -- retired worker volume. No old broker needs to be running for this failure.
+    request (.createDir (Project.assets ctx))
+    let legacy := Project.defaultConfig.setObjVal! "mailboxes" (Json.mkObj [
+      ("scheduler", Json.mkObj [("host", toJson "scheduler-mailbox"), ("port", toJson (5672 : Nat))]),
+      ("workers", toJson #[Json.mkObj [("worker", toJson "worker1"), ("broker", Json.mkObj [])]])])
+    saveJson (Project.assets ctx / "config.json") legacy
+    saveJson (ctx.home / "deployment.json") (Deployment.mk ctx.project "legacy" #[] 1 7)
+    request (.createDir (ctx.directory "old"))
+    saveJson (ctx.directory "old" / "trace.json") (Json.mkObj [])
+    discard <| docker #["volume", "create", retired]
+    let rejected ← cliCommand ctx #["deploy"] false
+    require (rejected.exitCode != 0 && ((rejected.stdout ++ rejected.stderr).splitOn "'clean', then 'deploy'").length > 1)
+      "Legacy deployment did not report the reset commands"
+    require ((← readJson (α := Json) (Project.assets ctx / "config.json")) == legacy)
+      "Failed deploy overwrote the old configuration"
+    discard <| cliCommand ctx #["clean"]
+    require (!(← request (.exists ctx.home))) "Clean retained the old deployment directory"
+    require ((← docker #["volume", "inspect", retired] false).exitCode != 0) "Clean retained retired worker storage"
+    require (!(← Deployments.load).entries.any (·.project == ctx.project)) "Clean retained the catalog entry"
+    -- Everything from here goes through the real CLI executable.
+    discard <| cliCommand ctx #["deploy", "--workers", "1"]
+    discard <| cliCommand ctx #["programs"]
+    discard <| cliCommand ctx #["status"]
+    let config : Json ← readJson (Project.assets ctx / "config.json")
+    require (config == (← liftExcept (Project.runtimeConfig Project.defaultConfig 1)))
+      "Fresh deployment did not use HTTP/SQLite configuration"
+    discard <| cliCommand ctx #["run", "sum-squares", "--id", "command-check"]
+    let deadline := (← request .now) + 90000
+    repeat
+      let output ← cliCommand ctx #["result", "command-check"]
+      if output.stdout.trimAscii.toString == "55" then break
+      require (output.stdout.trimAscii.toString == "pending") s!"Unexpected workflow result: {output.stdout}"
+      require ((← request .now) < deadline) "CLI workflow did not complete"
+      request (.sleep 1000)
+    let listing ← cliCommand ctx #["ps"]
+    require ((listing.stdout.splitOn "STARTED (UTC)").length > 1 &&
+      (listing.stdout.splitOn "FINISHED (UTC)").length > 1 &&
+      (listing.stdout.splitOn "ELAPSED").length > 1) "ps omitted time columns"
+    discard <| cliCommand ctx #["inspect", "command-check"]
+    let finalView ← cliCommand ctx #["watch", "command-check", "--once"]
+    require ((finalView.stdout.splitOn "LAST VIEW").length > 1 &&
+      (finalView.stdout.splitOn "BRANCHES").length > 1 &&
+      (finalView.stdout.splitOn "HISTORY").length == 1 &&
+      (finalView.stdout.splitOn "report worker").length == 1) "Watch still displayed an execution timeline"
+    require ((finalView.stdout.splitOn "ELAPSED").length > 1) "Tree omitted elapsed times"
+    let run ← ctx.loadRun "command-check"
+    let some timing ← ctx.timing run | throw "Scheduler did not expose timing metadata"
+    require (timing.span.any (fun span => span.startedMs > 0 && span.finishedMs.isSome))
+      "Completed run did not save its start and finish"
+    require (timing.branches.size == 6 && timing.groups.size == 1 &&
+      timing.branches.all (·.2.finishedMs.isSome) && timing.groups.all (·.2.finishedMs.isSome))
+      "Branch or parallel timing missing"
+    require (← request (.exists (ctx.directory "command-check" / "watch.json"))) "Final view was not saved"
+    require (!(← request (.exists (ctx.directory "command-check" / "trace.json")))) "Watch retained an execution history"
+    discard <| cliCommand ctx #["down"]
+    discard <| cliCommand ctx #["up"]
+    let some restored ← ctx.timing run | throw "Restart lost timings"
+    require (restored.span == timing.span && restored.branches == timing.branches && restored.groups == timing.groups)
+      "Restart changed completed durations"
+    let result ← cliCommand ctx #["result", "command-check"]
+    require (result.stdout.trimAscii.toString == "55") "Restart lost the completed result"
+    discard <| cliCommand ctx #["clean"]
+    for args in #[
+      #["ps", "-aq", "--filter", "label=lean-cloud.project=" ++ ctx.project],
+      #["ps", "-aq", "--filter", "label=com.docker.compose.project=" ++ ctx.project],
+      #["network", "ls", "-q", "--filter", "label=com.docker.compose.project=" ++ ctx.project],
+      #["volume", "ls", "-q", "--filter", "label=com.docker.compose.project=" ++ ctx.project],
+      #["image", "ls", "-q", ctx.project ++ "-app"]] do
+      require ((← docker args).stdout.trimAscii.isEmpty) s!"Clean left resources: {reprStr args}"
+    for volume in deploymentVolumes 1 do
+      require ((← docker #["volume", "inspect", ctx.project ++ "_" ++ volume] false).exitCode != 0)
+        s!"Clean left storage: {volume}"
+    require (!(← request (.exists ctx.home))) "Clean retained new workflow history"
+    require (!(← Deployments.load).entries.any (·.project == ctx.project)) "Clean retained the new catalog entry"
+    discard <| cliCommand ctx #["clean"]
+    require ((← request (.readFile (root / "LeanCloud.lean"))) == source &&
+      (← request (.readFile (root / "deploy/config.json"))) == defaults) "Commands changed application source or defaults"
+    printLine "CLI lifecycle passed: legacy rejection → clean → deploy → run/result → down/up → clean, using real Docker services."
+  finally
+    -- Independent cleanup still runs if a CLI assertion fails. Keep command logs.
+    cleanup ctx
+    discard <| docker #["volume", "rm", retired] false
+
 def run : Cli Unit := do
+  commandLifecycle
   demo
   scaling
   generatedApp
@@ -359,7 +480,8 @@ def main (args : List String) : IO UInt32 := do
     | ["--pool-only"] => LeanCloudTests.ConsoleRuntime.demo
     | ["--scaling-only"] => LeanCloudTests.ConsoleRuntime.scaling
     | ["--app-only"] => LeanCloudTests.ConsoleRuntime.generatedApp
-    | _ => throw "Usage: cloud_console_tests [--pool-only|--scaling-only|--app-only]"
+    | ["--lifecycle-only"] => LeanCloudTests.ConsoleRuntime.commandLifecycle
+    | _ => throw "Usage: cloud_console_tests [--pool-only|--scaling-only|--app-only|--lifecycle-only]"
   -- Keep test registrations out of the user's deployment catalog.
   let catalog := (← IO.Process.getCurrentDir) / ".lean-cloud" / s!"console-catalog-test-{← IO.Process.getPID}"
   let result ← LeanCloudCli.withHostIO fun handle =>

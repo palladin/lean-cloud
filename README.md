@@ -67,15 +67,15 @@ Use `deployments` and `use NAME` to switch applications, `status` or `doctor` to
 inspect them, and `down` / `up` to stop and restart services while preserving data.
 
 The CLI generates the deployment configuration and builds your executable in
-Docker. `ps` lists runs; `watch RUN` lets you browse execution steps across all
-workers or focus one worker, including completed, paused, and killed runs.
+Docker. `ps` lists runs; `watch RUN` shows the live branch tree, code, and workers.
+Completed, paused, and killed runs show their last view.
 Use `pause RUN` / `resume RUN` to stop and continue a run, or `kill RUN` to cancel it permanently.
 See the [console guide](LeanCloud/Console.md) for inputs, registration, and recovery.
 
 Once the workers finish, read the saved report:
 
 ```sh
-docker compose exec scheduler cloud-app result /etc/lean-cloud/config.json demo
+docker compose exec scheduler cloud-app result /etc/lean-cloud/config.json example-1
 # files=16, errors=24
 ```
 

@@ -1,7 +1,32 @@
 import LeanCloud.SourceInfo
+import LeanCloud.Scheduler
 
 namespace LeanCloud
 open Lean
+
+/-- Diagnostic state omits lease deadlines and records a parallel group's
+size rather than its unbounded array of child locations. -/
+inductive BranchStatus where
+  | pending
+  | running (worker : WorkerId) (attempt : Nat)
+  | waiting (children : Nat)
+  | done
+  deriving BEq, Repr, Inhabited, ToJson, FromJson
+
+structure BranchObservation where
+  branch : Location
+  location : Location
+  joining : Bool
+  status : BranchStatus
+  deriving BEq, Repr, Inhabited, ToJson, FromJson
+
+def BranchObservation.ofJob (job : Scheduler.Job) : BranchObservation :=
+  { branch := job.branch, location := job.location, joining := job.joining
+    status := match job.status with
+      | .pending => .pending
+      | .running worker attempt _ => .running worker attempt
+      | .waiting children => .waiting children.size
+      | .done => .done }
 
 /-- Container counters sampled alongside an observation. Missing counters stay
 missing. Monotonic time and incarnation fence rate calculations across restarts. -/

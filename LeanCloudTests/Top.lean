@@ -9,12 +9,10 @@ private def has (text fragment : String) : Bool := (text.splitOn fragment).lengt
 private def keys (text : String) : List UInt32 := text.toUTF8.data.toList.map (·.toUInt32)
 
 private def actors : Array Node := (Array.range 8).map fun i =>
-  let run := if i < 4 then "first" else "second"
-  let role := if i % 4 == 3 then "scheduler" else s!"worker{i % 4 + 1}"
-  { name := s!"demo-{run}-{role}", role, run := some run, state := "running", started := "boot" }
+  let role := if i == 0 then "scheduler" else s!"worker{i}"
+  { name := s!"demo-{role}", role, state := "running", started := "boot" }
 
 private def inventory : Array Node := actors ++ #[
-  { name := "demo-worker1-mailbox", role := "worker1-mailbox", state := "running", started := "boot" },
   { name := "demo-blobs", role := "blobs", state := "running", started := "boot" }]
 
 private def process (call : ConsoleModel.Invocation) : Except String ProcessOutput := do
@@ -23,8 +21,7 @@ private def process (call : ConsoleModel.Invocation) : Except String ProcessOutp
     | some "ps" => pure (String.intercalate "\n" (inventory.map (·.name)).toList)
     | some "inspect" =>
       let rows := inventory.map fun n =>
-        let labels := Json.mkObj ([("lean-cloud.role", toJson n.role)] ++
-          n.run.toList.map (fun run => ("lean-cloud.run", toJson run)))
+        let labels := Json.mkObj [("lean-cloud.role", toJson n.role)]
         Json.mkObj [("Name", toJson ("/" ++ n.name)),
           ("State", Json.mkObj [("Status", toJson n.state), ("StartedAt", toJson n.started)]),
           ("Config", Json.mkObj [("Labels", labels)])]
@@ -46,13 +43,13 @@ private def checked (program : Cli α) (world := initial) : IO (α × ConsoleMod
 
 def topCases : Array TestCase := #[
   ⟨"console.top.persistent-idle-nodes", do
-    let shared := actors.map fun node => { node with run := none }
-    assertEq (Top.actors (shared ++ inventory.extract 8 inventory.size)).size shared.size
-    assertTrue ((Top.actors shared).all (·.run.isNone)) "Idle pool was hidden"⟩,
+    let view := Top.actors inventory
+    assertEq (view.map (·.role)) (#["scheduler"] ++ workerNames 7)
+    assertTrue (view.all (fun node => node.name == ctx.node node.role)) "Dashboard did not use shared pool nodes"⟩,
   ⟨"console.top.all-runs-without-workflow-files", do
     let (_, world) ← checked (command ctx ["top", "--once"])
     for node in actors do assertTrue (has world.stdout node.name) s!"Missing node {node.name}"
-    assertTrue (!has world.stdout "demo-worker1-mailbox" && !has world.stdout "demo-blobs") "Infrastructure mixed with actors"
+    assertTrue (!has world.stdout "demo-blobs") "Infrastructure mixed with actors"
     for metric in ["CPU", "Mem", "Disk", "Net RX", "Net TX", "I/O R", "I/O W"] do
       assertTrue (has world.stdout metric) s!"Missing graph {metric}"
     assertTrue (!world.trace.contains "readFile" && !world.trace.contains "enterTerminal" &&
@@ -60,7 +57,7 @@ def topCases : Array TestCase := #[
     assertEq (world.processes.filter (·.args[0]? == some "stats")).size 1
     assertTrue (world.processes.all (fun call =>
       if call.args[0]? == some "stats" || call.args[0]? == some "exec" then
-        !call.args.contains "demo-blobs" && !call.args.contains "demo-worker1-mailbox" else true))
+        !call.args.contains "demo-blobs" else true))
       "Sampled shared services in actor dashboard"⟩,
   ⟨"console.top.paging-and-refresh", do
     let (_, world) ← checked (command ctx ["top"])

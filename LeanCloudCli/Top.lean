@@ -3,10 +3,9 @@ import LeanCloudCli.Input
 
 namespace LeanCloudCli.Top
 
-/-- Compute nodes only. Blob services remain in `nodes`. -/
+/-- Compute nodes only. Service health is listed by `status`. -/
 def actors (nodes : Array Node) : Array Node :=
-  (nodes.filter (fun node =>
-    (isActor node.role))).qsort fun a b =>
+  (nodes.filter (fun node => isActor node.role)).qsort fun a b =>
       if (a.state == "running") != (b.state == "running") then a.state == "running"
       else if a.role == "scheduler" || b.role == "scheduler" then
         if a.role == b.role then a.name < b.name else a.role == "scheduler"
@@ -29,7 +28,7 @@ private def panel (node : Node) (history : Array History) (disk : Option DiskUsa
     (width : Nat) : Array Styled.Line :=
   let points := history.find? (fun h => h.name == node.name && h.fresh &&
     h.points.back?.map (·.session) == some node.started)
-  #[Styled.text (pad width s!" {node.role} · {node.run.getD "shared pool"}") .selected,
+  #[Styled.text (pad width s!" {node.role} · shared pool") .selected,
     Styled.text (node.state ++ " ") (Styled.statusColor node.state) ++ Styled.text node.name .muted] ++
     (if node.state == "running" then metricLines (points.map (·.points) |>.getD #[]) width disk
      else #[Styled.text "No live samples; process is stopped" .muted])

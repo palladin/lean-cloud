@@ -33,6 +33,13 @@ private def handle (resources : IO.Ref Resources) : HostOp α → IO α
   | .writeFile path text => IO.FS.writeFile path text
   | .appendFile path text => IO.FS.withFile path .append (fun file => file.putStr text)
   | .rename source target => IO.FS.rename source target
+  | .removeTree path => do
+    let metadata ← try some <$> path.symlinkMetadata catch
+      | .noFileOrDirectory .. => pure none
+      | error => throw error
+    if let some metadata := metadata then
+      if metadata.type == .dir then IO.FS.removeDirAll path
+      else IO.FS.removeFile path
   | .exists path => path.pathExists
   | .readDir path => return (← path.readDir).map (·.fileName)
   | .isDir path => path.isDir

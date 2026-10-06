@@ -31,7 +31,8 @@ private def service : Application.Service α → StateM World (Except String α)
   | .definition _ _ => return .ok ⟨program.info.entry, Json.null, program.info.resultSchema⟩
   | .outcome _ _ => return .ok (some (.success (toJson (42 : Nat))))
   | .cancel _ _ => return .ok (.cancelled "Killed by user")
-  | .status _ _ | .referenceStatus _ _ => return .ok {}
+  | .status _ _ => return .ok {}
+  | .referenceStatus _ _ => return .ok {}
   | .readText _ _ => return .error "A Nat result must not be treated as a blob"
 
 def run : IO Unit := do
@@ -47,6 +48,10 @@ def run : IO Unit := do
     ("state", Json.mkObj [("runs", toJson (#[] : Array LeanCloud.Pool.Run)), ("cursor", toJson (0 : Nat))]),
     ("replies", toJson (#[] : Array (String × Except String Json)))]))
   assertTrue saved.routes.isNone "Legacy scheduler state fabricated routes"
+  assertTrue saved.timings.isEmpty "Legacy scheduler state fabricated timestamps"
+  let timing : LeanCloud.Timing.Run := { span := some ⟨1000, some 3000⟩, observedMs := 3000 }
+  let restored : LeanCloudRuntime.Pool.Saved ← unwrap (fromJson? (toJson { saved with timings := #[ ("one", timing) ] }))
+  assertEq restored.timings #[("one", timing)] "Saved scheduler timing did not roundtrip"
   for (args, expected) in [(["programs"], 0), (["validate", "user-program/v1"], 0),
       (["serve-scheduler", "config"], 0), (["serve-worker", "config"], 0),
       (["pool-workers", "config"], 0), (["pool-stopped", "config", "worker1", "2"], 0),

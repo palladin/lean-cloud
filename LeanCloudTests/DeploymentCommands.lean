@@ -161,9 +161,9 @@ def deploymentCommandCases : Array TestCase := #[
     let (_, after) ← checked (command ctx ["status"])
     assertTrue (has after.stdout "Services:   up" && has after.stdout "Actors:     4 running") "Incorrect deployment summary"
     assertEq after.files base.files
-    let partialNodes : Array Node := #[{ name := "broker", role := "worker1-mailbox", state := "running", started := "", health := some "unhealthy" }]
+    let partialNodes : Array Node := #[{ name := "demo-worker1", role := "worker1", state := "running", started := "", health := some "unhealthy" }]
     assertEq (deploymentState partialNodes) "partial / check status"
-    assertEq (serviceState partialNodes "worker1-mailbox") "unhealthy"
+    assertEq (serviceState partialNodes "worker1") "unhealthy"
     assertEq (serviceState partialNodes "blobs") "absent"⟩,
   ⟨"console.deployment.doctor-read-only", do
     let (_, after) ← checked (command ctx ["doctor"])

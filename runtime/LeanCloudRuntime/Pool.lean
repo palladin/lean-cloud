@@ -1,4 +1,6 @@
 import LeanCloud.Pool
+import LeanCloud.Timing
+import Std.Time.DateTime.Timestamp
 import LeanCloudRuntime.Run
 
 namespace LeanCloudRuntime.Pool
@@ -11,7 +13,22 @@ structure Saved where
   state : LeanCloud.Pool.State := {}
   routes : Option (Array HttpMailbox.WorkerEndpoint) := none
   replies : Array (String × Except String Json) := #[]
-  deriving ToJson, FromJson
+  timings : Array (String × Timing.Run) := #[]
+  deriving ToJson
+
+instance : FromJson Saved where
+  fromJson? json := do
+    let routes ← match json.getObjVal? "routes" with
+      | .ok value => fromJson? value
+      | .error _ => pure none
+    let timings ← match json.getObjVal? "timings" with
+      | .ok value => fromJson? value
+      | .error _ => pure #[]
+    return { state := ← json.getObjValAs? _ "state", routes
+             replies := ← json.getObjValAs? _ "replies", timings }
+
+private def wallTime : IO Nat := do
+  return (← Std.Time.Timestamp.now).toMillisecondsSinceUnixEpoch.val.toNat
 
 inductive Envelope where
   | event (message : LeanCloud.Pool.Message)
@@ -103,10 +120,29 @@ def scheduler (config : Config) : IO Unit := do
     try
       LocalDb.initializeSchema conn
       let mut saved : Saved ← LocalDb.loadValue conn "pool-v1" {}
+      let observed ← IO.mkRef saved.state.runs
+      let emitted ← IO.mkRef (#[] : Array LeanCloud.Pool.Run)
+      let persist (value : Saved) : IO Saved := do
+        let before ← observed.get
+        let now ← wallTime
+        let timings := value.state.runs.map fun run =>
+          let timing := (value.timings.find? (·.1 == run.id)).map (·.2) |>.getD {}
+          (run.id, Timing.observe timing (before.find? (·.id == run.id)) run now)
+        let value := { value with timings }
+        LocalDb.saveValue conn "pool-v1" value
+        -- Only committed scheduler transitions appear in the branch tree.
+        let before ← emitted.get
+        for run in value.state.runs do
+          let previous := (before.find? (·.id == run.id)).map (·.scheduler.jobs) |>.getD #[]
+          if previous != run.scheduler.jobs then
+            (← Trace.create "scheduler" run.id).branches previous run.scheduler.jobs
+        observed.set value.state.runs
+        emitted.set value.state.runs
+        return value
       if saved.routes.isNone then
         saved ← IO.ofExcept (reconfigure config saved config.mailboxes.workers)
       saved := { saved with state := LeanCloud.Pool.recover saved.state }
-      LocalDb.saveValue conn "pool-v1" saved
+      saved ← persist saved
       for run in saved.state.runs do
         settle config run
       let handle ← HttpMailbox.openMailbox config.mailboxes.scheduler address "scheduler"
@@ -131,7 +167,7 @@ def scheduler (config : Config) : IO Unit := do
             saved := updated
             if cached.isNone then
               saved := { saved with replies := saved.replies.push (replyTo, response) }
-              LocalDb.saveValue conn "pool-v1" saved
+              saved ← persist saved
             HttpMailbox.send config.mailboxes.scheduler address replyTo response
           | .event message =>
             let mailboxes := { config.mailboxes with workers := saved.routes.getD config.mailboxes.workers }
@@ -139,13 +175,13 @@ def scheduler (config : Config) : IO Unit := do
             | .submit run =>
               let (state, _) ← IO.ofExcept (LeanCloud.Pool.command saved.state (.submit run))
               saved := { saved with state }
-              LocalDb.saveValue conn "pool-v1" saved
+              saved ← persist saved
             | .ready worker =>
               unless saved.state.membership.drained.contains worker do
               if let .ok endpoint := mailboxes.worker worker then
                 let (state, reply) := LeanCloud.Pool.acquire config.scheduler.assignmentMs saved.state worker
                 saved := { saved with state }
-                LocalDb.saveValue conn "pool-v1" saved
+                saved ← persist saved
                 LeanCloudRuntime.Pool.reply endpoint worker reply
                 if let .execute run assignment := reply then
                   let trace ← Trace.create "scheduler" run
@@ -153,16 +189,16 @@ def scheduler (config : Config) : IO Unit := do
                   trace.emit "dispatch" worker
             | .drained worker generation =>
               saved := { saved with state := LeanCloud.Pool.drained saved.state worker generation }
-              LocalDb.saveValue conn "pool-v1" saved
+              saved ← persist saved
             | .renew run worker attempt =>
               let state := LeanCloud.Pool.renew config.scheduler.assignmentMs saved.state run worker attempt
               saved := { saved with state }
-              LocalDb.saveValue conn "pool-v1" saved
+              saved ← persist saved
             | .report run report =>
               unless saved.state.membership.drained.contains report.worker do
               if let .ok endpoint := mailboxes.worker report.worker then
                 saved := { saved with state := LeanCloud.Pool.report saved.state run report }
-                LocalDb.saveValue conn "pool-v1" saved
+                saved ← persist saved
                 if let some state := saved.state.runs.find? (·.id == run) then
                   settle config state
                   if let some error := state.scheduler.error then
@@ -180,7 +216,14 @@ def scheduler (config : Config) : IO Unit := do
               let cache := match command with | .check .. | .status .. | .health | .workers => false | _ => true
               if cache && cached.isNone then
                 saved := { saved with replies := saved.replies.push (replyTo, response) }
-              if cache then LocalDb.saveValue conn "pool-v1" saved
+              if cache then saved ← persist saved
+              let response ← match command, response with
+                | .status run, .ok json => do
+                  let now ← wallTime
+                  let timing := (saved.timings.find? (·.1 == run)).map fun (_, timing) =>
+                    { timing with observedMs := max now timing.observedMs }
+                  pure (.ok (json.setObjVal! "timing" (toJson timing)))
+                | _, response => pure response
               if response.isOk then
                 if let .kill run := command then
                   if let some state := saved.state.runs.find? (·.id == run) then settle config state
@@ -201,6 +244,9 @@ def submit (config : Config) (run : String) : IO Unit := do
   send config (.submit run)
 
 def status (config : Config) (run : String) : IO Scheduler.State := do
+  IO.ofExcept (fromJson? (← request config (.status run)))
+
+def observation (config : Config) (run : String) : IO Timing.Status := do
   IO.ofExcept (fromJson? (← request config (.status run)))
 
 end LeanCloudRuntime.Pool

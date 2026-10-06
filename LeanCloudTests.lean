@@ -6,11 +6,14 @@ import LeanCloudTests.ProgressWitness
 import LeanCloudTests.SequentialReplay
 import LeanCloudTests.Replay
 import LeanCloudTests.Console
+import LeanCloudTests.BranchTree
+import LeanCloudTests.Timing
 import LeanCloudTests.Styled
 import LeanCloudTests.ConsoleEffects
 import LeanCloudTests.Shell
 import LeanCloudTests.Project
 import LeanCloudTests.DeploymentCommands
+import LeanCloudTests.Clean
 import LeanCloudTests.Streaming
 import LeanCloudTests.ProcessLogging
 import LeanCloudTests.Top
@@ -22,6 +25,6 @@ import LeanCloudTests.Source
 namespace LeanCloudTests
 
 def allCases : Array TestCase := codecCases ++ mailboxCases ++ coordinationCases ++ simulationBoundaryCases ++
-  crashBoundaryCases ++ generatedCases ++ compositionCases ++ blobFailureCases ++ sequentialReplayCases ++ replayCases ++ consoleCases ++ styledCases ++ consoleEffectCases ++ shellCases ++ projectCases ++ deploymentCommandCases ++ streamingCases ++ processLoggingCases ++ topCases ++ helpCases ++ poolCases ++ PoolModel.cases ++ Source.cases
+  crashBoundaryCases ++ generatedCases ++ compositionCases ++ blobFailureCases ++ sequentialReplayCases ++ replayCases ++ consoleCases ++ BranchTree.cases ++ Timing.cases ++ styledCases ++ consoleEffectCases ++ shellCases ++ projectCases ++ deploymentCommandCases ++ Clean.cases ++ streamingCases ++ processLoggingCases ++ topCases ++ helpCases ++ poolCases ++ PoolModel.cases ++ Source.cases
 
 end LeanCloudTests

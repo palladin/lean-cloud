@@ -116,7 +116,7 @@ cloud> inspect logs-1
 cloud> watch logs-1
 cloud> result squares-1
 cloud> result logs-1
-cloud> nodes
+cloud> top --once
 cloud> quit
 ```
 
@@ -133,7 +133,7 @@ with the existing replay interpreter. Results remain isolated by run ID.
 After completing an assignment, the worker asks for more work; nodes remain
 running even when every workflow has finished. Closing the console leaves the
 pool running. `ps` lists workflows; `top` shows the deployed compute nodes,
-including idle nodes; `nodes` also includes blob storage.
+including idle nodes. `status` includes blob storage health.
 
 Use `down` to stop and remove the deployment's containers while preserving blobs,
 mailboxes, scheduler state, images, and the local catalog. `up` starts the saved
@@ -143,6 +143,23 @@ Use `deploy` when application code changes. Changing the image requires completi
 or killing unfinished runs first: replay must use the same application code.
 Redeploying after `down` starts the retained services before checking saved
 results. Missing durable volumes are reported instead of silently recreated.
+
+To remove a deployment completely, select it and run `clean`:
+
+```text
+cloud> use my-app
+cloud> clean
+```
+
+`clean` permanently deletes that deployment's containers, networks, storage volumes
+(including retired workers), application image tags, local history, generated files,
+and catalog entry. This includes workflows, results, replay records, and locally
+hosted blobs. Your Lean project, shared Docker images/build cache, and external
+storage services remain. It also works after `down` or an incomplete deployment.
+If cleanup fails, run `clean` again to finish; then `deploy` creates a fresh deployment.
+Saved RabbitMQ deployments require this reset before deploying the HTTP/SQLite
+runtime. `deploy` reports the required commands and preserves the old data until
+you explicitly run `clean`.
 
 ## Elastic worker capacity
 
@@ -174,7 +191,7 @@ The count is saved in the deployment and, for generated applications, in
 `lean-cloud.json` as `"workers": N`. `up` and subsequent deployments reuse it.
 Mailbox volumes and replay traces are retained after scale-down; growing the pool
 reuses stable worker names and their volumes. Repeating a scale command is safe,
-including after an interrupted command. Use `status`, `nodes`, or `top` to inspect
+including after an interrupted command. Use `status` or `top` to inspect
 the resulting pool.
 
 ## Pause and kill a run
@@ -364,49 +381,49 @@ Each node gets a panel with CPU, memory, filesystem usage, network RX/TX, and
 disk read/write rates. Panels resize with the terminal. Use PgUp/PgDn or the
 left/right arrows to change pages, and `q` to return to the console. Running
 actors appear first; stopped actors remain visible with their status.
-Each node includes its mailbox service. `nodes` also lists blob storage.
+Each node includes its mailbox service. `status` also lists blob storage health.
 
 `top --once` (or piped `top`) prints a plain-text snapshot of every page. Rates
 need two samples, so that first snapshot shows `—` for network and I/O rates.
 
-`watch RUN` browses execution steps for running, completed, paused, failed, and
-killed processes. It opens at the latest observation and follows new events.
+`watch RUN` shows a live branch tree, source code, and worker graphs.
+When the run completes, it freezes the last view. Completed, paused, failed, and
+killed runs can be opened again; there is no event list or execution timeline.
 
-The **Global view** shows workers in pages of three panels, each with
-its observed location, code window, and resource graphs. The **Worker view**
-expands that worker's code and metrics and filters the step list to that worker.
-The visible `[Global] [Worker 1] [Worker 2] [Worker 3]` tabs identify the current view.
-Use `[` and `]` to page through workers. Small terminals show compact panels; select one for full details.
-When browsing history, switching workers
-selects that worker's nearest preceding observation (or its first, if none precedes
-the cursor). The banner distinguishes following live activity from browsing history.
+`ps` shows start and finish timestamps in UTC and elapsed wall time. The tree's
+**ELAPSED** column shows the span of each branch and parallel group. Timing starts
+when the scheduler registers the run, branch, or group; it includes waiting,
+pauses, and retries. A parallel group's clock stops when all children complete;
+the parent branch continues through its remaining code. Completion, failure, or
+kill freezes unfinished clocks. These summaries are saved with scheduler state
+and survive restarts. Older runs without timings show `—`. An unavailable
+scheduler leaves the last saved observation fixed.
 
-- **Arrow keys:** select the previous or next step; browsing freezes the cursor.
-- **PgUp / PgDn:** move a page of steps; **Home:** select the first step.
-- **End / f:** return to the latest step and follow new observations.
-- **g / 0:** Global view; **1 / 2 / 3:** select a worker on the visible page.
-- **[ / ]:** previous or next page of workers.
-- **Tab / Shift-Tab:** cycle through Global and every Worker view, including retired workers in history.
-- **j / k:** scroll source; **a:** follow the selected step's source line.
+Select a **parallel group** to see all workers together, each with its current
+branch, code position, and resource graphs. Idle workers are labeled explicitly.
+Select an **individual branch** to see only the worker currently assigned to it;
+an old or revoked attempt is never shown as executing. A completed run shows the
+last observed worker and frozen statistics instead of current container activity.
+
+- **↑ / ↓:** select a branch or parallel group.
+- **← / →:** collapse or expand groups; move to the parent or first child.
+- **PgUp / PgDn:** page through worker cards when the terminal cannot fit them all.
+- **j / k:** scroll source; **a:** follow the selected branch's source line.
 - **q:** return to the prompt.
 
-The trace shows the actor, location, activity, and operation. Selecting a mapped
-step highlights its source line even if the worker has stopped. Each worker's
-panel shows its last observation at that point in the trace. `>` identifies a mapped
-step; `~` identifies the last mapped line at the same location and attempt when the
-latest observation has no source mapping. Navigation never resumes or re-executes
-the process. **Historical graphs use recorded samples at or before the cursor.**
-They never fall back to current Docker stats. Missing samples say `not recorded`.
+The branch tree sits beside the code; narrow terminals stack them. `>` marks the
+latest observed source line. Pending branches may show the parent parallel call.
 A noninteractive terminal or `--once` prints one frame without control sequences.
+Watching never submits, resumes, or re-executes a workflow.
 
-The console reads all retained Docker logs, including earlier worker incarnations,
-and saves observations in each run's local `trace.json`. `down` and image replacement
-collect logs after stopping actors and before removing their containers. Saved
-steps remain browsable when Docker or the deployment is unavailable. Log rotation,
-a dropped event, or containers removed outside the CLI can leave gaps; the cache
-cannot reconstruct observations that were never collected. The display uses Docker
-log timestamps, which do not establish causal order between concurrent workers.
-Ordinary pure code and arbitrary lines inside an IO body are not instrumented.
+The console reduces runtime observations to one latest snapshot in `watch.json`:
+branch states, source positions, and a bounded window for worker meters. It does
+not accumulate execution history. Old `trace.json` caches are compacted and removed
+on first use. `down` and image replacement save the last view before removing
+containers. If the deployment is unavailable, watch labels the saved view.
+Missing source or resource observations remain unavailable; Docker log rotation or
+dropped diagnostics can leave gaps. Ordinary pure code and lines inside an IO body
+are not individually instrumented.
 
 `cloud { ... }` captures source spans automatically. `program.register` bundles
 the exact source files and site map from the build, including imported workflow
@@ -428,7 +445,7 @@ includes a run ID, worker incarnation, sequence number, attempt, location, and a
 sequence numbers are local to each incarnation, not a global execution order.
 
 While following an active run, resource graphs use live Docker container statistics.
-While browsing history, or inspecting a completed, paused, or killed run, they use
+For the last view of a completed, paused, or killed run, they use
 resource counters attached to the worker's trace events. Collection happens in the
 runtime even when no console is connected. Rebuild with `deploy` once to enable it
 for future runs; already missing samples cannot be recovered.
@@ -437,14 +454,13 @@ The Linux container runtime samples cgroup v2 CPU, memory, and I/O counters,
 network-interface counters, and root-filesystem usage at trace boundaries.
 CPU and transfer rates use adjacent samples from the same process incarnation;
 they are unavailable until two usable samples exist. Sampling is event-based,
-so a long computation need not produce intermediate samples. A panel identifies
-the last recorded sample's time. These are container-wide measurements, including
+so a long computation need not produce intermediate samples. These are container-wide measurements, including
 the HTTP service, SQLite, and other workflows sharing that worker. Unsupported
 counters remain missing.
 The [kernel's cgroup documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html)
 defines the CPU, memory, and I/O counters.
 
-Both modes display:
+Worker panels display:
 
 - CPU utilization and memory usage/limit;
 - network receive/send rates;
@@ -454,8 +470,8 @@ Both modes display:
 CPU, memory, and filesystem usage have text meters. Their fill is green below
 70%, yellow from 70%, and red from 90%. A CPU meter represents one core; usage
 above 100% keeps its full numeric value and adds `+` to the meter. Memory and
-filesystem meters use their reported capacity. The `nodes` table also shows CPU
-and memory meters.
+filesystem meters use their reported capacity. Use `top --once` for a text
+snapshot and `status` for the health of all deployment services.
 
 Network receive/send and disk read/write rates have distinct colored histories.
 Graphs use `_` for measured zero and `·` for an unavailable rate; the first counter
@@ -466,15 +482,15 @@ Node statistics cover the Lean process, including HTTP and SQLite. CPU can excee
 multiple cores. Filesystem capacity can be shared between containers; it is not
 space attributed exclusively to the selected container. Missing samples are not
 zero utilization. Rate series restart when a container restarts or counters reset.
-Graphs display up to 30 samples from the chosen incarnation, ending at the selected
-moment. Historical samples are retained with the trace cache and survive console
-restart and deployment shutdown. Rate graphs scale independently.
+Graphs display up to 30 recent samples from one incarnation. The final meter
+window survives console restart and deployment shutdown; it has no history cursor.
+Rate graphs scale independently.
 
 ## Validation
 
 `lake test` includes shell parsing, input identifiers, source-map ambiguity,
-terminal escape sanitization, metric units, counter resets, bounded history, and
-historical source markers, trace deduplication, stable cursor selection during refresh,
+terminal escape sanitization, metric units, counter resets, bounded meter windows,
+latest source markers, snapshot compaction, stable branch selection during refresh,
 and navigation at several terminal widths. Docker integration tests
 validate the typed registry and compare an instrumented workflow against direct
 evaluation, including durable typed results and conflicting submissions.
@@ -491,12 +507,15 @@ Shell tests cover prompt placement, resizing, completion, file paths with spaces
 history, UTF-8 input, bracketed paste and handing terminal ownership to `watch`.
 Deployment-command tests cover persistent selection, conflicting names, corrupt
 catalog recovery, offline Docker, missing volumes, and read-only diagnostics.
+Cleanup tests cover resource ownership, retired workers, incomplete deployments,
+retries after Docker or filesystem failures, and preservation of other deployments.
 Streaming tests cover split UTF-8/CRLF, partial lines, bounded output, editing and
 scrolling during execution, resize, interruption, and finalizer failures.
 
 `lake exe cloud_process_tests` exercises the native handler with Lean subprocesses:
 incremental output, both pipes beyond pipe capacity, exit codes, invalid arguments,
 SIGINT recovery, and cleanup of descendants, including when their parent exits first.
+It also checks recursive deployment-file removal without following symlinks.
 
 Run `lake exe cloud_console_tests` for the console's Docker smoke test. It checks
 input rejection before launch, concurrent runs, retained images after replacing
@@ -506,9 +525,25 @@ preserved completed results, and cancellation after deployment restart.
 It cleans up its own containers, volumes, and image tags and retains its local
 catalog for diagnosis.
 
+CI also runs a focused test through the compiled CLI executable:
+
+```sh
+lake build lean_cloud
+lake exe cloud_console_tests --lifecycle-only
+```
+
+It starts with saved RabbitMQ configuration and a retired worker volume, verifies
+that `deploy` rejects them with reset instructions, then runs `clean`, `deploy`,
+`programs`, `status`, `run`, `result`, `ps`, `inspect`, `watch --once`, `down`, `up`,
+and `clean` against real Docker, HTTP, SQLite, and blob storage. It verifies the
+workflow result, persistence across restart, complete removal, and source
+preservation. The test uses a separate deployment and catalog; command logs are
+retained under `.lean-cloud/cli-command-logs-PID/` and uploaded by CI on failure.
+
 The console smoke test also creates a separate user application, builds a custom
 Lake executable with generated deployment files, and verifies results for sample
 and supplied input. It checks deployment selection, status and diagnostics, then
 takes the app down and verifies its results after `up` without rebuilding.
 Tests use an isolated deployment index. Run only the generated-app check with
-`lake exe cloud_console_tests --app-only`, or the shared-pool check with\n`lake exe cloud_console_tests --pool-only`.
+`lake exe cloud_console_tests --app-only`, or the shared-pool check with
+`lake exe cloud_console_tests --pool-only`.

@@ -52,12 +52,6 @@ def load : Cli Catalog := do
   let entries ← catalog.entries.filterM (fun entry => belongsTo directory entry.context)
   return { entries, selected := catalog.selected.filter fun name => entries.any (·.project == name) }
 
-/-- Call before an isolated test creates its deployment manifest. Discovery in
-the ordinary user catalog then leaves these retained artifacts alone. -/
-def isolate (ctx : Context) : Cli Unit := do
-  request (.createDir ctx.home)
-  saveJson (ctx.home / "catalog-owner.json") (← home).toString
-
 private def insert (catalog : Catalog) (ctx : Context) (select : Bool) : Cli Catalog := do
   validateId ctx.project
   unless ctx.project == ctx.project.toLower do throw "Deployment project must be lowercase"
@@ -77,6 +71,22 @@ def remember (ctx : Context) (select := true) : Cli Unit := do
   withLock (directory / "catalog.lock") do
     let catalog ← insert (← read directory) ctx select
     saveJson (directory / "deployments.json") catalog
+
+/-- Cleanup must not claim a project name that belongs to another directory. -/
+def checkOwnership (ctx : Context) : Cli Unit := do
+  let directory ← home
+  unless ← belongsTo directory ctx do throw "Deployment belongs to another catalog"
+  discard <| insert (← read directory) ctx false
+
+def forget (ctx : Context) : Cli Unit := do
+  let directory ← home
+  request (.createDir directory)
+  withLock (directory / "catalog.lock") do
+    let catalog ← read directory
+    discard <| insert catalog ctx false
+    saveJson (directory / "deployments.json") {
+      entries := catalog.entries.filter (·.project != ctx.project)
+      selected := catalog.selected.filter (· != ctx.project) : Catalog }
 
 /-- Import catalogs from this application directory, including deployments taken down. -/
 def discover (ctx : Context) : Cli Unit := do

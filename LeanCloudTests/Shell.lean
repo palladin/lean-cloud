@@ -65,8 +65,8 @@ def shellCases : Array TestCase := #[
     assertEq state.line "help"
     assertEq state.cursor 2
     assertEq (Shell.edit {} state .backspace).line "hlp"
-    let recalled := Shell.edit {} { line := "draft", cursor := 5, history := #["ps", "nodes"] } .up
-    assertEq recalled.line "nodes"
+    let recalled := Shell.edit {} { line := "draft", cursor := 5, history := #["ps", "top"] } .up
+    assertEq recalled.line "top"
     assertEq (Shell.edit {} recalled .up).line "ps"
     assertEq (Shell.edit {} recalled .down).line "draft"
     assertEq (Shell.edit {} recalled .clear).line ""⟩,

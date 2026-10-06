@@ -61,8 +61,8 @@ def styledCases : Array TestCase := #[
       ⟨2000, "boot", 92000, 1048576, 2097152, 10000, 20000, 30000, 40000⟩]
     for width in [5, 40, 80, 120, 180] do
       for height in [12, 24, 35] do
-        let plain := Watch.frame ctx run #[node] #[] #[⟨node.name, points, true⟩] {} width height
-        let colored := Watch.frame ctx run #[node] #[] #[⟨node.name, points, true⟩] {} width height "" #[] true
+        let plain := Watch.frame ctx run #[] #[⟨node.name, points, true⟩] {} width height
+        let colored := Watch.frame ctx run #[] #[⟨node.name, points, true⟩] {} width height "" #[] true
         assertEq (colored.map uncolor) plain
         assertTrue (plain.size < height && plain.all (·.length ≤ width)) "Resource frame escaped terminal dimensions"⟩,
   ⟨"console.style.shared-theme-and-no-color", do

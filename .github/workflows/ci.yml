@@ -16,7 +16,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -49,3 +49,15 @@ jobs:
       - name: Check application commands and HTTP inbox durability
         working-directory: runtime
         run: lake exe cloud_inbox_tests
+
+      - name: Check CLI commands against Docker services
+        run: lake exe cloud_console_tests --lifecycle-only
+
+      - name: Upload CLI command logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-command-logs
+          path: .lean-cloud/cli-command-logs-*/*.log
+          include-hidden-files: true
+          if-no-files-found: ignore
