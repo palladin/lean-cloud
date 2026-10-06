@@ -43,35 +43,40 @@ theorem replay (expected journal : Journal) (worker : WorkerId) (assignment : As
     (exhausted : fuel < steps → ∀ world, (ReplayContracts.rules expected).invariant world → pre world →
       post (.error ⟨.protocol, "Interpreter fuel exhausted"⟩) world)
     (continued : ∀ remainingFuel, steps + remainingFuel = fuel → (ReplayContracts.rules expected).Program pre post
-      (walk (observed worker).records blobs assignment remainingFuel remainingEncode remaining assignment.location true).run) :
+      (execute (observed worker).records blobs assignment remainingFuel remainingEncode remaining assignment.location).run) :
     (ReplayContracts.rules expected).Program pre post
-      (walk (observed worker).records blobs assignment fuel encode program current).run := by
+      (reconstruct (observed worker).records blobs assignment fuel encode program current).run := by
   induction witness generalizing fuel with
   | here encode program =>
-    rw [walk_at_assignment]
+    rw [reconstruct_at_assignment]
     exact continued fuel (Nat.zero_add fuel)
   | delay next before rest ih =>
     cases fuel with
     | zero => exact exhausted (Nat.zero_lt_succ _)
     | succ fuel =>
-      simpa only [walk, Bool.false_or, beq_eq_false_iff_ne.mpr before] using ih fuel (fun smaller => exhausted (by omega)) (fun remainingFuel same => continued remainingFuel (by omega))
+      simpa only [reconstruct, beq_eq_false_iff_ne.mpr before, Bool.false_eq_true, ite_false] using ih fuel (fun smaller => exhausted (by omega)) (fun remainingFuel same => continued remainingFuel (by omega))
   | command codec operation next record wire value before present checked success decoded rest ih =>
     cases fuel with
     | zero => exact exhausted (Nat.zero_lt_succ _)
     | succ fuel =>
-      simp only [walk, Bool.false_or, beq_eq_false_iff_ne.mpr before]
-      apply read_then expected worker _ record pre stable (fun world invariant holds => cached world invariant holds _ _ present)
-      simp only [Internal.check, checked, ite_true, success]
-      apply Rules.except_bind_value _ _ _ value (ExecutionContracts.decode expected pre codec wire value decoded)
-      exact ih fuel (fun smaller => exhausted (by omega)) (fun remainingFuel same => continued remainingFuel (by omega))
+      simp only [reconstruct, beq_eq_false_iff_ne.mpr before, Bool.false_eq_true, ite_false]
+      apply Rules.except_bind_value _ _ _ wire
+      · unfold Internal.recorded
+        apply read_then expected worker _ record pre stable (fun world invariant holds => cached world invariant holds _ _ present)
+        simp only [Internal.check, checked, ite_true, success]
+        exact Rules.returns_pure _ pre _
+      · apply Rules.except_bind_value _ _ _ value (ExecutionContracts.decode expected pre codec wire value decoded)
+        exact ih fuel (fun smaller => exhausted (by omega)) (fun remainingFuel same => continued remainingFuel (by omega))
   | joined codec count branches next record wire values before skip present checked success decoded size rest ih =>
     cases fuel with
     | zero => exact exhausted (Nat.zero_lt_succ _)
     | succ fuel =>
-      simp only [walk, Bool.false_or, beq_eq_false_iff_ne.mpr before, Bool.not_false, Bool.true_and, skip, Bool.false_eq_true, ite_false]
-      apply read_then expected worker _ record pre stable (fun world invariant holds => cached world invariant holds _ _ present)
-      simp only [Option.isNone_some, Bool.false_and, Bool.false_eq_true, ite_false,
-        Internal.check, checked, ite_true, success]
+      simp only [reconstruct, beq_eq_false_iff_ne.mpr before, skip, Bool.false_eq_true, ite_false]
+      apply Rules.except_bind_value _ _ _ wire
+      · unfold Internal.recorded
+        apply read_then expected worker _ record pre stable (fun world invariant holds => cached world invariant holds _ _ present)
+        simp only [Internal.check, checked, ite_true, success]
+        exact Rules.returns_pure _ pre _
       apply Rules.except_bind_value _ _ _ values
       · unfold Internal.decodeGroup
         apply Rules.returns_bind (value := values)
@@ -83,7 +88,7 @@ theorem replay (expected journal : Journal) (worker : WorkerId) (assignment : As
     cases fuel with
     | zero => exact exhausted (Nat.zero_lt_succ _)
     | succ fuel =>
-      simp only [walk, Bool.false_or, beq_eq_false_iff_ne.mpr before, Bool.not_false, Bool.true_and, enters, ite_true,
+      simp only [reconstruct, beq_eq_false_iff_ne.mpr before, Bool.false_eq_true, ite_false, enters, ite_true,
         selected, index.isLt, dite_true]
       exact ih fuel (fun smaller => exhausted (by omega)) (fun remainingFuel same => continued remainingFuel (by omega))
 
@@ -100,7 +105,7 @@ theorem at_prefix [codec : Codec α] (expected journal : Journal) (worker : Work
     (active : ∀ fuel, (ReplayContracts.rules expected).Program (ExecutionContracts.Ready expected assignment)
       (fun result world => ExecutionContracts.Result expected assignment.branch expectedReturn remainingEncode remaining assignment.location result world ∧
         ExecutionContracts.FuelBound fuel bound result ∧ ExecutionContracts.ForksAfter assignment assignment.location result)
-      (walk (observed worker).records blobs assignment fuel remainingEncode remaining assignment.location true).run) :
+      (execute (observed worker).records blobs assignment fuel remainingEncode remaining assignment.location).run) :
     ∀ fuel, (ReplayContracts.rules expected).Program
         (fun world => Extends journal world.records ∧ ExecutionContracts.Ready expected assignment world)
         (fun result world => ExecutionContracts.Result expected assignment.branch expectedReturn codec.encode (program input) Location.root result world ∧

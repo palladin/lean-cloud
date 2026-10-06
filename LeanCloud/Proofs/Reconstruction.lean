@@ -6,12 +6,12 @@ open Lean LeanEff ReplayModel ReplayInterpreter Routing
 
 variable {info : Option SourceSiteId}
 
-/-- At the assigned location, the next worker instruction is active. -/
-theorem walk_at_assignment [Monad m] (store : ReplayStore m) (blobs : BlobStorage m)
+/-- Reaching the assignment starts execution with the same fuel. -/
+theorem reconstruct_at_assignment [Monad m] (store : ReplayStore m) (blobs : BlobStorage m)
     (assignment : Assignment) (fuel : Nat) (encode : α → Json) (program : Cloud m α) :
-    walk store blobs assignment fuel encode program assignment.location false =
-      walk store blobs assignment fuel encode program assignment.location true := by
-  cases fuel <;> simp only [walk, Bool.false_or, Bool.true_or, beq_self_eq_true]
+    reconstruct store blobs assignment fuel encode program assignment.location =
+      execute store blobs assignment fuel encode program assignment.location := by
+  cases fuel <;> simp [reconstruct.eq_def, execute]
 
 /-- A recorded prefix leads to the assigned typed continuation. Descending into
 an array child selects its codec; ordinary continuation steps retain the current
@@ -138,27 +138,27 @@ theorem replay_reaches_continuation (journal : Journal) (blobs : BlobStorage M)
     (assignment : Assignment) {α β : Type} {encode : α → Json} {program : Cloud M α}
     {current steps} {remainingEncode : β → Json} {remaining : Cloud M β}
     (witness : Prefix journal assignment.location encode program current steps remainingEncode remaining) (fuel : Nat) :
-    (walk store blobs assignment (steps + fuel) encode program current).run journal =
-      (walk store blobs assignment fuel remainingEncode remaining assignment.location).run journal := by
+    (reconstruct store blobs assignment (steps + fuel) encode program current).run journal =
+      (execute store blobs assignment fuel remainingEncode remaining assignment.location).run journal := by
   induction witness with
-  | here encode program => simp
+  | here encode program => simp [reconstruct_at_assignment]
   | delay next before rest ih =>
-    rw [Nat.add_right_comm _ 1 fuel, walk]
+    rw [Nat.add_right_comm _ 1 fuel, reconstruct]
     simpa [beq_eq_false_iff_ne.mpr before] using ih
   | command codec operation next record wire value before present checked success decoded rest ih =>
-    rw [Nat.add_right_comm _ 1 fuel, walk]
-    simp [beq_eq_false_iff_ne.mpr before]
+    rw [Nat.add_right_comm _ 1 fuel, reconstruct]
+    simp [beq_eq_false_iff_ne.mpr before, Internal.recorded, bind_assoc]
     erw [read_then]
     simp [present, Internal.check, checked, success, Internal.decode, decoded]
     exact ih
   | joined codec count branches next record wire values before skip present checked success decoded size rest ih =>
-    rw [Nat.add_right_comm _ 1 fuel, walk]
-    simp [beq_eq_false_iff_ne.mpr before, skip]
+    rw [Nat.add_right_comm _ 1 fuel, reconstruct]
+    simp [beq_eq_false_iff_ne.mpr before, skip, Internal.recorded, bind_assoc]
     erw [read_then]
     simp [present, Internal.check, checked, success, Internal.decodeGroup, Internal.decode, decoded, size]
     exact ih
   | child codec count branches next index before enters selected rest ih =>
-    rw [Nat.add_right_comm _ 1 fuel, walk]
+    rw [Nat.add_right_comm _ 1 fuel, reconstruct]
     simp [beq_eq_false_iff_ne.mpr before, enters, selected, index.isLt]
     exact ih
 
@@ -172,7 +172,7 @@ theorem step_resumes_at_location [Codec α] (journal : Journal) (blobs : BlobSto
     (witness : Prefix journal assignment.location Codec.encode (program input)
       Location.root steps remainingEncode remaining) :
     (step store blobs (steps + fuel) program input assignment).run journal =
-      (walk store blobs assignment fuel remainingEncode remaining assignment.location).run journal := by
+      (execute store blobs assignment fuel remainingEncode remaining assignment.location).run journal := by
   simp [step, valid, ReplayStore.outcome]
   erw [read_then]
   simp [unfinished]

@@ -1,7 +1,7 @@
 import LeanCloud.Proofs.ParallelContracts
 import LeanCloud.Proofs.Suspension
 
-/-! Semantic contracts for the active portion of the existing replay walk.
+/-! Semantic contracts for execution of an assigned branch segment.
 The invariant is agreement with a pure specification, while actual storage may
 initially be missing any record the current assignment is allowed to create. -/
 
@@ -118,34 +118,37 @@ private theorem checked_then (expected : Journal) (request : Request) (outcome :
   subst actual
   simpa only [Internal.check, beq_self_eq_true, ite_true] using! continued
 
-/-- The command case records its pure result before continuing.
-The continuation receives both the value and its durable presence assertion. -/
-theorem exec_then (expected : Journal) (worker : WorkerId) (current : Location)
+/-- A pure command returns its specified result and establishes its durable record. -/
+theorem exec_recorded (expected : Journal) (worker : WorkerId) (current : Location)
     (codec : Codec α) (label : String) (body : Unit → α) (pre : World → Prop)
     (stable : (ReplayContracts.rules expected).Stable (ReplayContracts.rules expected).interference pre)
     (known : expected.lookup (ReplayStore.valueKey current) =
       some ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → SimM World α)),
-        .success (codec.encode (body ()))⟩)
-    (next : Exit → ExceptT CloudError (SimM World) β) (post : Except CloudError β → World → Prop)
-    (continued : (ReplayContracts.rules expected).Program
-      (fun world => pre world ∧ world.records.lookup (ReplayStore.valueKey current) =
-        some ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → SimM World α)),
-          .success (codec.encode (body ()))⟩)
-      post (next (.success (codec.encode (body ())))).run) :
+        .success (codec.encode (body ()))⟩) :
     let operation : Operation (SimM World) α := .exec label (fun _ => pure (body ()))
     let request := Internal.request codec operation
-    (ReplayContracts.rules expected).Program pre post
-      ((do
-        let outcome ← match ← (observed worker).records.read (ReplayStore.valueKey current) with
-          | some record => Internal.check request record
-          | none => do
-            let outcome ← try
-              pure (.success (codec.encode (← blobs.execute operation)))
-            catch error => pure (.failure error)
-            let accepted ← (observed worker).records.create (ReplayStore.valueKey current) ⟨request, outcome⟩
-            Internal.check request accepted
-        next outcome : ExceptT CloudError (SimM World) β).run) := by
+    let outcome := Exit.success (codec.encode (body ()))
+    (ReplayContracts.rules expected).Program pre
+      (fun result world => result = .ok outcome ∧ pre world ∧
+        world.records.lookup (ReplayStore.valueKey current) = some ⟨request, outcome⟩)
+      (Internal.command (observed worker).records blobs current codec operation).run := by
   dsimp only
+  let expectedRecord : ReplayRecord :=
+    ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → SimM World α)),
+      .success (codec.encode (body ()))⟩
+  have checked (record : ReplayRecord) :
+      (ReplayContracts.rules expected).Program
+        (fun world => record = expectedRecord ∧ pre world ∧
+          world.records.lookup (ReplayStore.valueKey current) = some record)
+        (fun result world => result = .ok expectedRecord.outcome ∧ pre world ∧
+          world.records.lookup (ReplayStore.valueKey current) = some expectedRecord)
+        (Internal.check expectedRecord.request record).run := by
+    apply Rules.Program.assuming
+    intro same
+    subst record
+    simp only [Internal.check, beq_self_eq_true, ite_true]
+    exact fun _ _ holds => ⟨rfl, holds⟩
+  unfold Internal.command
   apply Rules.except_bind (middle := fun record world => ReplayContracts.ReadReply (ReplayStore.valueKey current) record world ∧ pre world)
   · apply Rules.except_lift _ (ReplayContracts.preserving expected
       (ReplayContracts.observed_read expected worker (ReplayStore.valueKey current)) stable)
@@ -153,31 +156,26 @@ theorem exec_then (expected : Journal) (worker : WorkerId) (current : Location)
   · intro record
     cases record with
     | some record =>
-      apply Rules.Program.weaken _ (checked_then expected _ _ record _ _ _ continued)
+      apply Rules.Program.weaken _ (checked record)
       intro world invariant holds
       have found := holds.1 record rfl
       have same := Option.some.inj ((invariant _ _ found).symm.trans known)
-      exact ⟨same, holds.2, found.trans (congrArg some same)⟩
+      exact ⟨same, holds.2, found⟩
     | none =>
-      change (ReplayContracts.rules expected).Program _ post ((do
-        let accepted ← (observed worker).records.create (ReplayStore.valueKey current)
-          ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → SimM World α)),
-            .success (codec.encode (body ()))⟩
-        let value ← Internal.check
-          (Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → SimM World α))) accepted
-        next value : ExceptT CloudError (SimM World) β).run)
+      change (ReplayContracts.rules expected).Program _ _ ((do
+        let accepted ← (observed worker).records.create (ReplayStore.valueKey current) expectedRecord
+        Internal.check expectedRecord.request accepted :
+          ExceptT CloudError (SimM World) Exit).run)
       apply Rules.except_bind (middle := fun accepted world =>
-        ReplayContracts.Created (ReplayStore.valueKey current)
-          ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → SimM World α)),
-            .success (codec.encode (body ()))⟩ accepted world ∧ pre world)
+        ReplayContracts.Created (ReplayStore.valueKey current) expectedRecord accepted world ∧ pre world)
       · apply Rules.Program.weaken
         · apply Rules.except_lift _ (ReplayContracts.preserving expected
             (ReplayContracts.observed_create expected worker _ _ known) stable)
           exact fun _ _ _ holds => holds
         · exact fun _ _ holds => holds.2
       · intro accepted
-        apply Rules.Program.weaken _ (checked_then expected _ _ accepted _ _ _ continued)
-        exact fun _ _ holds => ⟨holds.1.1, holds.2, holds.1.2⟩
+        apply Rules.Program.weaken _ (checked accepted)
+        exact fun _ _ holds => ⟨holds.1.1, holds.2, holds.1.2.trans (congrArg some holds.1.1.symm)⟩
 
 private theorem finish (expected : Journal) (worker : WorkerId) (branch : Location) (outcome : Exit)
     (encode : α → Json) (program : Cloud (SimM World) α) (current : Location)
@@ -213,13 +211,13 @@ private theorem parallel (expected : Journal) (worker : WorkerId) (assignment : 
       ((match (generalizing := false) joined with
         | .success wire => do
           let values ← Internal.decodeGroup codec count wire
-          walk (observed worker).records blobs assignment fuel encode (next.apply values) current.next true
+          execute (observed worker).records blobs assignment fuel encode (next.apply values) current.next
         | outcome => Internal.finish (observed worker).records assignment.branch outcome :
           ExceptT CloudError (SimM World) Progress).run)) :
     (ReplayContracts.rules expected).Program (Ready expected assignment) post
-      (walk (observed worker).records blobs assignment (fuel + 1) encode
-        (.impure info (.parallel codec count branches) next) current true).run := by
-  simp only [walk, Bool.true_or, Bool.not_true, Bool.false_and, Bool.false_eq_true, ite_false, ite_true]
+      (execute (observed worker).records blobs assignment (fuel + 1) encode
+        (.impure info (.parallel codec count branches) next) current).run := by
+  simp only [execute]
   apply Rules.except_bind (middle := fun record world =>
     ReplayContracts.ReadReply (ReplayStore.valueKey current) record world ∧ Ready expected assignment world)
   · apply Rules.except_lift _ (ReplayContracts.preserving expected
@@ -276,7 +274,7 @@ theorem active_bounded (expected : Journal)
       ∀ fuel, (ReplayContracts.rules expected).Program (Ready expected assignment)
       (fun result world => Result expected assignment.branch (Parallel.recorded encode outcome) encode program current result world ∧
         FuelBound fuel bound result ∧ ForksAfter assignment current result)
-      (walk (observed worker).records blobs assignment fuel encode program current true).run := by
+      (execute (observed worker).records blobs assignment fuel encode program current).run := by
   induction meaning with
   | pure value =>
     refine ⟨1, fun worker assignment encode branch known fuel => ?_⟩
@@ -284,7 +282,7 @@ theorem active_bounded (expected : Journal)
     | zero => exact fun _ _ _ => ⟨⟨rfl, by intro location count impossible; cases impossible⟩, Or.inr (by decide),
         by intro location count impossible; cases impossible⟩
     | succ fuel =>
-      simpa only [walk, Bool.true_or, ite_true, Parallel.recorded] using!
+      simpa only [execute, Parallel.recorded] using!
         finish expected worker assignment.branch (.success (encode value)) encode _ _ (Ready expected assignment) known
   | fail error next =>
     refine ⟨1, fun worker assignment encode branch known fuel => ?_⟩
@@ -292,7 +290,7 @@ theorem active_bounded (expected : Journal)
     | zero => exact fun _ _ _ => ⟨⟨rfl, by intro location count impossible; cases impossible⟩, Or.inr (by decide),
         by intro location count impossible; cases impossible⟩
     | succ fuel =>
-      simpa only [walk, Bool.true_or, ite_true, Parallel.recorded] using!
+      simpa only [execute, Parallel.recorded] using!
         finish expected worker assignment.branch (.failure error) encode _ _ (Ready expected assignment) known
   | delay next rest ih =>
     obtain ⟨bound, continued⟩ := ih nonempty
@@ -301,7 +299,7 @@ theorem active_bounded (expected : Journal)
     | zero => exact fun _ _ _ => ⟨⟨rfl, by intro location count impossible; cases impossible⟩, Or.inr (Nat.zero_lt_succ _),
         by intro location count impossible; cases impossible⟩
     | succ fuel =>
-      simp only [walk, Bool.true_or]
+      simp only [execute]
       apply Rules.Program.weaken_post _ _ (continued worker assignment encode branch known fuel)
       exact fun _ _ _ holds => ⟨holds.1.lift (fun _ path => path.delay next), holds.2.1.succ, holds.2.2⟩
   | exec codec label body next roundtrip present rest ih =>
@@ -311,9 +309,11 @@ theorem active_bounded (expected : Journal)
     | zero => exact fun _ _ _ => ⟨⟨rfl, by intro location count impossible; cases impossible⟩, Or.inr (Nat.zero_lt_succ _),
         by intro location count impossible; cases impossible⟩
     | succ fuel =>
-      simp only [walk, Bool.true_or, ite_true]
-      apply exec_then expected worker _ codec label body (Ready expected assignment)
-        (ready_stable expected assignment) present
+      simp only [execute]
+      apply Rules.except_bind_known _ _ _ _
+        (exec_recorded expected worker _ codec label body (Ready expected assignment)
+          (ready_stable expected assignment) present)
+      simp only [Internal.resume]
       apply Rules.except_bind_value _ _ _ (body ()) (decode expected _ codec _ _ roundtrip)
       apply Rules.Program.weaken_post _ _ (ReplayContracts.preserve_record expected _ _
         (continued worker assignment encode (by simpa using branch) known fuel))
@@ -359,8 +359,8 @@ theorem active_bounded (expected : Journal)
             exact ⟨Routing.Follows.refl _ nonempty, fun joining => by simpa [joining] using canFork⟩⟩)
       exact finish expected worker assignment.branch _ encode _ _ _ known
 
-/-- The entry point either reuses the specified durable return or invokes the
-certified replay walk. The return probe preserves the walk's precondition. -/
+/-- The entry point either reuses the specified durable return or reconstructs
+the assignment. The return probe preserves the reconstruction precondition. -/
 theorem entry [codec : Codec α] (expected : Journal) (worker : WorkerId) (fuel : Nat)
     (program : ι → Cloud (SimM World) α) (input : ι) (assignment : Assignment) (outcome : Exit)
     (known : expected.lookup (ReplayStore.returnKey assignment.branch) = some ⟨ReplayStore.returnRequest, outcome⟩)
@@ -371,7 +371,7 @@ theorem entry [codec : Codec α] (expected : Journal) (worker : WorkerId) (fuel 
       world.records.lookup (ReplayStore.returnKey assignment.branch) = some ⟨ReplayStore.returnRequest, outcome⟩ →
       post (.ok .done) world)
     (traversal : (ReplayContracts.rules expected).Program pre post
-      (walk (observed worker).records blobs assignment fuel codec.encode (program input) Location.root).run) :
+      (reconstruct (observed worker).records blobs assignment fuel codec.encode (program input) Location.root).run) :
     (ReplayContracts.rules expected).Program pre post
       (step (observed worker).records blobs fuel program input assignment).run := by
   unfold ReplayInterpreter.step

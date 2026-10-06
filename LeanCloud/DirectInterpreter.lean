@@ -14,6 +14,7 @@ open LeanEff
 namespace Internal
 
 mutual
+  /-- A value finishes evaluation; an effect supplies the value for its continuation. -/
   def eval {α : Type} {m : Type → Type u} [Monad m]
       (blobs : BlobStorage m) (program : Cloud m α) : ExceptT CloudError m α :=
     match program with
@@ -30,13 +31,17 @@ mutual
     | .fail error => throw error
     | .command _ operation => blobs.execute operation
     | .parallel _ _ branches => do
+      -- Run every child, keeping failures as values so they cannot skip later children.
       let outcomes ← liftM (m := m)
         (Array.ofFnM fun index => (eval blobs (branches index)).run)
+      -- Preserve array order and select the first error only after all children ran.
       match outcomes.mapM id with
       | .ok values => return values
       | .error error => throw error
   termination_by structural request
 
+  /-- Interpret lean-eff's queue of binds from left to right. Keeping the queue
+  explicit makes evaluation structurally recursive, without a fuel parameter. -/
   def evalContinuation {α β : Type} {m : Type → Type u} [Monad m]
       (blobs : BlobStorage m) (continuation : ArrsF (Control m) SourceSiteId α β) (value : α) :
       ExceptT CloudError m β :=

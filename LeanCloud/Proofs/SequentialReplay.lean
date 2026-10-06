@@ -38,7 +38,7 @@ theorem Verified.step {expected journal current} {encode : β → Json} {remaini
     (consistent : Extends journal expected)
     (known : expected.lookup (ReplayStore.returnKey assignment.branch) = some ⟨ReplayStore.returnRequest, outcome⟩)
     (verified : Verified blobs source expected assignment.branch outcome
-      (fun fuel => walk store blobs assignment fuel encode remaining current true) journal) :
+      (fun fuel => execute store blobs assignment fuel encode remaining current) journal) :
     Verified blobs source expected assignment.branch outcome (sourceSteps blobs source assignment) journal := by
   cases found : journal.lookup (ReplayStore.returnKey assignment.branch) with
   | none => exact verified.replace blobs source (cursor.step blobs source assignment atLocation found)
@@ -84,8 +84,8 @@ private theorem join_records (expected journal : Journal) (assignment : Assignme
     ∃ after, Extends journal after ∧ Extends after expected ∧
       after.lookup (ReplayStore.valueKey assignment.location) =
         some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, outcome⟩ ∧
-      ∀ fuel, (walk store blobs assignment (fuel + 1) encode (.impure info (.parallel codec count branches) next) assignment.location true).run journal =
-        (walk store blobs assignment (fuel + 1) encode (.impure info (.parallel codec count branches) next) assignment.location true).run after := by
+      ∀ fuel, (execute store blobs assignment (fuel + 1) encode (.impure info (.parallel codec count branches) next) assignment.location).run journal =
+        (execute store blobs assignment (fuel + 1) encode (.impure info (.parallel codec count branches) next) assignment.location).run after := by
   cases found : journal.lookup (ReplayStore.valueKey assignment.location) with
   | some record =>
     exact ⟨journal, .refl _, consistent, found.trans ((consistent _ _ found).symm.trans known), by intros; rfl⟩
@@ -119,14 +119,14 @@ private theorem parallel_runs (expected journal : Journal) (assignment : Assignm
         some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩,
           Parallel.recorded (fun values => Json.arr (values.map codec.encode)) ((Array.ofFn outcomes).mapM id)⟩ →
       Verified blobs source expected target.branch outcome
-        (fun fuel => walk store blobs target fuel encode (.impure info (.parallel codec count branches) next) current true) after) :
+        (fun fuel => execute store blobs target fuel encode (.impure info (.parallel codec count branches) next) current) after) :
     Verified blobs source expected assignment.branch outcome
-      (fun fuel => walk store blobs assignment fuel encode (.impure info (.parallel codec count branches) next) current true) journal := by
+      (fun fuel => execute store blobs assignment fuel encode (.impure info (.parallel codec count branches) next) current) journal := by
   have joinRun : ∀ after, Extends journal after → Extends after expected →
       Recording.JoinReady expected after current →
       ∀ target : Assignment, target.branch = assignment.branch → target.location = current → target.joining = true →
       Verified blobs source expected target.branch outcome
-        (fun fuel => walk store blobs target fuel encode (.impure info (.parallel codec count branches) next) current true) after := by
+        (fun fuel => execute store blobs target fuel encode (.impure info (.parallel codec count branches) next) current) after := by
     intro after grows compatible ready target same atLocation joining
     obtain ⟨recorded, extension, consistentAfter, present, executes⟩ := join_records blobs expected after target encode codec count branches next _
       joining compatible (by simpa only [atLocation] using group) (by simpa only [atLocation] using ready)
@@ -159,8 +159,7 @@ private theorem parallel_runs (expected journal : Journal) (assignment : Assignm
         have suspend : (current != assignment.location || !assignment.joining) = true := by
           cases joining : assignment.joining <;> simp_all
         dsimp only
-        rw [walk]
-        simp only [Bool.true_or]
+        rw [execute]
         erw [read_then]
         simp [found, suspend]
       · have same : (List.finRange count).map (fun (index : Fin count) => Assignment.mk 0 (current.child index) (current.child index) false) =
@@ -185,20 +184,20 @@ theorem complete_runs {expected current} {program : Cloud M β} {outcome}
         some ⟨ReplayStore.returnRequest, Parallel.recorded encode outcome⟩ →
       (assignment.joining = true → Recording.JoinReady expected journal assignment.location) →
       Verified blobs source expected assignment.branch (Parallel.recorded encode outcome)
-        (fun fuel => walk store blobs assignment fuel encode program current true) journal := by
+        (fun fuel => execute store blobs assignment fuel encode program current) journal := by
   induction meaning with
   | pure value =>
     intro encode journal assignment consistent cursor known ready
     apply (finish_verified blobs source expected journal assignment.branch _ consistent known).replace blobs source
-    exact ⟨1, fun fuel => by simp [Nat.add_comm 1 fuel, walk, Parallel.recorded]⟩
+    exact ⟨1, fun fuel => by simp [Nat.add_comm 1 fuel, execute, Parallel.recorded]⟩
   | fail error next =>
     intro encode journal assignment consistent cursor known ready
     apply (finish_verified blobs source expected journal assignment.branch _ consistent known).replace blobs source
-    exact ⟨1, fun fuel => by simp [Nat.add_comm 1 fuel, walk, Parallel.recorded]⟩
+    exact ⟨1, fun fuel => by simp [Nat.add_comm 1 fuel, execute, Parallel.recorded]⟩
   | delay next rest ih =>
     intro encode journal assignment consistent cursor known ready
     apply (ih encode journal assignment consistent (cursor.delay blobs source next) known ready).replace blobs source
-    exact ⟨1, fun fuel => by simp [Nat.add_comm 1 fuel, walk]⟩
+    exact ⟨1, fun fuel => by simp [Nat.add_comm 1 fuel, execute]⟩
   | exec codec label body next roundtrip present rest ih =>
     intro encode journal assignment consistent cursor known ready
     obtain ⟨after, grows, compatible, recorded, executes⟩ := Recording.exec_within encode journal expected blobs assignment _ codec label body next roundtrip consistent present

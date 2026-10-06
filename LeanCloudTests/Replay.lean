@@ -93,6 +93,40 @@ private def reverseCompletion (fails : Bool) : TestCase :=
     assertOutcome (ReplayInterpreter.result (m := Id) outcome).run expected⟩
 
 def replayCases : Array TestCase := invalidReplayCases ++ #[
+  ⟨"replay/reconstruction-fuel-and-observations", do
+    let calls ← IO.mkRef (#[] : Array String)
+    let counted (label : String) (value : Nat) : Cloud IO Nat := Cloud.exec (fun _ => do
+      calls.modify (·.push label)
+      return value) label
+    let source : Cloud IO Nat := do
+      let value ← counted "prefix" 7
+      let values ← Cloud.parallel #[counted "child" (value + 1)]
+      return values[0]!
+    let saved ← IO.mkRef ([] : Records)
+    let fork := Location.root.next
+    assertOutcome (← resume (memoryStore saved) source) (.ok (.fork fork 1))
+    let prefixRecords ← saved.get
+    let child := fork.child 0
+    let assignment : Assignment := ⟨1, child, child, false⟩
+    -- Replay prefix command, descend at the fork, execute child command, return.
+    let path := #[Location.root, fork, child, child.next]
+    for fuel in [:6] do
+      saved.set prefixRecords
+      calls.set #[]
+      let visits ← IO.mkRef (#[] : Array Location)
+      let observer : ReplayInterpreter.Observer IO := fun location _ => visits.modify (·.push location)
+      let outcome ← (ReplayInterpreter.step (memoryStore saved) noBlobs fuel
+        (fun _ : Unit => source) () assignment (some observer)).run
+      if fuel < 4 then assertError outcome .protocol
+      else assertOutcome outcome (.ok .done)
+      assertEq (← visits.get) (path.extract 0 fuel) "Phase transition changed source observations"
+      assertEq (← calls.get) (if fuel < 3 then #[] else #["child"]) "Reconstruction executed user code"
+      assertEq ((← saved.get).lookup (ReplayStore.returnKey child)).isSome (fuel ≥ 4)
+        "Phase transition consumed extra fuel"
+    -- An already completed assignment bypasses both phases, even without fuel.
+    let visit : ReplayInterpreter.Observer IO := fun _ _ => throw (IO.userError "Observed a completed assignment")
+    assertOutcome (← (ReplayInterpreter.step (memoryStore saved) noBlobs 0
+      (fun _ : Unit => source) () assignment (some visit)).run) (.ok .done)⟩,
   ⟨"replay/cancelled-result-is-terminal", do
     let saved ← IO.mkRef ([] : Records)
     let store := memoryStore saved
