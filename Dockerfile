@@ -4,11 +4,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsqlite3-dev freetds-dev default-libmysqlclient-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
 ARG TARGETARCH
-RUN set -eux; \
+ARG LEAN_VERSION=4.34.1
+RUN set -eu; \
     case "$TARGETARCH" in arm64) platform=linux_aarch64 ;; amd64) platform=linux ;; *) exit 1 ;; esac; \
-    curl -fL --retry 3 "https://github.com/leanprover/lean4/releases/download/v4.34.1/lean-4.34.1-${platform}.tar.zst" \
+    curl -fL --retry 3 --connect-timeout 20 --max-time 180 --retry-max-time 180 \
+      "https://github.com/leanprover/lean4/releases/download/v${LEAN_VERSION}/lean-${LEAN_VERSION}-${platform}.tar.zst" \
       | tar --zstd -x -C /opt; \
-    ln -s "/opt/lean-4.34.1-${platform}" /opt/lean
+    ln -s "/opt/lean-${LEAN_VERSION}-${platform}" /opt/lean
 ENV PATH="/opt/lean/bin:${PATH}"
 RUN apt-get update && apt-get install -y --no-install-recommends libcurl4-openssl-dev \
     && rm -rf /var/lib/apt/lists/*

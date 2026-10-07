@@ -79,108 +79,74 @@ jobs:
         uses: docker/setup-buildx-action@v4
 
       - name: Restore Docker layers
-        uses: actions/cache@v5
+        id: layers
+        uses: actions/cache/restore@v5
         with:
           path: .lean-cloud/buildkit
           key: ${{ runner.os }}-${{ runner.arch }}-buildkit-zstd-v1-${{ hashFiles('lean-toolchain') }}-${{ github.sha }}
           restore-keys: |
             ${{ runner.os }}-${{ runner.arch }}-buildkit-zstd-v1-${{ hashFiles('lean-toolchain') }}-
 
-      # One builder and one demo image serve all three demo suites. Separate
-      # runners previously compiled and exported the same image three times.
-      - name: Build deployment image (cached)
-        id: demo
-        timeout-minutes: 4
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          target: worker
-          load: true
-          tags: lean-cloud-ci:demo
-          cache-from: |
-            type=local,src=.lean-cloud/buildkit/demo
-            type=gha,scope=demo,timeout=30s
-
       - name: Prepare generated chaos application
-        id: fixture
-        if: ${{ !cancelled() && steps.driver.outcome == 'success' && steps.buildx.outcome == 'success' }}
         timeout-minutes: 1
         run: lake exe cloud_console_tests --prepare-chaos-image
 
-      - name: Build generated chaos image (cached)
-        id: chaos
-        if: ${{ !cancelled() && steps.fixture.outcome == 'success' }}
-        timeout-minutes: 4
-        uses: docker/build-push-action@v7
-        with:
-          context: .lean-cloud/ci-chaos/application
-          file: .lean-cloud/ci-chaos/application/.lean-cloud/ci-chaos/deployment/Dockerfile
-          build-contexts: |
-            sdk=.
-            node_assets=.lean-cloud/ci-chaos/application/.lean-cloud/ci-chaos/deployment
-          build-args: |
-            APP_TARGET=cloud_app
-            LEAN_VERSION=${{ steps.lean.outputs.version }}
-          load: true
-          tags: lean-cloud-ci:chaos
-          cache-from: |
-            type=local,src=.lean-cloud/buildkit/chaos
-            type=gha,scope=chaos,timeout=30s
-
-      - name: Check deployed runtime suites concurrently
-        if: ${{ !cancelled() && (steps.demo.outcome == 'success' || steps.chaos.outcome == 'success') }}
-        timeout-minutes: 7
+      # Bake schedules both builds together and deduplicates their identical
+      # toolchain steps. Normal CLI deploy calls reuse the resulting builder.
+      - name: Build runtime images together
+        id: images
+        timeout-minutes: 5
+        uses: docker/bake-action@v7
         env:
-          BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
-          DEMO_READY: ${{ steps.demo.outcome }}
-          CHAOS_READY: ${{ steps.chaos.outcome }}
-        shell: bash
-        run: |
-          suites=()
-          if [[ "$DEMO_READY" == success ]]; then suites+=(lifecycle pool scaling); fi
-          if [[ "$CHAOS_READY" == success ]]; then suites+=(chaos); fi
-          bash .github/scripts/check-runtime.sh "${suites[@]}"
-
-      # Cache transfer is optional and timed separately from compilation/tests.
-      # It must neither delay test feedback nor make a successful suite fail.
-      - name: Save demo image cache
-        if: ${{ !cancelled() && steps.demo.outcome == 'success' }}
-        timeout-minutes: 1
-        continue-on-error: true
-        uses: docker/build-push-action@v7
+          LEAN_VERSION: ${{ steps.lean.outputs.version }}
         with:
-          context: .
-          target: worker
-          outputs: type=cacheonly
-          cache-to: type=local,dest=.lean-cloud/buildkit-next/demo,mode=max,compression=zstd,compression-level=1,ignore-error=true
+          source: .
+          files: .github/docker-bake.hcl
+          set: |
+            *.cache-from+=type=gha,scope=demo,timeout=30s
+            *.cache-from+=type=gha,scope=chaos,timeout=30s
 
-      - name: Save generated chaos image cache
-        if: ${{ !cancelled() && steps.chaos.outcome == 'success' }}
-        timeout-minutes: 1
-        continue-on-error: true
-        uses: docker/build-push-action@v7
-        with:
-          context: .lean-cloud/ci-chaos/application
-          file: .lean-cloud/ci-chaos/application/.lean-cloud/ci-chaos/deployment/Dockerfile
-          build-contexts: |
-            sdk=.
-            node_assets=.lean-cloud/ci-chaos/application/.lean-cloud/ci-chaos/deployment
-          build-args: |
-            APP_TARGET=cloud_app
-            LEAN_VERSION=${{ steps.lean.outputs.version }}
-          outputs: type=cacheonly
-          cache-to: type=local,dest=.lean-cloud/buildkit-next/chaos,mode=max,compression=zstd,compression-level=1,ignore-error=true
-
-      - name: Replace exported layer caches
+      - name: Collect completed image caches
+        id: exported
         if: ${{ !cancelled() }}
         run: |
           mkdir -p .lean-cloud/buildkit
+          available=false
           for image in demo chaos; do
             if [[ -f ".lean-cloud/buildkit-next/$image/index.json" ]]; then
               rm -rf ".lean-cloud/buildkit/$image"
               mv ".lean-cloud/buildkit-next/$image" ".lean-cloud/buildkit/$image"
+              available=true
             fi
           done
+          # Both exports contain the shared toolchain. Hard links let the cache
+          # archive store each immutable, content-addressed blob only once.
+          for blob in .lean-cloud/buildkit/chaos/blobs/sha256/*; do
+            common=".lean-cloud/buildkit/demo/blobs/sha256/${blob##*/}"
+            if [[ -f "$blob" && -f "$common" && ! "$blob" -ef "$common" ]]; then
+              ln -f "$common" "$blob"
+            fi
+          done
+          echo "available=$available" >> "$GITHUB_OUTPUT"
+
+      # Save explicitly before tests: a later assertion failure or job timeout
+      # must not discard the expensive setup. Preserve any completed image even
+      # when its sibling build failed. The cache is only an optimization.
+      - name: Save Docker layers before tests
+        if: ${{ !cancelled() && steps.exported.outputs.available == 'true' && steps.layers.outputs.cache-hit != 'true' }}
+        timeout-minutes: 1
+        continue-on-error: true
+        uses: actions/cache/save@v5
+        with:
+          path: .lean-cloud/buildkit
+          key: ${{ steps.layers.outputs.cache-primary-key }}
+
+      - name: Check deployed runtime suites concurrently
+        if: ${{ !cancelled() && steps.images.outcome == 'success' }}
+        timeout-minutes: 7
+        env:
+          BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
+        run: bash .github/scripts/check-runtime.sh lifecycle pool scaling chaos
 
       - name: Upload runtime diagnostics on failure
         if: failure() || cancelled()

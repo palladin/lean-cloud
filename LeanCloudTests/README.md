@@ -17,10 +17,10 @@ lake exe cloud_chaos --seed 1
 ```
 
 CI runs library/proof checks separately from Docker integration on pull requests
-and pushes to `main`. The Docker job builds the demo image once, then runs CLI
-lifecycle, pool recovery, and scaling against that same builder. It also builds
-and tests the generated chaos application. The four suites run concurrently on
-isolated deployments, using the already-built test driver. The runner waits for
+and pushes to `main`. Docker Bake builds the demo and generated chaos images
+together, sharing identical toolchain setup steps. CLI lifecycle, pool recovery,
+scaling, and generated chaos use that same builder. The four suites run concurrently
+on isolated deployments, using the already-built test driver. The runner waits for
 every suite and fails if any suite fails; one failure does not cancel the others.
 Both CI jobs have a ten-minute execution limit. Each runtime suite has a
 six-minute limit; a timeout fails the check rather than omitting tests.
@@ -37,9 +37,13 @@ changes. Each suite then uses that same builder for its ordinary `deploy` calls;
 deployment, compilation checks, and recovery assertions are still exercised.
 Docker layers use fast zstd compression and one Actions cache archive, avoiding
 separate uploads for each layer. Existing GitHub BuildKit caches remain a fallback
-with a 30-second request limit. Exports run after tests in separate one-minute
-steps; export failures do not fail the job or hide test failures. New exports
-replace old directories only after an index is written, avoiding cache growth.
+with a 30-second request limit. Each image exports its cache during the build.
+Completed exports replace old directories only after an index is written,
+avoiding cache growth. Shared toolchain blobs are hard-linked so the archive stores
+them once. An explicit one-minute cache save runs before the tests,
+so later test failures or timeouts do not discard completed image caches. Cache
+save failures do not fail the job or hide test failures. No runtime suite is
+omitted from a successful run; both images must build before the suites start.
 An empty cache still performs the complete build. A cold build or infrastructure
 stall may hit the ten-minute job limit; that is a failed run, not a passing run
 with omitted tests. Queueing for a GitHub runner is outside the execution limit.
