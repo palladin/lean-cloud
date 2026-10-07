@@ -13,7 +13,9 @@ target "common" {
     "type=local,src=.lean-cloud/buildkit/demo",
     "type=local,src=.lean-cloud/buildkit/chaos"
   ]
-  output = ["type=docker"]
+  // CLI deploy loads its own deployment image from this builder's cache.
+  // Exporting extra, unused images to the Docker daemon wastes setup time.
+  output = ["type=cacheonly"]
 }
 
 target "demo" {
@@ -21,7 +23,6 @@ target "demo" {
   context = "."
   dockerfile = "Dockerfile"
   target = "worker"
-  tags = ["lean-cloud-ci:demo"]
   cache-to = ["type=local,dest=.lean-cloud/buildkit-next/demo,mode=max,compression=zstd,compression-level=1,ignore-error=true"]
 }
 
@@ -34,6 +35,5 @@ target "chaos" {
     node_assets = ".lean-cloud/ci-chaos/application/.lean-cloud/ci-chaos/deployment"
   }
   args = { APP_TARGET = "cloud_app" }
-  tags = ["lean-cloud-ci:chaos"]
   cache-to = ["type=local,dest=.lean-cloud/buildkit-next/chaos,mode=max,compression=zstd,compression-level=1,ignore-error=true"]
 }

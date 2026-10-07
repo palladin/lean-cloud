@@ -28,12 +28,18 @@ Failures retain build/startup output, the test transcript, and available schedul
 worker, and blob-service logs and health state for seven days. Test containers and
 volumes are isolated from the user's deployment and cleaned up after each suite.
 
-Native setup installs only missing packages, with bounded download and lock waits.
+Native setup installs only missing packages. It first uses the runner's package
+indexes; failed downloads retry with fresh, signed indexes from Ubuntu's official
+archive. Download, refresh, and offline installation have separate limits within
+the five-minute setup budget. CI checks timeout recovery and failure propagation
+without touching system packages.
 CI caches the pinned Lean toolchain and Lake build outputs. Proof checks and tests
 still run on every commit. Docker image preparation is a separate timed step,
 using persistent BuildKit caches for the demo and generated chaos application.
 Dependencies are compiled in image layers so they survive cache export and source
-changes. Each suite then uses that same builder for its ordinary `deploy` calls;
+changes. CI files are excluded from the Docker context. Image preparation fills
+the build cache without loading unused images into Docker. Each suite then uses
+that same builder for its ordinary `deploy` calls;
 deployment, compilation checks, and recovery assertions are still exercised.
 Docker layers use fast zstd compression and one Actions cache archive, avoiding
 separate uploads for each layer. Existing GitHub BuildKit caches remain a fallback

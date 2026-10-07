@@ -20,6 +20,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check native installer recovery
+        run: bash .github/scripts/test-install-native.sh
+
       - name: Install native build tools
         timeout-minutes: 5
         run: |
