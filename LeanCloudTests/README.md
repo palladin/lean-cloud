@@ -16,8 +16,10 @@ lake exe cloud_runtime_tests
 lake exe cloud_chaos --seed 1
 ```
 
-CI runs library/proof checks separately from Docker integration on pull requests
-and pushes to `main`. Docker Bake builds the demo and generated chaos images
+CI runs library/proof checks on pull requests and pushes to `main`, then passes
+the compiled CLI and test driver to the Docker job. Both jobs use Ubuntu 24.04;
+the Docker job uses the runner's libcurl runtime and installs no native development
+packages or Lean toolchain. Docker Bake builds the demo and generated chaos images
 together, sharing identical toolchain setup steps. CLI lifecycle, pool recovery,
 scaling, and generated chaos use that same builder. The four suites run concurrently
 on isolated deployments, using the already-built test driver. The runner waits for

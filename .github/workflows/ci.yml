@@ -17,6 +17,8 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    outputs:
+      lean_version: ${{ steps.lean.outputs.version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -29,6 +31,7 @@ jobs:
           bash .github/scripts/install-native.sh build-essential pkg-config tzdata libcurl4-openssl-dev libsqlite3-dev libpq-dev freetds-dev default-libmysqlclient-dev
 
       - uses: ./.github/actions/setup-lean
+        id: lean
         with:
           scope: tests
 
@@ -37,8 +40,23 @@ jobs:
 
       - name: Build the console and native process tests
         run: |
-          lake build lean_cloud cloud_process_tests
+          lake build lean_cloud cloud_process_tests cloud_console_tests
           cc -std=c11 -O2 -Wall -Wextra -Werror LeanCloudCli/Templates/node.c -o /tmp/cloud-node
+
+      - name: Package runtime test executables
+        run: |
+          mkdir -p .lean-cloud
+          tar -C .lake/build/bin -cf .lean-cloud/runtime-driver.tar lean_cloud cloud_console_tests
+
+      - name: Share runtime test executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-driver
+          path: .lean-cloud/runtime-driver.tar
+          include-hidden-files: true
+          compression-level: 1
+          retention-days: 1
+          if-no-files-found: error
 
       - name: Run tests
         run: lake test
@@ -52,29 +70,26 @@ jobs:
 
   runtime:
     name: Runtime
+    needs: test
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install native build tools
-        timeout-minutes: 5
-        run: |
-          bash .github/scripts/install-native.sh build-essential pkg-config tzdata libcurl4-openssl-dev libsqlite3-dev
-
-      - uses: ./.github/actions/setup-lean
-        id: lean
+      # Both jobs use the same Ubuntu image and architecture. The CLI loads the
+      # runner's libcurl runtime; it needs no headers or Lean installation here.
+      - name: Download runtime test executables
+        uses: actions/download-artifact@v5
         with:
-          scope: console
+          name: runtime-driver
+          path: .lean-cloud
 
-      - name: Build runtime test driver
-        id: driver
-        timeout-minutes: 5
-        shell: bash
+      - name: Unpack runtime test executables
         run: |
-          set -o pipefail
-          mkdir -p .lean-cloud/ci-runtime-logs
-          lake build lean_cloud cloud_console_tests 2>&1 | tee .lean-cloud/ci-runtime-logs/build.log
+          mkdir -p .lake/build/bin
+          tar -C .lake/build/bin -xf .lean-cloud/runtime-driver.tar
+          test -x .lake/build/bin/lean_cloud
+          test -x .lake/build/bin/cloud_console_tests
 
       - name: Set up Docker build cache
         id: buildx
@@ -92,7 +107,7 @@ jobs:
 
       - name: Prepare generated chaos application
         timeout-minutes: 1
-        run: lake exe cloud_console_tests --prepare-chaos-image
+        run: .lake/build/bin/cloud_console_tests --prepare-chaos-image
 
       # Bake schedules both builds together and deduplicates their identical
       # toolchain steps. Normal CLI deploy calls reuse the resulting builder.
@@ -101,7 +116,7 @@ jobs:
         timeout-minutes: 5
         uses: docker/bake-action@v7
         env:
-          LEAN_VERSION: ${{ steps.lean.outputs.version }}
+          LEAN_VERSION: ${{ needs.test.outputs.lean_version }}
         with:
           source: .
           files: .github/docker-bake.hcl
