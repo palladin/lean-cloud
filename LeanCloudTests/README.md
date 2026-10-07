@@ -11,15 +11,42 @@ lake exe lean_cloud_tests pool
 lake exe cloud_console_tests
 lake exe cloud_console_tests --pool-only
 lake exe cloud_console_tests --scaling-only
+lake exe cloud_console_tests --chaos-only --seed 1
 lake exe cloud_runtime_tests
 lake exe cloud_chaos --seed 1
 ```
 
-CI runs the real pool recovery and scaling suites in separate Docker jobs on
-pull requests and pushes to `main`. A failed suite does not cancel the other.
+CI runs the real pool recovery, scaling, and generated chaos suites in separate
+Docker jobs on pull requests and pushes to `main`. A failed suite does not cancel
+the others.
 Failures retain build/startup output, the test transcript, and available scheduler,
 worker, and blob-service logs and health state for seven days. Test containers and
 volumes are isolated from the user's deployment and cleaned up after each suite.
+
+CI caches the pinned Lean toolchain and Lake build outputs. Proof checks and tests
+still run on every commit. Docker image preparation is a separate timed step,
+using persistent BuildKit caches for the demo and generated chaos application.
+Dependencies are compiled in image layers so they survive cache export and source
+changes. Each suite then uses that same builder for its ordinary `deploy` calls;
+deployment, compilation checks, and recovery assertions are still exercised.
+An empty cache performs the complete build, and cache export failures do not hide
+test failures. The first run populating these caches will still take longer.
+
+`--chaos-only` deploys a test application on the production shared pool: three
+workers, one scheduler, and S3-compatible blob storage. Three generated pure
+workflows run together, with nested parallel groups, captured inputs, dependent
+binds, and competing failures. Six seeded faults kill and restart active scheduler
+or worker nodes, with later faults waiting for completed branches. After faults
+stop, every durable result must equal direct evaluation, including the selected
+error. A final scheduler restart checks that
+completed outcomes survive. No timing effects or interpreter hooks are added to
+the workflows. The test fails if it cannot find active work to exercise.
+
+The retained test directory contains `chaos-plan.json` with inputs, program trees,
+expected outcomes, and the fault plan, plus `chaos-events.jsonl` with observed
+assignments, actual victims, restart evidence, and results. CI retains these on
+failure along with node logs. `--seed N` reproduces generated programs and fault
+choices; concurrent timing and the set of busy workers may differ.
 
 The generator produces finite Cloud programs containing values, recorded pure
 computations, blobs, delays, failures, captured inputs, dependent binds, and nested

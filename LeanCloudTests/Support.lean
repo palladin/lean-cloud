@@ -1,4 +1,5 @@
 import LeanCloud
+import LeanCloudTests.GeneratedProgram
 
 namespace LeanCloudTests
 open Lean LeanCloud
@@ -64,8 +65,6 @@ def event (start : Start) (event : Simulation.Event 4) (state : Machine) : Excep
   match SimulationBackend.step start event state with
   | .ok state => pure state
   | .error error => throw (reprStr error)
-
-def nextSeed (seed : Nat) : Nat := (1664525 * seed + 1013904223) % 4294967296
 
 /-- Finite chaos followed by fair delivery and actor scheduling. Includes crashes
 of the scheduler, lost or late remote requests, duplicate messages, redelivery, and expiry.

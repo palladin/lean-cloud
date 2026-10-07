@@ -1,0 +1,41 @@
+name: Set up cached Lean builds
+description: Restore the pinned Lean toolchain and incremental Lake build outputs
+inputs:
+  scope:
+    description: Keep the full test build separate from the console-only build
+    required: true
+outputs:
+  version:
+    description: Lean release selected by lean-toolchain
+    value: ${{ steps.elan.outputs.version }}
+runs:
+  using: composite
+  steps:
+    - name: Cache Lean toolchain
+      uses: actions/cache@v5
+      with:
+        path: ~/.elan
+        key: ${{ runner.os }}-${{ runner.arch }}-elan-v1-${{ hashFiles('lean-toolchain') }}
+
+    - name: Install elan
+      id: elan
+      shell: bash
+      run: |
+        if [ ! -x "$HOME/.elan/bin/elan" ]; then
+          curl -fsSL https://github.com/leanprover/elan/releases/latest/download/elan-x86_64-unknown-linux-gnu.tar.gz -o /tmp/elan.tar.gz
+          tar -xzf /tmp/elan.tar.gz -C /tmp
+          /tmp/elan-init -y --default-toolchain none
+        fi
+        echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+        read -r lean_toolchain < lean-toolchain
+        printf 'version=%s\n' "${lean_toolchain#leanprover/lean4:v}" >> "$GITHUB_OUTPUT"
+
+    - name: Cache Lake build outputs
+      uses: actions/cache@v5
+      with:
+        path: |
+          .lake
+          runtime/.lake
+        key: ${{ runner.os }}-${{ runner.arch }}-lake-v1-${{ inputs.scope }}-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json', 'runtime/lakefile.lean', 'runtime/lake-manifest.json', '.github/actions/setup-lean/action.yml') }}-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-${{ runner.arch }}-lake-v1-${{ inputs.scope }}-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json', 'runtime/lakefile.lean', 'runtime/lake-manifest.json', '.github/actions/setup-lean/action.yml') }}-

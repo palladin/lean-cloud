@@ -90,14 +90,22 @@ def runtimeConfig (config : Json) (workers : Nat) : Except String Json := do
         ("endpoint", prototype.setObjVal! "host" (toJson (name ++ "-mailbox")))])
   return config.setObjVal! "mailboxes" (mailboxes.setObjVal! "workers" (toJson routes))
 
-private def sdkCopy : String := "COPY --from=sdk lean-toolchain lakefile.lean lake-manifest.json LeanCloud.lean /opt/lean-cloud/\n" ++
+private def sdkCopy : String := "COPY --from=sdk lean-toolchain lakefile.lean lake-manifest.json /opt/lean-cloud/\n" ++
+  "COPY --from=sdk runtime/lakefile.lean runtime/lake-manifest.json /opt/lean-cloud/runtime/\n" ++
+  -- Compile in the application's workspace, so Lake uses the same transitive
+  -- package directories here and when it links the final executable.
+  "WORKDIR /src\nCOPY lakefile.lean lean-toolchain ./\n" ++
+  "RUN lake -KleanCloudSdk=/opt/lean-cloud update lean_cloud_runtime && " ++
+  "lake -KleanCloudSdk=/opt/lean-cloud build LeanEff LeanLinq LeanLinq.Driver.Sqlite\n" ++
+  "COPY --from=sdk LeanCloud.lean /opt/lean-cloud/\n" ++
   "COPY --from=sdk LeanCloud /opt/lean-cloud/LeanCloud\n" ++
   "COPY --from=sdk LeanCloudCli /opt/lean-cloud/LeanCloudCli\n" ++
   "COPY --from=sdk native /opt/lean-cloud/native\n" ++
   "COPY --from=sdk deploy /opt/lean-cloud/deploy\n" ++
-  "COPY --from=sdk runtime/lakefile.lean runtime/lake-manifest.json runtime/LeanCloudRuntime.lean /opt/lean-cloud/runtime/\n" ++
+  "COPY --from=sdk runtime/LeanCloudRuntime.lean /opt/lean-cloud/runtime/\n" ++
   "COPY --from=sdk runtime/LeanCloudRuntime /opt/lean-cloud/runtime/LeanCloudRuntime\n" ++
-  "COPY --from=sdk runtime/native /opt/lean-cloud/runtime/native"
+  "COPY --from=sdk runtime/native /opt/lean-cloud/runtime/native\n" ++
+  "RUN lake -KleanCloudSdk=/opt/lean-cloud build LeanCloudRuntime"
 
 def dockerfile (localSdk : Bool) : String :=
   (include_str "Templates/Dockerfile")

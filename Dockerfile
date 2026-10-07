@@ -18,15 +18,20 @@ FROM toolchain AS node-build
 COPY LeanCloudCli/Templates/node.c /tmp/node.c
 RUN cc -O2 -Wall -Wextra -Werror /tmp/node.c -o /usr/local/bin/cloud-node
 
-FROM toolchain AS build
-COPY . .
+FROM toolchain AS dependencies
+# Keep dependencies in ordinary layers: external BuildKit caches do not export
+# the contents of RUN cache mounts. Source changes retain this compiled layer.
+COPY lean-toolchain lakefile.lean lake-manifest.json ./
+COPY runtime/lakefile.lean runtime/lake-manifest.json ./runtime/
 WORKDIR /src/runtime
-RUN --mount=type=cache,id=lean-cloud-runtime,target=/src/runtime/.lake,sharing=locked --mount=type=cache,target=/src/.lake \
-    lake build cloud_demo && mkdir -p /out && cp .lake/build/bin/cloud_demo /out/cloud_demo
+RUN lake build LeanEff LeanLinq LeanLinq.Driver.Sqlite
+
+FROM dependencies AS build
+COPY . /src
+RUN lake build cloud_demo && mkdir -p /out && cp .lake/build/bin/cloud_demo /out/cloud_demo
 
 FROM build AS integration-build
-RUN --mount=type=cache,id=lean-cloud-runtime,target=/src/runtime/.lake,sharing=locked --mount=type=cache,target=/src/.lake \
-    lake build cloud_integration_tests && cp .lake/build/bin/cloud_integration_tests /out/cloud_integration_tests
+RUN lake build cloud_integration_tests && cp .lake/build/bin/cloud_integration_tests /out/cloud_integration_tests
 
 FROM ubuntu:24.04 AS runner
 RUN apt-get update && apt-get install -y --no-install-recommends \

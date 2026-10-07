@@ -1,0 +1,13 @@
+import LeanCloudRuntime
+import ChaosFixture.PoolWorkload
+
+open LeanCloud LeanCloudRuntime LeanCloudTests
+
+def program : CloudProgram PoolWorkload.Input Nat := {
+  name := "generated"
+  version := "v1"
+  run := PoolWorkload.workflow
+}
+
+def main (args : List String) : IO UInt32 :=
+  Application.main ⟨#[program.register #[]]⟩ args

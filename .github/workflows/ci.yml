@@ -25,12 +25,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config tzdata libcurl4-openssl-dev libsqlite3-dev libpq-dev freetds-dev default-libmysqlclient-dev
 
-      - name: Install elan
-        run: |
-          curl -fsSL https://github.com/leanprover/elan/releases/latest/download/elan-x86_64-unknown-linux-gnu.tar.gz -o /tmp/elan.tar.gz
-          tar -xzf /tmp/elan.tar.gz -C /tmp
-          /tmp/elan-init -y --default-toolchain none
-          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - uses: ./.github/actions/setup-lean
+        with:
+          scope: tests
 
       - name: Check library and proofs
         run: lake build
@@ -50,7 +47,23 @@ jobs:
         working-directory: runtime
         run: lake exe cloud_inbox_tests
 
+      - name: Set up Docker build cache
+        id: buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build deployment image (cached)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: worker
+          load: true
+          tags: lean-cloud-ci:demo
+          cache-from: type=gha,scope=demo
+          cache-to: type=gha,scope=demo,mode=max,ignore-error=true
+
       - name: Check CLI commands against Docker services
+        env:
+          BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
         run: lake exe cloud_console_tests --lifecycle-only
 
       - name: Upload CLI command logs on failure
@@ -69,7 +82,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [pool, scaling]
+        suite: [pool, scaling, chaos]
     steps:
       - uses: actions/checkout@v4
 
@@ -78,12 +91,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config tzdata libcurl4-openssl-dev libsqlite3-dev
 
-      - name: Install elan
-        run: |
-          curl -fsSL https://github.com/leanprover/elan/releases/latest/download/elan-x86_64-unknown-linux-gnu.tar.gz -o /tmp/elan.tar.gz
-          tar -xzf /tmp/elan.tar.gz -C /tmp
-          /tmp/elan-init -y --default-toolchain none
-          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - uses: ./.github/actions/setup-lean
+        id: lean
+        with:
+          scope: console
 
       - name: Build runtime test driver
         shell: bash
@@ -92,7 +103,45 @@ jobs:
           mkdir -p .lean-cloud/ci-runtime-logs
           lake build lean_cloud cloud_console_tests 2>&1 | tee .lean-cloud/ci-runtime-logs/build.log
 
+      - name: Set up Docker build cache
+        id: buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build deployment image (cached)
+        if: matrix.suite != 'chaos'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: worker
+          load: true
+          tags: lean-cloud-ci:demo
+          cache-from: type=gha,scope=demo
+          cache-to: type=gha,scope=demo,mode=max,ignore-error=true
+
+      - name: Prepare generated chaos application
+        if: matrix.suite == 'chaos'
+        run: lake exe cloud_console_tests --prepare-chaos-image
+
+      - name: Build generated chaos image (cached)
+        if: matrix.suite == 'chaos'
+        uses: docker/build-push-action@v7
+        with:
+          context: .lean-cloud/ci-chaos/application
+          file: .lean-cloud/ci-chaos/application/.lean-cloud/ci-chaos/deployment/Dockerfile
+          build-contexts: |
+            sdk=.
+            node_assets=.lean-cloud/ci-chaos/application/.lean-cloud/ci-chaos/deployment
+          build-args: |
+            APP_TARGET=cloud_app
+            LEAN_VERSION=${{ steps.lean.outputs.version }}
+          load: true
+          tags: lean-cloud-ci:chaos
+          cache-from: type=gha,scope=chaos
+          cache-to: type=gha,scope=chaos,mode=max,ignore-error=true
+
       - name: Check deployed ${{ matrix.suite }}
+        env:
+          BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
         shell: bash
         run: |
           set -o pipefail
@@ -110,5 +159,8 @@ jobs:
             .lean-cloud/lean-cloud-console-test-*/logs/*.log
             .lean-cloud/lean-cloud-scaling-test-*/failure-*.log
             .lean-cloud/lean-cloud-scaling-test-*/logs/*.log
+            .lean-cloud/lean-cloud-pool-chaos-test-*/application/.lean-cloud/*/chaos-*
+            .lean-cloud/lean-cloud-pool-chaos-test-*/application/.lean-cloud/*/failure-*.log
+            .lean-cloud/lean-cloud-pool-chaos-test-*/application/.lean-cloud/*/logs/*.log
           include-hidden-files: true
           if-no-files-found: ignore

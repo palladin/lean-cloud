@@ -159,6 +159,7 @@ migration.
 lake test
 (cd runtime && lake exe cloud_inbox_tests)
 lake exe cloud_console_tests
+lake exe cloud_console_tests --chaos-only --seed 1
 lake exe cloud_runtime_tests
 lake exe cloud_chaos --seed 1 --crashes 8 --workers 3
 ```
@@ -172,7 +173,10 @@ the real HTTP scheduler and private SQLite. Generated Pool model tests interleav
 multiple workflows, restarts, controls, scaling, and delayed worker operations,
 then compare durable results with direct evaluation.
 Console tests cover the production layout, shared processes,
-controls, scaling, generated applications, and node restarts. Component tests run
+controls, scaling, generated applications, and node restarts. The pool chaos suite
+runs generated pure workflows together on those combined nodes, crashes and
+restarts workers and the scheduler, then compares durable outcomes with direct
+evaluation. Component tests run
 HTTP inboxes separately to inject transport faults and compare generated cloud
 programs with the direct interpreter. These standalone inboxes are test fixtures;
 production nodes keep HTTP, SQLite, and their actor in one process.
