@@ -79,6 +79,21 @@ private def cleanup (ctx : Context) : Cli Unit := do
   for tag in images.stdout.splitOn "\n" do
     if tag.startsWith (ctx.project ++ "-app:") then discard <| docker #["image", "rm", tag] false
 
+/-- Capture the combined nodes and blob service before cleanup removes them.
+Record only container state, not configuration or credentials. -/
+private def captureFailure (ctx : Context) : Cli Unit := do
+  let save (name : String) (action : Cli ProcessOutput) : Cli Unit := do
+    let content ← match ← observing action with
+      | .ok output => pure s!"exit={output.exitCode}\n{output.stdout}{output.stderr}"
+      | .error error => pure error
+    request (.writeFile (ctx.home / s!"failure-{name}.log") content)
+  match ← observing ctx.nodes with
+  | .error error => request (.writeFile (ctx.home / "failure-inventory.log") error)
+  | .ok nodes =>
+    for node in nodes do
+      save s!"{node.name}-state" (docker #["inspect", "--format", "{{json .State}}", node.name] false)
+      save node.name (docker #["logs", "--timestamps", "--tail", "2000", node.name] false)
+
 def demo : Cli Unit := do
   let root ← request (.realPath (← request .currentDir))
   let ctx : Context := ⟨root, s!"lean-cloud-console-test-{← request .pid}"⟩
@@ -217,9 +232,7 @@ def demo : Cli Unit := do
     require ((← ctx.remote interrupted "result") == "files=16, errors=24") "Run failed to resume after shutdown"
     printLine "Console tests passed: registry, validation, concurrent runs, image retention, typed results, source events, crash recovery, pause/resume, and terminal kill."
   catch error =>
-    for role in #["scheduler", "worker1", "worker2", "worker3"] do
-      let output ← docker #["logs", "--tail", "100", ctx.node role] false
-      request (.writeFile (ctx.home / s!"failure-{role}.log") (output.stdout ++ output.stderr))
+    discard <| observing (captureFailure ctx)
     throw error
   finally
     cleanup ctx
@@ -281,9 +294,7 @@ def scaling : Cli Unit := do
     discard (poolNodes ctx)
     printLine "Elastic scaling passed: live grow/drain, stable nodes, zero capacity, rejoin, restart, and retained history."
   catch error =>
-    for role in #["scheduler"] ++ workerNames 4 do
-      let logs ← docker #["logs", "--tail", "120", ctx.node role] false
-      request (.writeFile (ctx.home / s!"failure-{role}.log") (logs.stdout ++ logs.stderr))
+    discard <| observing (captureFailure ctx)
     throw error
   finally cleanup ctx
 

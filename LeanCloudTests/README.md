@@ -9,9 +9,17 @@ lake exe lean_cloud_tests sequential/
 lake exe lean_cloud_tests pool
 (cd runtime && lake exe cloud_inbox_tests)
 lake exe cloud_console_tests
+lake exe cloud_console_tests --pool-only
+lake exe cloud_console_tests --scaling-only
 lake exe cloud_runtime_tests
 lake exe cloud_chaos --seed 1
 ```
+
+CI runs the real pool recovery and scaling suites in separate Docker jobs on
+pull requests and pushes to `main`. A failed suite does not cancel the other.
+Failures retain build/startup output, the test transcript, and available scheduler,
+worker, and blob-service logs and health state for seven days. Test containers and
+volumes are isolated from the user's deployment and cleaned up after each suite.
 
 The generator produces finite Cloud programs containing values, recorded pure
 computations, blobs, delays, failures, captured inputs, dependent binds, and nested
