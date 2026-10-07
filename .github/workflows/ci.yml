@@ -16,14 +16,14 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
       - name: Install native build tools
+        timeout-minutes: 5
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config tzdata libcurl4-openssl-dev libsqlite3-dev libpq-dev freetds-dev default-libmysqlclient-dev
+          bash .github/scripts/install-native.sh build-essential pkg-config tzdata libcurl4-openssl-dev libsqlite3-dev libpq-dev freetds-dev default-libmysqlclient-dev
 
       - uses: ./.github/actions/setup-lean
         with:
@@ -47,49 +47,17 @@ jobs:
         working-directory: runtime
         run: lake exe cloud_inbox_tests
 
-      - name: Set up Docker build cache
-        id: buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Build deployment image (cached)
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          target: worker
-          load: true
-          tags: lean-cloud-ci:demo
-          cache-from: type=gha,scope=demo
-          cache-to: type=gha,scope=demo,mode=max,ignore-error=true
-
-      - name: Check CLI commands against Docker services
-        env:
-          BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
-        run: lake exe cloud_console_tests --lifecycle-only
-
-      - name: Upload CLI command logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: cli-command-logs
-          path: .lean-cloud/cli-command-logs-*/*.log
-          include-hidden-files: true
-          if-no-files-found: ignore
-
   runtime:
-    name: Runtime (${{ matrix.suite }})
+    name: Runtime
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        suite: [pool, scaling, chaos]
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
       - name: Install native build tools
+        timeout-minutes: 5
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config tzdata libcurl4-openssl-dev libsqlite3-dev
+          bash .github/scripts/install-native.sh build-essential pkg-config tzdata libcurl4-openssl-dev libsqlite3-dev
 
       - uses: ./.github/actions/setup-lean
         id: lean
@@ -97,6 +65,8 @@ jobs:
           scope: console
 
       - name: Build runtime test driver
+        id: driver
+        timeout-minutes: 5
         shell: bash
         run: |
           set -o pipefail
@@ -105,25 +75,42 @@ jobs:
 
       - name: Set up Docker build cache
         id: buildx
+        timeout-minutes: 2
         uses: docker/setup-buildx-action@v4
 
+      - name: Restore Docker layers
+        uses: actions/cache@v5
+        with:
+          path: .lean-cloud/buildkit
+          key: ${{ runner.os }}-${{ runner.arch }}-buildkit-zstd-v1-${{ hashFiles('lean-toolchain') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-buildkit-zstd-v1-${{ hashFiles('lean-toolchain') }}-
+
+      # One builder and one demo image serve all three demo suites. Separate
+      # runners previously compiled and exported the same image three times.
       - name: Build deployment image (cached)
-        if: matrix.suite != 'chaos'
+        id: demo
+        timeout-minutes: 4
         uses: docker/build-push-action@v7
         with:
           context: .
           target: worker
           load: true
           tags: lean-cloud-ci:demo
-          cache-from: type=gha,scope=demo
-          cache-to: type=gha,scope=demo,mode=max,ignore-error=true
+          cache-from: |
+            type=local,src=.lean-cloud/buildkit/demo
+            type=gha,scope=demo,timeout=30s
 
       - name: Prepare generated chaos application
-        if: matrix.suite == 'chaos'
+        id: fixture
+        if: ${{ !cancelled() && steps.driver.outcome == 'success' && steps.buildx.outcome == 'success' }}
+        timeout-minutes: 1
         run: lake exe cloud_console_tests --prepare-chaos-image
 
       - name: Build generated chaos image (cached)
-        if: matrix.suite == 'chaos'
+        id: chaos
+        if: ${{ !cancelled() && steps.fixture.outcome == 'success' }}
+        timeout-minutes: 4
         uses: docker/build-push-action@v7
         with:
           context: .lean-cloud/ci-chaos/application
@@ -136,25 +123,74 @@ jobs:
             LEAN_VERSION=${{ steps.lean.outputs.version }}
           load: true
           tags: lean-cloud-ci:chaos
-          cache-from: type=gha,scope=chaos
-          cache-to: type=gha,scope=chaos,mode=max,ignore-error=true
+          cache-from: |
+            type=local,src=.lean-cloud/buildkit/chaos
+            type=gha,scope=chaos,timeout=30s
 
-      - name: Check deployed ${{ matrix.suite }}
+      - name: Check deployed runtime suites concurrently
+        if: ${{ !cancelled() && (steps.demo.outcome == 'success' || steps.chaos.outcome == 'success') }}
+        timeout-minutes: 7
         env:
           BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
+          DEMO_READY: ${{ steps.demo.outcome }}
+          CHAOS_READY: ${{ steps.chaos.outcome }}
         shell: bash
         run: |
-          set -o pipefail
-          lake exe cloud_console_tests --${{ matrix.suite }}-only 2>&1 | tee .lean-cloud/ci-runtime-logs/test.log
+          suites=()
+          if [[ "$DEMO_READY" == success ]]; then suites+=(lifecycle pool scaling); fi
+          if [[ "$CHAOS_READY" == success ]]; then suites+=(chaos); fi
+          bash .github/scripts/check-runtime.sh "${suites[@]}"
+
+      # Cache transfer is optional and timed separately from compilation/tests.
+      # It must neither delay test feedback nor make a successful suite fail.
+      - name: Save demo image cache
+        if: ${{ !cancelled() && steps.demo.outcome == 'success' }}
+        timeout-minutes: 1
+        continue-on-error: true
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: worker
+          outputs: type=cacheonly
+          cache-to: type=local,dest=.lean-cloud/buildkit-next/demo,mode=max,compression=zstd,compression-level=1,ignore-error=true
+
+      - name: Save generated chaos image cache
+        if: ${{ !cancelled() && steps.chaos.outcome == 'success' }}
+        timeout-minutes: 1
+        continue-on-error: true
+        uses: docker/build-push-action@v7
+        with:
+          context: .lean-cloud/ci-chaos/application
+          file: .lean-cloud/ci-chaos/application/.lean-cloud/ci-chaos/deployment/Dockerfile
+          build-contexts: |
+            sdk=.
+            node_assets=.lean-cloud/ci-chaos/application/.lean-cloud/ci-chaos/deployment
+          build-args: |
+            APP_TARGET=cloud_app
+            LEAN_VERSION=${{ steps.lean.outputs.version }}
+          outputs: type=cacheonly
+          cache-to: type=local,dest=.lean-cloud/buildkit-next/chaos,mode=max,compression=zstd,compression-level=1,ignore-error=true
+
+      - name: Replace exported layer caches
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p .lean-cloud/buildkit
+          for image in demo chaos; do
+            if [[ -f ".lean-cloud/buildkit-next/$image/index.json" ]]; then
+              rm -rf ".lean-cloud/buildkit/$image"
+              mv ".lean-cloud/buildkit-next/$image" ".lean-cloud/buildkit/$image"
+            fi
+          done
 
       - name: Upload runtime diagnostics on failure
         if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
-          name: runtime-${{ matrix.suite }}-logs
+          name: runtime-logs
           retention-days: 7
           path: |
             .lean-cloud/ci-runtime-logs/*.log
+            .lean-cloud/cli-command-logs-*/*.log
             .lean-cloud/lean-cloud-console-test-*/failure-*.log
             .lean-cloud/lean-cloud-console-test-*/logs/*.log
             .lean-cloud/lean-cloud-scaling-test-*/failure-*.log
