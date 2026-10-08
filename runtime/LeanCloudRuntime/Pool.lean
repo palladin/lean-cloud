@@ -61,23 +61,20 @@ def withHeartbeat (config : Config) (run worker : String) (attempt : Nat)
     stopped.set true
     discard <| IO.ofExcept heartbeat.get
 
-/-- One request/reply exchange. Each call owns a unique reply address. The
-scheduler caches administrative replies before acknowledging requests. -/
+/-- One request/reply exchange. A timeout is ambiguous: the command may already
+be committed. Its retired reply address cannot be reused to execute it again. -/
 private def exchange (config : Config) (message : String → Envelope) : IO Json := do
-  let random ← IO.Process.output { cmd := "openssl", args := #["rand", "-hex", "16"] }
-  unless random.exitCode == 0 do throw (IO.userError "Cannot allocate reply address")
-  let replyTo := "reply-" ++ random.stdout.trimAscii.toString
-  let handle ← HttpMailbox.openMailbox config.mailboxes.scheduler address replyTo
+  let handle ← HttpMailbox.openReply config.mailboxes.scheduler
   try
     let inbox : Mailbox IO (Except String Json) := HttpMailbox.inbox handle
     HttpMailbox.send config.mailboxes.scheduler address "scheduler"
-      (message replyTo)
+      (message handle.queue)
     let deadline := (← IO.monoMsNow) + 30000
     repeat
-      if (← IO.monoMsNow) > deadline then throw (IO.userError "Deployment scheduler request timed out")
+      if (← IO.monoMsNow) > deadline then
+        throw (IO.userError "Deployment scheduler request timed out; the command may already have completed")
       let some delivery ← inbox.receive | continue
       inbox.acknowledge delivery.receipt
-      handle.delete
       return ← IO.ofExcept delivery.message
   finally handle.close
 
@@ -111,8 +108,8 @@ private def reply (endpoint : HttpMailbox.Config) (worker : String) (message : L
   catch _ => IO.eprintln s!"Mailbox for {worker} unavailable; waiting for worker readiness."
 
 /-- Sole owner of the deployment's SQLite database. State is durable before
-replies and input acknowledgements. Administrative replies use confirmed delivery;
-an offline worker recovers its reply by repeating readiness. -/
+replies and input acknowledgements. Administrative replies are cached until the
+caller's address retires; offline workers recover replies by repeating readiness. -/
 def scheduler (config : Config) : IO Unit := do
   let lock ← ProcessLock.acquire (config.scheduler.database ++ ".lock")
   try
@@ -149,13 +146,31 @@ def scheduler (config : Config) : IO Unit := do
       try
         let inbox : Mailbox IO Envelope := HttpMailbox.inbox handle
         let mut lastTime ← IO.monoMsNow
+        let mut nextCleanup := 0
         IO.println "deployment scheduler ready"
         (← IO.getStdout).flush
         repeat
           let now ← IO.monoMsNow
           saved := { saved with state := LeanCloud.Pool.tick (now - lastTime) saved.state }
           lastTime := now
+          -- Replies are needed only while their non-reusable destination lives.
+          -- Check while idle too, so the final request does not leak its cache.
+          if now ≥ nextCleanup then
+            let live ← HttpMailbox.liveReplies config.mailboxes.scheduler
+            let replies := saved.replies.filter (fun r => live.contains r.1)
+            if replies.size != saved.replies.size then
+              saved ← persist { saved with replies }
+            nextCleanup := now + 1000
           let some delivery ← inbox.receive | continue
+          let replyTo := match delivery.message with
+            | .configure replyTo _ | .event (.request replyTo _) => some replyTo
+            | _ => none
+          if let some replyTo := replyTo then
+            -- Reject delayed duplicates even after their cached reply is gone.
+            -- An exchange abandoned before execution need not execute at all.
+            unless (← HttpMailbox.liveReplies config.mailboxes.scheduler).contains replyTo do
+              inbox.acknowledge delivery.receipt
+              continue
           match delivery.message with
           | .configure replyTo routes =>
             let cached := saved.replies.find? (·.1 == replyTo)
@@ -168,7 +183,7 @@ def scheduler (config : Config) : IO Unit := do
             if cached.isNone then
               saved := { saved with replies := saved.replies.push (replyTo, response) }
               saved ← persist saved
-            HttpMailbox.send config.mailboxes.scheduler address replyTo response
+            discard <| HttpMailbox.reply config.mailboxes.scheduler replyTo response
           | .event message =>
             let mailboxes := { config.mailboxes with workers := saved.routes.getD config.mailboxes.workers }
             match message with
@@ -232,7 +247,7 @@ def scheduler (config : Config) : IO Unit := do
                 | .resume run => (← Trace.create "scheduler" run).emit "resumed" ""
                 | .kill run => (← Trace.create "scheduler" run).emit "sealed" ""
                 | _ => pure ()
-              HttpMailbox.send config.mailboxes.scheduler address replyTo response
+              discard <| HttpMailbox.reply config.mailboxes.scheduler replyTo response
           inbox.acknowledge delivery.receipt
       finally handle.close
     finally conn.close

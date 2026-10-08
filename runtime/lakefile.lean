@@ -17,6 +17,7 @@ lean_lib LeanCloudRuntime
 
 lean_lib ApplicationTests
 lean_lib PoolTests
+lean_lib ReplyTests
 
 lean_exe cloud_inbox_tests where
   root := `InboxTests

@@ -86,16 +86,13 @@ private def acquireSession (config : Config) (queue session : String) (waitMs : 
         throw error
       IO.sleep 100
 
-/-- Acquire the inbox's consumer session. Publishing alone uses `send`. -/
-def openMailbox (config : Config) (run actor : String)
-    (waitMs : Nat := 0) : IO Handle := do
+private def openHandle (config : Config) (acquire : String → IO (String × Nat)) : IO Handle := do
   let random ← IO.Process.output { cmd := "openssl", args := #["rand", "-hex", "16"] }
   unless random.exitCode == 0 do throw (IO.userError "Cannot allocate consumer session")
-  let queue := (toJson (run, actor)).compress
   let session := random.stdout.trimAscii.toString
   let closed ← IO.mkRef false
   let failure ← IO.mkRef none
-  let lease ← acquireSession config queue session waitMs
+  let (queue, lease) ← acquire session
   let heartbeat ← IO.asTask (do
     let mut next := (← IO.monoMsNow) + lease / 3
     while !(← closed.get) do
@@ -108,6 +105,27 @@ def openMailbox (config : Config) (run actor : String)
           failure.set (some s!"Mailbox consumer lost its session: {error}")
           return) .dedicated
   return ⟨config, queue, session, closed, failure, ← IO.mkRef none, heartbeat⟩
+
+/-- Acquire the inbox's consumer session. Publishing alone uses `send`. -/
+def openMailbox (config : Config) (run actor : String)
+    (waitMs : Nat := 0) : IO Handle :=
+  openHandle config fun session => do
+    let queue := (toJson (run, actor)).compress
+    return (queue, ← acquireSession config queue session waitMs)
+
+/-- A reply inbox exists only for this exchange. Close, lease expiry, or service
+restart retires its address permanently; late replies cannot recreate it. -/
+def openReply (config : Config) : IO Handle :=
+  openHandle config fun session => do
+    IO.ofExcept (fromJson? (← call config ⟨"", session, .openReply⟩))
+
+def liveReplies (config : Config) : IO (Array String) := do
+  IO.ofExcept (fromJson? (← call config ⟨"", "", .liveReplies⟩))
+
+/-- False means the caller has gone away. Transport errors still propagate so
+the scheduler retries committed commands before acknowledging their input. -/
+def reply [ToJson α] (config : Config) (queue : String) (message : α) : IO Bool := do
+  IO.ofExcept (fromJson? (← call config ⟨queue, "", .reply (toJson message).compress⟩))
 
 def Handle.send [ToJson α] (handle : Handle) (message : α) : IO Unit :=
   discard (handle.operation (.send (toJson message).compress))

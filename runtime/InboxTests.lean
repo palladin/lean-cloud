@@ -4,6 +4,7 @@ import LeanCloudRuntime.Programs
 import LeanCloud.MailboxModel
 import LeanCloudTests.Support
 import ApplicationTests
+import ReplyTests
 
 open Lean LeanCloud LeanCloudRuntime LeanCloudTests
 
@@ -314,6 +315,7 @@ def main (args : List String) : IO UInt32 := do
     processSignals
     http
     poolLeases
+    ReplyTests.run
     IO.println "Pool assignment renewal, pause fencing, expiry, and heartbeat cleanup passed"
     IO.println "SQLite inbox laws, 32 × 200 model operations, SIGKILL recovery, termination signals, HTTP transport, renewal, fencing, and registry API passed."
     return 0

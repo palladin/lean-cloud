@@ -58,6 +58,16 @@ connection is separate from the scheduler's coordination connection. Typed
 lean-linq schemas generate table definitions, keys, queries, inserts and deletes.
 Both databases explicitly use WAL and `synchronous=FULL`.
 
+Administrative calls use temporary reply inboxes. Closing the call, losing its
+consumer lease, or restarting the inbox service retires the reply address and
+removes its messages and counter. Late replies cannot recreate it. The scheduler
+caches mutating command replies while that address is live, then reclaims them
+within its next cleanup pass (once per second while polling). Delayed commands
+with retired addresses are acknowledged without executing again. A timeout is
+ambiguous: the command may already have committed; inspect the process before
+retrying it as a new request. Workflow state, results, replay records, and final
+watch views are retained independently of this temporary state.
+
 ## HTTP and configuration
 
 [config.json](../deploy/config.json) contains `mailboxes.scheduler` and
@@ -169,7 +179,10 @@ It checks real SQLite against the simulator's mailbox model over generated
 operation traces, plus session expiry, renewal, duplicate publication,
 stale acknowledgements, HTTP authentication, registry access, and committed mail
 surviving a SIGKILL. It also checks Pool assignment renewal and revocation using
-the real HTTP scheduler and private SQLite. Generated Pool model tests interleave
+the real HTTP scheduler and private SQLite. Reply cleanup tests cover abandoned
+inboxes, restarts, legacy reply rows, cached errors, and delayed duplicate controls
+after cache retirement. Repeated requests return the temporary row and cache
+counts to their baseline without removing workflow state. Generated Pool model tests interleave
 multiple workflows, restarts, controls, scaling, and delayed worker operations,
 then compare durable results with direct evaluation.
 Console tests cover the production layout, shared processes,
