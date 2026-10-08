@@ -175,8 +175,10 @@ then compare durable results with direct evaluation.
 Console tests cover the production layout, shared processes,
 controls, scaling, generated applications, and node restarts. The pool chaos suite
 runs generated pure workflows together on those combined nodes, crashes and
-restarts workers and the scheduler, then compares durable outcomes with direct
-evaluation. Component tests run
+restarts workers and the scheduler, and disconnects their Docker network while
+work is active. It checks reassignment, healthy-worker progress during isolation,
+rejection of late reports, and automatic recovery after reconnecting. Durable
+outcomes must match direct evaluation. Component tests run
 HTTP inboxes separately to inject transport faults and compare generated cloud
 programs with the direct interpreter. These standalone inboxes are test fixtures;
 production nodes keep HTTP, SQLite, and their actor in one process.

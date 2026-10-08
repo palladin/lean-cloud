@@ -21,7 +21,10 @@ done
 trap 'trap - INT TERM; kill "${pids[@]}" 2>/dev/null || true; wait || true; exit 130' INT TERM
 for suite in "$@"; do
   echo "Starting runtime $suite"
-  timeout --kill-after=15s 360s "$driver" "--$suite-only" \
+  # Network chaos must outlast real assignment leases before asserting recovery.
+  limit=360
+  if [[ "$suite" == chaos ]]; then limit=480; fi
+  timeout --kill-after=15s "${limit}s" "$driver" "--$suite-only" \
     > ".lean-cloud/ci-runtime-logs/$suite.log" 2>&1 &
   pids+=("$!")
   suites+=("$suite")
@@ -33,7 +36,7 @@ for i in "${!pids[@]}"; do
     echo "Runtime ${suites[$i]} passed"
   else
     status=$?
-    echo "::error::Runtime ${suites[$i]} failed (exit $status; 124 means the six-minute limit expired)"
+    echo "::error::Runtime ${suites[$i]} failed (exit $status; 124 means the suite time limit expired)"
     tail -n 80 ".lean-cloud/ci-runtime-logs/${suites[$i]}.log" || true
     failed=1
   fi
