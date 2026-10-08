@@ -61,7 +61,16 @@ with omitted tests. Queueing for a GitHub runner is outside the execution limit.
 `--chaos-only` deploys a test application on the production shared pool: three
 workers, one scheduler, and S3-compatible blob storage. Three generated pure
 workflows run together, with nested parallel groups, captured inputs, dependent
-binds, and competing failures. First, Docker disconnects a busy worker from the
+binds, and competing failures. First, it snapshots every replay record already
+confirmed by the scheduler for those runs, then disconnects shared blob storage.
+Every worker must report a new S3 transport failure, while coordination must
+remain free of terminal errors. After at least five seconds of isolation, storage
+reconnects. The suite requires fresh branch completions without manual worker or
+scheduler restarts, and compares the saved records with their original values.
+A test-only command reads them through the production S3 adapter; it never runs
+a workflow or opens coordination databases and is not exposed by the HTTP API.
+
+Next, Docker disconnects a busy worker from the
 deployment network. The test requires a newer assignment on a different worker
 and completed branches while the victim remains isolated. It then delivers
 synthetic late failure reports and a heartbeat for the expired attempt through
@@ -69,19 +78,22 @@ the real HTTP/SQLite inbox; neither may fail the run or revive that attempt.
 The worker reconnects with its original DNS alias. Next, the scheduler loses its
 network connection for longer than the configured assignment lease. No explicit
 node restart accompanies these network faults; transport errors may trigger the
-normal Docker restart policy. Both partitions must recover automatically.
+normal Docker restart policy. All three partitions must recover automatically.
 
 Six seeded faults then kill and restart active scheduler
 or worker nodes, with later faults waiting for completed branches. After faults
 stop, every durable result must equal direct evaluation, including the selected
 error. Duplicate late reports and a final scheduler restart check that
-completed outcomes survive. No timing effects or interpreter hooks are added to
+completed outcomes survive. The pre-outage replay records must still match at
+the end of the suite. No timing effects or interpreter hooks are added to
 the workflows. The test fails if it cannot find active work to exercise.
 
 The retained test directory contains `chaos-plan.json` with inputs, program trees,
 expected outcomes, and the fault plan, plus `chaos-events.jsonl` with observed
 assignments, network disconnections/reconnections, reassignment evidence,
-late-message checks, actual victims, restart evidence, and results. Scheduler
+late-message checks, storage failures, actual victims, restart evidence, and
+results. `chaos-records-before.json`, `chaos-records-recovery.json`, and
+`chaos-records-completion.json` retain the compared record sets. Scheduler
 observations establish that reassignment happened even if a short assignment
 finishes between polls; missing evidence fails the test. Durable results remain
 the correctness oracle. CI retains these on

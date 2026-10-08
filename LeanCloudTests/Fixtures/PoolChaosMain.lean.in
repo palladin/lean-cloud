@@ -9,5 +9,22 @@ def program : CloudProgram PoolWorkload.Input Nat := {
   run := PoolWorkload.workflow
 }
 
+/-- Test-only inspection through the production S3 reader. It neither executes
+a workflow nor opens scheduler/inbox storage, and is not exposed by HTTP. -/
+private def readRecords (path : String) : IO UInt32 := do
+  let config ← Config.load path
+  let keys : Array (String × Array String) ← IO.ofExcept
+    (Lean.Json.parse (← (← IO.getStdin).getLine) >>= Lean.fromJson?)
+  let saved ← keys.mapM fun (run, keys) => do
+    let records ← keys.mapM fun key => do
+      let some value ← S3.readJson config.blobs run key
+        | throw (IO.userError s!"Missing confirmed record: {run}/{key}")
+      return (key, value)
+    return (run, records)
+  IO.println (Lean.toJson saved).compress
+  return 0
+
 def main (args : List String) : IO UInt32 :=
-  Application.main ⟨#[program.register #[]]⟩ args
+  match args with
+  | ["read-records", path] => readRecords path
+  | _ => Application.main ⟨#[program.register #[]]⟩ args

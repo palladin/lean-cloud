@@ -61,10 +61,12 @@ private def crashNode (ctx : Context) (role : String) : Cli Unit := do
   chaosEvent ctx "restarted" [("node", toJson role)]
 
 private def connection (ctx : Context) (role : String) (connected : Bool) : Cli Unit := do
+  let some node := (← ctx.nodes).find? (·.role == role) | throw s!"Missing {role} container"
+  let alias := if role == "blobs" then "blobs" else role ++ "-mailbox"
   let network := ctx.project ++ "_default"
   let deadline := (← request .now) + 60000
   repeat
-    let output ← docker #["inspect", "--format", "{{json .NetworkSettings.Networks}}", ctx.node role]
+    let output ← docker #["inspect", "--format", "{{json .NetworkSettings.Networks}}", node.name]
     let networks ← liftExcept (Json.parse output.stdout)
     let endpoint := (networks.getObjVal? network).toOption
     if connected then
@@ -72,10 +74,10 @@ private def connection (ctx : Context) (role : String) (connected : Bool) : Cli 
       -- may be registered before its network sandbox has been recreated.
       if endpoint.any (fun value => (value.getObjValAs? String "IPAddress").toOption.any (!·.isEmpty)) then break
       if endpoint.isNone then
-        discard <| docker #["network", "connect", "--alias", role ++ "-mailbox", network, ctx.node role] false
+        discard <| docker #["network", "connect", "--alias", alias, network, node.name] false
     else
       if endpoint.isNone then break
-      discard <| docker #["network", "disconnect", network, ctx.node role] false
+      discard <| docker #["network", "disconnect", network, node.name] false
     require ((← request .now) < deadline) s!"{role}: network change was not applied"
     request (.sleep 200)
   chaosEvent ctx (if connected then "connected" else "disconnected") [("node", toJson role)]
@@ -117,6 +119,90 @@ private def lateMessages (ctx : Context) (old : Interrupted) : Cli Unit := do
 
 private def completedCount (snapshots : Array Scheduler.State) : Nat :=
   snapshots.foldl (fun n state => n + (state.jobs.filter (·.status == .done)).size) 0
+
+/-- Health alone cannot establish recovery: require fresh completed branches
+after the first successful status read, before any later fault is injected. -/
+private def awaitProgress (ctx : Context) (runs : Array Run) (event : String) : Cli Unit := do
+  let deadline := (← request .now) + 90000
+  let mut baseline : Option Nat := none
+  repeat
+    if let .ok current ← observing (states ctx runs) then
+      require (current.all (·.error.isNone)) "Transport failure became a terminal scheduler error"
+      let completed := completedCount current
+      match baseline with
+      | none => baseline := some completed
+      | some before =>
+        if completed > before then
+          chaosEvent ctx event [("completedBefore", toJson before), ("completedAfter", toJson completed)]
+          return
+    require ((← request .now) < deadline) s!"{event}: no progress after reconnecting"
+    request (.sleep 500)
+
+private abbrev SavedRecords := Array (String × Array (String × Json))
+
+private def readRecords (ctx : Context) (keys : Array (String × Array String)) : Cli SavedRecords := do
+  let output ← docker #["exec", "-i", ctx.node "scheduler", "cloud-app", "read-records", "/etc/lean-cloud/config.json"]
+    (input := some ((toJson keys).compress ++ "\n"))
+  liftExcept (Json.parse output.stdout >>= fromJson?)
+
+private def checkRecords (ctx : Context) (saved : SavedRecords) (stage : String) : Cli Unit := do
+  let keys := saved.map fun (run, records) => (run, records.map Prod.fst)
+  -- Blob-service routing can take a moment to recover. A successful read must
+  -- match immediately; mismatches are never retried or used as a new baseline.
+  let deadline := (← request .now) + 90000
+  repeat
+    match ← observing (readRecords ctx keys) with
+    | .ok actual =>
+      saveJson (ctx.home / s!"chaos-records-{stage}.json") actual
+      require (toJson actual == toJson saved) s!"Confirmed replay records changed after {stage}"
+      chaosEvent ctx "records-preserved" [("stage", toJson stage),
+        ("count", toJson (saved.foldl (fun n (_, records) => n + records.size) 0))]
+      return
+    | .error error =>
+      require ((← request .now) < deadline) s!"Cannot read confirmed records after {stage}: {error}"
+      request (.sleep 500)
+
+private def storageFailures (ctx : Context) (workers : Array String) : Cli (Array Nat) :=
+  workers.mapM fun worker => do
+    let logs ← docker #["logs", ctx.node worker]
+    return ((logs.stdout ++ logs.stderr).splitOn "S3 transport failed (curl ").length - 1
+
+/-- Isolate the shared blob service while retaining its process and volume.
+Require real failed record operations, then automatic recovery and preservation
+of every record already confirmed by the scheduler at the snapshot boundary. -/
+private def blobOutage (ctx : Context) (runs : Array Run) : Cli SavedRecords := do
+  let (snapshots, _) ← busy ctx runs 3 true
+  let keys := (runs.zip snapshots).map fun (run, state) =>
+    (run.id, state.workers.foldl (fun keys worker => worker.recorded.foldl
+      (fun keys key => if keys.contains key then keys else keys.push key) keys) (#[] : Array String))
+  require (keys.all (!·.2.isEmpty)) "Blob outage needs confirmed replay records in every run"
+  let saved ← readRecords ctx keys
+  saveJson (ctx.home / "chaos-records-before.json") saved
+  -- Snapshotting is read-only but takes time: confirm work is still active.
+  let (snapshots, _) ← busy ctx runs 3 true
+  let workers := workerNames (← ctx.deployment).workers
+  let before ← storageFailures ctx workers
+  chaosEvent ctx "blob-isolation" [("runs", toJson snapshots),
+    ("records", toJson (saved.foldl (fun n (_, records) => n + records.size) 0))]
+  connection ctx "blobs" false
+  try
+    let started ← request .now
+    let deadline := started + 90000
+    repeat
+      let current ← states ctx runs
+      require (current.all (·.error.isNone)) "Blob outage installed a permanent workflow error"
+      let failures ← storageFailures ctx workers
+      if (failures.zip before).all (fun (after, before) => after > before) &&
+          (← request .now) ≥ started + 5000 then
+        chaosEvent ctx "blob-unavailable" [("workers", toJson workers),
+          ("newTransportFailures", toJson (failures.zip before |>.map fun (after, before) => after - before))]
+        break
+      require ((← request .now) < deadline) "Blob outage did not exercise S3 failures on every worker"
+      request (.sleep 500)
+  finally connection ctx "blobs" true
+  awaitProgress ctx runs "blob-recovered"
+  checkRecords ctx saved "recovery"
+  return saved
 
 /-- Disconnect a busy worker, then capture the assignment still owned by it.
 It may have advanced since the initial observation. If it has no outstanding
@@ -191,21 +277,7 @@ private def networkFaults (ctx : Context) (runs : Array Run) : Cli Interrupted :
   try request (.sleep (lease + 5000).toUInt32)
   finally connection ctx "scheduler" true
   healthy ctx "scheduler"
-  -- Health confirms only the HTTP server. Require new completed branches after
-  -- reconnecting, before any explicit crash/restart could hide failed recovery.
-  let deadline := (← request .now) + 90000
-  let mut baseline : Option Nat := none
-  repeat
-    if let .ok current ← observing (states ctx runs) then
-      let completed := completedCount current
-      match baseline with
-      | none => baseline := some completed
-      | some before =>
-        if completed > before then
-          chaosEvent ctx "network-recovered" [("completedBefore", toJson before), ("completedAfter", toJson completed)]
-          break
-    require ((← request .now) < deadline) "Scheduler did not recover after reconnecting"
-    request (.sleep 500)
+  awaitProgress ctx runs "network-recovered"
   return old
 
 private def chaosFixture (owner : Context) : Cli Context := do
@@ -237,8 +309,9 @@ def poolChaos (seed : Nat := 1) : Cli Unit := do
   let inputs := PoolWorkload.inputs seed
   let faults := PoolWorkload.plan seed
   saveJson (ctx.home / "chaos-plan.json") (Json.mkObj [
-    ("generator", toJson "pool-chaos/v2"), ("seed", toJson seed), ("faults", toJson faults),
-    ("networkFaults", toJson #["busy-worker-until-reassigned", "scheduler-beyond-assignment-lease"]),
+    ("generator", toJson "pool-chaos/v3"), ("seed", toJson seed), ("faults", toJson faults),
+    ("networkFaults", toJson #["blobs-until-worker-transport-failures",
+      "busy-worker-until-reassigned", "scheduler-beyond-assignment-lease"]),
     ("programs", toJson (inputs.map fun input => Json.mkObj [
       ("input", toJson input), ("tree", toJson (reprStr (PoolWorkload.tree input))),
       ("expected", toJson (PoolWorkload.expected input))]))])
@@ -253,6 +326,7 @@ def poolChaos (seed : Nat := 1) : Cli Unit := do
       let id := s!"generated-{i}"
       ctx.launch "generated" (some file.toString) (some id)
       runs := runs.push (← ctx.loadRun id)
+    let saved ← blobOutage ctx runs
     let interrupted ← networkFaults ctx runs
     for i in [:faults.size] do
       let fault := faults[i]!
@@ -279,9 +353,10 @@ def poolChaos (seed : Nat := 1) : Cli Unit := do
       require ((← awaitOutcome ctx run deadline) == PoolWorkload.expected input)
         s!"Completed result changed after restart: {run.id}"
     settled ctx runs deadline
+    checkRecords ctx saved "completion"
     require ((← poolNodes ctx) == identities) "Recovery replaced deployed nodes"
-    chaosEvent ctx "passed" [("seed", toJson seed), ("crashes", toJson faults.size), ("partitions", toJson (2 : Nat))]
-    printLine "Pool chaos passed: network partitions, reassignment, stale reports, scheduler/worker crashes, direct outcomes, and durable recovery."
+    chaosEvent ctx "passed" [("seed", toJson seed), ("crashes", toJson faults.size), ("partitions", toJson (3 : Nat))]
+    printLine "Pool chaos passed: blob outage, preserved records, network partitions, reassignment, stale reports, scheduler/worker crashes, and direct outcomes."
   catch error =>
     discard <| observing (chaosEvent ctx "failed" [("error", toJson error)])
     discard <| observing (captureFailure ctx)
