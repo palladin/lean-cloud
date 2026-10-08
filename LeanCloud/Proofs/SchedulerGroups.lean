@@ -1,10 +1,11 @@
 import LeanCloud.Proofs.SchedulerRecords
 import LeanCloud.Proofs.Recording
+import LeanCloud.Proofs.Checkpoint
 
 namespace LeanCloud.Proofs.SchedulerGroups
 open LeanCloud.Scheduler Internal ReplayModel SchedulerRecords
 
-/-- Waiting metadata names the specified children. A join assignment already
+/-- Waiting metadata names the specified children. A runnable parent already
 has their returns in storage; the scheduler only checks completion markers. -/
 structure JobValid (expected journal : Journal) (job : Job) : Prop where
   branch : job.branch = Location.branchStart job.location
@@ -17,9 +18,9 @@ structure JobValid (expected journal : Journal) (job : Job) : Prop where
 def Valid (expected journal : Journal) (jobs : Array Job) : Prop :=
   ∀ job ∈ jobs, JobValid expected journal job
 
-/-- The replay location belongs to the assigned branch, and a requested join
-has its required child records. This certificate survives reassignment. -/
-structure AssignmentReady (expected journal : Journal) (issued : Assignment) : Prop where
+/-- The checkpoint belongs to the assigned branch. A parent marked ready has
+its child returns in storage. This proof certificate survives reassignment. -/
+structure AssignmentReady (expected journal : Journal) (issued : Checkpoint) : Prop where
   branch : issued.branch = Location.branchStart issued.location
   ready : issued.joining = true → Recording.JoinReady expected journal issued.location
   origin : issued.location = issued.branch ∨ ∃ count, Specification.Group expected issued.location count
@@ -29,8 +30,8 @@ theorem AssignmentReady.extend {expected before after issued}
     AssignmentReady expected after issued :=
   ⟨ready.1, fun joining => (ready.2 joining).extend extension, ready.origin⟩
 
-private theorem JobValid.assignment {expected journal job} (valid : JobValid expected journal job) (attempt : Nat) :
-    AssignmentReady expected journal (assignment job attempt) := ⟨valid.branch, valid.ready, valid.origin⟩
+theorem JobValid.assignment {expected journal job} (valid : JobValid expected journal job) (attempt : Nat) :
+    AssignmentReady expected journal (Checkpoint.ofJob job attempt) := ⟨valid.branch, valid.ready, valid.origin⟩
 
 theorem Valid.extend {expected before after jobs} (valid : Valid expected before jobs)
     (extension : Extends before after) : Valid expected after jobs := by
@@ -119,15 +120,6 @@ theorem acquire_preserves (state : State) (expected journal : Journal) (worker :
           exact replace valid index _ ((valid _ member).with_status _ (by intros; simp))
         next => exact valid
 
-/-- The scheduler never emits a join assignment before its children have
-durable returns. Subsequent record creation preserves this certificate. -/
-theorem handle_ready (state : State) (expected journal : Journal) (duration : Nat) (message : SchedulerMessage)
-    (valid : Valid expected journal state.jobs) (delivery : Delivery) (issued : Assignment)
-    (sent : delivery ∈ (handle duration state message).2) (executes : delivery.message = .execute issued) :
-    AssignmentReady expected journal issued := by
-  obtain ⟨job, member, attempt, rfl⟩ := Scheduler.handle_from_job state duration message delivery issued sent executes
-  exact (valid job member).assignment attempt
-
 /-- Accepting a certified fork records the matching child set. Completion may
 awaken joins only after the reported return has reached durable storage. -/
 theorem accept_preserves (state : State) (expected journal : Journal) (report : Report)
@@ -188,7 +180,7 @@ theorem recover_preserves (state : State) (expected journal : Journal)
   | running owner attempt deadline => exact sound.with_status .pending (by intros; simp)
 
 /-- Every actual scheduler transition preserves specified waiting groups and
-the child-return precondition of authorized joins. -/
+the child-return certificate of runnable parents. -/
 theorem handle_preserves (state : State) (expected journal : Journal) (duration : Nat) (message : SchedulerMessage)
     (valid : Valid expected journal state.jobs) (completed : DoneRecords journal state.jobs)
     (consistent : Extends journal expected) (backed : MessageBacked journal state message)

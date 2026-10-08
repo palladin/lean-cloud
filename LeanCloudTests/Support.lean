@@ -134,7 +134,7 @@ def differential [Codec α] [BEq α] [Repr α]
   -- Reconstructing any completed branch must reuse its result without writes.
   for job in finished.scheduler.jobs do
     assertEq job.status .done "Scheduler finished with unfinished branches"
-    let assignment : Assignment := ⟨9999999, job.branch, job.location, job.joining⟩
+    let assignment : Assignment := ⟨9999999, job.branch⟩
     let (repeated, after) ← unwrap (evaluate 100000
       (ReplayInterpreter.step SimulationBackend.records SimulationBackend.blobs 10000 program () assignment).run
       finished)

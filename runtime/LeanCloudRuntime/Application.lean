@@ -19,7 +19,7 @@ inductive Service : Type → Type where
   | worker (config : Config) (run : String) : Service Unit
   | definition (config : Config) (run : String) : Service RunDefinition
   | outcome (config : Config) (run : String) : Service (Option Exit)
-  | cancel (config : Config) (run : String) : Service Exit
+  | cancel (config : Config) (run : String) : Service (Option Exit)
   | referenceStatus (config : Config) (run : String) : Service Scheduler.State
   | status (config : Config) (run : String) : Service Timing.Status
   | readText (config : Config) (ref : BlobRef) : Service String
@@ -155,8 +155,7 @@ private def handle (registry : Registry) (prepare : Config → String → Json �
   | .outcome config id => completed config id
   | .cancel config id => do
     discard (Pool.request config (.kill id))
-    let some outcome ← completed config id | throw (IO.userError "Cancellation did not persist an outcome")
-    return outcome
+    completed config id
   | .referenceStatus config id => LeanCloudRuntime.status config id
   | .status config id => Pool.observation config id
   | .readText config ref => do

@@ -7,15 +7,16 @@ variable {info : Option SourceSiteId}
 
 variable [rootCodec : Codec α] (blobs : BlobStorage M) (source : Cloud M α)
 
-/-- A proof-only cursor into the source. Unlike an assigned location it can also
-pass transparent delays at that location. It carries no runtime continuation. -/
+/-- A proof-only cursor into the source. It can pass transparent delays without
+advancing the location. It carries no runtime continuation. -/
 structure Cursor (journal : Journal) (current : Location) (encode : β → Json)
     (remaining : Cloud M β) : Prop where
   follows : Follows Location.root current
   replay : ∃ cost, ∀ after, Extends journal after → ∀ assignment,
+    assignment.branch = Location.branchStart assignment.location →
     Follows current assignment.location → ∀ fuel,
-      (reconstruct store blobs assignment (cost + fuel) rootCodec.encode source Location.root).run after =
-        (reconstruct store blobs assignment fuel encode remaining current).run after
+      (ReplayCursor.atPoint store blobs assignment (cost + fuel) rootCodec.encode source Location.root).run after =
+        (ReplayCursor.atPoint store blobs assignment fuel encode remaining current).run after
 
 theorem Cursor.root (journal : Journal) : Cursor blobs source journal Location.root rootCodec.encode source :=
   ⟨.refl _ (by decide), 0, by intros; simp⟩
@@ -31,12 +32,9 @@ theorem Cursor.delay {journal current encode} (next : ArrsF (Control M) SourceSi
     Cursor blobs source journal current encode (next.apply ()) := by
   obtain ⟨route, cost, replay⟩ := cursor
   refine ⟨route, cost + 1, ?_⟩
-  intro after extension assignment follows fuel
-  rw [Nat.add_assoc, replay after extension assignment follows, Nat.add_comm 1, reconstruct]
-  by_cases same : current = assignment.location
-  · subst current
-    simp [reconstruct_at_assignment, execute]
-  · simp [beq_eq_false_iff_ne.mpr same]
+  intro after extension assignment branch follows fuel
+  rw [Nat.add_assoc, replay after extension assignment branch follows, Nat.add_comm 1,
+    ReplayCursor.delay _ _ _ branch]
 
 theorem Cursor.exec {journal current encode} (codec : Codec β) (label : String) (body : Unit → β)
     (next : ArrsF (Control M) SourceSiteId β γ)
@@ -49,12 +47,11 @@ theorem Cursor.exec {journal current encode} (codec : Codec β) (label : String)
   have nonempty : 0 < current.size := Nat.lt_of_lt_of_le (by decide) route.depth
   have edge := next_follows current nonempty
   refine ⟨route.trans edge, cost + 1, ?_⟩
-  intro after extension assignment follows fuel
+  intro after extension assignment branch follows fuel
   have before := different_follows edge follows (next_ne current nonempty)
-  rw [Nat.add_assoc, replay after extension assignment (edge.trans follows), Nat.add_comm 1, reconstruct]
-  simp only [beq_eq_false_iff_ne.mpr before, Bool.false_eq_true, ite_false, Internal.recorded, bind_assoc]
-  erw [read_then]
-  simp [extension _ _ present, Internal.check, Internal.decode, roundtrip]
+  rw [Nat.add_assoc, replay after extension assignment branch (edge.trans follows), Nat.add_comm 1]
+  exact ReplayCursor.command after blobs assignment branch current fuel encode codec _ next _ _ _ _
+    (extension _ _ present) (by simp) rfl roundtrip
 
 theorem Cursor.joined {journal current encode} (codec : Codec β) (count : Nat)
     (branches : Fin count → Cloud M β) (next : ArrsF (Control M) SourceSiteId (Array β) γ) (values : Array β)
@@ -68,13 +65,12 @@ theorem Cursor.joined {journal current encode} (codec : Codec β) (count : Nat)
   have nonempty : 0 < current.size := Nat.lt_of_lt_of_le (by decide) route.depth
   have edge := next_follows current nonempty
   refine ⟨route.trans edge, cost + 1, ?_⟩
-  intro after extension assignment follows fuel
+  intro after extension assignment branch follows fuel
   have before := different_follows edge follows (next_ne current nonempty)
   have skip := skip_follows edge follows (next_ne current nonempty) (skip_next current)
-  rw [Nat.add_assoc, replay after extension assignment (edge.trans follows), Nat.add_comm 1, reconstruct]
-  simp only [beq_eq_false_iff_ne.mpr before, skip, Bool.false_eq_true, ite_false, Internal.recorded, bind_assoc]
-  erw [read_then]
-  simp [extension _ _ present, Internal.check, Internal.decodeGroup, Internal.decode, decoded, size]
+  rw [Nat.add_assoc, replay after extension assignment branch (edge.trans follows), Nat.add_comm 1]
+  exact ReplayCursor.joined after blobs assignment branch current fuel encode codec count branches next _ _ _ values
+    (edge.trans follows) skip (extension _ _ present) (by simp) rfl decoded size
 
 theorem Cursor.child {journal current encode} (codec : Codec β) (count : Nat)
     (branches : Fin count → Cloud M β) (next : ArrsF (Control M) SourceSiteId (Array β) γ)
@@ -84,34 +80,37 @@ theorem Cursor.child {journal current encode} (codec : Codec β) (count : Nat)
   have nonempty : 0 < current.size := Nat.lt_of_lt_of_le (by decide) route.depth
   have edge := child_follows current nonempty index
   refine ⟨route.trans edge, cost + 1, ?_⟩
-  intro after extension assignment follows fuel
+  intro after extension assignment branch follows fuel
   have different : current ≠ current.child index := by intro same; have := congrArg Array.size same; simp [LeanCloud.Location.child] at this
   have before := different_follows edge follows different
   have enters := enters_follows (enters_child current index) follows
   have selected : assignment.location[current.size]!.1 = index.val := by
     simpa [LeanCloud.Location.child] using (follows.branch_at current.size (by simp [LeanCloud.Location.child])).symm
-  rw [Nat.add_assoc, replay after extension assignment (edge.trans follows), Nat.add_comm 1, reconstruct]
-  simp [beq_eq_false_iff_ne.mpr before, enters, selected, index.isLt]
+  rw [Nat.add_assoc, replay after extension assignment branch (edge.trans follows), Nat.add_comm 1,
+    ReplayCursor.child _ _ _ branch _ _ codec count branches next _ _ index enters selected follows]
 
 /-- The ordinary worker entry point reconstructs this cursor from the root. -/
 theorem Cursor.step {journal current} {encode : β → Json} {remaining : Cloud M β}
-    (cursor : Cursor blobs source journal current encode remaining) (assignment : Assignment)
+    (cursor : Cursor blobs source journal current encode remaining) (assignment : Checkpoint)
+    (branch : assignment.branch = Location.branchStart assignment.location)
     (atLocation : assignment.location = current)
     (unfinished : journal.lookup (ReplayStore.returnKey assignment.branch) = none) :
     ∃ cost, ∀ fuel,
       (step store blobs (cost + fuel) (fun _ : Unit => source) () assignment).run journal =
-        (execute store blobs assignment fuel encode remaining current).run journal := by
+        (ReplayInterpreter.replay store blobs assignment.branch fuel encode remaining current).run journal := by
   obtain ⟨route, cost, replay⟩ := cursor
   have nonempty : 0 < current.size := Nat.lt_of_lt_of_le (by decide) route.depth
   have first : current[0]!.1 = 0 := by simpa [LeanCloud.Location.root] using (route.branch_at 0 (by decide)).symm
-  have valid : (!assignment.location.isEmpty && assignment.location[0]!.1 == 0) = true := by
-    simp [atLocation, Array.isEmpty, Nat.ne_of_gt nonempty, first]
+  have valid : (!assignment.branch.isEmpty && assignment.branch[0]!.1 == 0) = true := by
+    simp [branch, atLocation, Array.isEmpty, Nat.ne_of_gt nonempty, Location.branchStart_index _ 0 nonempty, first]
   refine ⟨cost, fun fuel => ?_⟩
-  simp [ReplayInterpreter.step, valid, ReplayStore.outcome]
+  simp [ReplayInterpreter.step, Checkpoint.work, valid, ReplayStore.outcome]
   erw [read_then]
   simp only [unfinished, Option.isSome_none, Bool.false_eq_true, ↓reduceIte, pure_bind]
-  rw [replay journal (.refl _) assignment (by simpa only [atLocation] using Follows.refl current nonempty)]
+  have follows : Follows current assignment.location := by simpa only [atLocation] using Follows.refl current nonempty
+  rw [← ReplayCursor.boundary store blobs assignment branch _ _ _ Location.root (route.trans follows) (by simp)]
+  rw [replay journal (.refl _) assignment branch follows]
   simpa only [atLocation] using congrArg (fun action => action.run journal)
-    (reconstruct_at_assignment store blobs assignment fuel encode remaining)
+    (ReplayCursor.at_target store blobs assignment fuel encode remaining)
 
 end LeanCloud.Proofs.SequentialCursor

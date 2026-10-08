@@ -440,9 +440,9 @@ def Context.kill (ctx : Context) (id : String) : Cli Unit := do
   ctx.withDeploymentLock do
   withLock (ctx.directory id / "launch.lock") do
     ctx.setControl id .killing
-    let outcome : Exit ← liftExcept (Json.parse (← ctx.remote run "cancel") >>= fromJson?)
+    let outcome : Option Exit ← liftExcept (Json.parse (← ctx.remote run "cancel") >>= fromJson?)
     match outcome with
-    | .cancelled _ =>
+    | none | some (.cancelled _) =>
       ctx.setControl id .killed
       printStyled (Styled.text s!"Killed {id}. Its replay records are preserved; it cannot be resumed." .red)
     | _ =>

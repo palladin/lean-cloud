@@ -28,7 +28,7 @@ def current (observed : Array Trace.Step) : Array Entry := Id.run do
     if step.event.worker == "scheduler" then
       match step.event.activity with
       | "paused" => control := "paused"
-      | "sealed" => control := "killed"
+      | "sealed" | "killed" => control := "killed"
       | "failed" => control := "stopped"
       | "resumed" => control := ""
       | _ => pure ()

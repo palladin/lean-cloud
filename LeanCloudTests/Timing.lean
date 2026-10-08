@@ -9,7 +9,7 @@ private def fork : Location := #[(0, 2)]
 private def child := fork.child 0
 private def sibling := fork.child 1
 
-private def initial : Pool.Run := ⟨"test", .active, {}⟩
+private def initial : Pool.Run := { id := "test" }
 private def waiting : Pool.Run := { initial with scheduler := { jobs := #[
   ⟨root, fork, false, .waiting #[child, sibling]⟩,
   ⟨child, child, false, .pending⟩, ⟨sibling, sibling, false, .pending⟩] } }

@@ -53,23 +53,6 @@ def completed (config : Config) (run : String) : IO (Option Exit) := do
   | .ok outcome => return outcome
   | .error error => throw (IO.userError (reprStr error))
 
-/-- Seal the root after the coordinator durably revokes the run. Atomic creation
-preserves any result already committed, including one whose reply was lost. -/
-def recordOutcome (config : Config) (run : String) (outcome : Exit) : IO Exit := do
-  validateRun run
-  -- Also seal a locally registered run whose initial submission was interrupted.
-  S3.initializeBucket config.blobs
-  let store := S3.records config.blobs run
-  match ← (do
-    store.finish Location.root outcome
-    let some outcome ← store.outcome | throw ⟨.protocol, "Missing terminal result"⟩
-    pure outcome : ExceptT CloudError IO Exit).run with
-  | .ok outcome => return outcome
-  | .error error => throw (IO.userError error.message)
-
-def cancel (config : Config) (run : String) : IO Exit :=
-  recordOutcome config run (.cancelled "Killed by user")
-
 /-- One durable scheduler mailbox and a private SQLite volume. The same actor
 turn as Sim saves state, confirms its outgoing messages, then acknowledges input.
 Broker/connection failures terminate the process; restart reopens the mailbox. -/
@@ -157,7 +140,7 @@ def runWorker [Codec α] (config : Config) (run : String)
             match delivery.message with
             | .execute assignment =>
               trace.assign assignment
-              IO.println s!"worker {id} attempt={assignment.attempt} location={assignment.location.key}"
+              IO.println s!"worker {id} attempt={assignment.attempt} location={assignment.branchStart.key}"
               (← IO.getStdout).flush
             | .failed error => failure.set (some error)
             | _ => pure ()

@@ -94,12 +94,6 @@ private def reconfigure (config : Config) (saved : Saved)
     (all.filter (·.worker != route.worker)).push route) retained
   return { saved with state, routes := some retained }
 
-/-- Call only after saving coordination state. Repeating the publication after
-a crash cannot replace the canonical root or reactivate this run. -/
-private def settle (config : Config) (run : LeanCloud.Pool.Run) : IO Unit := do
-  if let some outcome := run.terminalOutcome then
-    discard (recordOutcome config run.id outcome)
-
 /-- An offline worker must not block pool administration. Its assignment/report
 is already durable. Workers repeat readiness and recover the same assignment;
 report acknowledgements carry no state needed by the worker. -/
@@ -140,8 +134,6 @@ def scheduler (config : Config) : IO Unit := do
         saved ← IO.ofExcept (reconfigure config saved config.mailboxes.workers)
       saved := { saved with state := LeanCloud.Pool.recover saved.state }
       saved ← persist saved
-      for run in saved.state.runs do
-        settle config run
       let handle ← HttpMailbox.openMailbox config.mailboxes.scheduler address "scheduler"
       try
         let inbox : Mailbox IO Envelope := HttpMailbox.inbox handle
@@ -215,7 +207,6 @@ def scheduler (config : Config) : IO Unit := do
                 saved := { saved with state := LeanCloud.Pool.report saved.state run report }
                 saved ← persist saved
                 if let some state := saved.state.runs.find? (·.id == run) then
-                  settle config state
                   if let some error := state.scheduler.error then
                     (← Trace.create "scheduler" run).emit "failed" error.message
                 reply endpoint report.worker .acknowledged
@@ -240,12 +231,10 @@ def scheduler (config : Config) : IO Unit := do
                   pure (.ok (json.setObjVal! "timing" (toJson timing)))
                 | _, response => pure response
               if response.isOk then
-                if let .kill run := command then
-                  if let some state := saved.state.runs.find? (·.id == run) then settle config state
                 match command with
                 | .pause run => (← Trace.create "scheduler" run).emit "paused" ""
                 | .resume run => (← Trace.create "scheduler" run).emit "resumed" ""
-                | .kill run => (← Trace.create "scheduler" run).emit "sealed" ""
+                | .kill run => (← Trace.create "scheduler" run).emit "killed" ""
                 | _ => pure ()
               discard <| HttpMailbox.reply config.mailboxes.scheduler replyTo response
           inbox.acknowledge delivery.receipt

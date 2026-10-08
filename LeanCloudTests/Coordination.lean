@@ -43,7 +43,7 @@ def coordinationCases : Array TestCase := #[
       putBlob := fun _ => throw ⟨.unsupported, "Unexpected blob operation"⟩
       readBlob := fun _ => throw ⟨.unsupported, "Unexpected blob operation"⟩
       resolveBlob := fun _ => throw ⟨.unsupported, "Unexpected blob operation"⟩ }
-    let result ← (ReplayInterpreter.step records blobs 100 program 7 ⟨0, branch, branch, false⟩).run
+    let result ← (ReplayInterpreter.step records blobs 100 program 7 ⟨0, branch⟩).run
     assertOutcome result (.ok .done)
     assertEq (← saved.get) (some (rootRecord 9))⟩,
   ⟨"replay/typed-root-and-nested-child-codecs", do
@@ -91,14 +91,13 @@ def coordinationCases : Array TestCase := #[
     let (state, _) := Scheduler.handle 10 state (.report ⟨"a", first.attempt, .ok .done, #[]⟩)
     let (_, joined) := Scheduler.handle 10 state (.ready "c")
     let joined ← assigned joined
-    assertTrue joined.joining "Parent was not resumed for joining"
-    assertEq joined.location Location.root⟩,
+    assertEq joined.branchStart Location.root⟩,
   ⟨"scheduler/empty-parallel-is-immediately-joinable", do
     let (state, root) := Scheduler.handle 10 {} (.ready "a")
     let root ← assigned root
     let (state, _) := Scheduler.handle 10 state (.report ⟨"a", root.attempt, .ok (.fork Location.root 0), #[]⟩)
     let (_, resumed) := Scheduler.handle 10 state (.ready "a")
-    assertTrue (← assigned resumed).joining "Empty group remained suspended"⟩,
+    assertEq (← assigned resumed).branchStart Location.root⟩,
   ⟨"records/first-successful-create-wins", do
     let old : Fin 2 := ⟨0, by decide⟩
     let fresh : Fin 2 := ⟨1, by decide⟩
@@ -233,7 +232,7 @@ def simulationBoundaryCases : Array TestCase := #[
     assertEq again.scheduler recoveredScheduler "Recovery was not idempotent"
     let (_, deliveries) := Scheduler.handle 10 world.scheduler (.ready "replacement")
     let assignment ← assigned deliveries
-    assertEq assignment.branch (Location.root.child 0)
+    assertEq assignment.branchStart (Location.root.child 0)
     assertEq assignment.attempt 12⟩,
   ⟨"simulation/recovery-local-save-crash-boundaries", do
     let actor : Fin 1 := ⟨0, by decide⟩

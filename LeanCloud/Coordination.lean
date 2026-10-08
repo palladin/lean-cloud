@@ -7,14 +7,21 @@ open Lean
 /-- A stable actor address. A restarted worker reopens the same durable mailbox. -/
 abbrev WorkerId := String
 
-/-- Reconstruct the root program at `location`. `branch` identifies the stable
-completion key. `joining` authorizes reading the now-complete child records. -/
+/-- A stable branch start and its current attempt. The worker discovers progress
+from immutable records; assignments contain no replay cursor or join flag. -/
 structure Assignment where
   attempt : Nat
-  branch : Location
-  location : Location
-  joining : Bool := false
-  deriving Repr, BEq, ToJson, FromJson
+  branchStart : Location
+  deriving Repr, BEq, ToJson
+
+/-- Old durable inbox messages may still contain a cursor. Keep their stable
+branch identity and let replay discover progress from storage. -/
+instance : FromJson Assignment where
+  fromJson? json := do
+    let branchStart ← match json.getObjVal? "branchStart" with
+      | .ok value => fromJson? value
+      | .error _ => json.getObjValAs? Location "branch"
+    return { attempt := ← json.getObjValAs? Nat "attempt", branchStart }
 
 /-- A worker reports control flow and record keys, never result values. -/
 inductive Progress where

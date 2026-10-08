@@ -137,10 +137,11 @@ def demo : Cli Unit := do
     require (← ctx.outcome killed).isNone "Kill test missed the active run"
     discard (command ctx ["kill", "killed"])
     require ((← poolNodes ctx) == originalNodes) "Kill replaced or stopped shared nodes"
-    require ((← ctx.outcome killed) == some (.cancelled "Killed by user")) "Kill did not publish cancellation"
+    require ((← awaitOutcome ctx killed ((← request .now) + 120000)) == .cancelled "Killed by user")
+      "Worker did not publish cancellation"
     discard (command ctx ["watch", "killed", "--once"])
     let killedTrace ← LeanCloudCli.Trace.load ctx killed
-    require (killedTrace.steps.any (·.event.activity == "sealed")) "Killed run lost its scheduler event"
+    require (killedTrace.steps.any (·.event.activity == "sealed")) "Killed run lost its worker finalization event"
     ctx.kill "killed"
     require (← observing (ctx.resume "killed")).toOption.isNone "Killed run resumed"
     require ((← poolNodes ctx) == originalNodes) "Pause replaced or stopped shared nodes"

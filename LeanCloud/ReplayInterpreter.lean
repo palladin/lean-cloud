@@ -3,12 +3,13 @@ import LeanCloud.BlobStorage
 import LeanCloud.ReplayStore
 import LeanCloud.Coordination
 
-/-! `step` starts at the root. `reconstruct` follows recorded results to the
-assigned location, then calls `execute` with the remaining fuel. `execute` runs
-until the next fork or branch completion.
+/-! `step` starts at the root. `reconstruct` follows ancestor records to the
+assigned branch start. `replay` then reuses recorded results, executes missing
+commands, and joins completed children. Missing children cause suspension.
 
 Command results, joined arrays, and branch returns are immutable global records.
-Partial joins and assignment ownership live only in the scheduler. -/
+Only workers read and create replay records. The scheduler tracks dependencies
+and assignment ownership. -/
 
 namespace LeanCloud.ReplayInterpreter
 open Lean LeanEff
@@ -54,20 +55,25 @@ def finish [Monad m] (store : ReplayStore m) (branch : Location) (outcome : Exit
   store.finish branch outcome
   return .done
 
-/-- Reuse a command's record, or execute the command and publish its result.
+/-- Execute a missing command and publish its result.
 Always use the record returned by `create`: another attempt may have published first.
 Only workflow errors are recorded; failures in the base monad still escape. -/
-def command [Monad m] (store : ReplayStore m) (blobs : BlobStorage m)
+def execute [Monad m] (store : ReplayStore m) (blobs : BlobStorage m)
     (current : Location) (codec : Codec α) (operation : Operation m α) :
     ExceptT CloudError m Exit := do
   let expected := request codec operation
+  let outcome ← try
+    pure (.success (codec.encode (← blobs.execute operation)))
+  catch error => pure (.failure error)
+  check expected (← store.create (ReplayStore.valueKey current) ⟨expected, outcome⟩)
+
+/-- Read a command's canonical result, executing only when it is absent. -/
+def command [Monad m] (store : ReplayStore m) (blobs : BlobStorage m)
+    (current : Location) (codec : Codec α) (operation : Operation m α) :
+    ExceptT CloudError m Exit := do
   match ← store.read (ReplayStore.valueKey current) with
-  | some record => check expected record
-  | none =>
-    let outcome ← try
-      pure (.success (codec.encode (← blobs.execute operation)))
-    catch error => pure (.failure error)
-    check expected (← store.create (ReplayStore.valueKey current) ⟨expected, outcome⟩)
+  | some record => check (request codec operation) record
+  | none => execute store blobs current codec operation
 
 /-- Decode a successful result and continue, or finish the assigned branch. -/
 @[inline] def resume [Monad m] (store : ReplayStore m) (branch : Location)
@@ -86,14 +92,20 @@ def recorded [Monad m] (store : ReplayStore m) (current : Location)
   | .success value => return value
   | _ => throw ⟨.divergence, "Replay prefix failed"⟩
 
-/-- The scheduler authorizes a join only after all child returns are durable. -/
-def join [Monad m] (store : ReplayStore m) (location : Location) (count : Nat) :
-    ExceptT CloudError m Exit := do
-  let outcomes ← (Array.range count).mapM fun index => do
-    let some outcome ← store.outcome (location.child index)
-      | throw ⟨.protocol, "Scheduler resumed a group before its children completed"⟩
-    return outcome
-  return collect outcomes
+def readChildren [Monad m] (store : ReplayStore m) (location : Location) :
+    List Nat → ExceptT CloudError m (Option (List Exit))
+  | [] => pure (some [])
+  | index :: rest => do
+    let some outcome ← store.outcome (location.child index) | return none
+    let remaining ← readChildren store location rest
+    return remaining.map (outcome :: ·)
+
+/-- Join only when every child return is durable. A missing child suspends the
+branch; storage failures still propagate. Empty groups complete immediately. -/
+def tryJoin [Monad m] (store : ReplayStore m) (location : Location) (count : Nat) :
+    ExceptT CloudError m (Option Exit) := do
+  let outcomes ← readChildren store location (List.range count)
+  return outcomes.map (fun values => collect values.toArray)
 
 end Internal
 open Internal
@@ -107,9 +119,9 @@ def result [Monad m] [codec : Codec α] (outcome : Exit) : ExceptT CloudError m 
 /-- Optional diagnostic context. It is not persisted and never affects routing. -/
 abbrev Observer (m : Type → Type u) := Location → Option SourceSiteId → m Unit
 
-/-- Execute the assigned branch segment. Commands reuse or create records;
-parallel groups reuse a result, perform an authorized join, or suspend. -/
-def execute [Monad m] (store : ReplayStore m) (blobs : BlobStorage m) (assignment : Assignment)
+/-- Replay the assigned branch until its next suspension or completion.
+Storage alone determines whether a command or parallel group has finished. -/
+def replay [Monad m] (store : ReplayStore m) (blobs : BlobStorage m) (branchStart : Location)
     (fuel : Nat) (encode : α → Json) (program : Cloud m α) (current : Location)
     (observer : Option (Observer m) := none) :
     ExceptT CloudError m Progress :=
@@ -118,47 +130,48 @@ def execute [Monad m] (store : ReplayStore m) (blobs : BlobStorage m) (assignmen
   | fuel + 1 =>
     let action :=
       match program with
-      | EffF.pure _ value => finish store assignment.branch (.success (encode value))
+      | EffF.pure _ value => finish store branchStart (.success (encode value))
       | .impure _ control continuation =>
         match control, continuation with
         | .delay, continuation =>
-          execute store blobs assignment fuel encode (ArrsF.apply continuation ()) current observer
-        | .fail error, _ => finish store assignment.branch (.failure error)
+          replay store blobs branchStart fuel encode (ArrsF.apply continuation ()) current observer
+        | .fail error, _ => finish store branchStart (.failure error)
         | .command codec operation, continuation => do
           let outcome ← command store blobs current codec operation
-          resume store assignment.branch (decode codec)
-            (fun value => execute store blobs assignment fuel encode
+          resume store branchStart (decode codec)
+            (fun value => replay store blobs branchStart fuel encode
               (ArrsF.apply continuation value) current.next observer) outcome
         | .parallel codec count _, continuation => do
           let expected : Request := ⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩
-          let existing ← store.read (ReplayStore.valueKey current)
-          if existing.isNone && (current != assignment.location || !assignment.joining) then
-            return .fork current count
-          let outcome ← match existing with
-            | some record => check expected record
-            | none => do
-              let outcome ← join store current count
-              check expected (← store.create (ReplayStore.valueKey current) ⟨expected, outcome⟩)
-          resume store assignment.branch (decodeGroup codec count)
-            (fun values => execute store blobs assignment fuel encode
-              (ArrsF.apply continuation values) current.next observer) outcome
+          let continueWith (outcome : Exit) :=
+            resume store branchStart (decodeGroup codec count)
+              (fun values => replay store blobs branchStart fuel encode
+                (ArrsF.apply continuation values) current.next observer) outcome
+          match ← store.read (ReplayStore.valueKey current) with
+          | some record => continueWith (← check expected record)
+          | none =>
+            match ← tryJoin store current count with
+            | none => return .fork current count
+            | some outcome =>
+              let record ← store.create (ReplayStore.valueKey current) ⟨expected, outcome⟩
+              continueWith (← check expected record)
     match observer with
     | none => action
     | some visit => do
       visit current program.metadata
       action
 
-/-- Follow the recorded prefix from the root to the assignment. Descending into
-a child selects its computation and result encoder. At the target, execution
-starts directly: changing phase consumes no fuel and adds no observation. -/
-def reconstruct [Monad m] (store : ReplayStore m) (blobs : BlobStorage m) (assignment : Assignment)
+/-- Follow ancestor records from the root to `branchStart`. Descending into a
+child selects its computation and result encoder. At the branch start, switch
+to replay without consuming fuel or adding an observation. -/
+def reconstruct [Monad m] (store : ReplayStore m) (blobs : BlobStorage m) (branchStart : Location)
     (fuel : Nat) (encode : α → Json) (program : Cloud m α) (current : Location)
     (observer : Option (Observer m) := none) : ExceptT CloudError m Progress :=
   match fuel with
   | 0 => throw ⟨.protocol, "Interpreter fuel exhausted"⟩
   | fuel + 1 =>
-    if current == assignment.location then
-      execute store blobs assignment (fuel + 1) encode program current observer
+    if current == branchStart then
+      replay store blobs branchStart (fuel + 1) encode program current observer
     else
       let action :=
         match program with
@@ -166,24 +179,24 @@ def reconstruct [Monad m] (store : ReplayStore m) (blobs : BlobStorage m) (assig
         | .impure _ control continuation =>
           match control, continuation with
           | .delay, continuation =>
-            reconstruct store blobs assignment fuel encode (ArrsF.apply continuation ()) current observer
+            reconstruct store blobs branchStart fuel encode (ArrsF.apply continuation ()) current observer
           | .fail _, _ => throw ⟨.divergence, "Computation failed before the assigned location"⟩
           | .command codec operation, continuation => do
             let wire ← recorded store current (request codec operation) "Missing result in replay prefix"
             let value ← decode codec wire
-            reconstruct store blobs assignment fuel encode (ArrsF.apply continuation value) current.next observer
+            reconstruct store blobs branchStart fuel encode (ArrsF.apply continuation value) current.next observer
           | .parallel codec count branches, continuation => do
-            if current.entersChild assignment.location then
-              let index := assignment.location[current.size]!.1
+            if current.entersChild branchStart then
+              let index := branchStart[current.size]!.1
               if inside : index < count then
-                reconstruct store blobs assignment fuel codec.encode (branches ⟨index, inside⟩)
+                reconstruct store blobs branchStart fuel codec.encode (branches ⟨index, inside⟩)
                   (current.child index) observer
               else throw ⟨.divergence, "Child index is outside the group"⟩
             else
               let expected : Request := ⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩
               let wire ← recorded store current expected "Missing joined result in replay prefix"
               let values ← decodeGroup codec count wire
-              reconstruct store blobs assignment fuel encode (ArrsF.apply continuation values) current.next observer
+              reconstruct store blobs branchStart fuel encode (ArrsF.apply continuation values) current.next observer
       match observer with
       | none => action
       | some visit => do
@@ -196,9 +209,9 @@ def step [Monad m] [Codec α] (store : ReplayStore m) (blobs : BlobStorage m) (f
     (program : ι → Cloud m α) (input : ι) (assignment : Assignment)
     (observer : Option (Observer m) := none) :
     ExceptT CloudError m Progress := do
-  unless !assignment.location.isEmpty && assignment.location[0]!.1 == 0 do
+  unless !assignment.branchStart.isEmpty && assignment.branchStart[0]!.1 == 0 do
     throw ⟨.protocol, "A location must start at root branch 0"⟩
-  if (← store.outcome assignment.branch).isSome then return .done
-  reconstruct store blobs assignment fuel Codec.encode (program input) Location.root observer
+  if (← store.outcome assignment.branchStart).isSome then return .done
+  reconstruct store blobs assignment.branchStart fuel Codec.encode (program input) Location.root observer
 
 end LeanCloud.ReplayInterpreter

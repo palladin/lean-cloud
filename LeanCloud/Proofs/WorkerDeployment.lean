@@ -49,10 +49,15 @@ theorem execute [codec : Codec α] (expected : Journal) (worker : WorkerId) (ass
       (fun world => Traffic.ToWorker codec.encode (program input) expected world.scheduler world.records worker (.execute assignment))
       (fun report world => Traffic.ToScheduler codec.encode (program input) expected world.scheduler world.records (.report report))
       (LeanCloud.Worker.execute worker (observed worker) blobs fuel program input assignment) := by
+  apply Rules.Program.exists_pre
+  intro point
+  apply Rules.Program.assuming
+  intro same
+  subst assignment
   have execution := (refinement expected codec.encode (program input)).program _
-    (WorkerContracts.assigned expected worker assignment fuel program input meaning known)
+    (WorkerContracts.assigned expected worker point fuel program input meaning known)
   have identity : (rules expected codec.encode (program input) false).Frame
-      (fun world => SchedulerAssignments.Identifies world.scheduler worker assignment) :=
+      (fun world => SchedulerAssignments.Identifies world.scheduler worker point) :=
     ⟨(fun _ _ _ _ moves holds => holds.advance moves.1.1),
       (fun _ _ _ _ moves holds => holds.advance moves.1),
       (fun _ _ _ _ _ moves holds => holds.advance moves.1.1)⟩

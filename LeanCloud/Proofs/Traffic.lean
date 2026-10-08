@@ -11,8 +11,8 @@ open Lean ReplayModel SchedulerAssignments SchedulerRecords SimulationBackend
 
 variable {m : Type → Type u} {α : Type}
 
-/-- A live fork report advances its job's location; an authorized join cannot
-report its own suspension again. Expired attempts impose no constraint on a
+/-- A live fork report advances its job's location; a completed child group
+cannot cause the same suspension again. Expired attempts impose no constraint on a
 replacement job, and their reports cannot change that job. -/
 def ForkForward (state : Scheduler.State) (report : Report) : Prop :=
   ∀ job ∈ state.jobs, ∀ deadline location count,
@@ -34,8 +34,9 @@ def ToScheduler (encode : α → Json) (program : Cloud m α)
 
 def ToWorker (encode : α → Json) (program : Cloud m α)
     (expected : Journal) (state : Scheduler.State) (journal : Journal) (worker : WorkerId) : WorkerMessage → Prop
-  | .execute issued => Identifies state worker issued ∧ SchedulerGroups.AssignmentReady expected journal issued ∧
-      Reconstruction.Resumable journal encode program Location.root issued.location
+  | .execute issued => ∃ point : Checkpoint, point.work = issued ∧
+      Identifies state worker point ∧ SchedulerGroups.AssignmentReady expected journal point ∧
+      Reconstruction.Resumable journal encode program Location.root point.location
   | _ => True
 
 def EnvelopeValid (encode : α → Json) (program : Cloud m α)
@@ -57,7 +58,9 @@ theorem ToScheduler.advance {before after first last message} (valid : ToSchedul
 theorem ToWorker.advance {before after first last worker message} (valid : ToWorker encode program expected before first worker message)
     (forward : Forward before after) (extension : Extends first last) : ToWorker encode program expected after last worker message := by
   cases message with
-  | execute issued => exact ⟨valid.1.advance forward, valid.2.1.extend extension, valid.2.2.extend extension⟩
+  | execute issued =>
+    obtain ⟨point, same, identity, ready, path⟩ := valid
+    exact ⟨point, same, identity.advance forward, ready.extend extension, path.extend extension⟩
   | acknowledged _ | idle | finished | failed _ | status _ => trivial
 
 theorem EnvelopeValid.advance {before after first last envelope} (valid : EnvelopeValid encode program expected before first envelope)
@@ -66,8 +69,9 @@ theorem EnvelopeValid.advance {before after first last envelope} (valid : Envelo
   | scheduler message => exact ToScheduler.advance valid forward extension
   | worker delivery => exact ToWorker.advance valid forward extension
 
-/-- The scheduler emits assignments with certified identity, join readiness, and
-reconstruction paths. Replies can remain in the broker through later restarts. -/
+/-- Each emitted assignment has a proof checkpoint certifying its identity,
+child readiness, and reconstruction path. Only the branch start and attempt
+travel in the message, which can remain in transport through later restarts. -/
 theorem scheduler_sends_valid (state : Scheduler.State) (expected journal : Journal) (duration : Nat) (message : SchedulerMessage)
     (valid : SchedulerAssignments.Valid state) (groups : SchedulerGroups.Valid expected journal state.jobs)
     (paths : SchedulerPaths.Valid journal encode program state.jobs) (delivery : Delivery)
@@ -75,9 +79,10 @@ theorem scheduler_sends_valid (state : Scheduler.State) (expected journal : Jour
     ToWorker encode program expected (Scheduler.handle duration state message).1 journal delivery.worker delivery.message := by
   cases kind : delivery.message with
   | execute issued =>
-    exact ⟨handle_identifies state duration message valid delivery issued sent kind,
-      SchedulerGroups.handle_ready state expected journal duration message groups delivery issued sent kind,
-      SchedulerPaths.handle_resumable state journal duration message paths delivery issued sent kind⟩
+    obtain ⟨job, member, attempt, same, identity⟩ :=
+      handle_identifies state duration message valid delivery issued sent kind
+    exact ⟨Checkpoint.ofJob job attempt, same, identity,
+      (groups job member).assignment attempt, paths job member⟩
   | acknowledged _ | idle | finished | failed _ | status _ => trivial
 
 structure Valid (encode : α → Json) (program : Cloud m α) (expected : Journal) (world : World) : Prop where

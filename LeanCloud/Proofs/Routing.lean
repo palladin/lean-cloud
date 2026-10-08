@@ -49,6 +49,21 @@ theorem Follows.branch_at {source target : Location} (follows : Follows source t
   · have atLast : index = source.size - 1 := by omega
     simpa only [atLast] using follows.branch
 
+theorem Follows.same_branch {source target : Location} (follows : Follows source target)
+    (depth : source.size = target.size) :
+    Proofs.Location.branchStart source = Proofs.Location.branchStart target := by
+  apply Array.ext (by simp [depth])
+  intro index left right
+  have inside : index < source.size := by simpa using left
+  by_cases last : index = source.size - 1
+  · subst index
+    simp [Proofs.Location.branchStart, Array.set!, ← depth, follows.branch]
+  · have earlier : index + 1 < source.size := by omega
+    have same := follows.ancestry index earlier
+    simpa [Proofs.Location.branchStart, Array.set!, Array.getElem_setIfInBounds inside,
+      Array.getElem_setIfInBounds (show index < target.size by omega), ← depth, Ne.symm last,
+      getElem!_pos source index inside, getElem!_pos target index (by omega)] using same
+
 private theorem at_push (location : Location) (address : Nat × Nat) (index : Nat) (inside : index < location.size) :
     (location.push address)[index]! = location[index]! := by
   rw [getElem!_pos _ index (by simp; omega), getElem!_pos _ index inside, Array.getElem_push_lt inside]
@@ -107,6 +122,14 @@ theorem entersChild_iff (source target : Location) :
 theorem enters_child (location : Location) (child : Nat) : location.entersChild (location.child child) = true := by
   apply (entersChild_iff _ _).mpr
   exact ⟨by simp [LeanCloud.Location.child], fun index inside => (at_push location (child, 0) index inside).symm⟩
+
+theorem enters_branchStart {source target : Location} (depth : source.size < target.size) :
+    source.entersChild (Proofs.Location.branchStart target) = source.entersChild target := by
+  apply Bool.eq_iff_iff.mpr
+  simp only [entersChild_iff, Proofs.Location.branchStart_size, depth, true_and]
+  constructor <;> intro entries index inside
+  · simpa only [Proofs.Location.branchStart_ancestor target index (by omega)] using entries index inside
+  · simpa only [Proofs.Location.branchStart_ancestor target index (by omega)] using entries index inside
 
 /-- Extending a destination retains all earlier ancestor decisions. -/
 theorem enters_follows {source middle target : Location} (enters : source.entersChild middle = true)

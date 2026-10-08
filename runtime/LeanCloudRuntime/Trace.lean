@@ -46,7 +46,7 @@ def Sink.emit (sink : Sink) (activity operation : String) (job : Option BranchOb
   catch _ => pure ()
 
 def Sink.assign (sink : Sink) (assignment : Assignment) : IO Unit := do
-  sink.state.modify fun state => { state with attempt := some assignment.attempt, location := assignment.location.key, source := none, branch := some assignment.branch }
+  sink.state.modify fun state => { state with attempt := some assignment.attempt, location := assignment.branchStart.key, source := none, branch := some assignment.branchStart }
   sink.emit "assigned" ""
 
 /-- Lease renewal changes no visible branch state. Emit deltas, not the entire

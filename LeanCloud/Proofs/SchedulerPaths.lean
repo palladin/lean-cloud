@@ -127,12 +127,4 @@ theorem handle_preserves (state : State) (journal : Journal) (duration : Nat) (m
   | inspect replyTo => exact valid
   | tick elapsed => exact tick_preserves state journal duration elapsed valid
 
-/-- Every emitted assignment has a path from the original workflow. -/
-theorem handle_resumable (state : State) (journal : Journal) (duration : Nat) (message : SchedulerMessage)
-    (valid : Valid journal encode program state.jobs) (delivery : Delivery) (issued : Assignment)
-    (sent : delivery ∈ (handle duration state message).2) (executes : delivery.message = .execute issued) :
-    Resumable journal encode program Location.root issued.location := by
-  obtain ⟨job, member, attempt, rfl⟩ := Scheduler.handle_from_job state duration message delivery issued sent executes
-  exact valid job member
-
 end LeanCloud.Proofs.SchedulerPaths

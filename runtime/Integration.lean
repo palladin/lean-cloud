@@ -5,6 +5,13 @@ import PoolTests
 
 open Lean LeanCloud LeanCloudRuntime LeanCloudTests
 
+/-- Exercise the worker's terminal publication without a deployment coordinator. -/
+private def finalize (config : Config) (run : String) : IO Exit := do
+  let report ← Worker.finalize "test-worker" ⟨S3.records config.blobs run, pure #[]⟩ 0 (.cancelled "Killed by user")
+  assertOutcome report.progress (.ok .done)
+  let some outcome ← completed config run | throw (IO.userError "Worker did not publish the terminal result")
+  return outcome
+
 private def checkPrograms (config : Config) (runPrefix : String) : IO Unit := do
   IO.ofExcept programs.validate
   assertEq programs.programs.size 2
@@ -29,15 +36,15 @@ private def checkPrograms (config : Config) (runPrefix : String) : IO Unit := do
     pure false
   catch _ => pure true
   assertTrue conflict "Conflicting typed submission overwrote a run"
-  assertEq (← cancel config process.id) (.success (toJson (29 : Nat)))
+  assertEq (← finalize config process.id) (.success (toJson (29 : Nat)))
     "Administrative cancellation overwrote a completed result"
   let killed ← sumSquares.submit config (runPrefix ++ "-killed") input
   for _ in [:2] do
-    assertEq (← cancel config killed.id) (.cancelled "Killed by user")
+    assertEq (← finalize config killed.id) (.cancelled "Killed by user")
   assertOutcome (← killed.await) (.error ⟨.cancelled, "Killed by user"⟩)
   -- Killing a locally registered run also works if submission never reached S3.
   let unfinished := runPrefix ++ "-unfinished-launch"
-  assertEq (← cancel config unfinished) (.cancelled "Killed by user")
+  assertEq (← finalize config unfinished) (.cancelled "Killed by user")
   let late ← sumSquares.submit config unfinished input
   assertOutcome (← late.await) (.error ⟨.cancelled, "Killed by user"⟩)
 

@@ -28,7 +28,7 @@ private def process (completed : Bool) (call : Invocation) : Except String Proce
   else if args.contains "status" then response (toJson ({} : Scheduler.State)).compress
   else if args.contains "result" then response "29"
   else if args.contains "cancel" then
-    response (toJson (if completed then Exit.success (toJson (29 : Nat)) else .cancelled "Killed by user")).compress
+    response (toJson (if completed then some (Exit.success (toJson (29 : Nat))) else none)).compress
   else if args[0]? == some "logs" then
     let worker := (args.back?.getD "").splitOn "-" |>.getLast!
     let event : ExecutionEvent := ⟨"boot", 1, 10, worker, some 1, "0:1", "execute", "square", savedRun.id, some "square"⟩

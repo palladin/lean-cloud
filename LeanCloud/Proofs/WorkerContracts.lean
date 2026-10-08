@@ -8,7 +8,7 @@ does not serialize proof witnesses, programs, or continuations. -/
 namespace LeanCloud.Proofs.WorkerContracts
 open Lean SimulationBackend ReplayModel SimulationLogic
 
-def ReportResult (expected : Journal) (worker : WorkerId) (assignment : Assignment) (outcome : Exit)
+def ReportResult (expected : Journal) (worker : WorkerId) (assignment : Checkpoint) (outcome : Exit)
     (encode : α → Json) (program : Cloud (SimM World) α) (report : Report) (world : World) : Prop :=
   report.worker = worker ∧ report.attempt = assignment.attempt ∧
     ExecutionContracts.Result expected assignment.branch outcome encode program Location.root report.progress world ∧
@@ -16,7 +16,7 @@ def ReportResult (expected : Journal) (worker : WorkerId) (assignment : Assignme
 
 /-- Reading observation keys preserves any stable interpreter postcondition,
 including semantic results, replay paths, and fuel guarantees. -/
-theorem execute [codec : Codec α] (expected : Journal) (worker : WorkerId) (assignment : Assignment)
+theorem execute [codec : Codec α] (expected : Journal) (worker : WorkerId) (assignment : Checkpoint)
     (fuel : Nat) (program : ι → Cloud (SimM World) α) (input : ι) (pre : World → Prop)
     (post : Except CloudError Progress → World → Prop)
     (stable : ∀ result, (ReplayContracts.rules expected).Stable (ReplayContracts.rules expected).interference (post result))
@@ -33,11 +33,10 @@ theorem execute [codec : Codec α] (expected : Journal) (worker : WorkerId) (ass
   intro recorded
   exact fun _ _ holds => ⟨rfl, rfl, holds⟩
 
-/-- A worker obtains its reconstruction witness from the received assignment's
-current validity. Callers need only a reconstructible location and completed
-children for an authorized join; they do not supply a journal snapshot, a typed
-continuation, or a branch result. The source specification determines the result. -/
-theorem assigned [codec : Codec α] (expected : Journal) (worker : WorkerId) (assignment : Assignment)
+/-- Assignment validity supplies a proof checkpoint with a reconstructible
+location and child-readiness certificate. Callers supply no journal snapshot,
+typed continuation, or branch result. The source determines the result. -/
+theorem assigned [codec : Codec α] (expected : Journal) (worker : WorkerId) (assignment : Checkpoint)
     (fuel : Nat) (program : ι → Cloud (SimM World) α) (input : ι) {outcome}
     (meaning : Specification.Complete expected Location.root (program input) outcome)
     (known : expected.lookup (ReplayStore.returnKey Location.root) =
@@ -77,7 +76,7 @@ error. A workflow failure is still a valid durable completion. The precondition
 requires only its recorded prefix and, for a join, the completed child records.
 This is fuel adequacy; eventual delivery of atomic replies is a separate issue. -/
 theorem sufficient_fuel [codec : Codec α] (expected journal : Journal) (worker : WorkerId)
-    (assignment : Assignment) (program : ι → Cloud (SimM World) α) (input : ι)
+    (assignment : Checkpoint) (program : ι → Cloud (SimM World) α) (input : ι)
     {β : Type} {remainingEncode : β → Json} {remaining : Cloud (SimM World) β} {steps outcome}
     (meaning : Specification.Complete expected Location.root (program input) outcome)
     (known : expected.lookup (ReplayStore.returnKey Location.root) =
@@ -118,7 +117,7 @@ theorem ReportResult.to_scheduler {expected worker assignment outcome world repo
   · intro job member deadline running completed
     have running' : job.status = .running worker assignment.attempt deadline := by
       simpa [result.1, result.2.1] using running
-    have branch := congrArg Assignment.branch (identity.2 job member worker deadline running').2
+    have branch := congrArg Checkpoint.branch (identity.2 job member worker deadline running').2
     change job.branch = assignment.branch at branch
     refine ⟨outcome, ?_⟩
     rw [branch]
@@ -127,7 +126,7 @@ theorem ReportResult.to_scheduler {expected worker assignment outcome world repo
   · intro job member deadline location count running forked
     have running' : job.status = .running worker assignment.attempt deadline := by
       simpa [result.1, result.2.1] using running
-    have branch := congrArg Assignment.branch (identity.2 job member worker deadline running').2
+    have branch := congrArg Checkpoint.branch (identity.2 job member worker deadline running').2
     change job.branch = assignment.branch at branch
     rw [branch]
     have group := result.2.2.1.1
@@ -137,8 +136,8 @@ theorem ReportResult.to_scheduler {expected worker assignment outcome world repo
       simpa [result.1, result.2.1] using running
     have same := (identity.2 job member worker deadline running').2
     have advanced := result.2.2.2 location count forked
-    have place : job.location = assignment.location := congrArg Assignment.location same
-    have joining : job.joining = assignment.joining := congrArg Assignment.joining same
+    have place : job.location = assignment.location := congrArg Checkpoint.location same
+    have joining : job.joining = assignment.joining := congrArg Checkpoint.joining same
     simpa only [place, joining] using advanced
 
 end LeanCloud.Proofs.WorkerContracts

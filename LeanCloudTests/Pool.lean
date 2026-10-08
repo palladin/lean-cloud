@@ -14,9 +14,51 @@ private def takeJob (state : Pool.State) (worker : String) : IO (Pool.State × S
   | .execute run assignment => return (next, run, assignment)
   | _ => throw (IO.userError "Expected a pool assignment")
 
-private def initial : Pool.State := { runs := #[⟨"first", .active, {}⟩, ⟨"second", .active, {}⟩] }
+private def initial : Pool.State := { runs := #[{ id := "first" }, { id := "second" }] }
 
 def poolCases : Array TestCase := #[
+  ⟨"pool.terminal-publication-retries-after-worker-and-scheduler-crash", do
+    let state ← change {} (.submit "cancelled")
+    let state ← change state (.configureWorkers #[])
+    let state ← change state (.kill "cancelled")
+    assertEq (state.runs[0]?.map (·.finalization)) (some .pending)
+    let (_, reply) := Pool.acquire 100 state "worker1"
+    assertTrue (match reply with | .drain _ => true | _ => false) "Zero-worker pool assigned a finalizer"
+    let state ← change state (.configureWorkers #["worker1", "worker2"])
+    let (state, reply) := Pool.acquire 100 state "worker1"
+    let .finalize id first outcome := reply | throw (IO.userError "Missing finalizer")
+    let (duplicateState, duplicate) := Pool.acquire 100 state "worker1"
+    assertEq (toJson duplicateState) (toJson state)
+    assertEq (toJson duplicate) (toJson reply)
+    let renewed := Pool.renew 100 (Pool.tick 50 state) id "worker1" first
+    assertTrue (Pool.valid (Pool.tick 75 renewed) id "worker1" first) "Finalizer renewal was ignored"
+    let expired := Pool.tick 100 state
+    let (state, replacement) := Pool.acquire 100 expired "worker2"
+    let .finalize _ second _ := replacement | throw (IO.userError "Expired finalizer was not retried")
+    assertTrue (second > first) "Finalizer reused an expired attempt"
+    assertEq (toJson (Pool.report state id ⟨"worker1", first, .ok .done, #[]⟩)) (toJson state)
+    let (report, world) ← unwrap (evaluate 10000
+      (Worker.finalize "worker2" (SimulationBackend.observed "worker2") second outcome) ({} : SimulationBackend.World))
+    assertTrue (report.recorded.contains (ReplayStore.returnKey Location.root)) "Report omitted the durable root record"
+    -- Publication survived; the report was lost and the scheduler restarted.
+    let recovered := Pool.recover state
+    assertTrue (!Pool.valid recovered id "worker2" second) "Restart retained finalization ownership"
+    let (state, retry) := Pool.acquire 100 recovered "worker1"
+    let .finalize _ third _ := retry | throw (IO.userError "Restart lost terminal intent")
+    assertTrue (third > second) "Restart reused finalization attempt"
+    let (report, after) ← unwrap (evaluate 10000
+      (Worker.finalize "worker1" (SimulationBackend.observed "worker1") third outcome) world)
+    assertEq after.records world.records "Retry overwrote the durable outcome"
+    let finished := Pool.report state id report
+    assertEq (finished.runs[0]?.map (·.finalization)) (some .done)
+    assertEq (toJson (Pool.acquire 100 finished "worker1").2) (toJson Pool.Reply.idle)⟩,
+  ⟨"pool.legacy-run-defaults-to-pending-finalization", do
+    let run : Pool.Run ← unwrap (fromJson? (Json.mkObj [
+      ("id", toJson "old"), ("mode", toJson Pool.Mode.killed),
+      ("scheduler", toJson ({} : Scheduler.State))]))
+    assertEq run.finalization Scheduler.Status.pending
+    let (_, reply) := Pool.acquire 100 { runs := #[run] } "worker1"
+    assertTrue (match reply with | .finalize .. => true | _ => false) "Saved terminal intent was lost"⟩,
   ⟨"pool.failure-in-child-revokes-siblings-and-survives-recovery", do
     let source := lower (.parallel [.value 7, .value 9]) (m := SimM SimulationBackend.World)
     let runJob (world : SimulationBackend.World) (worker : String) (fuel : Nat) (job : Assignment) :=
@@ -46,6 +88,15 @@ def poolCases : Array TestCase := #[
     assertTrue (Pool.command recovered (.pause id)).toOption.isNone "Failure became paused"
     let killed ← change recovered (.kill id)
     assertEq (killed.runs[0]?.bind Pool.Run.terminalOutcome) (some (.failure error))
+    let (sealing, reply) := Pool.acquire 100 recovered "worker1"
+    let .finalize failed attempt outcome := reply | throw (IO.userError "Missing terminal assignment")
+    assertEq failed id
+    assertEq outcome (.failure error)
+    let (report, world) ← unwrap (evaluate 10000
+      (Worker.finalize "worker1" (SimulationBackend.observed "worker1") attempt outcome) world)
+    assertEq ((world.records.lookup (ReplayStore.returnKey Location.root)).map (·.outcome)) (some outcome)
+    let recovered := Pool.report sealing id report
+    assertEq (recovered.runs[0]?.map (·.finalization)) (some .done)
     let next ← change recovered (.submit "healthy")
     let (next, other, job) ← takeJob next "worker1"
     assertEq other "healthy"
@@ -145,6 +196,11 @@ def poolCases : Array TestCase := #[
     let duplicate ← change state (.submit "first")
     assertEq (toJson state).compress (toJson duplicate).compress
     assertTrue (Pool.command state (.resume "first")).toOption.isNone "Killed run resumed"
+    let (state, reply) := Pool.acquire 100 state "worker1"
+    let .finalize id attempt outcome := reply | throw (IO.userError "Missing cancellation assignment")
+    assertEq id "first"
+    assertEq outcome (.cancelled "Killed by user")
+    let state := Pool.report state id ⟨"worker1", attempt, .ok .done, #[]⟩
     let (_, run, _) ← takeJob state "worker1"
     assertEq run "second"
     assertTrue (Pool.command state (.pause "missing")).toOption.isNone "Unknown run accepted"
@@ -217,7 +273,7 @@ def poolCases : Array TestCase := #[
         state := Pool.report state run ⟨s!"w{index}", job.attempt, .ok .done, #[]⟩
       for worker in ["worker1", "worker2"] do
         let (next, run, job) ← takeJob state worker
-        assertTrue job.joining "Parent resumed before collecting children"
+        assertEq job.branchStart Location.root "Expected the parent branch start"
         state := Pool.report next run ⟨worker, job.attempt, .ok .done, #[]⟩
       assertTrue (state.runs.all (·.scheduler.finished)) "A run lost its completion"⟩
 ]

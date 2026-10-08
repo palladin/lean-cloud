@@ -83,7 +83,7 @@ private theorem work_trace : Trace created executed := after_trace working creat
 private theorem report_trace : Trace executed delivered := after_trace reporting executed (by cbv)
 private theorem save_trace : Trace delivered saved := after_trace saving delivered (by cbv)
 
-private def assignment : Assignment := ⟨0, Location.root, Location.root, false⟩
+private def assignment : Assignment := ⟨0, Location.root⟩
 private def report : Report := ⟨"worker-1", 0, .ok .done, #[ReplayStore.returnKey Location.root]⟩
 
 -- Compute a finite witness for the existing Execution relation. This only runs

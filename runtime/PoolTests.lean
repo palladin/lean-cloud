@@ -39,6 +39,24 @@ private def report (config : Config) (run : String) (value : Report) : IO Unit :
   -- the report before inspecting the durable scheduler state or result.
   discard <| LeanCloudRuntime.Pool.request config .health
 
+/-- The coordinator supplies intent and lease; this worker publishes the root
+before reporting completion. No scheduler-side record IO is involved. -/
+private def finalize (config : Config) (handle : HttpMailbox.Handle) (worker run : String) : IO Unit := do
+  LeanCloudRuntime.Pool.send config (.ready worker)
+  let inbox : Mailbox IO LeanCloud.Pool.Reply := HttpMailbox.inbox handle
+  let deadline := (← IO.monoMsNow) + 10000
+  repeat
+    unless (← IO.monoMsNow) < deadline do throw (IO.userError "Pool did not assign finalization")
+    let some delivery ← inbox.receive | continue
+    if let .finalize id attempt outcome := delivery.message then
+      assertEq id run
+      let value ← Worker.finalize worker (← observe (S3.records config.blobs id)) attempt outcome
+      assertOutcome value.progress (.ok .done)
+      report config id value
+      inbox.acknowledge delivery.receipt
+      return
+    inbox.acknowledge delivery.receipt
+
 private def execute (config : Config) (run worker : String) (fuel : Nat) (input : Array Nat)
     (job : Assignment) : IO Report := do
   Worker.execute worker (← observe (S3.records config.blobs run)) (S3.storage config.blobs)
@@ -55,11 +73,13 @@ private def liveFailure (config : Config) (runPrefix : String) : IO Unit := do
     report config failed.id (← execute config failed.id "worker1" 1000 #[2, 3] root)
     let left ← assignment config first "worker1" failed.id
     let right ← assignment config second "worker2" failed.id
-    assertTrue (left.branch != Location.root && right.branch != Location.root) "Expected parallel children"
+    assertTrue (left.branchStart != Location.root && right.branchStart != Location.root) "Expected parallel children"
     let failure ← execute config failed.id "worker1" 0 #[2, 3] left
     let .error error := failure.progress | throw (IO.userError "Expected actual interpreter exhaustion")
     assertEq error fuelError
     report config failed.id failure
+    assertTrue (← failed.poll).isNone "Scheduler wrote the failure result"
+    finalize config first "worker1" failed.id
     assertOutcome (← waitOutcome failed) (.error fuelError)
     assertOutcome (← failed.await) (.error fuelError)
     let state ← LeanCloudRuntime.Pool.status config failed.id
@@ -117,12 +137,14 @@ def run (original : Config) (runPrefix : String) : IO Unit :=
     (runPrefix ++ "-completed-first", some (Exit.success (toJson (29 : Nat))), Exit.success (toJson (29 : Nat)))]
   for (id, existing, _) in scenarios do
     programs.submit config id sumSquares.info.entry (toJson (#[2, 3, 4] : Array Nat))
-    if let some outcome := existing then discard (recordOutcome config id outcome)
+    if let some outcome := existing then
+      let value ← Worker.finalize "test-worker" ⟨S3.records config.blobs id, pure #[]⟩ 0 outcome
+      assertOutcome value.progress (.ok .done)
   let conn ← LeanLinq.Sqlite.connect database.toString
   try
     LocalDb.initializeSchema conn
     let state : LeanCloud.Pool.State := { runs := scenarios.map fun (id, _, _) =>
-      ⟨id, .active, { error := some fuelError, nextAttempt := 7 }⟩ }
+      { id, scheduler := { error := some fuelError, nextAttempt := 7 } } }
     LocalDb.saveValue conn "pool-v1" ({ state } : LeanCloudRuntime.Pool.Saved)
   finally conn.close
   let child ← IO.Process.spawn {
@@ -130,10 +152,15 @@ def run (original : Config) (runPrefix : String) : IO Unit :=
     args := #[configPath.toString, "pool-scheduler"], stdout := .piped }
   let logs ← IO.asTask child.stdout.readToEnd .dedicated
   try
-    for (id, _, expected) in scenarios do
-      let process : CloudProcess Nat := ⟨config, id, sumSquares.info.entry⟩
-      let actual ← waitOutcome process
-      assertOutcome actual ((ReplayInterpreter.result (m := Id) expected).run)
+    let handle ← HttpMailbox.openMailbox (← IO.ofExcept (config.mailboxes.worker "worker1"))
+      LeanCloudRuntime.Pool.address "worker.worker1"
+    try
+      for (id, _, expected) in scenarios do
+        finalize config handle "worker1" id
+        let process : CloudProcess Nat := ⟨config, id, sumSquares.info.entry⟩
+        let actual ← waitOutcome process
+        assertOutcome actual ((ReplayInterpreter.result (m := Id) expected).run)
+    finally handle.close
     liveFailure config runPrefix
   finally
     try child.kill catch _ => pure ()

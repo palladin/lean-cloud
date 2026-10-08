@@ -67,7 +67,7 @@ theorem window_productive [codec : Codec α] (expected : ReplayModel.Journal)
     (meaning : Specification.Complete expected Location.root (program input) outcome)
     (known : expected.lookup (ReplayStore.returnKey Location.root) =
       some ⟨ReplayStore.returnRequest, Parallel.recorded codec.encode outcome⟩)
-    (budget : ∀ worker assignment, (ReplayContracts.rules expected).Program
+    (budget : ∀ worker (assignment : Checkpoint), (ReplayContracts.rules expected).Program
       (fun world => SchedulerGroups.AssignmentReady expected world.records assignment ∧
         Resumable world.records codec.encode (program input) Location.root assignment.location)
       (fun report _ => report.progress.isOk = true)
@@ -82,11 +82,13 @@ theorem window_productive [codec : Codec α] (expected : ReplayModel.Journal)
     committed, stored, finish⟩ := window
   have safe := ConcurrentSafety.invariant expected workers turns fuel duration program input meaning known (history.trans approach)
   have ready := Traffic.inbox_valid safe.messages worker (.execute assignment) queued
+  obtain ⟨point, same, _, ready⟩ := ready
+  subst assignment
   have successful := execution.post (ReplayContracts.rules expected) _
     (fun _ reached => (ConcurrentSafety.invariant expected workers turns fuel duration program input meaning known reached).records)
     (fun _ _ reached continued =>
       (ConcurrentSafety.trace_advances workers turns fuel duration program input meaning.evaluation reached continued).records)
-    (budget worker assignment) (history.trans approach) ready.2
+    (budget worker point) (history.trans approach) ready
   exact ⟨delivered, saved, (approach.trans execution.trace).trans transported, committed,
     ⟨report, received, job, member, deadline, running, successful, stored⟩, finish⟩
 

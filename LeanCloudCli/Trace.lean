@@ -79,7 +79,7 @@ def latest (steps : Array Step) : Array Step := Id.run do
       keys := keys.push ("job/" ++ job.branch.key)
       if let .waiting _ := job.status then keys := keys.push ("group/" ++ job.location.key)
     if step.event.worker == "scheduler" then
-      if ["paused", "resumed", "sealed", "failed"].contains step.event.activity then
+      if ["paused", "resumed", "sealed", "killed", "failed"].contains step.event.activity then
         keys := keys.push "control"
     else if let some owner := step.owner then
       keys := keys.push ("branch/" ++ owner.key)

@@ -90,7 +90,7 @@ def commands : Array Command := #[
     details := "Revokes this run's assignments. Workers stop at record boundaries; an IO action already executing may finish. Shared nodes keep running."
     examples := #["pause example-1", "resume example-1"] },
   { name := "kill", arguments := "RUN", summary := "Permanently cancel a cloud run."
-    details := "Revokes the run and records cancellation. Shared nodes keep running. Replay records remain, but the run cannot resume.\nAn already completed result is preserved."
+    details := "Revokes the run; a worker records cancellation. With zero workers, that record waits for a worker. Shared nodes keep running. Replay records remain, but the run cannot resume.\nAn already completed result is preserved."
     examples := #["kill example-1"] },
   { name := "help", arguments := "[COMMAND]", summary := "Show commands or help for one command."
     details := "COMMAND --help and COMMAND -h show the same detailed help."

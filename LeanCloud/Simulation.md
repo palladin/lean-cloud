@@ -81,7 +81,7 @@ whole workflow's finished status.
 [CoordinationProgress.productive_intervals_bounded](Proofs/CoordinationProgress.lean)
 proves a finite bound on useful scheduling work from the original pure source.
 A live successful report increases a bounded measure; crashes and retries cannot
-decrease it. Authorized joins cannot suspend again at the same fork.
+decrease it. A fork whose child returns are durable cannot suspend again.
 [DeploymentProgress](Proofs/DeploymentProgress.lean) proves that the processing
 windows are productive and that an unfinished run cannot contain infinitely
 many of them. The run is sampled at finite batches of events; the window

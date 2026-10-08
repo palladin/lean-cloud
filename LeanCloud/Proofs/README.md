@@ -24,6 +24,17 @@ to the fuel-based driver, and [SequentialReplay.lean](SequentialReplay.lean)
 proves completion and the final result from empty storage. Its expected journal
 is a proof witness, never runtime input.
 
+Workers receive only `{ attempt, branchStart }`. Reconstruction follows ancestor
+records to that branch; replay reads its recorded prefix and continues where
+records are missing. At a parallel group it either joins durable child returns
+or suspends. No replay cursor or join permission is sent to the worker.
+
+[Checkpoint.lean](Checkpoint.lean) names the scheduler's last suspension in the
+proof only. [ReplayCursor.lean](ReplayCursor.lean) relates that checkpoint to the
+actual reconstruction and replay phases. These witnesses let the progress proof
+show that completed children cannot cause the same fork to suspend again; they
+are neither persisted replay data nor an extra interpreter.
+
 The concurrent deployment adds scheduling and recovery:
 
 `completed_replay_matches_direct` states:
@@ -138,7 +149,7 @@ The following progress guarantees are checked:
   containing the return key of every reachable job, independent of worker count
   and scheduling. This bounds possible branch identities, not retry attempts.
 - `ExecutionContracts.ForksAfter`: a worker cannot move backwards within its
-  assigned branch. An authorized join cannot suspend again at its own fork.
+  assigned branch. A fork whose children are complete cannot suspend again.
   Worker execution proves this fact and mailbox transport preserves it for
   every report whose attempt remains live.
 - `CoordinationProgress.productive_intervals_bounded`: the original pure source

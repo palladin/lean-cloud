@@ -50,9 +50,20 @@ private def settled (ctx : Context) (runs : Array Run) (deadline : Nat) : Cli Un
 
 private def crashNode (ctx : Context) (role : String) : Cli Unit := do
   let before ← docker #["inspect", "--format", "{{.State.StartedAt}}", ctx.node role]
-  discard <| docker #["kill", "--signal", "KILL", ctx.node role]
-  let killed ← docker #["inspect", "--format", "{{.State.Running}} {{.State.ExitCode}}", ctx.node role]
-  require (killed.stdout.trimAscii.toString == "false 137") s!"{role} was not observed exiting from SIGKILL"
+  let mut confirmed := false
+  for attempt in [:3] do
+    let signal ← docker #["kill", "--signal", "KILL", ctx.node role] false
+    let killed ← docker #["inspect", "--format", "{{.State.Running}} {{.State.ExitCode}}", ctx.node role]
+    if signal.exitCode == 0 && killed.stdout.trimAscii.toString == "false 137" then
+      confirmed := true
+      break
+    -- A preceding network fault can terminate the actor between selection and
+    -- signalling. Recover and retry; an ordinary failure is not SIGKILL evidence.
+    chaosEvent ctx "missed-kill" [("node", toJson role), ("attempt", toJson attempt),
+      ("state", toJson killed.stdout.trimAscii.toString), ("signalExit", toJson signal.exitCode.toNat)]
+    discard <| docker #["start", ctx.node role]
+    healthy ctx role
+  require confirmed s!"{role} was not observed exiting from SIGKILL after recovery retries"
   chaosEvent ctx "killed" [("node", toJson role), ("exitCode", toJson (137 : Nat))]
   discard <| docker #["start", ctx.node role]
   healthy ctx role
@@ -88,7 +99,7 @@ private structure Interrupted where
   assignment : Assignment
 
 private def owns (state : Scheduler.State) (old : Interrupted) : Bool :=
-  state.jobs.any fun job => job.branch == old.assignment.branch &&
+  state.jobs.any fun job => job.branch == old.assignment.branchStart &&
     (Scheduler.Internal.assignedTo old.worker job).any (·.attempt == old.assignment.attempt)
 
 /-- Deliver an explicitly synthetic late failure and heartbeat through the real
@@ -243,7 +254,7 @@ private def awaitReplacement (ctx : Context) (runs : Array Run) (old : Interrupt
       let step ← LeanCloudCli.Trace.parse line
       guard (step.event.run == old.run.id)
       let job ← step.job
-      guard (job.branch == old.assignment.branch)
+      guard (job.branch == old.assignment.branchStart)
       let .running worker attempt := job.status | none
       guard (worker != old.worker && attempt > old.assignment.attempt)
       return (worker, attempt)
@@ -251,7 +262,7 @@ private def awaitReplacement (ctx : Context) (runs : Array Run) (old : Interrupt
       if completedCount snapshots > before then
         chaosEvent ctx "reassigned" [("run", toJson old.run.id), ("from", toJson old.worker),
           ("to", toJson worker), ("oldAttempt", toJson old.assignment.attempt),
-          ("attempt", toJson attempt), ("branch", toJson old.assignment.branch),
+          ("attempt", toJson attempt), ("branch", toJson old.assignment.branchStart),
           ("completedBefore", toJson before), ("completedAfter", toJson (completedCount snapshots))]
         return
     require ((← request .now) < deadline) "Disconnected work was not reassigned while healthy workers progressed"

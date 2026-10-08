@@ -74,7 +74,7 @@ private def observeReplay : IO Unit := do
       | none => (proposed, (key, proposed) :: records) }
   let visit : ReplayInterpreter.Observer IO := fun location source =>
     observations.modify (·.push (location, source))
-  let assignment : Assignment := ⟨0, Location.root, Location.root, false⟩
+  let assignment : Assignment := ⟨0, Location.root⟩
   let run := (ReplayInterpreter.step records ioBlobs 20 (fun _ : Unit => repeated) () assignment (some visit)).run
   assertOutcome (← run) (.ok .done)
   let first ← observations.get

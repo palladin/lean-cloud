@@ -91,6 +91,22 @@ theorem next_push (parent : LeanCloud.Location) (branch command : Nat) :
 def branchStart (location : LeanCloud.Location) : LeanCloud.Location :=
   location.set! (location.size - 1) (location[location.size - 1]!.1, 0)
 
+@[simp] theorem branchStart_size (location : LeanCloud.Location) :
+    (branchStart location).size = location.size := by simp [branchStart]
+
+theorem branchStart_ancestor (location : LeanCloud.Location) (index : Nat)
+    (ancestor : index + 1 < location.size) :
+    (branchStart location)[index]! = location[index]! := by
+  exact Array.getElem!_set!_ne location (location.size - 1) index _ (by omega)
+
+@[simp] theorem branchStart_index (location : LeanCloud.Location) (index : Nat)
+    (inside : index < location.size) :
+    (branchStart location)[index]!.1 = location[index]!.1 := by
+  by_cases last : index = location.size - 1
+  · subst index
+    rw [branchStart, Array.getElem!_set!_self _ _ _ inside]
+  · rw [branchStart, Array.getElem!_set!_ne _ _ _ _ (Ne.symm last)]
+
 @[simp] theorem branchStart_push (parent : LeanCloud.Location) (branch command : Nat) :
     branchStart (parent.push (branch, command)) = parent.push (branch, 0) := by
   simp [branchStart, Array.setIfInBounds, Array.set_push]

@@ -17,7 +17,7 @@ private def noBlobs : BlobStorage IO where
   readBlob _ := throw ⟨.unsupported, "Unexpected blob operation"⟩
   resolveBlob _ := throw ⟨.unsupported, "Unexpected blob operation"⟩
 
-private def root : Assignment := ⟨0, Location.root, Location.root, false⟩
+private def root : Assignment := ⟨0, Location.root⟩
 
 private def resume [Codec α] (store : ReplayStore IO) (source : Cloud IO α)
     (assignment : Assignment := root) : IO (Except CloudError Progress) :=
@@ -37,11 +37,10 @@ private def groupRequest : Request := ⟨"parallel", "array(nat/v1)/v1", toJson 
 
 private def invalidReplayCases : Array TestCase :=
   let valueKey := ReplayStore.valueKey Location.root
-  let later := { root with location := Location.root.next }
-  let joining := { root with joining := true }
+  let later := { root with branchStart := Location.root.next.child 0 }
   #[
-    rejectReplay "empty-location" captured { root with location := #[] } [] .protocol,
-    rejectReplay "non-root-location" captured { root with location := #[(1, 0)] } [] .protocol,
+    rejectReplay "empty-location" captured { root with branchStart := #[] } [] .protocol,
+    rejectReplay "non-root-location" captured { root with branchStart := #[(1, 0)] } [] .protocol,
     rejectReplay "ended-before-assignment" (pure 7 : Cloud IO Nat) later [] .divergence,
     rejectReplay "failed-before-assignment" (Cloud.fail "failed" : Cloud IO Nat) later [] .divergence,
     rejectReplay "missing-prefix" captured later [] .divergence,
@@ -58,15 +57,13 @@ private def invalidReplayCases : Array TestCase :=
     rejectReplay "invalid-return-record" captured root
       [(ReplayStore.returnKey Location.root, ⟨capturedRequest, .success (toJson (7 : Nat))⟩)] .divergence,
     rejectReplay "child-outside-group" group
-      ⟨0, Location.root.child 2, Location.root.child 2, false⟩ [] .divergence,
+      ⟨0, Location.root.child 2⟩ [] .divergence,
     rejectReplay "missing-joined-prefix" group later [] .divergence,
-    rejectReplay "premature-join" group joining
-      [(ReplayStore.returnKey (Location.root.child 0), ⟨ReplayStore.returnRequest, .success (toJson (10 : Nat))⟩)] .protocol,
-    rejectReplay "changed-child-count" group joining
+    rejectReplay "changed-child-count" group root
       [(valueKey, ⟨{ groupRequest with payload := toJson (1 : Nat) }, .success (toJson (#[10] : Array Nat))⟩)] .divergence,
-    rejectReplay "wrong-result-count" group joining
+    rejectReplay "wrong-result-count" group root
       [(valueKey, ⟨groupRequest, .success (toJson (#[10] : Array Nat))⟩)] .divergence,
-    rejectReplay "invalid-child-value" group joining
+    rejectReplay "invalid-child-value" group root
       [(valueKey, ⟨groupRequest, .success (toJson #["ten", "twenty"])⟩)] .codec
   ]
 
@@ -85,14 +82,48 @@ private def reverseCompletion (fails : Bool) : TestCase :=
     assertOutcome (← resume store source) (.ok (.fork Location.root 3))
     for index in [2, 1, 0] do
       let child := Location.root.child index
-      assertOutcome (← resume store source ⟨index + 1, child, child, false⟩) (.ok .done)
+      assertOutcome (← resume store source ⟨index + 1, child⟩) (.ok .done)
       assertTrue ((← saved.get).lookup (ReplayStore.returnKey child)).isSome "Child has no durable result"
       assertTrue ((← saved.get).lookup (ReplayStore.returnKey Location.root)).isNone "Child completed the parent"
-    assertOutcome (← resume store source { root with joining := true }) (.ok .done)
+    assertOutcome (← resume store source root) (.ok .done)
     let .ok (some outcome) ← store.outcome.run | throw (IO.userError "Missing root result")
     assertOutcome (ReplayInterpreter.result (m := Id) outcome).run expected⟩
 
 def replayCases : Array TestCase := invalidReplayCases ++ #[
+  ⟨"replay/assignment-wire-format-and-legacy-inbox", do
+    let child := Location.root.next.child 1
+    let assignment : Assignment := ⟨7, child⟩
+    assertEq (toJson assignment) (Json.mkObj [("attempt", toJson (7 : Nat)), ("branchStart", toJson child)])
+    let decoded : Assignment ← unwrap (fromJson? (toJson assignment))
+    assertEq decoded assignment
+    let legacy : Assignment ← unwrap (fromJson? (Json.mkObj [
+      ("attempt", toJson (7 : Nat)), ("branch", toJson child),
+      ("location", toJson child.next), ("joining", toJson true)]))
+    assertEq legacy assignment "Legacy cursor changed the assigned branch"⟩,
+  ⟨"replay/partial-group-suspends-until-all-children-return", do
+    let saved ← IO.mkRef ([] : Records)
+    let store := memoryStore saved
+    assertOutcome (← resume store group) (.ok (.fork Location.root 2))
+    assertEq (← saved.get) [] "Suspension created a group result"
+    assertOutcome (← resume store group ⟨1, Location.root.child 1⟩) (.ok .done)
+    let partialRecords ← saved.get
+    assertOutcome (← resume store group) (.ok (.fork Location.root 2))
+    assertEq (← saved.get) partialRecords "Partial join wrote a result"
+    assertOutcome (← resume store group ⟨2, Location.root.child 0⟩) (.ok .done)
+    -- Exactly the same assignment discovers the complete group and joins it.
+    assertOutcome (← resume store group) (.ok .done)
+    assertEq ((← saved.get).lookup (ReplayStore.valueKey Location.root))
+      (some ⟨groupRequest, .success (toJson (#[10, 20] : Array Nat))⟩)
+    assertOutcome (← store.outcome.run) (.ok (some (.success (toJson (#[10, 20] : Array Nat)))))⟩,
+  ⟨"replay/empty-group-continues-without-suspension", do
+    let saved ← IO.mkRef ([] : Records)
+    let store := memoryStore saved
+    let source : Cloud IO Nat := do
+      let values ← Cloud.parallel (#[] : Array (Cloud IO Nat))
+      return values.size + 42
+    assertOutcome (← resume store source) (.ok .done)
+    assertOutcome (← store.outcome.run) (.ok (some (.success (toJson (42 : Nat)))))
+    assertEq (← saved.get).length 2 "Empty group created child records"⟩,
   ⟨"replay/reconstruction-fuel-and-observations", do
     let calls ← IO.mkRef (#[] : Array String)
     let counted (label : String) (value : Nat) : Cloud IO Nat := Cloud.exec (fun _ => do
@@ -107,7 +138,7 @@ def replayCases : Array TestCase := invalidReplayCases ++ #[
     assertOutcome (← resume (memoryStore saved) source) (.ok (.fork fork 1))
     let prefixRecords ← saved.get
     let child := fork.child 0
-    let assignment : Assignment := ⟨1, child, child, false⟩
+    let assignment : Assignment := ⟨1, child⟩
     -- Replay prefix command, descend at the fork, execute child command, return.
     let path := #[Location.root, fork, child, child.next]
     for fuel in [:6] do
@@ -158,8 +189,8 @@ def replayCases : Array TestCase := invalidReplayCases ++ #[
     for index in [1, 0] do
       let child := fork.child index
       for attempt in [:2] do
-        assertOutcome (← resume store source ⟨attempt, child, child, false⟩) (.ok .done)
-    assertOutcome (← resume store source { root with location := fork, joining := true }) (.ok .done)
+        assertOutcome (← resume store source ⟨attempt, child⟩) (.ok .done)
+    assertOutcome (← resume store source root) (.ok .done)
     assertEq (← calls.get) #["prefix", "child-1", "child-0", "after"]
     let before ← saved.get
     assertOutcome (← resume store source) (.ok .done)

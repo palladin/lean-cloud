@@ -30,7 +30,7 @@ private def service : Application.Service α → StateM World (Except String α)
   | .worker _ _ => do modify (fun w => { w with services := w.services.push "worker" }); return .ok ()
   | .definition _ _ => return .ok ⟨program.info.entry, Json.null, program.info.resultSchema⟩
   | .outcome _ _ => return .ok (some (.success (toJson (42 : Nat))))
-  | .cancel _ _ => return .ok (.cancelled "Killed by user")
+  | .cancel _ _ => return .ok (some (.cancelled "Killed by user"))
   | .status _ _ => return .ok {}
   | .referenceStatus _ _ => return .ok {}
   | .readText _ _ => return .error "A Nat result must not be treated as a blob"

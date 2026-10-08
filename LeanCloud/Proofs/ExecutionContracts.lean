@@ -10,10 +10,10 @@ open Lean LeanEff SimulationBackend ReplayModel ReplayInterpreter SimulationLogi
 
 variable {info : Option SourceSiteId}
 
-def Ready (expected : Journal) (assignment : Assignment) (world : World) : Prop :=
+def Ready (expected : Journal) (assignment : Checkpoint) (world : World) : Prop :=
   assignment.joining = true → Recording.JoinReady expected world.records assignment.location
 
-theorem ready_stable (expected : Journal) (assignment : Assignment) :
+theorem ready_stable (expected : Journal) (assignment : Checkpoint) :
     (ReplayContracts.rules expected).Stable (ReplayContracts.rules expected).interference (Ready expected assignment) :=
   fun _ _ _ _ grows ready joining => (ready joining).extend grows
 
@@ -49,10 +49,10 @@ Together with `Result`, this excludes every interpreter error above the bound. -
 def FuelBound (fuel bound : Nat) (result : Except CloudError Progress) : Prop :=
   result.isOk = true ∨ fuel < bound
 
-/-- A segment never moves backwards. An authorized join cannot suspend again
-at the fork it was sent to join, even if another worker writes its result while
-the segment is running. This is progress of locations, not delivery fairness. -/
-def ForksAfter (assignment : Assignment) (current : Location)
+/-- A segment never moves backwards. If the scheduler checkpoint certifies all
+children complete, replay cannot suspend at that fork again. Concurrent record
+creation preserves this fact. This is progress of locations, not fairness. -/
+def ForksAfter (assignment : Checkpoint) (current : Location)
     (result : Except CloudError Progress) : Prop :=
   ∀ location count, result = .ok (.fork location count) →
     Routing.Follows current location ∧ (assignment.joining = true → location ≠ assignment.location)
@@ -195,7 +195,7 @@ private theorem finish (expected : Journal) (worker : WorkerId) (branch : Locati
 
 /-- The actual parallel case either suspends at this fork or obtains its
 specified group result before invoking the supplied continuation contract. -/
-private theorem parallel (expected : Journal) (worker : WorkerId) (assignment : Assignment)
+private theorem parallel (expected : Journal) (worker : WorkerId) (assignment : Checkpoint)
     (fuel : Nat) (encode : β → Json) (current : Location) (codec : Codec α) (count : Nat)
     (branches : Fin count → Cloud (SimM World) α) (next : ArrsF (Control (SimM World)) SourceSiteId (Array α) β)
     (joined : Exit) (post : Except CloudError Progress → World → Prop)
@@ -211,13 +211,31 @@ private theorem parallel (expected : Journal) (worker : WorkerId) (assignment : 
       ((match (generalizing := false) joined with
         | .success wire => do
           let values ← Internal.decodeGroup codec count wire
-          execute (observed worker).records blobs assignment fuel encode (next.apply values) current.next
+          replay (observed worker).records blobs assignment.branch fuel encode (next.apply values) current.next
         | outcome => Internal.finish (observed worker).records assignment.branch outcome :
           ExceptT CloudError (SimM World) Progress).run)) :
     (ReplayContracts.rules expected).Program (Ready expected assignment) post
-      (execute (observed worker).records blobs assignment (fuel + 1) encode
+      (replay (observed worker).records blobs assignment.branch (fuel + 1) encode
         (.impure info (.parallel codec count branches) next) current).run := by
-  simp only [execute]
+  have publish : (ReplayContracts.rules expected).Program (Ready expected assignment) post
+      ((do
+        let accepted ← (observed worker).records.create (ReplayStore.valueKey current)
+          ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, joined⟩
+        let outcome ← Internal.check ⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩ accepted
+        Internal.resume (observed worker).records assignment.branch (Internal.decodeGroup codec count)
+          (fun values => replay (observed worker).records blobs assignment.branch fuel encode
+            (next.apply values) current.next) outcome : ExceptT CloudError (SimM World) Progress).run) := by
+    apply Rules.except_bind (middle := fun accepted world =>
+      ReplayContracts.Created (ReplayStore.valueKey current)
+        ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, joined⟩ accepted world ∧
+          Ready expected assignment world)
+    · apply Rules.except_lift _ (ReplayContracts.preserving expected
+        (ReplayContracts.observed_create expected worker _ _ known) (ready_stable expected assignment))
+      exact fun _ _ _ holds => holds
+    · intro accepted
+      apply Rules.Program.weaken _ (checked_then expected _ joined accepted _ _ _ continued)
+      exact fun _ _ holds => ⟨holds.1.1, holds.2, holds.1.2⟩
+  simp only [replay]
   apply Rules.except_bind (middle := fun record world =>
     ReplayContracts.ReadReply (ReplayStore.valueKey current) record world ∧ Ready expected assignment world)
   · apply Rules.except_lift _ (ReplayContracts.preserving expected
@@ -226,38 +244,47 @@ private theorem parallel (expected : Journal) (worker : WorkerId) (assignment : 
   · intro record
     cases record with
     | some record =>
-      simp only [Option.isNone_some, Bool.false_and, Bool.false_eq_true, ite_false]
       apply Rules.Program.weaken _ (checked_then expected _ joined record _ _ _ continued)
       intro world invariant holds
       have found := holds.1 record rfl
       have same := Option.some.inj ((invariant _ _ found).symm.trans known)
       exact ⟨same, holds.2, found.trans (congrArg some same)⟩
     | none =>
-      simp only [Option.isNone_none, Bool.true_and]
-      split
-      · rename_i canFork
-        exact fun world invariant holds => forked canFork world invariant holds.2
-      · rename_i authorized
-        have same : current = assignment.location := by simpa using (Bool.or_eq_false_iff.mp (Bool.eq_false_iff.mpr authorized)).1
-        have joining : assignment.joining = true := by simpa using (Bool.or_eq_false_iff.mp (Bool.eq_false_iff.mpr authorized)).2
-        obtain ⟨children, returned, collected⟩ :=
-          Recording.JoinReady.of_specification group codec.schema count joined known
-        have joinedResult := (ParallelContracts.join_ready expected worker current codec.schema count joined children known returned collected).weaken
-          (ReplayContracts.rules expected)
-          (pre := fun world => ReplayContracts.ReadReply (ReplayStore.valueKey current) none world ∧ Ready expected assignment world)
-          (fun _ _ holds => by simpa [same] using holds.2 joining)
-        apply Rules.except_bind_known _ _ _ joined joinedResult
-        apply Rules.except_bind (middle := fun accepted world =>
-          ReplayContracts.Created (ReplayStore.valueKey current)
-            ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, joined⟩ accepted world ∧
-              Recording.JoinReady expected world.records current)
-        · apply Rules.except_lift _ (ReplayContracts.preserving expected
-            (ReplayContracts.observed_create expected worker _ _ known)
-            (fun _ _ _ _ grows ready => ready.extend grows))
-          exact fun _ _ _ holds => holds
-        · intro accepted
-          apply Rules.Program.weaken _ (checked_then expected _ joined accepted _ _ _ continued)
-          exact fun _ _ holds => ⟨holds.1.1, (fun _ => by simpa [same] using holds.2), holds.1.2⟩
+      obtain ⟨children, returned, collected⟩ :=
+        Recording.JoinReady.of_specification group codec.schema count joined known
+      apply Rules.Program.weaken (required := Ready expected assignment)
+      · by_cases authorized : current = assignment.location ∧ assignment.joining = true
+        · have ready := ParallelContracts.join_preserving expected worker current count children
+            (Ready expected assignment) (ready_stable expected assignment) (by
+              intro world invariant holds index inside
+              obtain ⟨actual, present, _⟩ := (holds authorized.2) codec.schema count joined (by simpa [authorized.1] using known)
+              have found : world.records.lookup (ReplayStore.returnKey (current.child index)) =
+                  some ⟨ReplayStore.returnRequest, actual index⟩ := by simpa [authorized.1] using present index inside
+              exact found.trans ((invariant _ _ found).symm.trans (returned index inside)))
+          rw [collected] at ready
+          exact Rules.except_bind_value _ _ _ (some joined) ready publish
+        · have canFork : (current != assignment.location || !assignment.joining) = true := by
+            cases joining : assignment.joining <;> simp_all
+          have inspected := ReplayContracts.preserving expected
+            (ParallelContracts.join_partial expected worker current count children returned)
+            (ready_stable expected assignment)
+          rw [collected] at inspected
+          apply Rules.except_bind (middle := fun outcome world =>
+            ParallelContracts.Partial joined (.ok outcome) world ∧ Ready expected assignment world)
+          · apply Rules.Program.weaken_post _ _ inspected
+            intro result world invariant holds
+            cases result with
+            | error _ => exact holds.1.elim
+            | ok _ => exact holds
+          · intro outcome
+            cases outcome with
+            | none => exact fun world invariant holds => forked canFork world invariant holds.2
+            | some actual =>
+              apply Rules.Program.assuming
+              intro same
+              subst actual
+              exact publish
+      · exact fun _ _ holds => holds.2
 
 /-- Every pure active segment has a sufficient fuel bound, independently of
 which correct records other workers create while it runs. Its result preserves
@@ -267,14 +294,14 @@ theorem active_bounded (expected : Journal)
     {current : Location} {program : Cloud (SimM World) α} {outcome}
     (meaning : Specification.Complete expected current program outcome)
     (nonempty : 0 < current.size) :
-    ∃ bound, ∀ (worker : WorkerId) (assignment : Assignment) (encode : α → Json),
+    ∃ bound, ∀ (worker : WorkerId) (assignment : Checkpoint) (encode : α → Json),
       assignment.branch = Location.branchStart current →
       expected.lookup (ReplayStore.returnKey assignment.branch) =
         some ⟨ReplayStore.returnRequest, Parallel.recorded encode outcome⟩ →
       ∀ fuel, (ReplayContracts.rules expected).Program (Ready expected assignment)
       (fun result world => Result expected assignment.branch (Parallel.recorded encode outcome) encode program current result world ∧
         FuelBound fuel bound result ∧ ForksAfter assignment current result)
-      (execute (observed worker).records blobs assignment fuel encode program current).run := by
+      (replay (observed worker).records blobs assignment.branch fuel encode program current).run := by
   induction meaning with
   | pure value =>
     refine ⟨1, fun worker assignment encode branch known fuel => ?_⟩
@@ -282,7 +309,7 @@ theorem active_bounded (expected : Journal)
     | zero => exact fun _ _ _ => ⟨⟨rfl, by intro location count impossible; cases impossible⟩, Or.inr (by decide),
         by intro location count impossible; cases impossible⟩
     | succ fuel =>
-      simpa only [execute, Parallel.recorded] using!
+      simpa only [replay, Parallel.recorded] using!
         finish expected worker assignment.branch (.success (encode value)) encode _ _ (Ready expected assignment) known
   | fail error next =>
     refine ⟨1, fun worker assignment encode branch known fuel => ?_⟩
@@ -290,7 +317,7 @@ theorem active_bounded (expected : Journal)
     | zero => exact fun _ _ _ => ⟨⟨rfl, by intro location count impossible; cases impossible⟩, Or.inr (by decide),
         by intro location count impossible; cases impossible⟩
     | succ fuel =>
-      simpa only [execute, Parallel.recorded] using!
+      simpa only [replay, Parallel.recorded] using!
         finish expected worker assignment.branch (.failure error) encode _ _ (Ready expected assignment) known
   | delay next rest ih =>
     obtain ⟨bound, continued⟩ := ih nonempty
@@ -299,7 +326,7 @@ theorem active_bounded (expected : Journal)
     | zero => exact fun _ _ _ => ⟨⟨rfl, by intro location count impossible; cases impossible⟩, Or.inr (Nat.zero_lt_succ _),
         by intro location count impossible; cases impossible⟩
     | succ fuel =>
-      simp only [execute]
+      simp only [replay]
       apply Rules.Program.weaken_post _ _ (continued worker assignment encode branch known fuel)
       exact fun _ _ _ holds => ⟨holds.1.lift (fun _ path => path.delay next), holds.2.1.succ, holds.2.2⟩
   | exec codec label body next roundtrip present rest ih =>
@@ -309,7 +336,7 @@ theorem active_bounded (expected : Journal)
     | zero => exact fun _ _ _ => ⟨⟨rfl, by intro location count impossible; cases impossible⟩, Or.inr (Nat.zero_lt_succ _),
         by intro location count impossible; cases impossible⟩
     | succ fuel =>
-      simp only [execute]
+      simp only [replay]
       apply Rules.except_bind_known _ _ _ _
         (exec_recorded expected worker _ codec label body (Ready expected assignment)
           (ready_stable expected assignment) present)
@@ -362,20 +389,20 @@ theorem active_bounded (expected : Journal)
 /-- The entry point either reuses the specified durable return or reconstructs
 the assignment. The return probe preserves the reconstruction precondition. -/
 theorem entry [codec : Codec α] (expected : Journal) (worker : WorkerId) (fuel : Nat)
-    (program : ι → Cloud (SimM World) α) (input : ι) (assignment : Assignment) (outcome : Exit)
+    (program : ι → Cloud (SimM World) α) (input : ι) (assignment : Checkpoint) (outcome : Exit)
     (known : expected.lookup (ReplayStore.returnKey assignment.branch) = some ⟨ReplayStore.returnRequest, outcome⟩)
-    (valid : (!assignment.location.isEmpty && assignment.location[0]!.1 == 0) = true)
+    (valid : (!assignment.branch.isEmpty && assignment.branch[0]!.1 == 0) = true)
     (pre : World → Prop) (stable : (ReplayContracts.rules expected).Stable (ReplayContracts.rules expected).interference pre)
     (post : Except CloudError Progress → World → Prop)
     (completed : ∀ world, (ReplayContracts.rules expected).invariant world → pre world →
       world.records.lookup (ReplayStore.returnKey assignment.branch) = some ⟨ReplayStore.returnRequest, outcome⟩ →
       post (.ok .done) world)
     (traversal : (ReplayContracts.rules expected).Program pre post
-      (reconstruct (observed worker).records blobs assignment fuel codec.encode (program input) Location.root).run) :
+      (reconstruct (observed worker).records blobs assignment.branch fuel codec.encode (program input) Location.root).run) :
     (ReplayContracts.rules expected).Program pre post
       (step (observed worker).records blobs fuel program input assignment).run := by
   unfold ReplayInterpreter.step
-  simp only [valid, ite_true]
+  simp only [Checkpoint.work, valid, ite_true]
   apply Rules.except_bind (middle := fun reply world => ReplayContracts.OutcomeReply assignment.branch outcome reply world ∧ pre world)
   · apply Rules.Program.weaken_post _ _ (ReplayContracts.preserving expected
       (ReplayContracts.outcome expected worker assignment.branch outcome known) stable)

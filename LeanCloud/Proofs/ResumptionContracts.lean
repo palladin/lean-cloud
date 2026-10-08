@@ -30,10 +30,11 @@ private theorem read_then (expected : Journal) (worker : WorkerId) (key : String
 /-- Following a recorded prefix reaches the supplied typed continuation, unless
 the budget runs out first. All prefix reads retain the caller's stable facts;
 unrelated records may be created before a read's continuation resumes. -/
-theorem replay (expected journal : Journal) (worker : WorkerId) (assignment : Assignment)
+theorem replay (expected journal : Journal) (worker : WorkerId) (assignment : Checkpoint)
     {α β : Type} {encode : α → Json} {program : Cloud (SimM World) α}
     {current steps} {remainingEncode : β → Json} {remaining : Cloud (SimM World) β}
     (witness : Prefix journal assignment.location encode program current steps remainingEncode remaining)
+    (branch : assignment.branch = Location.branchStart assignment.location) (nonempty : 0 < current.size)
     (pre : World → Prop) (stable : (ReplayContracts.rules expected).Stable
       (ReplayContracts.rules expected).interference pre)
     (cached : ∀ world, (ReplayContracts.rules expected).invariant world → pre world →
@@ -43,61 +44,100 @@ theorem replay (expected journal : Journal) (worker : WorkerId) (assignment : As
     (exhausted : fuel < steps → ∀ world, (ReplayContracts.rules expected).invariant world → pre world →
       post (.error ⟨.protocol, "Interpreter fuel exhausted"⟩) world)
     (continued : ∀ remainingFuel, steps + remainingFuel = fuel → (ReplayContracts.rules expected).Program pre post
-      (execute (observed worker).records blobs assignment remainingFuel remainingEncode remaining assignment.location).run) :
+      (ReplayInterpreter.replay (observed worker).records blobs assignment.branch remainingFuel remainingEncode remaining assignment.location).run) :
     (ReplayContracts.rules expected).Program pre post
-      (reconstruct (observed worker).records blobs assignment fuel encode program current).run := by
+      (ReplayCursor.atPoint (observed worker).records blobs assignment fuel encode program current).run := by
   induction witness generalizing fuel with
   | here encode program =>
-    rw [reconstruct_at_assignment]
+    rw [ReplayCursor.at_target]
     exact continued fuel (Nat.zero_add fuel)
   | delay next before rest ih =>
     cases fuel with
-    | zero => exact exhausted (Nat.zero_lt_succ _)
+    | zero =>
+      simp only [ReplayCursor.atPoint, ReplayInterpreter.replay, reconstruct, ite_self]
+      exact exhausted (Nat.zero_lt_succ _)
     | succ fuel =>
-      simpa only [reconstruct, beq_eq_false_iff_ne.mpr before, Bool.false_eq_true, ite_false] using ih fuel (fun smaller => exhausted (by omega)) (fun remainingFuel same => continued remainingFuel (by omega))
-  | command codec operation next record wire value before present checked success decoded rest ih =>
+      rw [ReplayCursor.delay _ _ _ branch]
+      exact ih nonempty fuel (fun smaller => exhausted (by omega)) (fun remainingFuel same => continued remainingFuel (by omega))
+  | @command _ _ _ _ _ _ _ current _ codec operation next record wire value before present checked success decoded rest ih =>
     cases fuel with
-    | zero => exact exhausted (Nat.zero_lt_succ _)
+    | zero =>
+      simp only [ReplayCursor.atPoint, ReplayInterpreter.replay, reconstruct, ite_self]
+      exact exhausted (Nat.zero_lt_succ _)
     | succ fuel =>
-      simp only [reconstruct, beq_eq_false_iff_ne.mpr before, Bool.false_eq_true, ite_false]
-      apply Rules.except_bind_value _ _ _ wire
-      · unfold Internal.recorded
-        apply read_then expected worker _ record pre stable (fun world invariant holds => cached world invariant holds _ _ present)
-        simp only [Internal.check, checked, ite_true, success]
-        exact Rules.returns_pure _ pre _
-      · apply Rules.except_bind_value _ _ _ value (ExecutionContracts.decode expected pre codec wire value decoded)
-        exact ih fuel (fun smaller => exhausted (by omega)) (fun remainingFuel same => continued remainingFuel (by omega))
-  | joined codec count branches next record wire values before skip present checked success decoded size rest ih =>
+      have following := ih (by simpa [LeanCloud.Location.next] using nonempty) fuel
+        (fun smaller => exhausted (by omega)) (fun remainingFuel same => continued remainingFuel (by omega))
+      by_cases depth : current.size = assignment.location.size
+      · simp only [ReplayCursor.atPoint, depth, beq_self_eq_true, ite_true, ReplayInterpreter.replay]
+        apply Rules.except_bind_value _ _ _ (.success wire)
+        · unfold Internal.command
+          apply read_then expected worker _ record pre stable (fun world invariant holds => cached world invariant holds _ _ present)
+          simp only [Internal.check, checked, ite_true, success]
+          exact Rules.returns_pure _ pre _
+        simp only [Internal.resume]
+        apply Rules.except_bind_value _ _ _ value (ExecutionContracts.decode expected pre codec wire value decoded)
+        simpa only [ReplayCursor.atPoint, LeanCloud.Location.next, Array.size_set!, depth, beq_self_eq_true, ite_true] using following
+      · simp only [ReplayCursor.atPoint, beq_eq_false_iff_ne.mpr depth, ite_false, reconstruct,
+          beq_eq_false_iff_ne.mpr (ReplayCursor.before_branch branch depth), Bool.false_eq_true]
+        apply Rules.except_bind_value _ _ _ wire
+        · unfold Internal.recorded
+          apply read_then expected worker _ record pre stable (fun world invariant holds => cached world invariant holds _ _ present)
+          simp only [Internal.check, checked, ite_true, success]
+          exact Rules.returns_pure _ pre _
+        apply Rules.except_bind_value _ _ _ value (ExecutionContracts.decode expected pre codec wire value decoded)
+        simpa only [ReplayCursor.atPoint, LeanCloud.Location.next, Array.size_set!, beq_eq_false_iff_ne.mpr depth, Bool.false_eq_true, ite_false] using following
+  | @joined _ _ _ _ _ _ _ current _ codec count branches next record wire values before skip present checked success decoded size rest ih =>
     cases fuel with
-    | zero => exact exhausted (Nat.zero_lt_succ _)
+    | zero =>
+      simp only [ReplayCursor.atPoint, ReplayInterpreter.replay, reconstruct, ite_self]
+      exact exhausted (Nat.zero_lt_succ _)
     | succ fuel =>
-      simp only [reconstruct, beq_eq_false_iff_ne.mpr before, skip, Bool.false_eq_true, ite_false]
-      apply Rules.except_bind_value _ _ _ wire
-      · unfold Internal.recorded
-        apply read_then expected worker _ record pre stable (fun world invariant holds => cached world invariant holds _ _ present)
-        simp only [Internal.check, checked, ite_true, success]
-        exact Rules.returns_pure _ pre _
-      apply Rules.except_bind_value _ _ _ values
-      · unfold Internal.decodeGroup
+      have following := ih (by simpa [LeanCloud.Location.next] using nonempty) fuel
+        (fun smaller => exhausted (by omega)) (fun remainingFuel same => continued remainingFuel (by omega))
+      have decoding : (ReplayContracts.rules expected).Returns pre
+          (Internal.decodeGroup codec count wire) values := by
+        unfold Internal.decodeGroup
         apply Rules.returns_bind (value := values)
         · exact ExecutionContracts.decode expected pre _ wire values decoded
         · simp only [size, beq_self_eq_true]
           exact Rules.returns_pure _ pre values
-      · exact ih fuel (fun smaller => exhausted (by omega)) (fun remainingFuel same => continued remainingFuel (by omega))
+      by_cases depth : current.size = assignment.location.size
+      · simp only [ReplayCursor.atPoint, depth, beq_self_eq_true, ite_true, ReplayInterpreter.replay]
+        apply read_then expected worker _ record pre stable (fun world invariant holds => cached world invariant holds _ _ present)
+        simp only [Internal.check, checked, ite_true, success, Internal.resume]
+        apply Rules.except_bind_value _ _ _ values decoding
+        simpa only [ReplayCursor.atPoint, LeanCloud.Location.next, Array.size_set!, depth, beq_self_eq_true, ite_true] using following
+      · have route := (Routing.next_follows current nonempty).trans
+          (rest.follows (by simpa [LeanCloud.Location.next] using nonempty))
+        have skipped : current.entersChild assignment.branch = false := by
+          rw [branch, Routing.enters_branchStart (by have := route.depth; omega), skip]
+        simp only [ReplayCursor.atPoint, beq_eq_false_iff_ne.mpr depth, ite_false, reconstruct,
+          beq_eq_false_iff_ne.mpr (ReplayCursor.before_branch branch depth), skipped, Bool.false_eq_true]
+        apply Rules.except_bind_value _ _ _ wire
+        · unfold Internal.recorded
+          apply read_then expected worker _ record pre stable (fun world invariant holds => cached world invariant holds _ _ present)
+          simp only [Internal.check, checked, ite_true, success]
+          exact Rules.returns_pure _ pre _
+        apply Rules.except_bind_value _ _ _ values decoding
+        simpa only [ReplayCursor.atPoint, LeanCloud.Location.next, Array.size_set!, beq_eq_false_iff_ne.mpr depth, Bool.false_eq_true, ite_false] using following
   | child codec count branches next index before enters selected rest ih =>
     cases fuel with
-    | zero => exact exhausted (Nat.zero_lt_succ _)
+    | zero =>
+      simp only [ReplayCursor.atPoint, ReplayInterpreter.replay, reconstruct, ite_self]
+      exact exhausted (Nat.zero_lt_succ _)
     | succ fuel =>
-      simp only [reconstruct, beq_eq_false_iff_ne.mpr before, Bool.false_eq_true, ite_false, enters, ite_true,
-        selected, index.isLt, dite_true]
-      exact ih fuel (fun smaller => exhausted (by omega)) (fun remainingFuel same => continued remainingFuel (by omega))
+      rw [ReplayCursor.child _ _ _ branch _ _ codec count branches next _ _ index enters selected
+        (rest.follows (by simp [LeanCloud.Location.child]))]
+      exact ih (by simp [LeanCloud.Location.child]) fuel (fun smaller => exhausted (by omega))
+        (fun remainingFuel same => continued remainingFuel (by omega))
 
 /-- Compose a certified active continuation with its actual recorded prefix.
 The budget is the prefix length plus the supplied continuation bound. -/
 theorem at_prefix [codec : Codec α] (expected journal : Journal) (worker : WorkerId)
-    (assignment : Assignment) (program : ι → Cloud (SimM World) α) (input : ι)
+    (assignment : Checkpoint) (program : ι → Cloud (SimM World) α) (input : ι)
     {β : Type} {remainingEncode : β → Json} {remaining : Cloud (SimM World) β} {steps}
     (expectedReturn : Exit)
+    (branch : assignment.branch = Location.branchStart assignment.location)
     (returned : expected.lookup (ReplayStore.returnKey assignment.branch) = some ⟨ReplayStore.returnRequest, expectedReturn⟩)
     (witness : Prefix journal assignment.location codec.encode (program input)
       Location.root steps remainingEncode remaining)
@@ -105,7 +145,7 @@ theorem at_prefix [codec : Codec α] (expected journal : Journal) (worker : Work
     (active : ∀ fuel, (ReplayContracts.rules expected).Program (ExecutionContracts.Ready expected assignment)
       (fun result world => ExecutionContracts.Result expected assignment.branch expectedReturn remainingEncode remaining assignment.location result world ∧
         ExecutionContracts.FuelBound fuel bound result ∧ ExecutionContracts.ForksAfter assignment assignment.location result)
-      (execute (observed worker).records blobs assignment fuel remainingEncode remaining assignment.location).run) :
+      (ReplayInterpreter.replay (observed worker).records blobs assignment.branch fuel remainingEncode remaining assignment.location).run) :
     ∀ fuel, (ReplayContracts.rules expected).Program
         (fun world => Extends journal world.records ∧ ExecutionContracts.Ready expected assignment world)
         (fun result world => ExecutionContracts.Result expected assignment.branch expectedReturn codec.encode (program input) Location.root result world ∧
@@ -119,10 +159,15 @@ theorem at_prefix [codec : Codec α] (expected journal : Journal) (worker : Work
     fun before after first last grows holds =>
       ⟨holds.1.trans grows, ExecutionContracts.ready_stable expected assignment before after first last grows holds.2⟩
   intro fuel
-  apply ExecutionContracts.entry expected worker fuel program input assignment _ returned path.valid_root pre stable _
+  have branchValid : (!assignment.branch.isEmpty && assignment.branch[0]!.1 == 0) = true := by
+    have valid := path.valid_root
+    have depth := (witness.follows (by decide)).depth
+    simpa only [branch, Array.isEmpty, Location.branchStart_size, Location.branchStart_index _ 0 (Nat.lt_of_lt_of_le (by decide) depth)] using valid
+  apply ExecutionContracts.entry expected worker fuel program input assignment _ returned branchValid pre stable _
     (fun _ _ _ present => ⟨⟨present, by intro location count impossible; cases impossible⟩, Or.inl rfl,
       by intro location count impossible; cases impossible⟩)
-  apply replay expected journal worker assignment witness pre stable (fun _ _ holds => holds.1) _ fuel
+  rw [← ReplayCursor.boundary _ _ assignment branch fuel codec.encode (program input) Location.root (witness.follows (by decide)) (by simp)]
+  apply replay expected journal worker assignment witness branch (by decide) pre stable (fun _ _ holds => holds.1) _ fuel
   · exact fun short _ _ _ => ⟨⟨rfl, by intro location count impossible; cases impossible⟩, Or.inr (by omega),
       by intro location count impossible; cases impossible⟩
   · intro remainingFuel accounted
@@ -143,7 +188,7 @@ The recorded path determines its continuation, encoder, and branch result; no
 separate meaning for that continuation is assumed. Its sufficient fuel includes
 both reconstruction and the active continuation. -/
 theorem assigned [codec : Codec α] (expected journal : Journal) (worker : WorkerId)
-    (assignment : Assignment) (program : ι → Cloud (SimM World) α) (input : ι)
+    (assignment : Checkpoint) (program : ι → Cloud (SimM World) α) (input : ι)
     {β : Type} {remainingEncode : β → Json} {remaining : Cloud (SimM World) β} {steps outcome}
     (meaning : Specification.Complete expected Location.root (program input) outcome)
     (known : expected.lookup (ReplayStore.returnKey Location.root) =
@@ -163,7 +208,7 @@ theorem assigned [codec : Codec α] (expected journal : Journal) (worker : Worke
   rw [← branch] at returned
   obtain ⟨bound, active⟩ := ExecutionContracts.active_bounded expected resumed
     (Nat.lt_of_lt_of_le (by decide) (witness.follows (by decide)).depth)
-  exact ⟨_, returned, steps + bound, at_prefix expected journal worker assignment program input _ returned witness bound
+  exact ⟨_, returned, steps + bound, at_prefix expected journal worker assignment program input _ branch returned witness bound
     (active worker assignment remainingEncode branch returned)⟩
 
 /-- One budget works for this location across all workers, attempts, join modes,
@@ -175,7 +220,7 @@ theorem location_fuel [codec : Codec α] (expected : Journal) (target : Location
     (known : expected.lookup (ReplayStore.returnKey Location.root) =
       some ⟨ReplayStore.returnRequest, Parallel.recorded codec.encode outcome⟩)
     (available : Resumable expected codec.encode (program input) Location.root target) :
-    ∃ bound, ∀ worker assignment,
+    ∃ bound, ∀ worker (assignment : Checkpoint),
       assignment.location = target → assignment.branch = Location.branchStart target →
       ∀ journal, Extends journal expected → Resumable journal codec.encode (program input) Location.root target →
       ∀ fuel, bound ≤ fuel → (ReplayContracts.rules expected).Program
@@ -191,7 +236,7 @@ theorem location_fuel [codec : Codec α] (expected : Journal) (target : Location
   subst target
   have path := witness.in_snapshot consistent available
   rw [← branch] at returned
-  have valid := at_prefix expected journal worker assignment program input _ returned path bound
+  have valid := at_prefix expected journal worker assignment program input _ branch returned path bound
     (active worker assignment remainingEncode branch returned) fuel
   exact valid.weaken_post _ _ (fun _ _ _ holds => holds.2.1.isOk enough)
 

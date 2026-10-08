@@ -17,12 +17,12 @@ mutual
     | done (returned : Returns action before .done after) : Execution step branch action before after
     | fork (returned : Returns action before (.fork location count) forked)
         (children : Batch step ((List.range count).map fun index =>
-          Assignment.mk 0 (location.child index) (location.child index) false) forked joined)
-        (resumed : Execution step branch (step ⟨0, branch, location, true⟩) joined after) :
+          Assignment.mk 0 (location.child index)) forked joined)
+        (resumed : Execution step branch (step ⟨0, branch⟩) joined after) :
         Execution step branch action before after
   inductive Batch (step : Step) : List Assignment → Journal → Journal → Prop where
     | nil : Batch step [] journal journal
-    | cons (first : Execution step assignment.branch (step assignment) before middle)
+    | cons (first : Execution step assignment.branchStart (step assignment) before middle)
         (rest : Batch step assignments middle after) : Batch step (assignment :: assignments) before after
 end
 

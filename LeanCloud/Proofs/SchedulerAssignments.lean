@@ -1,4 +1,5 @@
 import LeanCloud.Proofs.Scheduler
+import LeanCloud.Proofs.Checkpoint
 
 namespace LeanCloud.Proofs.SchedulerAssignments
 open LeanCloud.Scheduler Internal
@@ -14,11 +15,11 @@ structure Valid (state : State) : Prop where
 
 /-- Historical assignment identity remains meaningful after timeout: if its
 attempt is still live, its owner, branch, location, and join mode are unchanged. -/
-def Identifies (state : State) (worker : WorkerId) (issued : Assignment) : Prop :=
+def Identifies (state : State) (worker : WorkerId) (issued : Checkpoint) : Prop :=
   issued.attempt < state.nextAttempt ∧
     ∀ job ∈ state.jobs, ∀ owner deadline,
       job.status = .running owner issued.attempt deadline →
-      owner = worker ∧ assignment job issued.attempt = issued
+      owner = worker ∧ Checkpoint.ofJob job issued.attempt = issued
 
 /-- Old attempts cannot reappear as different jobs. New live attempts, if any,
 are allocated at or above the preceding counter. -/
@@ -258,7 +259,7 @@ theorem recover_preserves (state : State) (valid : Valid state) :
 
 private theorem Valid.identifies {state : State} (valid : Valid state) (job : Job) (member : job ∈ state.jobs)
     (worker : WorkerId) (attempt deadline : Nat) (running : job.status = .running worker attempt deadline) :
-    Identifies state worker (assignment job attempt) := by
+    Identifies state worker (Checkpoint.ofJob job attempt) := by
   refine ⟨valid.bounded job member worker attempt deadline running, ?_⟩
   intro other otherMember owner expires otherRunning
   have same := valid.unique job member other otherMember worker owner attempt deadline expires running otherRunning
@@ -269,7 +270,9 @@ private theorem Valid.identifies {state : State} (valid : Valid state) (job : Jo
 durable scheduler state. Repeated requests preserve the same certificate. -/
 theorem acquire_identifies (state : State) (worker : WorkerId) (duration : Nat) (issued : Assignment)
     (valid : Valid state) (sent : (acquire state worker duration).2 = .execute issued) :
-    Identifies (acquire state worker duration).1 worker issued := by
+    ∃ job ∈ state.jobs, ∃ attempt,
+      assignment job attempt = issued ∧
+      Identifies (acquire state worker duration).1 worker (Checkpoint.ofJob job attempt) := by
   cases error : state.error with
   | some errorValue => simp [acquire, error] at sent
   | none =>
@@ -291,7 +294,7 @@ theorem acquire_identifies (state : State) (worker : WorkerId) (duration : Nat) 
             have ownerEq : owner = worker := beq_iff_eq.mp sameOwner
             subst owner
             cases owned
-            exact valid.identifies job member worker attempt deadline status
+            exact ⟨job, member, attempt, rfl, valid.identifies job member worker attempt deadline status⟩
           · contradiction
       | none =>
         cases pending : state.jobs.findIdx? (fun job => job.status == .pending) with
@@ -304,6 +307,7 @@ theorem acquire_identifies (state : State) (worker : WorkerId) (duration : Nat) 
           have identity := (allocate state index state.jobs[index]! worker (state.now + max 1 duration) valid).1.identifies
             { state.jobs[index]! with status := .running worker state.nextAttempt (state.now + max 1 duration) }
             (Array.mem_setIfInBounds inside) worker state.nextAttempt (state.now + max 1 duration) rfl
+          refine ⟨state.jobs[index]!, by simpa only [getElem!_pos state.jobs index inside] using Array.getElem_mem (xs := state.jobs) inside, state.nextAttempt, rfl, ?_⟩
           simpa only [acquire, error, finished, existing, pending, Bool.false_eq_true, ↓reduceIte] using! identity
 
 /-- Every execute message emitted by the actual scheduler carries an assignment
@@ -311,13 +315,16 @@ whose identity survives subsequent scheduler transitions and restarts. -/
 theorem handle_identifies (state : State) (duration : Nat) (message : SchedulerMessage) (valid : Valid state)
     (delivery : Delivery) (issued : Assignment)
     (sent : delivery ∈ (handle duration state message).2) (executes : delivery.message = .execute issued) :
-    Identifies (handle duration state message).1 delivery.worker issued := by
+    ∃ job ∈ state.jobs, ∃ attempt,
+      assignment job attempt = issued ∧
+      Identifies (handle duration state message).1 delivery.worker (Checkpoint.ofJob job attempt) := by
   cases message with
   | ready worker =>
     change delivery ∈ #[⟨worker, (acquire (observe state worker #[]) worker duration).2⟩] at sent
     have same := Array.mem_singleton.mp sent
     subst delivery
-    exact acquire_identifies (observe state worker #[]) worker duration issued (observe_valid _ _ _ valid) executes
+    simpa only [handle, Scheduler.observe_jobs] using
+      acquire_identifies (observe state worker #[]) worker duration issued (observe_valid _ _ _ valid) executes
   | report report =>
     simp only [handle, Array.mem_singleton] at sent
     subst delivery

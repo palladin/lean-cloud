@@ -63,7 +63,7 @@ def awaken (state : State) : State :=
       | _ => job }
 
 def assignment (job : Job) (attempt : Nat) : Assignment :=
-  ⟨attempt, job.branch, job.location, job.joining⟩
+  ⟨attempt, job.branch⟩
 
 /-- Locate an existing assignment when a worker repeats its request. -/
 def assignedTo (worker : WorkerId) (job : Job) : Option Assignment :=

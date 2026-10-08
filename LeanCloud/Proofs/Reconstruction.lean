@@ -1,17 +1,10 @@
-import LeanCloud.Proofs.ReplayModel
+import LeanCloud.Proofs.ReplayCursor
 import LeanCloud.Proofs.Routing
 
 namespace LeanCloud.Proofs.Reconstruction
 open Lean LeanEff ReplayModel ReplayInterpreter Routing
 
 variable {info : Option SourceSiteId}
-
-/-- Reaching the assignment starts execution with the same fuel. -/
-theorem reconstruct_at_assignment [Monad m] (store : ReplayStore m) (blobs : BlobStorage m)
-    (assignment : Assignment) (fuel : Nat) (encode : α → Json) (program : Cloud m α) :
-    reconstruct store blobs assignment fuel encode program assignment.location =
-      execute store blobs assignment fuel encode program assignment.location := by
-  cases fuel <;> simp [reconstruct.eq_def, execute]
 
 /-- A recorded prefix leads to the assigned typed continuation. Descending into
 an array child selects its codec; ordinary continuation steps retain the current
@@ -135,59 +128,59 @@ theorem Prefix.append {m : Type → Type u} {journal : Journal}
 /-- Replaying the prefix reaches exactly the assigned continuation, with the same
 journal and remaining fuel. No recorded prefix action needs to execute again. -/
 theorem replay_reaches_continuation (journal : Journal) (blobs : BlobStorage M)
-    (assignment : Assignment) {α β : Type} {encode : α → Json} {program : Cloud M α}
+    (assignment : Checkpoint) {α β : Type} {encode : α → Json} {program : Cloud M α}
     {current steps} {remainingEncode : β → Json} {remaining : Cloud M β}
-    (witness : Prefix journal assignment.location encode program current steps remainingEncode remaining) (fuel : Nat) :
-    (reconstruct store blobs assignment (steps + fuel) encode program current).run journal =
-      (execute store blobs assignment fuel remainingEncode remaining assignment.location).run journal := by
+    (witness : Prefix journal assignment.location encode program current steps remainingEncode remaining) (fuel : Nat)
+    (branch : assignment.branch = Location.branchStart assignment.location) (nonempty : 0 < current.size) :
+    (ReplayCursor.atPoint store blobs assignment (steps + fuel) encode program current).run journal =
+      (replay store blobs assignment.branch fuel remainingEncode remaining assignment.location).run journal := by
   induction witness with
-  | here encode program => simp [reconstruct_at_assignment]
+  | here encode program => simp [ReplayCursor.at_target]
   | delay next before rest ih =>
-    rw [Nat.add_right_comm _ 1 fuel, reconstruct]
-    simpa [beq_eq_false_iff_ne.mpr before] using ih
+    rw [Nat.add_right_comm _ 1 fuel, ReplayCursor.delay _ _ _ branch]
+    exact ih nonempty
   | command codec operation next record wire value before present checked success decoded rest ih =>
-    rw [Nat.add_right_comm _ 1 fuel, reconstruct]
-    simp [beq_eq_false_iff_ne.mpr before, Internal.recorded, bind_assoc]
-    erw [read_then]
-    simp [present, Internal.check, checked, success, Internal.decode, decoded]
-    exact ih
+    rw [Nat.add_right_comm _ 1 fuel,
+      ReplayCursor.command journal blobs assignment branch _ _ _ codec operation next _ record wire value present checked success decoded]
+    exact ih (by simpa [LeanCloud.Location.next] using nonempty)
   | joined codec count branches next record wire values before skip present checked success decoded size rest ih =>
-    rw [Nat.add_right_comm _ 1 fuel, reconstruct]
-    simp [beq_eq_false_iff_ne.mpr before, skip, Internal.recorded, bind_assoc]
-    erw [read_then]
-    simp [present, Internal.check, checked, success, Internal.decodeGroup, Internal.decode, decoded, size]
-    exact ih
+    have route := (next_follows _ nonempty).trans (rest.follows (by simpa [LeanCloud.Location.next] using nonempty))
+    rw [Nat.add_right_comm _ 1 fuel,
+      ReplayCursor.joined journal blobs assignment branch _ _ _ codec count branches next _ record wire values route skip present checked success decoded size]
+    exact ih (by simpa [LeanCloud.Location.next] using nonempty)
   | child codec count branches next index before enters selected rest ih =>
-    rw [Nat.add_right_comm _ 1 fuel, reconstruct]
-    simp [beq_eq_false_iff_ne.mpr before, enters, selected, index.isLt]
-    exact ih
+    rw [Nat.add_right_comm _ 1 fuel,
+      ReplayCursor.child _ _ _ branch _ _ codec count branches next _ _ index enters selected (rest.follows (by simp [LeanCloud.Location.child]))]
+    exact ih (by simp [LeanCloud.Location.child])
 
 /-- The worker entry point resumes the continuation certified by the recorded
 prefix. An already completed branch instead takes `step`'s warm-replay shortcut. -/
 theorem step_resumes_at_location [Codec α] (journal : Journal) (blobs : BlobStorage M)
-    (assignment : Assignment) (program : ι → Cloud M α) (input : ι)
+    (assignment : Checkpoint) (program : ι → Cloud M α) (input : ι)
     {β : Type} {steps} {remainingEncode : β → Json} {remaining : Cloud M β} (fuel : Nat)
-    (valid : (!assignment.location.isEmpty && assignment.location[0]!.1 == 0) = true)
+    (branch : assignment.branch = Location.branchStart assignment.location)
+    (valid : (!assignment.branch.isEmpty && assignment.branch[0]!.1 == 0) = true)
     (unfinished : journal.lookup (ReplayStore.returnKey assignment.branch) = none)
     (witness : Prefix journal assignment.location Codec.encode (program input)
       Location.root steps remainingEncode remaining) :
     (step store blobs (steps + fuel) program input assignment).run journal =
-      (execute store blobs assignment fuel remainingEncode remaining assignment.location).run journal := by
-  simp [step, valid, ReplayStore.outcome]
+      (replay store blobs assignment.branch fuel remainingEncode remaining assignment.location).run journal := by
+  simp [step, Checkpoint.work, valid, ReplayStore.outcome]
   erw [read_then]
   simp [unfinished]
-  exact replay_reaches_continuation journal blobs assignment witness fuel
+  rw [← ReplayCursor.boundary store blobs assignment branch _ _ _ Location.root (witness.follows (by decide)) (by simp)]
+  exact replay_reaches_continuation journal blobs assignment witness fuel branch (by decide)
 
 /-- A completed branch reuses its durable return record without running its
 program or changing the journal, even if the interpreter has no fuel left. -/
 theorem completed_step_reuses_record [Codec α] (journal : Journal) (blobs : BlobStorage M)
-    (assignment : Assignment) (program : ι → Cloud M α) (input : ι) (fuel : Nat)
+    (assignment : Checkpoint) (program : ι → Cloud M α) (input : ι) (fuel : Nat)
     (record : ReplayRecord)
-    (valid : (!assignment.location.isEmpty && assignment.location[0]!.1 == 0) = true)
+    (valid : (!assignment.branch.isEmpty && assignment.branch[0]!.1 == 0) = true)
     (completed : journal.lookup (ReplayStore.returnKey assignment.branch) = some record)
     (checked : (record.request == ReplayStore.returnRequest) = true) :
     (step store blobs fuel program input assignment).run journal = (.ok .done, journal) := by
-  simp [step, valid, ReplayStore.outcome]
+  simp [step, Checkpoint.work, valid, ReplayStore.outcome]
   erw [read_then]
   simp [completed, checked]
 

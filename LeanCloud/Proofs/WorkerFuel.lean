@@ -52,7 +52,7 @@ theorem step [codec : Codec α] (expected : Journal)
     (meaning : Specification.Complete expected Location.root (program input) outcome)
     (known : expected.lookup (ReplayStore.returnKey Location.root) =
       some ⟨ReplayStore.returnRequest, Parallel.recorded codec.encode outcome⟩) :
-    ∃ bound, ∀ worker assignment fuel, bound ≤ fuel →
+    ∃ bound, ∀ worker (assignment : Checkpoint) fuel, bound ≤ fuel →
       (ReplayContracts.rules expected).Program
         (fun world => SchedulerGroups.AssignmentReady expected world.records assignment ∧
           Resumable world.records codec.encode (program input) Location.root assignment.location)
@@ -60,7 +60,7 @@ theorem step [codec : Codec α] (expected : Journal)
         (ReplayInterpreter.step (observed worker).records blobs fuel program input assignment).run := by
   classical
   obtain ⟨locations, covered⟩ := locations_finite expected
-  let Sufficient := fun target bound => ∀ worker assignment,
+  let Sufficient := fun target bound => ∀ worker (assignment : Checkpoint),
     assignment.location = target → assignment.branch = Location.branchStart target →
     ∀ journal, Extends journal expected → Resumable journal codec.encode (program input) Location.root target →
     ∀ fuel, bound ≤ fuel → (ReplayContracts.rules expected).Program
@@ -108,7 +108,7 @@ theorem execute [codec : Codec α] (expected : Journal)
     (meaning : Specification.Complete expected Location.root (program input) outcome)
     (known : expected.lookup (ReplayStore.returnKey Location.root) =
       some ⟨ReplayStore.returnRequest, Parallel.recorded codec.encode outcome⟩) :
-    ∃ bound, ∀ worker assignment fuel, bound ≤ fuel →
+    ∃ bound, ∀ worker (assignment : Checkpoint) fuel, bound ≤ fuel →
       (ReplayContracts.rules expected).Program
         (fun world => SchedulerGroups.AssignmentReady expected world.records assignment ∧
           Resumable world.records codec.encode (program input) Location.root assignment.location)

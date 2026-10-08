@@ -22,7 +22,7 @@ theorem job_can_report [codec : Codec α] (workers turns fuel duration : Nat)
     (job : Scheduler.Job) (member : job ∈ current.world.scheduler.jobs)
     (worker : WorkerId) (attempt : Nat) :
     ∃ bound, ∀ budget, bound ≤ budget →
-      let assignment := Scheduler.Internal.assignment job attempt
+      let assignment := Checkpoint.ofJob job attempt
       let action := LeanCloud.Worker.execute worker (observed worker) blobs budget program input assignment
       let run : Simulation.Start World Report 1 := fun _ _ => action
       ∃ events report final,
@@ -37,7 +37,7 @@ theorem job_can_report [codec : Codec α] (workers turns fuel duration : Nat)
   have safe := ConcurrentSafety.invariant expected workers turns fuel duration program input meaning known history
   have ready := safe.groups job member
   obtain ⟨β, encode, remaining, steps, path⟩ := safe.paths job member
-  let assignment := Scheduler.Internal.assignment job attempt
+  let assignment := Checkpoint.ofJob job attempt
   obtain ⟨bound, contract⟩ := WorkerContracts.sufficient_fuel expected current.world.records worker assignment
     program input meaning known safe.records ready.branch path
   refine ⟨bound, fun budget enough => ?_⟩
@@ -52,7 +52,7 @@ theorem job_can_report [codec : Codec α] (workers turns fuel duration : Nat)
     by simp [Simulation.State.setActor], sound.1, sound.2.1, success, sound.2.2.2, ?_⟩
   intro completed
   refine ⟨⟨ReplayStore.returnRequest, returned⟩, ?_⟩
-  simpa [ExecutionContracts.Outcome, completed, assignment, Scheduler.Internal.assignment] using sound.2.2.1.1
+  simpa [ExecutionContracts.Outcome, completed, assignment, Checkpoint.ofJob] using sound.2.2.1.1
 
 /-- A pure source determines a finite set of possible branch identities,
 independently of scheduling, worker count, crashes, and retries. Every reachable

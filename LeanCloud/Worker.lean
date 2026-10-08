@@ -28,6 +28,13 @@ def execute [Monad m] [Codec α] (id : WorkerId) (store : ObservedStore m)
   let progress ← (ReplayInterpreter.step store.records blobs fuel program input assignment observer).run
   return ⟨id, assignment.attempt, progress, ← store.confirmed⟩
 
+/-- Publish a terminal coordination intent. Only a worker touches the root
+record; an already published workflow outcome remains the winner. -/
+def finalize [Monad m] (id : WorkerId) (store : ObservedStore m)
+    (attempt : Nat) (outcome : Exit) : m Report := do
+  let progress ← (ReplayInterpreter.Internal.finish store.records Location.root outcome).run
+  return ⟨id, attempt, progress, ← store.confirmed⟩
+
 /-- Finish an assignment by recording its values, publishing its report with a
 broker confirmation, and only then acknowledging its delivery. A crash before
 acknowledgement replays the assignment; duplicates reuse the immutable records. -/

@@ -211,8 +211,9 @@ revocation. The shared containers and other runs keep running. `resume RUN`
 reactivates the run with fresh attempts and reconstructs execution from its
 immutable records; it does not restore an in-memory continuation.
 
-`kill RUN` durably revokes the run and creates a terminal cancellation in its
-root record. A normal result that won the atomic creation race is preserved.
+`kill RUN` durably revokes the run. A worker then publishes its terminal
+cancellation record; with zero workers, publication waits for a worker to become
+available. A normal result that won the atomic creation race is preserved.
 A killed run cannot resume or reuse its ID. Killing does not undo external
 actions or delete records. `Cloud.exec` can execute again if interruption occurs
 before its result is recorded, so external actions must tolerate retries.

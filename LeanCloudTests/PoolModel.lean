@@ -11,7 +11,7 @@ open Lean LeanCloud
 
 private abbrev World := SimulationBackend.World
 private instance : Inhabited World := ⟨{}⟩
-private instance : Inhabited Pool.Run := ⟨⟨"", .active, {}⟩⟩
+private instance : Inhabited Pool.Run := ⟨{ id := "" }⟩
 
 private structure Workflow where
   id : String
@@ -25,6 +25,7 @@ private structure Task where
   run : Nat
   assignment : Assignment
   actor : Simulation.Actor World Report
+  finalizing : Option Exit := none
 
 private structure Model where
   pool : Pool.State := {}
@@ -60,7 +61,13 @@ private def acquire (model : Model) (worker : Nat) : Except String Model := do
   | .execute id assignment =>
     let some run := model.workflows.findIdx? (·.id == id) | throw "Assignment names an unknown workflow"
     ensure (Pool.valid pool id workers[worker]! assignment.attempt) "New assignment is invalid"
-    let task := Task.mk run assignment (.ofProgram (execute model worker run assignment))
+    let task := Task.mk run assignment (.ofProgram (execute model worker run assignment)) none
+    return { model with tasks := model.tasks.set! worker (some task) }
+  | .finalize id attempt outcome =>
+    let some run := model.workflows.findIdx? (·.id == id) | throw "Finalization names an unknown workflow"
+    ensure (Pool.valid pool id workers[worker]! attempt) "New finalization is invalid"
+    let action := Worker.finalize workers[worker]! (SimulationBackend.observed workers[worker]!) attempt outcome
+    let task : Task := ⟨run, ⟨attempt, Location.root⟩, .ofProgram action, some outcome⟩
     return { model with tasks := model.tasks.set! worker (some task) }
   | .drain generation => return { model with pool := Pool.drained pool workers[worker]! generation }
   | .idle => return model
@@ -68,7 +75,9 @@ private def acquire (model : Model) (worker : Nat) : Except String Model := do
 
 private def simulationEvent (model : Model) (worker : Nat) (task : Task) (event : Simulation.Event 1) :
     Except String Model := do
-  let start : Simulation.Start World Report 1 := fun _ _ => execute model worker task.run task.assignment
+  let start : Simulation.Start World Report 1 := fun _ _ => match task.finalizing with
+    | none => execute model worker task.run task.assignment
+    | some outcome => Worker.finalize workers[worker]! (SimulationBackend.observed workers[worker]!) task.assignment.attempt outcome
   let state : Simulation.State World Report 1 := ⟨model.worlds[task.run]!, fun _ => task.actor, fun _ => 0, #[]⟩
   let after ← (Simulation.step start event state).mapError reprStr
   return { model with
@@ -127,12 +136,7 @@ private def restart (model : Model) : Except String Model := do
   return { model with pool }
 
 private def kill (model : Model) (run : Nat) : Except String Model := do
-  let model ← control model (.kill model.workflows[run]!.id)
-  -- Match the runtime's separate create-if-absent root cancellation. A result
-  -- committed before kill keeps winning, including an orphaned root write.
-  let (_, world) := SimulationBackend.create (ReplayStore.returnKey Location.root)
-    ⟨ReplayStore.returnRequest, cancelled⟩ model.worlds[run]!
-  return { model with worlds := model.worlds.set! run world }
+  control model (.kill model.workflows[run]!.id)
 
 private def check (before after : Model) : Except String PUnit.{2} := do
   ensure (decide ((after.pool.runs.map (·.id)).toList.Pairwise (· ≠ ·))) "Duplicate run IDs"
@@ -162,13 +166,14 @@ private def check (before after : Model) : Except String PUnit.{2} := do
     if let some record := world.records.lookup (ReplayStore.returnKey Location.root) then
       ensure (record.outcome == after.workflows[index]!.expected ||
         (run.mode == .killed && record.outcome == cancelled)) "Stored outcome differs from direct evaluation"
-    if run.mode == .killed then
+    if run.finalization == .done then
       ensure ((world.records.lookup (ReplayStore.returnKey Location.root)).isSome) "Kill lost its terminal result"
   for worker in workers do
     let assignments := after.pool.runs.foldl (fun count run => count +
       (run.scheduler.jobs.filter fun job => match job.status with
         | .running owner attempt _ => owner == worker && Pool.valid after.pool run.id worker attempt
-        | _ => false).size) 0
+        | _ => false).size +
+      (match run.finalization with | .running owner _ _ => if owner == worker then 1 else 0 | _ => 0)) 0
     ensure (assignments ≤ 1) s!"{worker} has valid assignments in several runs"
 
 private def isolated (before after : Model) (id : String) : Except String PUnit.{2} := do
@@ -318,7 +323,7 @@ private def runSeed (seed : Nat) : Except String PUnit.{2} := do
     check model after
     model := after
   for _ in [:10000] do
-    if model.pool.runs.all (fun run => run.mode == .killed || run.scheduler.finished) then
+    if model.pool.runs.all (fun run => if run.mode == .killed then run.finalization == .done else run.scheduler.finished) then
       check model model
       return
     model ← progress model

@@ -54,14 +54,21 @@ private theorem outcome (ports : Ports allowed store blobs) (branch : Location) 
   | none => trivial
   | some record => dsimp only; split <;> trivial
 
-private theorem join (ports : Ports allowed store blobs) (location : Location) (count : Nat) :
-    Effects.Program allowed (Internal.join store location count).run := by
-  apply Effects.except_bind
-  · apply Effects.except_mapM
-    intro index
+private theorem readChildren (ports : Ports allowed store blobs) (location : Location) (indices : List Nat) :
+    Effects.Program allowed (Internal.readChildren store location indices).run := by
+  induction indices with
+  | nil => trivial
+  | cons index rest ih =>
     apply Effects.except_bind _ (outcome ports _)
-    intro result
-    cases result <;> trivial
+    intro first
+    cases first with
+    | none => trivial
+    | some value => exact Effects.except_bind _ ih (fun _ => trivial)
+
+private theorem join (ports : Ports allowed store blobs) (location : Location) (count : Nat) :
+    Effects.Program allowed (Internal.tryJoin store location count).run := by
+  apply Effects.except_bind
+  · exact readChildren ports _ _
   · intro _
     trivial
 
@@ -88,10 +95,10 @@ private theorem recorded (ports : Ports allowed store blobs) (current : Location
     cases result <;> trivial
 
 /-- Execution respects the port and user-action contracts at every continuation. -/
-theorem execute_preserves (ports : Ports allowed store blobs) (assignment : Assignment) (fuel : Nat)
+theorem replay_preserves (ports : Ports allowed store blobs) (branchStart : Location) (fuel : Nat)
     (encode : α → Json) (program : Cloud (EffF e Empty) α) (current : Location)
     (valid : CloudEffects.Program (fun action => Effects.Program allowed action) program) :
-    Effects.Program allowed (execute store blobs assignment fuel encode program current).run := by
+    Effects.Program allowed (replay store blobs branchStart fuel encode program current).run := by
   induction fuel generalizing α encode program current with
   | zero => trivial
   | succ fuel ih =>
@@ -104,10 +111,10 @@ theorem execute_preserves (ports : Ports allowed store blobs) (assignment : Assi
       | delay => exact ih encode _ _ (CloudEffects.apply _ next continuation ())
       | fail error => exact finish ports _ _
       | command codec operation =>
-        have resumed := resume ports assignment.branch (Internal.decode codec)
-          (fun decoded => execute store blobs assignment fuel encode (next.apply decoded) current.next)
+        have resumed := resume ports branchStart (Internal.decode codec)
+          (fun decoded => replay store blobs branchStart fuel encode (next.apply decoded) current.next)
           (decode codec) (fun decoded => ih encode _ _ (CloudEffects.apply _ next continuation decoded))
-        simp only [execute]
+        simp only [replay]
         apply Effects.except_bind _ ?_ resumed
         unfold Internal.command
         apply Effects.except_bind _ (Effects.except_lift _ (ports.read _))
@@ -115,6 +122,7 @@ theorem execute_preserves (ports : Ports allowed store blobs) (assignment : Assi
         cases record with
         | some record => exact check _ _
         | none =>
+          unfold Internal.execute
           apply Effects.except_bind
           · apply Effects.except_catch
             · exact Effects.except_bind _ (ports.execute codec operation request) (fun _ => trivial)
@@ -125,36 +133,37 @@ theorem execute_preserves (ports : Ports allowed store blobs) (assignment : Assi
             intro accepted
             exact check _ _
       | parallel codec count branches =>
-        have resumed := resume ports assignment.branch (Internal.decodeGroup codec count)
-          (fun decoded => execute store blobs assignment fuel encode (next.apply decoded) current.next)
+        have resumed := resume ports branchStart (Internal.decodeGroup codec count)
+          (fun decoded => replay store blobs branchStart fuel encode (next.apply decoded) current.next)
           (decodeGroup codec count) (fun decoded => ih encode _ _ (CloudEffects.apply _ next continuation decoded))
-        simp only [execute]
+        simp only [replay]
         apply Effects.except_bind _ (Effects.except_lift _ (ports.read _))
         intro record
-        split
-        · trivial
-        · cases record with
-          | some record => exact Effects.except_bind _ (check _ _) resumed
-          | none =>
-            apply Effects.except_bind _ (join ports _ _)
-            intro joined
+        cases record with
+        | some record => exact Effects.except_bind _ (check _ _) resumed
+        | none =>
+          apply Effects.except_bind _ (join ports _ _)
+          intro joined
+          cases joined with
+          | none => trivial
+          | some outcome =>
             apply Effects.except_bind _ (Effects.except_lift _ (ports.create _ _))
             intro accepted
             exact Effects.except_bind _ (check _ _) resumed
 
 /-- Reconstruction follows recorded replies, then hands the same computation
 and remaining fuel to execution. -/
-theorem reconstruct_preserves (ports : Ports allowed store blobs) (assignment : Assignment) (fuel : Nat)
+theorem reconstruct_preserves (ports : Ports allowed store blobs) (branchStart : Location) (fuel : Nat)
     (encode : α → Json) (program : Cloud (EffF e Empty) α) (current : Location)
     (valid : CloudEffects.Program (fun action => Effects.Program allowed action) program) :
-    Effects.Program allowed (reconstruct store blobs assignment fuel encode program current).run := by
+    Effects.Program allowed (reconstruct store blobs branchStart fuel encode program current).run := by
   induction fuel generalizing α encode program current with
   | zero => trivial
   | succ fuel ih =>
     rw [reconstruct.eq_def]
     dsimp only
     split
-    · exact execute_preserves ports assignment (fuel + 1) encode program current valid
+    · exact replay_preserves ports branchStart (fuel + 1) encode program current valid
     · cases program with
       | pure info value => trivial
       | impure info control next =>
@@ -191,7 +200,7 @@ theorem step_preserves (ports : Ports allowed store blobs) [Codec α] (fuel : Na
     intro completed
     split
     · trivial
-    · exact reconstruct_preserves ports assignment fuel Codec.encode _ Location.root valid
+    · exact reconstruct_preserves ports assignment.branchStart fuel Codec.encode _ Location.root valid
   · trivial
 
 end LeanCloud.Proofs.InterpreterEffects

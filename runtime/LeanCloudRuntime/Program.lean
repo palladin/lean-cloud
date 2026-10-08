@@ -81,6 +81,21 @@ def Registry.serveWorker (registry : Registry) (config : Config) : IO Unit := do
         nextReady := (← IO.monoMsNow) + 2000
       let some delivery ← inbox.receive | continue
       match delivery.message with
+      | .finalize run attempt outcome =>
+        let trace ← Trace.create id run
+        Pool.withHeartbeat config run id attempt fun healthy => do
+          healthy
+          let allowed : Bool ← IO.ofExcept (fromJson? (← Pool.request config (.check run id attempt)))
+          if allowed then
+            trace.assign ⟨attempt, Location.root⟩
+            S3.initializeBucket config.blobs
+            let records ← observe (trace.records (S3.records config.blobs run))
+            let report ← Worker.finalize id records attempt outcome
+            send (.report run report)
+            trace.emit "sealed" ""
+        trace.emit "idle" ""
+        send (.ready id)
+        nextReady := (← IO.monoMsNow) + 2000
       | .execute run assignment =>
         let revoked ← IO.mkRef false
         let trace ← Trace.create id run

@@ -44,14 +44,16 @@ flowchart LR
 
 The scheduler persists assignments, attempts, dependencies, and confirmed record
 keys. It is the sole writer of its coordination database. It does not evaluate
-workflow code or assemble branch results. Administrative kill seals the root
-cancellation record in blob storage.
+workflow code or access replay records. Administrative kill revokes work and
+assigns a worker to publish the root cancellation record.
 
-Workers reconstruct captured variables from the root program, read recorded
-prefixes, and execute commands until a parallel fork or completion. Command
+Assignments contain only an attempt number and a stable `branchStart`. Workers
+reconstruct captured variables from the root program, then replay records in
+that branch and execute missing commands until suspension or completion. Command
 results, joins, and branch returns have immutable blob keys. Once children report
 completion, the scheduler makes the parent runnable. A worker reads the ordered
-child results and continues.
+child results, records their joined outcome, and continues. Storage determines
+whether a join is ready; no replay cursor or join flag is sent to the worker.
 
 The inbox service serializes complete SQLite transactions through a mutex. Its
 connection is separate from the scheduler's coordination connection. Typed
