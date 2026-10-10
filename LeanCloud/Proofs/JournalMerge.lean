@@ -84,6 +84,32 @@ theorem Writes.extends {region before after} (writes : Writes region before afte
   have absent := List.lookup_eq_none_iff.mp (valid entry member).1 other found
   simp [same] at absent
 
+/-- Successful worker replies expose exactly the storage merge, with no further effects. -/
+theorem merge_success (items : List κ) (records : κ → Journal) (before : Journal) :
+    (ParallelReplay.mergeChildren (items.map fun item => (.ok (), records item))).run before =
+      match ReplayModel.merge before (items.flatMap records) with
+      | .error error => (.error error, before)
+      | .ok after => (.ok (), after) := by
+  have noErrors (items : List κ) : (items.map fun item => ((Except.ok () : Except CloudError Unit), records item)).forM
+      (fun pair => (liftExcept pair.1 : ExceptT CloudError ReplayModel.M Unit)) = pure () := by
+    induction items with
+    | nil => rfl
+    | cons item rest ih =>
+      change (do
+        liftExcept (.ok ())
+        (rest.map fun item => ((Except.ok () : Except CloudError Unit), records item)).forM
+          (fun pair => (liftExcept pair.1 : ExceptT CloudError ReplayModel.M Unit))) = _
+      rw [ih]
+      rfl
+  simp only [ParallelReplay.mergeChildren, bind_run, get_run, List.flatMap_map]
+  cases merged : ReplayModel.merge before (items.flatMap records) with
+  | error error => rfl
+  | ok after =>
+    change ((items.map fun item => ((Except.ok () : Except CloudError Unit), records item)).forM
+      (fun pair => (liftExcept pair.1 : ExceptT CloudError ReplayModel.M Unit))).run after = _
+    rw [noErrors]
+    rfl
+
 /-- Every child supplies only its fresh prefix. Disjoint ownership makes their
 concatenation a valid journal and preserves every child's result. -/
 theorem children_within (items : List κ) (records : κ → Journal) (region : κ → String → Prop)
@@ -140,23 +166,8 @@ theorem children_within (items : List κ) (records : κ → Journal) (region : �
   have merged : merge initial combined = .ok (combined ++ initial) := by
     unfold merge
     rw [ite_eq_left ⟨unique, fun entry member => (fresh entry member).1⟩]
-  have noErrors (xs : List κ) :
-      (xs.map fun item => ((Except.ok () : Except CloudError Unit), additions item)).forM
-        (fun pair => (liftExcept pair.1 : ExceptT CloudError M Unit)) = pure () := by
-    induction xs with
-    | nil => rfl
-    | cons item rest ih =>
-      change (do liftExcept (.ok ());
-                 (rest.map fun item => ((Except.ok () : Except CloudError Unit), additions item)).forM
-                   (fun pair => (liftExcept pair.1 : ExceptT CloudError M Unit))) = _
-      rw [ih]
-      rfl
-  simp only [mergeChildren, bind_run, get_run, List.flatMap_map]
+  rw [merge_success]
   rw [merged]
-  change ((items.map fun item => ((Except.ok () : Except CloudError Unit), additions item)).forM
-    (fun pair => (liftExcept pair.1 : ExceptT CloudError M Unit))).run (combined ++ initial) = _
-  rw [noErrors]
-  rfl
 
 end LeanCloud.Proofs.JournalMerge
 

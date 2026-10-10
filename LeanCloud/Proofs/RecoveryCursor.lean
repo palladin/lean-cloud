@@ -1,7 +1,9 @@
-import LeanCloud.Proofs.RecoveryMeaning
+import LeanCloud.ReplayFaults
+import LeanCloud.Proofs.ReplayModel
+import LeanCloud.Proofs.Routing
 
 namespace LeanCloud.Proofs.RecoveryCursor
-open Lean LeanEff ReplayFaults ReplayModel ReplayInterpreter Routing WorkerRecovery
+open Lean LeanEff ReplayFaults ReplayModel ReplayInterpreter Routing
 
 variable [rootCodec : Codec α] (source : Cloud WorkerM α)
 

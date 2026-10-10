@@ -5,8 +5,6 @@ import LeanCloud.Proofs.JournalRegion
 namespace LeanCloud.Proofs.Specification
 open Lean LeanEff ReplayModel JournalRegion
 
-variable {info : Option SourceSiteId}
-
 /-- A real parallel group in the pure specification: its children have known
 returns, and their ordered reduction is the expected group result. -/
 def Group (journal : Journal) (location : LeanCloud.Location) (count : Nat) : Prop :=
@@ -19,50 +17,68 @@ def Group (journal : Journal) (location : LeanCloud.Location) (count : Nat) : Pr
 
 /-- A complete pure specification includes every evaluated child, its return
 record, and the ordered join result. The branch's own return record is separate.
+The budget bounds a path through the finite evaluation, including children.
 This relation describes the program; it does not execute another interpreter. -/
-inductive Complete {m : Type → Type u} [Monad m] (journal : Journal) :
-    {α : Type} → LeanCloud.Location → Cloud m α → Except CloudError α → Prop where
-  | pure {info : Option SourceSiteId} (value : α) : Complete journal current (EffF.pure info value) (.ok value)
+inductive Complete {m : Type → Type u} [Monad m] (expected : Journal) :
+    {α : Type} → Location → Cloud m α → Except CloudError α → Nat → Prop where
+  | pure {info : Option SourceSiteId} (value : α) : Complete expected current (EffF.pure info value) (.ok value) 1
   | fail {info : Option SourceSiteId} (error : CloudError) (next : ArrsF (Control m) SourceSiteId α β) :
-      Complete journal current (.impure info (.fail error) next) (.error error)
+      Complete expected current (.impure info (.fail error) next) (.error error) 1
   | delay {info : Option SourceSiteId} (next : ArrsF (Control m) SourceSiteId Unit α)
-      (rest : Complete journal current (next.apply ()) outcome) :
-      Complete journal current (.impure info .delay next) outcome
-  | exec {info : Option SourceSiteId} (codec : Codec α) (label : String) (body : Unit → α) (next : ArrsF (Control m) SourceSiteId α β)
+      (rest : Complete expected current (next.apply ()) outcome budget) :
+      Complete expected current (.impure info .delay next) outcome (budget + 1)
+  | exec {info : Option SourceSiteId} (codec : Codec α) (label : String) (body : Unit → α)
+      (next : ArrsF (Control m) SourceSiteId α β)
       (roundtrip : codec.decode (codec.encode (body ())) = .ok (body ()))
-      (present : journal.lookup (ReplayStore.valueKey current) =
-        some ⟨ReplayInterpreter.Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → m _)),
+      (present : expected.lookup (ReplayStore.valueKey current) =
+        some ⟨ReplayInterpreter.Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → m α)),
           .success (codec.encode (body ()))⟩)
-      (rest : Complete journal current.next (next.apply (body ())) outcome) :
-      Complete journal current
-        (.impure info (.command codec (.exec label (fun _ => pure (body ())))) next) outcome
+      (rest : Complete expected current.next (next.apply (body ())) outcome budget) :
+      Complete expected current (.impure info (.command codec (.exec label (fun _ => pure (body ())))) next)
+        outcome (budget + 1)
   | parallelOk {info : Option SourceSiteId} (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
       (next : ArrsF (Control m) SourceSiteId (Array α) β) (outcomes : Fin count → Except CloudError α)
       (roundtrip : Pure.RoundTrips codec)
-      (children : ∀ index : Fin count, Complete journal (current.child index) (branches index) (outcomes index))
-      (returned : ∀ index : Fin count, journal.lookup (ReplayStore.returnKey (current.child index)) =
+      (children : ∀ index, Complete expected (current.child index) (branches index) (outcomes index) childBudget)
+      (returned : ∀ index, expected.lookup (ReplayStore.returnKey (current.child index)) =
         some ⟨ReplayStore.returnRequest, Parallel.recorded codec.encode (outcomes index)⟩)
       (collected : (Array.ofFn outcomes).mapM id = .ok values)
-      (present : journal.lookup (ReplayStore.valueKey current) =
-        some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩,
-          .success (Json.arr (values.map codec.encode))⟩)
-      (rest : Complete journal current.next (next.apply values) outcome) :
-      Complete journal current (.impure info (.parallel codec count branches) next) outcome
+      (present : expected.lookup (ReplayStore.valueKey current) =
+        some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, .success (Json.arr (values.map codec.encode))⟩)
+      (rest : Complete expected current.next (next.apply values) outcome budget) :
+      Complete expected current (.impure info (.parallel codec count branches) next) outcome
+        (childBudget + budget + 1)
   | parallelError {info : Option SourceSiteId} (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
       (next : ArrsF (Control m) SourceSiteId (Array α) β) (outcomes : Fin count → Except CloudError α)
       (roundtrip : Pure.RoundTrips codec)
-      (children : ∀ index : Fin count, Complete journal (current.child index) (branches index) (outcomes index))
-      (returned : ∀ index : Fin count, journal.lookup (ReplayStore.returnKey (current.child index)) =
+      (children : ∀ index, Complete expected (current.child index) (branches index) (outcomes index) childBudget)
+      (returned : ∀ index, expected.lookup (ReplayStore.returnKey (current.child index)) =
         some ⟨ReplayStore.returnRequest, Parallel.recorded codec.encode (outcomes index)⟩)
       (collected : (Array.ofFn outcomes).mapM id = .error error)
-      (present : journal.lookup (ReplayStore.valueKey current) =
+      (present : expected.lookup (ReplayStore.valueKey current) =
         some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, .failure error⟩) :
-      Complete journal current (.impure info (.parallel codec count branches) next) (.error error)
+      Complete expected current (.impure info (.parallel codec count branches) next) (.error error) (childBudget + 1)
+  | weaken (meaning : Complete expected current program outcome budget) (enough : budget ≤ larger) :
+      Complete expected current program outcome larger
+
+private theorem common_bound (count : Nat) (property : Fin count → Nat → Prop)
+    (each : ∀ index, ∃ bound, property index bound)
+    (increase : ∀ index small large, small ≤ large → property index small → property index large) :
+    ∃ bound, ∀ index, property index bound := by
+  induction count with
+  | zero => exact ⟨0, fun i => Fin.elim0 i⟩
+  | succ count ih =>
+    obtain ⟨first, hf⟩ := each 0
+    obtain ⟨rest, hr⟩ := ih (fun i => property i.succ) (fun i => each i.succ) (fun i => increase i.succ)
+    refine ⟨max first rest, ?_⟩
+    intro index
+    exact Fin.cases (increase 0 _ _ (Nat.le_max_left _ _) hf)
+      (fun i => increase i.succ _ _ (Nat.le_max_right _ _) (hr i)) index
 
 theorem Complete.extend {m : Type → Type u} [Monad m] {α : Type}
-    {before after current} {program : Cloud m α} {outcome}
-    (complete : Complete before current program outcome) (extension : Extends before after) :
-    Complete after current program outcome := by
+    {before after current} {program : Cloud m α} {outcome budget}
+    (complete : Complete before current program outcome budget) (extension : Extends before after) :
+    Complete after current program outcome budget := by
   induction complete with
   | pure value => exact .pure value
   | fail error next => exact .fail error next
@@ -75,34 +91,40 @@ theorem Complete.extend {m : Type → Type u} [Monad m] {α : Type}
   | parallelError codec count branches next outcomes roundtrip children returned collected present ihChildren =>
     exact .parallelError codec count branches next outcomes roundtrip ihChildren
       (fun index => extension _ _ (returned index)) collected (extension _ _ present)
+  | weaken complete enough ih => exact .weaken ih enough
 
 private theorem children_exist {m : Type → Type u} [Monad m] (current : LeanCloud.Location)
     (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
     (outcomes : Fin count → Except CloudError α)
-    (each : ∀ index : Fin count, ∃ journal, Complete journal (current.child index) (branches index) (outcomes index) ∧
+    (each : ∀ index : Fin count, ∃ journal budget, Complete journal (current.child index) (branches index) (outcomes index) budget ∧
       Covers (After current index 0) journal) :
-    ∃ journal,
-      (∀ index : Fin count, Complete journal (current.child index) (branches index) (outcomes index)) ∧
+    ∃ journal budget,
+      (∀ index : Fin count, Complete journal (current.child index) (branches index) (outcomes index) budget) ∧
       (∀ index : Fin count, journal.lookup (ReplayStore.returnKey (current.child index)) =
         some ⟨ReplayStore.returnRequest, Parallel.recorded codec.encode (outcomes index)⟩) ∧
       Covers (fun key => ∃ child, Under current child key) journal := by
   classical
-  have full : ∀ index : Fin count, ∃ journal,
-      Complete journal (current.child index) (branches index) (outcomes index) ∧
+  have full : ∀ index : Fin count, ∃ journal budget,
+      Complete journal (current.child index) (branches index) (outcomes index) budget ∧
       journal.lookup (ReplayStore.returnKey (current.child index)) =
         some ⟨ReplayStore.returnRequest, Parallel.recorded codec.encode (outcomes index)⟩ ∧
       Covers (Under current index) journal := by
     intro index
-    obtain ⟨journal, complete, covered⟩ := each index
+    obtain ⟨journal, budget, complete, covered⟩ := each index
     let record : ReplayRecord := ⟨ReplayStore.returnRequest, Parallel.recorded codec.encode (outcomes index)⟩
     obtain ⟨extension, coverage⟩ := covered.add_return (start := 0) record
-    exact ⟨_, complete.extend extension, by simp [LeanCloud.Location.child, record], coverage⟩
+    exact ⟨_, budget, complete.extend extension, by simp [LeanCloud.Location.child, record], coverage⟩
   let journals := fun index => Classical.choose (full index)
-  have evidence := fun index => Classical.choose_spec (full index)
+  let budgets := fun index => Classical.choose (Classical.choose_spec (full index))
+  have evidence := fun index => Classical.choose_spec (Classical.choose_spec (full index))
   obtain ⟨merged, extension, coverage⟩ := merge_family count journals (fun index => Under current index)
     (fun index => (evidence index).2.2)
     (fun i j different _ first second => Under.separate (by intro same; exact different (Fin.ext same)) first second)
-  exact ⟨merged, fun index => (evidence index).1.extend (extension index),
+  obtain ⟨budget, bounded⟩ := common_bound count
+    (fun index budget => Complete merged (current.child index) (branches index) (outcomes index) budget)
+    (fun index => ⟨budgets index, (evidence index).1.extend (extension index)⟩)
+    (fun _ _ _ enough complete => .weaken complete enough)
+  exact ⟨merged, budget, bounded,
     fun index => extension index _ _ (evidence index).2.1,
     fun entry member => let ⟨index, inside⟩ := coverage entry member; ⟨index, inside⟩⟩
 
@@ -112,45 +134,45 @@ this construction consistent without assuming any records already exist. -/
 theorem complete_journal_exists {m : Type → Type u} [Monad m] {α : Type}
     {program : Cloud m α} {outcome} (evaluation : Pure.Evaluation program outcome)
     (parent : LeanCloud.Location) (branch command : Nat) :
-    ∃ journal, Complete journal (parent.push (branch, command)) program outcome ∧
+    ∃ journal budget, Complete journal (parent.push (branch, command)) program outcome budget ∧
       Covers (After parent branch command) journal := by
   induction evaluation generalizing parent branch command with
-  | pure value => exact ⟨[], .pure value, by simp [Covers]⟩
-  | fail error next => exact ⟨[], .fail error next, by simp [Covers]⟩
+  | pure value => exact ⟨[], 1, .pure value, by simp [Covers]⟩
+  | fail error next => exact ⟨[], 1, .fail error next, by simp [Covers]⟩
   | delay next rest ih =>
-    obtain ⟨journal, complete, coverage⟩ := ih parent branch command
-    exact ⟨journal, .delay next complete, coverage⟩
+    obtain ⟨journal, budget, complete, coverage⟩ := ih parent branch command
+    exact ⟨journal, budget + 1, .delay next complete, coverage⟩
   | exec codec label body next roundtrip rest ih =>
-    obtain ⟨journal, complete, coverage⟩ := ih parent branch (command + 1)
+    obtain ⟨journal, budget, complete, coverage⟩ := ih parent branch (command + 1)
     let record : ReplayRecord :=
       ⟨ReplayInterpreter.Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → m _)),
         .success (codec.encode (body ()))⟩
     obtain ⟨_, extension, present, coverage⟩ := assemble parent branch command [] journal record (by simp [Covers]) coverage
-    refine ⟨_, .exec codec label body next roundtrip present ?_, coverage⟩
+    refine ⟨_, budget + 1, .exec codec label body next roundtrip present ?_, coverage⟩
     simpa only [Location.next_push] using complete.extend extension
   | parallelOk codec count branches next outcomes roundtrip children collected rest ihChildren ih =>
     rename_i valueType resultType values result sourceInfo
-    obtain ⟨descendants, childSpecs, returned, childRegion⟩ :=
+    obtain ⟨descendants, childBudget, childSpecs, returned, childRegion⟩ :=
       children_exist (parent.push (branch, command)) codec count branches outcomes
         (fun index => ihChildren index (parent.push (branch, command)) index 0)
-    obtain ⟨journal, complete, coverage⟩ := ih parent branch (command + 1)
+    obtain ⟨journal, budget, complete, coverage⟩ := ih parent branch (command + 1)
     let record : ReplayRecord :=
       ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, .success (Json.arr (values.map codec.encode))⟩
     obtain ⟨childExtension, extension, present, coverage⟩ :=
       assemble parent branch command descendants journal record childRegion coverage
-    refine ⟨_, .parallelOk codec count branches next outcomes roundtrip
+    refine ⟨_, childBudget + budget + 1, .parallelOk codec count branches next outcomes roundtrip
       (fun index => (childSpecs index).extend childExtension)
       (fun index => childExtension _ _ (returned index)) collected present ?_, coverage⟩
     simpa only [Location.next_push] using complete.extend extension
   | parallelError codec count branches next outcomes roundtrip children collected ihChildren =>
     rename_i valueType resultType error sourceInfo
-    obtain ⟨descendants, childSpecs, returned, childRegion⟩ :=
+    obtain ⟨descendants, childBudget, childSpecs, returned, childRegion⟩ :=
       children_exist (parent.push (branch, command)) codec count branches outcomes
         (fun index => ihChildren index (parent.push (branch, command)) index 0)
     let record : ReplayRecord := ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, .failure error⟩
     obtain ⟨extension, _, present, coverage⟩ :=
       assemble parent branch command descendants [] record childRegion (by simp [Covers])
-    exact ⟨_, .parallelError codec count branches next outcomes roundtrip
+    exact ⟨_, childBudget + 1, .parallelError codec count branches next outcomes roundtrip
       (fun index => (childSpecs index).extend extension)
       (fun index => extension _ _ (returned index)) collected present, coverage⟩
 
@@ -158,12 +180,12 @@ theorem complete_journal_exists {m : Type → Type u} [Monad m] {α : Type}
 The caller supplies a pure program and its meaning, not a prebuilt journal. -/
 theorem workflow_journal_exists {m : Type → Type u} [Monad m] {α : Type}
     {program : Cloud m α} {outcome} (evaluation : Pure.Evaluation program outcome) (encode : α → Json) :
-    ∃ journal, Complete journal LeanCloud.Location.root program outcome ∧
+    ∃ journal budget, Complete journal LeanCloud.Location.root program outcome budget ∧
       journal.lookup (ReplayStore.returnKey LeanCloud.Location.root) =
         some ⟨ReplayStore.returnRequest, Parallel.recorded encode outcome⟩ := by
-  obtain ⟨journal, complete, coverage⟩ := complete_journal_exists evaluation #[] 0 0
+  obtain ⟨journal, budget, complete, coverage⟩ := complete_journal_exists evaluation #[] 0 0
   let record : ReplayRecord := ⟨ReplayStore.returnRequest, Parallel.recorded encode outcome⟩
   obtain ⟨extension, _⟩ := coverage.add_return (start := 0) record
-  exact ⟨_, complete.extend extension, by simp [LeanCloud.Location.root, record]⟩
+  exact ⟨_, budget, complete.extend extension, by simp [LeanCloud.Location.root, record]⟩
 
 end LeanCloud.Proofs.Specification

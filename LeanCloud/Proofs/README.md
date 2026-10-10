@@ -1,6 +1,8 @@
 # Interpreter semantics
 
-Start with [MainTheorems.lean](MainTheorems.lean). It contains three theorems:
+Start with [MainTheorems.lean](MainTheorems.lean). These three theorems are the
+roots of the proof library; the other modules supply their supporting definitions
+and lemmas:
 
 - `sequential_replay_matches_direct`
 - `parallel_replay_matches_direct`
@@ -85,13 +87,13 @@ availability, arbitrary IO equivalence, or OS task scheduling progress.
 | --- | --- |
 | [Pure.lean](Pure.lean), [Direct.lean](Direct.lean) | Pure workflow meaning agrees with direct interpretation. |
 | [Location.lean](Location.lean), [JournalRegion.lean](JournalRegion.lean) | Locations identify separate command, return, sibling, and descendant records. |
-| [Specification.lean](Specification.lean) | Construct the expected records from a finite pure evaluation. These records are a proof witness, never runtime input. |
+| [Specification.lean](Specification.lean) | One shared specification of expected records and a finite evaluation budget for all three proofs. These are proof witnesses, never runtime input. |
 | [ProgramCursor.lean](ProgramCursor.lean), [ReplayCursor.lean](ReplayCursor.lean) | Reconstruct the right typed continuation from recorded prefixes. |
 | [Recording.lean](Recording.lean), [Results.lean](Results.lean), [Parallel.lean](Parallel.lean) | Execute missing commands, preserve records, and join results in source order. |
 | [JournalMerge.lean](JournalMerge.lean) | Workers preserve the old journal and return fresh records in disjoint regions; union preserves all results. |
 | [ReplayExecution.lean](ReplayExecution.lean), [ReplayCompletion.lean](ReplayCompletion.lean) | One shared completion proof, with sequential and parallel batch cases. |
-| [WorkerRestart.lean](WorkerRestart.lean), [WorkerRecovery.lean](WorkerRecovery.lean) | Atomic before/after faults and whole-attempt retry laws. |
-| [RecoveryMeaning.lean](RecoveryMeaning.lean), [RecoveryCursor.lean](RecoveryCursor.lean), [RecoveryPrefix.lean](RecoveryPrefix.lean) | Bound replay paths and recover their typed continuations across interruptions. |
+| [WorkerRecovery.lean](WorkerRecovery.lean) | Atomic before/after faults, sequencing interrupted operations, and whole-attempt retry. |
+| [RecoveryCursor.lean](RecoveryCursor.lean), [RecoveryPrefix.lean](RecoveryPrefix.lean) | Bound replay paths and recover their typed continuations across interruptions. |
 | [RecoveryStep.lean](RecoveryStep.lean), [RecoveryReads.lean](RecoveryReads.lean), [RecoveryReplay.lean](RecoveryReplay.lean), [RecoveryWorker.lean](RecoveryWorker.lean) | Verify actual worker execution and local restart. |
 | [RecoveryBatch.lean](RecoveryBatch.lean), [RecoveryProgress.lean](RecoveryProgress.lean), [RecoveryDriver.lean](RecoveryDriver.lean), [RecoveryCompletion.lean](RecoveryCompletion.lean) | Merge isolated writes, establish progress, and finish from empty storage with finite worker faults. |
 

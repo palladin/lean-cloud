@@ -211,8 +211,8 @@ private theorem finish_verified (expected journal : Journal) (branch : Location)
 
 /-- Every pure source subtree has a finite execution through actual replay
 steps. The journal may start empty; only records already written are replayed. -/
-theorem complete_runs {expected current} {program : Cloud M β} {outcome}
-    (meaning : Specification.Complete expected current program outcome) :
+theorem complete_runs {expected current} {program : Cloud M β} {outcome budget}
+    (meaning : Specification.Complete expected current program outcome budget) :
     ∀ (encode : β → Json) journal branch, Extends journal expected →
       branch = Location.branchStart current →
       Cursor blobs source journal current encode program →
@@ -271,6 +271,7 @@ theorem complete_runs {expected current} {program : Cloud M β} {outcome}
       apply (finish_verified blobs source mode expected after branch _ compatible known).replace blobs source mode
       exact ⟨1, fun fuel => by simpa only [Nat.add_comm 1, Parallel.recorded] using
         Recording.group_failure encode after blobs branch _ fuel codec count branches next _ recorded⟩
+  | weaken complete enough ih => exact ih
 
 /-- From empty storage, the reference driver finishes and durably records the
 pure result. No correct cache, successful execution, or fairness is a premise. -/
@@ -280,7 +281,7 @@ theorem finishes_from_empty {outcome} (evaluation : Pure.Evaluation source outco
         ⟨0, Location.root⟩).run [] = (.ok (), journal) ∧
       journal.lookup (ReplayStore.returnKey Location.root) =
         some ⟨ReplayStore.returnRequest, Parallel.recorded rootCodec.encode outcome⟩ := by
-  obtain ⟨expected, meaning, known⟩ := Specification.workflow_journal_exists evaluation rootCodec.encode
+  obtain ⟨expected, budget, meaning, known⟩ := Specification.workflow_journal_exists evaluation rootCodec.encode
   let assignment : Assignment := ⟨0, Location.root⟩
   have cursor := Cursor.root blobs source []
   have active := complete_runs blobs source mode meaning rootCodec.encode [] Location.root (.empty _) (by simp) cursor known

@@ -1,12 +1,11 @@
-import LeanCloud.Proofs.WorkerRestart
-import LeanCloud.Proofs.Specification
+import LeanCloud.ReplayFaults
 
 /-! Whole-attempt recovery. Crashes preserve the worker invariant and consume a
 fault; ordinary returns establish the postcondition. The retry loop never catches
 workflow errors or borrows another worker's state. -/
 
 namespace LeanCloud.Proofs.WorkerRecovery
-open ReplayFaults ReplayModel JournalMerge
+open ReplayFaults ReplayModel
 
 /-- A successful operation establishes its postcondition. An interrupted one
 still preserves the durable invariant and consumes a pending fault. -/
@@ -79,43 +78,27 @@ theorem Ensures.bind {action : ExceptT CloudError WorkerM α} {next : α → Exc
       | ok result =>
         cases result <;> simp only [outcome] at correct ⊢ <;> exact correct
 
-private theorem atomic_nonincreasing (label : ReplayFaults.Operation) (operation : Journal → α × Journal)
-    (saved : State Journal) :
-    ((atomic label operation).run saved).2.faults.remaining.length ≤ saved.faults.remaining.length := by
-  rcases saved with ⟨durable, ⟨remaining, visited, crashes⟩⟩
-  cases remaining with
-  | nil => simp [ExceptT.run, ReplayFaults.atomic]
-  | cons fault rest =>
-    rcases fault with ⟨operation', side⟩
-    cases same : operation' == label <;> cases side <;>
-      simp [ExceptT.run, ReplayFaults.atomic, same,
-        show (Side.before == Side.before) = true from rfl,
-        show (Side.after == Side.before) = false from rfl]
-
+/-- Check all three atomic outcomes: normal return, crash before the operation,
+and crash after its commit. Every crash consumes the selected fault. -/
 theorem Ensures.atomic (label : ReplayFaults.Operation) (operation : Journal → α × Journal)
     (before : ∀ journal, pre journal → invariant journal)
     (after : ∀ journal, pre journal → invariant (operation journal).2 ∧ post (operation journal).1 (operation journal).2) :
     Ensures invariant pre (liftM (ReplayFaults.atomic label operation)) post := by
-  intro saved valid
-  have cases := WorkerRestart.atomic_cases label operation saved
-  have bounded := atomic_nonincreasing label operation saved
-  have mapped : (liftM (ReplayFaults.atomic label operation) : ExceptT CloudError WorkerM α).run.run saved =
-      (((ReplayFaults.atomic label operation).run saved).1.map Except.ok, ((ReplayFaults.atomic label operation).run saved).2) := by
-    change (ExceptT.map Except.ok (ReplayFaults.atomic label operation)).run saved = _
-    unfold ExceptT.map ExceptT.run ExceptT.mk
-    change (ExceptT.bindCont (m := StateM (State Journal)) _ ((ReplayFaults.atomic label operation saved).1)) ((ReplayFaults.atomic label operation saved).2) = _
-    cases (ReplayFaults.atomic label operation saved).1 <;> rfl
-  rw [mapped]
-  generalize executed : (ReplayFaults.atomic label operation).run saved = result at cases bounded ⊢
-  rcases result with ⟨value, finished⟩
-  dsimp only at cases bounded ⊢
-  rcases cases with ⟨returned, committed⟩ | ⟨interrupted, unchanged, fewer⟩ | ⟨interrupted, committed, fewer⟩
-  · rw [returned, committed]
-    exact ⟨(after _ valid).1, bounded, (after _ valid).2⟩
-  · rw [interrupted, unchanged]
-    exact ⟨before _ valid, bounded, fewer⟩
-  · rw [interrupted, committed]
-    exact ⟨(after _ valid).1, bounded, fewer⟩
+  change Ensures invariant pre (ExceptT.mk (ExceptT.map Except.ok (ReplayFaults.atomic label operation))) post
+  intro ⟨journal, ⟨remaining, visited, crashes⟩⟩ valid
+  have old := before journal valid
+  have committed := after journal valid
+  cases remaining with
+  | nil =>
+    simpa [ReplayFaults.atomic, ExceptT.run, ExceptT.map, ExceptT.mk,
+      Bind.bind, Pure.pure, StateT.bind, StateT.pure] using committed
+  | cons fault rest =>
+    rcases fault with ⟨operation', side⟩
+    cases same : operation' == label <;> cases side <;>
+      simp [ReplayFaults.atomic, ExceptT.run, ExceptT.map, ExceptT.mk,
+        Bind.bind, Pure.pure, StateT.bind, StateT.pure, same,
+        show (Side.before == Side.before) = true from rfl,
+        show (Side.after == Side.before) = false from rfl, old, committed]
 
 /-- A read preserves its precondition as well as the durable journal. -/
 theorem Ensures.read (key : String) (valid : ∀ journal, pre journal → invariant journal) :

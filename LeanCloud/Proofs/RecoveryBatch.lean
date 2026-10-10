@@ -72,31 +72,6 @@ def Reported (expected : Journal) (budget : Nat) (before after : Journal)
       (∀ index : Fin count, Ready source expected budget after (location.child index)) ∧
       ∃ index : Fin count, before.lookup (ReplayStore.returnKey (location.child index)) = none
 
-private theorem merge_only (items : List κ) (records : κ → Journal) (before : Journal) :
-    (ParallelReplay.mergeChildren (items.map fun item => (.ok (), records item))).run before =
-      match ReplayModel.merge before (items.flatMap records) with
-      | .error error => (.error error, before)
-      | .ok after => (.ok (), after) := by
-  have noErrors (items : List κ) : (items.map fun item => ((Except.ok () : Except CloudError Unit), records item)).forM
-      (fun pair => (liftExcept pair.1 : ExceptT CloudError ReplayModel.M Unit)) = pure () := by
-    induction items with
-    | nil => rfl
-    | cons item rest ih =>
-      change (do
-        liftExcept (.ok ())
-        (rest.map fun item => ((Except.ok () : Except CloudError Unit), records item)).forM
-          (fun pair => (liftExcept pair.1 : ExceptT CloudError ReplayModel.M Unit))) = _
-      rw [ih]
-      rfl
-  simp only [ParallelReplay.mergeChildren, bind_run, get_run, List.flatMap_map]
-  cases merged : ReplayModel.merge before (items.flatMap records) with
-  | error error => rfl
-  | ok after =>
-    change ((items.map fun item => ((Except.ok () : Except CloudError Unit), records item)).forM
-      (fun pair => (liftExcept pair.1 : ExceptT CloudError ReplayModel.M Unit))).run after = _
-    rw [noErrors]
-    rfl
-
 private theorem mapM_ok (items : List κ) (action : κ → Except ε β) (values : κ → β)
     (each : ∀ item ∈ items, action item = .ok (values item)) :
     items.mapM action = .ok (items.map values) := by
@@ -135,7 +110,7 @@ theorem workers_correct {expected saved assignments budget faults fuel}
   have additions : ∀ a, newRecords saved.journal (journals a) = (replies a).records := by
     intro a
     simp [newRecords, journals]
-  rw [merge_only] at merges
+  rw [merge_success] at merges
   simp only [additions] at merges
   have mergedEq : ReplayModel.merge saved.journal (assignments.reverse.flatMap fun a => (replies a).records) = .ok merged := by
     cases result : ReplayModel.merge saved.journal (assignments.reverse.flatMap fun a => (replies a).records) with

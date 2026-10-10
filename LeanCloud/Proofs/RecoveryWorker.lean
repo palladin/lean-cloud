@@ -2,7 +2,7 @@ import LeanCloud.Proofs.RecoveryReplay
 
 namespace LeanCloud.Proofs.RecoveryStep
 open Lean LeanEff ReplayFaults ReplayModel ReplayInterpreter JournalMerge JournalRegion WorkerRecovery
-open RecoveryMeaning RecoveryCursor
+open Specification RecoveryCursor
 
 variable [rootCodec : Codec α] (source : Cloud WorkerM α)
 

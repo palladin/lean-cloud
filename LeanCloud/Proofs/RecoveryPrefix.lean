@@ -1,4 +1,6 @@
 import LeanCloud.Proofs.RecoveryCursor
+import LeanCloud.Proofs.ReplayCursor
+import LeanCloud.Proofs.WorkerRecovery
 
 namespace LeanCloud.Proofs.RecoveryPrefix
 open Lean LeanEff ReplayFaults ReplayModel ReplayInterpreter WorkerRecovery

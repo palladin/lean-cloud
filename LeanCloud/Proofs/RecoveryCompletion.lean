@@ -24,8 +24,7 @@ theorem finishes_from_empty {outcome} (evaluation : Pure.Evaluation source outco
         (.ok [Parallel.recorded codec.encode outcome], after) ∧
       after.journal.lookup (ReplayStore.returnKey Location.root) =
         some ⟨ReplayStore.returnRequest, Parallel.recorded codec.encode outcome⟩ := by
-  obtain ⟨expected, complete, known⟩ := Specification.workflow_journal_exists evaluation codec.encode
-  obtain ⟨budget, meaning⟩ := RecoveryMeaning.of_complete complete
+  obtain ⟨expected, budget, meaning, known⟩ := Specification.workflow_journal_exists evaluation codec.encode
   obtain ⟨faults, bounded⟩ := fault_bound (Saved.initial plan).workers
   have ready : Ready source expected budget [] Location.root :=
     ⟨α, codec.encode, source, outcome, Location.root, 0, budget, by simp, by simp,

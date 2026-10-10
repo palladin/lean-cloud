@@ -2,7 +2,7 @@ import LeanCloud.Proofs.RecoveryReads
 
 namespace LeanCloud.Proofs.RecoveryStep
 open Lean LeanEff ReplayFaults ReplayModel ReplayInterpreter JournalMerge JournalRegion WorkerRecovery
-open RecoveryMeaning RecoveryCursor
+open Specification RecoveryCursor
 
 variable {info : Option SourceSiteId}
 
@@ -115,7 +115,7 @@ private theorem group (expected base : Journal) (branch current : Location) (cod
 at a genuine incomplete group. Every interrupted prefix preserves its records. -/
 theorem replay_safe [rootCodec : Codec α] (source : Cloud WorkerM α)
     {expected current} {program : Cloud WorkerM β} {outcome budget}
-    (meaning : Meaning expected current program outcome budget) :
+    (meaning : Complete expected current program outcome budget) :
     ∀ (encode : β → Json) (base : Journal) (branch : Location) (cost limit fuel : Nat),
       branch = Proofs.Location.branchStart current → cost + budget ≤ limit → budget ≤ fuel →
       expected.lookup (ReplayStore.returnKey branch) = some ⟨ReplayStore.returnRequest, Parallel.recorded encode outcome⟩ →

@@ -1,9 +1,10 @@
 import LeanCloud.Proofs.RecoveryPrefix
-import LeanCloud.Proofs.Recording
+import LeanCloud.Proofs.JournalMerge
+import LeanCloud.Proofs.Specification
 
 namespace LeanCloud.Proofs.RecoveryStep
 open Lean LeanEff ReplayFaults ReplayModel ReplayInterpreter JournalMerge JournalRegion WorkerRecovery
-open RecoveryMeaning RecoveryCursor
+open Specification RecoveryCursor
 
 /-- A worker may prepend fresh records in its region; every old record remains
 unchanged, and every new record agrees with the pure workflow's specification. -/
@@ -18,7 +19,7 @@ def Ready (expected : Journal) (budget : Nat) (journal : Journal) (branch : Loca
   ∃ (β : Type) (encode : β → Json) (program : Cloud WorkerM β) (outcome : Except CloudError β)
       (current : Location) (cost remaining : Nat),
     branch = Proofs.Location.branchStart current ∧ cost + remaining ≤ budget ∧
-    Cursor source journal current encode program cost ∧ Meaning expected current program outcome remaining ∧
+    Cursor source journal current encode program cost ∧ Complete expected current program outcome remaining ∧
     expected.lookup (ReplayStore.returnKey branch) = some ⟨ReplayStore.returnRequest, Parallel.recorded encode outcome⟩
 
 /-- A suspension identifies genuine child computations and at least one missing
@@ -50,32 +51,6 @@ theorem Ready.depth {expected budget journal branch} (ready : Ready source expec
   rw [same, Proofs.Location.branchStart_size]
   omega
 
-theorem valid_create {expected base branch key record}
-    (owned : Owns branch key) (known : expected.lookup key = some record) :
-    Ensures (Valid expected base branch) (Valid expected base branch)
-      (liftM (ReplayFaults.store.create key record))
-      (fun value journal => value = record ∧ journal.lookup key = some record) := by
-  apply Ensures.atomic (.create key) (ReplayModel.store.create key record) (fun _ h => h)
-  intro journal valid
-  have writes := valid.1.trans (Writes.create _ _ key record owned)
-  have created := create_within journal expected key record valid.2 known
-  exact ⟨⟨writes, created.2⟩, created.1, (create_visible journal key record).trans (congrArg some created.1)⟩
-
-theorem finish {expected base branch outcome budget}
-    (known : expected.lookup (ReplayStore.returnKey branch) = some ⟨ReplayStore.returnRequest, outcome⟩) :
-    Ensures (Valid expected base branch) (Valid expected base branch)
-      (Internal.finish ReplayFaults.store branch outcome) (ProgressValid source expected budget branch) := by
-  unfold Internal.finish ReplayStore.finish
-  simp only [bind_assoc]
-  apply (valid_create (Owns.returned branch) known).bind
-  intro record saved ⟨valid, same, present⟩
-  subst record
-  simpa using (Ensures.pure (invariant := Valid expected base branch)
-    (pre := fun journal => Valid expected base branch journal ∧ journal.lookup (ReplayStore.returnKey branch) =
-      some ⟨ReplayStore.returnRequest, outcome⟩)
-    (post := ProgressValid source expected budget branch) Progress.done
-    (fun journal h => ⟨h.1, outcome, h.2, known⟩)) saved ⟨valid, present⟩
-
 /-- Prefix facts survive a fresh write because they concern immutable records. -/
 theorem create_preserving {expected base branch key record} (property : Journal → Prop)
     (monotone : ∀ before after, property before → Extends before after → property after)
@@ -89,5 +64,19 @@ theorem create_preserving {expected base branch key record} (property : Journal 
   refine ⟨⟨valid.1.trans (Writes.create _ _ _ _ owned), created.2⟩,
     monotone journal _ holds (create_extends journal key record), created.1, ?_⟩
   exact (create_visible journal key record).trans (congrArg some created.1)
+
+theorem finish {expected base branch outcome budget}
+    (known : expected.lookup (ReplayStore.returnKey branch) = some ⟨ReplayStore.returnRequest, outcome⟩) :
+    Ensures (Valid expected base branch) (Valid expected base branch)
+      (Internal.finish ReplayFaults.store branch outcome) (ProgressValid source expected budget branch) := by
+  unfold Internal.finish ReplayStore.finish
+  simp only [bind_assoc]
+  apply Ensures.consequence (pre := fun journal => Valid expected base branch journal ∧ True)
+    ?_ (fun _ valid => ⟨valid, trivial⟩) (fun _ _ result => result)
+  apply (create_preserving (fun _ => True) (fun _ _ _ _ => trivial) (Owns.returned branch) known).bind
+  intro record saved ⟨valid, _, same, present⟩
+  subst record
+  simp only [beq_self_eq_true, ↓reduceIte, pure_bind]
+  exact ⟨valid, Nat.le_refl _, outcome, present, known⟩
 
 end LeanCloud.Proofs.RecoveryStep

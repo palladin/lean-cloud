@@ -28,9 +28,6 @@ theorem bind_run (action : ExceptT CloudError (StateM σ) α) (next : α → Exc
 @[simp] theorem get_run (journal : Journal) :
     ((get : ExceptT CloudError M Journal).run journal) = (.ok journal, journal) := rfl
 
-@[simp] theorem set_run (after journal : Journal) :
-    ((set after : ExceptT CloudError M Unit).run journal) = (.ok (), after) := rfl
-
 /-- Every previously committed record retains its value. New keys may appear. -/
 def Extends (before after : Journal) : Prop :=
   ∀ key record, before.lookup key = some record → after.lookup key = some record

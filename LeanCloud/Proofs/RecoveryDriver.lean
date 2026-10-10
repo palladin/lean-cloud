@@ -120,12 +120,7 @@ theorem run_correct {expected budget faults} (fuel : Nat) :
                 pure values.flatten : Backend (List Exit)).run saved) = _
     simp only [bind_run, batch]
     rw [handled]
-    have singletons (xs : List Exit) : (xs.map List.singleton).flatten = xs := by
-      induction xs with
-      | nil => rfl
-      | cons value rest ih =>
-        simpa only [List.map_cons, List.flatten_cons, List.singleton, List.singleton_append]
-          using congrArg (List.cons value) ih
-    simp only [pure_run, singletons]
+    simp only [pure_run]
+    exact congrArg (fun values => (Except.ok values, after)) (List.flatMap_singleton' values)
 
 end LeanCloud.Proofs.RecoveryDriver

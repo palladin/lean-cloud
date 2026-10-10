@@ -65,17 +65,15 @@ the returned `Saved` to another call with more fuel to retain progress.
 
 ## Verification
 
-[WorkerRestart.lean](Proofs/WorkerRestart.lean) proves local storage laws:
+[WorkerRecovery.lean](Proofs/WorkerRecovery.lean) checks the normal, before-crash,
+and after-crash cases of atomic operations, then composes them into whole-attempt
+recovery. Every interruption preserves the durable invariant and consumes one
+fault. More attempts than pending faults suffice for a correct return.
 
-- Reads preserve the journal, including interrupted reads.
-- Interrupted writes preserve old records and the worker's write region.
-- With more attempts than scripted faults, retrying a read or create returns
-  exactly the result and journal of one uninterrupted operation. An acknowledged
-  or unacknowledged committed create is not duplicated.
-
-[RecoveryWorker.lean](Proofs/RecoveryWorker.lean) lifts these laws to the whole
-`ReplayInterpreter.step` and its final result read. A retry starts at the branch's
-entry, reconstructs from surviving records, and preserves all committed writes.
+[RecoveryWorker.lean](Proofs/RecoveryWorker.lean) applies this reasoning to the
+actual `ReplayInterpreter.step` and its final result read. A retry starts at the
+branch's entry, reconstructs from surviving records, and preserves all committed
+writes within the worker's region.
 
 The third theorem in [MainTheorems.lean](Proofs/MainTheorems.lean),
 `restarting_parallel_replay_matches_direct`, covers the complete restarting
