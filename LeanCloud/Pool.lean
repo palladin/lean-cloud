@@ -30,6 +30,7 @@ structure State where
   runs : Array Run := #[]
   cursor : Nat := 0
   membership : Membership := {}
+  removed : Array String := #[]
   deriving Repr, ToJson
 
 /-- Persistence contains administrative intent and counters, never observations
@@ -45,6 +46,7 @@ structure Catalog where
   runs : Array RunCatalog := #[]
   cursor : Nat := 0
   membership : Membership := {}
+  removed : Array String := #[]
   deriving ToJson
 
 instance : FromJson RunCatalog where
@@ -63,16 +65,19 @@ instance : FromJson Catalog where
     let membership ← match json.getObjVal? "membership" with
       | .ok value => fromJson? value
       | .error _ => pure {}
-    return { runs := ← json.getObjValAs? _ "runs", cursor := ← json.getObjValAs? Nat "cursor", membership }
+    let removed ← match json.getObjVal? "removed" with
+      | .ok value => fromJson? value
+      | .error _ => pure #[]
+    return { runs := ← json.getObjValAs? _ "runs", cursor := ← json.getObjValAs? Nat "cursor", membership, removed }
 
 def State.catalog (state : State) : Catalog :=
-  { cursor := state.cursor, membership := state.membership
+  { cursor := state.cursor, membership := state.membership, removed := state.removed
     runs := state.runs.map fun run =>
       { id := run.id, mode := run.mode, scheduler := run.scheduler.catalog
         finalization := if run.finalization == .done then .done else .pending } }
 
 def Catalog.restore (catalog : Catalog) : State :=
-  { cursor := catalog.cursor, membership := catalog.membership
+  { cursor := catalog.cursor, membership := catalog.membership, removed := catalog.removed
     runs := catalog.runs.map fun run =>
       { id := run.id, mode := run.mode, scheduler := run.scheduler.restore
         finalization := if run.finalization == .done then .done else .pending } }
@@ -87,6 +92,8 @@ inductive Command where
   | resume (run : String)
   | kill (run : String)
   | status (run : String)
+  | remove (run : String)
+  | removed (run : String)
   | check (run worker : String) (attempt : Nat)
   deriving Repr, ToJson, FromJson
 
@@ -240,6 +247,7 @@ def report (state : State) (id : String) (value : Report) : State :=
       else run }
 
 private def setMode (state : State) (id : String) (mode : Mode) : Except String State := do
+  if state.removed.contains id then throw "Run was removed; use a new run ID"
   let some index := state.runs.findIdx? (·.id == id)
     | if mode == .killed then return { state with runs := state.runs.push { id, mode := .killed } }
       else throw s!"Unknown run: {id}"
@@ -250,6 +258,41 @@ private def setMode (state : State) (id : String) (mode : Mode) : Except String 
   let run := { run with mode }
   let run := if mode == .active || !run.scheduler.stopping.isEmpty then run else run.cancel
   return { state with runs := state.runs.set! index run }
+
+inductive Phase where
+  | completed | failed | killed | paused | stopping | finalizing | noWorkers | queued | running
+  deriving Repr, BEq, ToJson, FromJson
+
+/-- Current observations from the executable tickets. These are neither a saved
+schedule nor authority for dispatch. A configured worker need not be reachable. -/
+structure Diagnostics where
+  phase : Phase
+  stopping : Array WorkerId
+  configuredWorkers : Option Nat
+  pending : Nat
+  running : Nat
+  replies : Nat
+  deriving Repr, BEq, ToJson, FromJson
+
+def diagnostics (state : State) (run : Run) : Diagnostics := Id.run do
+  let pending := (run.scheduler.pending.filter (·.status == .pending)).size
+  let running := (run.scheduler.pending.filter fun task =>
+    match task.status with | .running .. => true | _ => false).size +
+    (match run.finalization with | .running .. => 1 | _ => 0)
+  let configuredWorkers := state.membership.active.map (·.size)
+  let phase :=
+    if !run.scheduler.stopping.isEmpty then Phase.stopping
+    else if run.scheduler.finished then .completed
+    else if run.finalization == .done then
+      if run.scheduler.error.isSome then .failed else .killed
+    else if run.terminalOutcome.isSome then
+      if configuredWorkers == some 0 then .noWorkers else .finalizing
+    else if run.mode == .paused then .paused
+    else if configuredWorkers == some 0 then .noWorkers
+    else if running > 0 then .running else .queued
+  return {
+    phase, stopping := run.scheduler.stopping, configuredWorkers, pending, running
+    replies := (run.scheduler.pending.filter (·.reply.isSome)).size }
 
 /-- Administrative requests are serialized with assignment and report handling.
 Pausing revokes attempts; resuming never reuses an attempt number. -/
@@ -264,12 +307,20 @@ def command (state : State) : Command → Except String (State × Json)
     .ok ({ state with membership }, toJson membership)
   | .check id worker attempt => .ok (state, toJson (valid state id worker attempt))
   | .submit id =>
+    if state.removed.contains id then .error "Run was removed; use a new run ID" else
     let state := if state.runs.any (·.id == id) then state
       else { state with runs := state.runs.push { id } }
     .ok (state, Json.null)
   | .status id => do
     let some run := state.runs.find? (·.id == id) | throw s!"Unknown run: {id}"
-    return (state, toJson run.scheduler)
+    return (state, (toJson run.scheduler).setObjVal! "diagnostics" (toJson (diagnostics state run)))
+  | .removed id => return (state, toJson (state.removed.contains id))
+  | .remove id => do
+    if state.removed.contains id then return (state, Json.null)
+    let some run := state.runs.find? (·.id == id) | throw s!"Unknown run: {id}"
+    unless run.scheduler.stopping.isEmpty && (run.scheduler.finished || run.finalization == .done) do
+      throw "Only finished runs can be removed; wait for completion or kill the run first"
+    return ({ state with runs := state.runs.filter (·.id != id), removed := state.removed.push id }, Json.null)
   | .pause id => return (← setMode state id .paused, Json.null)
   | .resume id => return (← setMode state id .active, Json.null)
   | .kill id => return (← setMode state id .killed, Json.null)

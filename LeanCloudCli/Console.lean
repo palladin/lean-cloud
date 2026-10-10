@@ -3,6 +3,7 @@ import LeanCloudCli.Top
 import LeanCloudCli.Help
 import LeanCloudCli.Watch
 import LeanCloudCli.Clean
+import LeanCloudCli.Backup
 import LeanCloudCli.Time
 
 namespace LeanCloudCli
@@ -12,6 +13,23 @@ private def exitLabel : Exit → String
   | .success _ => "completed"
   | .failure _ => "failed"
   | .cancelled _ => "cancelled"
+
+def phaseLabel : Pool.Phase → String
+  | .completed => "completed"
+  | .failed => "failed"
+  | .killed => "killed"
+  | .paused => "paused"
+  | .stopping => "waiting for workers to stop"
+  | .finalizing => "publishing terminal result"
+  | .noWorkers => "waiting for workers"
+  | .queued => "waiting for assignment"
+  | .running => "running"
+
+def phaseShortLabel : Pool.Phase → String
+  | .stopping => "waiting for stop"
+  | .finalizing => "publishing result"
+  | .queued => "pending assignment"
+  | phase => phaseLabel phase
 
 private def inspectRun (ctx : Context) (id : String) : Cli Unit := do
   let run ← ctx.loadRun id
@@ -24,10 +42,23 @@ private def inspectRun (ctx : Context) (id : String) : Cli Unit := do
     if let .failure error := outcome then printLine s!"Error: {safe error.message}"
   if control != .active then
     if outcome.isNone then printStyled (Styled.text "Status: " ++ Styled.text control.label (Styled.statusColor control.label))
-    return
-  let state ← try pure (some (← ctx.scheduler run)) catch error =>
-    if outcome.isSome then pure none else throw error
+  let state ← try pure (some (← ctx.observation run)) catch error =>
+    if outcome.isSome || control != .active then pure none else throw error
   let some state := state | return
+  if let some diagnostics := state.diagnostics then
+    printLine s!"Execution: {phaseLabel diagnostics.phase}"
+    printLine s!"Assignments: {diagnostics.pending} pending, {diagnostics.running} running, {diagnostics.replies} replies collected"
+    if diagnostics.configuredWorkers == some 0 then printLine "No workers configured. Use 'scale N' to add capacity."
+    unless diagnostics.stopping.isEmpty do
+      printLine s!"Waiting for stop acknowledgement: {String.intercalate ", " diagnostics.stopping.toList}"
+  let traces ← Trace.load ctx run
+  for job in state.jobs do
+    if let .running worker attempt _ := job.status then
+      let latest := traces.steps.toList.reverse.find? fun step =>
+        step.event.worker == worker && step.event.attempt == some attempt
+      if let some step := latest then
+        if step.event.activity == "retrying" then
+          printLine s!"{safe worker}: {safe step.event.operation} after an IO/transport failure (last observation)"
   printHeading "LOCATION             STATUS       WORKER      ATTEMPT"
   for job in state.jobs do
     let (status, worker, attempt) := match job.status with
@@ -51,13 +82,18 @@ private def listRuns (ctx : Context) : Cli Unit := do
       | some outcome => pure (exitLabel outcome)
       | none =>
         let control ← ctx.control run.id
-        if control != .active then pure control.label else do
+        if let some diagnostics := observed.toOption.bind (·.diagnostics) then
+          pure (phaseShortLabel diagnostics.phase)
+        else if control != .active then pure control.label else do
           let state ← liftExcept observed
           pure (if state.error.isSome then "scheduler error" else
             s!"running ({(state.jobs.filter (·.status == .done)).size}/{state.jobs.size})")
     catch _ =>
-      let control ← ctx.control run.id
-      pure (if control != .active then control.label else "unavailable / launch incomplete")
+      if (observed.toOption.bind (·.diagnostics)).any (·.phase == .stopping) then
+        pure (phaseShortLabel .stopping)
+      else do
+        let control ← ctx.control run.id
+        pure (if control != .active then control.label else "unavailable / launch incomplete")
     let span := timing >>= (·.span)
     let started := span.map (Time.stamp ∘ Timing.Span.startedMs) |>.getD "—"
     let finished := (span >>= (·.finishedMs)).map Time.stamp |>.getD "—"
@@ -123,6 +159,8 @@ def command (ctx : Context) (args : List String) : Cli Bool := do
     ctx.scale count
   | ["down"] => ctx.down
   | ["clean"] => ctx.clean
+  | ["remove", id] => ctx.removeRun id
+  | ["backup", directory] => Backup.save ctx directory
   | "up" :: options =>
     let (_, verbose, _) ← liftExcept (deploymentOptions options false)
     ctx.up verbose
@@ -172,6 +210,7 @@ def command (ctx : Context) (args : List String) : Cli Bool := do
 def dispatch (ctx : Context) (args : List String) : Cli (Context × Bool) := do
   if Help.requested args then return (ctx, ← command ctx args)
   match args with
+  | ["restore", directory] => return (← Backup.restore ctx.root directory, true)
   | ["use", name] =>
     unless (← Deployments.load).entries.any (·.project == name) do Deployments.discover ctx
     let selected ← Deployments.select name

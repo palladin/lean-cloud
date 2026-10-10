@@ -161,6 +161,61 @@ Saved RabbitMQ deployments require this reset before deploying the HTTP/SQLite
 runtime. `deploy` reports the required commands and preserves the old data until
 you explicitly run `clean`.
 
+Use `remove RUN` to delete one finished, failed, or killed workflow while the
+deployment keeps running:
+
+```text
+cloud> remove example-1
+```
+
+The scheduler retires the run ID, then a worker deletes its replay records and
+result. The CLI removes the local run entry only after that succeeds. The ID
+stays reserved, so delayed submissions cannot recreate the run. Active or paused
+runs must finish or be killed first; all old attempts must have stopped.
+Cleanup needs an available worker. If interrupted, repeat `remove RUN`.
+If a timed-out blob request commits late, repeating removal reclaims its remaining
+records; the retired ID cannot become a runnable workflow again.
+Named blobs and user blob objects are preserved because other runs may share them.
+
+## Backup and restore
+
+Back up a stopped deployment to a new directory outside its `.lean-cloud/PROJECT`
+directory. The parent directory must already exist:
+
+```text
+cloud> down
+cloud> backup /backups/my-app-01
+cloud> up
+```
+
+The backup includes exact application and blob-service images, scheduler and
+inbox volumes (including retired workers), the bundled blob volume, configuration,
+run inputs, and final watch snapshots. It includes credentials; keep it private.
+It does not back up your Lean source checkout or an external blob service.
+`down` must have removed the containers before backup, including stopped ones
+that could otherwise restart. The blob image ID is saved at service startup.
+For an older deployment without that ID, run `up`, then `down` once before backup.
+
+To recover into fresh storage, select the destination project directory and run:
+
+```text
+cloud> restore /backups/my-app-01
+cloud> up
+```
+
+Restore selects the deployment name saved in the backup, verifies archive
+checksums, imports the images and volumes, and leaves everything stopped.
+The destination must have no deployment files, containers, or volumes under that
+name, including retired-worker volumes. The saved images need a compatible Docker platform. Application source is
+not needed for `up`; keep it separately for future development and `deploy`.
+Active workflows recover from their records, paused workflows stay paused, and
+completed results remain available. Removed run IDs stay reserved.
+
+An interrupted backup has no completion manifest and cannot be restored. An
+interrupted restore cannot start; use `clean` on that incomplete destination,
+then repeat `restore`. A backup is a point-in-time copy of durable workflow data;
+restoring it does not roll back external actions previously performed by user IO.
+
 ## Elastic worker capacity
 
 ```text
@@ -249,8 +304,17 @@ as shell code. `logs RUN [worker1|worker2|worker3|scheduler]` prints recent stru
 | `top [--once]` | Live worker and scheduler resource graphs across the selected deployment. |
 | `up` | Restart services and the node pool without rebuilding the application. |
 | `doctor` | Check configuration, Docker/Compose, retained images, volumes, and container health. |
+| `remove RUN` | Delete a terminal run's records and local entry; preserve shared user blobs. |
+| `backup DIRECTORY` | Snapshot a stopped deployment, including its images and retained volumes. |
+| `restore DIRECTORY` | Import a backup into fresh storage; start it separately with `up`. |
 
 `status` counts locally recorded runs; use `ps` for workflow completion status.
+`ps` distinguishes active execution, pending assignment, zero worker capacity,
+stop acknowledgements, and terminal-result publication when the runtime provides
+these diagnostics. `inspect RUN` includes pending/running/replied assignment
+counts and the workers whose stop acknowledgement is still needed. It also shows
+the last observed local retry for a current attempt, if available; missing or
+dropped telemetry is not evidence that storage is healthy or that a worker stopped.
 An unavailable Docker daemon is reported as unavailable, not as a stopped deployment.
 `doctor` is read-only and returns a nonzero exit code if required checks fail,
 including stopped services. It does not test runtime credentials or execute a workflow.
@@ -540,6 +604,12 @@ and `clean` against real Docker, HTTP, SQLite, and blob storage. It verifies the
 workflow result, persistence across restart, complete removal, and source
 preservation. The test uses a separate deployment and catalog; command logs are
 retained under `.lean-cloud/cli-command-logs-PID/` and uploaded by CI on failure.
+
+`lake exe cloud_console_tests --maintenance-only` drives the real CLI through
+scaling from zero workers, per-run removal, backup, complete cleanup, restore,
+and resumed execution. It checks that shared nodes and neighboring runs survive
+removal, removed IDs stay reserved, paused runs remain paused, and incomplete
+restores cannot start. CI runs this alongside the existing runtime suites.
 
 The console smoke test also creates a separate user application, builds a custom
 Lake executable with generated deployment files, and verifies results for sample

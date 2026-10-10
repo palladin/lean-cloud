@@ -38,7 +38,9 @@ private def process (completed : Bool) (call : Invocation) : Except String Proce
       ("CPUPerc", toJson "10.00%"), ("MemUsage", toJson "1MiB / 2MiB"),
       ("NetIO", toJson "1kB / 2kB"), ("BlockIO", toJson "3kB / 4kB")]).compress
   else if args[0]? == some "ps" then
-    response (if args.any (·.startsWith "label=com.docker.compose.service=") then "" else "node1\n")
+    response (if args.contains "label=com.docker.compose.service=blobs" then "blob-container"
+      else if args.any (·.startsWith "label=com.docker.compose.service=") then "" else "node1\n")
+  else if args.contains "{{.Image}}" then response "sha256:blob"
   else if args.contains "{{if .State.Health}}{{.State.Health.Status}}{{end}}" then
     response (String.intercalate "\n" (List.replicate (args.size - 3) "healthy"))
   else if args[0]? == some "inspect" then
@@ -96,6 +98,31 @@ private def scaleProcess (drained : Bool) (call : Invocation) : Except String Pr
   else process false call
 
 def consoleEffectCases : Array TestCase := #[
+  ⟨"console.effects.changed-limits-replace-existing-nodes", do
+    let limits : ExecutionConfig := ⟨12, 25, 100⟩
+    let initial := { deployed with process := scaleProcess true }
+      |>.json (Project.assets ctx / "config.json") (Project.defaultConfig.setObjVal! "worker" (toJson limits))
+    let (_, world) ← checked ctx.deploy initial
+    let some stopped := world.processes.findIdx? (·.args[0]? == some "stop")
+      | throw (IO.userError "Changed limits reused old nodes")
+    let some created := world.processes.findIdx? (·.args.toList.take 2 == ["run", "-d"])
+      | throw (IO.userError "No replacement nodes")
+    assertTrue (stopped < created) "Replacement overlapped the old pool"
+    for role in #["scheduler", "worker1", "worker2", "worker3"] do
+      let config ← unwrap (Json.parse (world.file (Project.assets ctx / s!"node-{role}.json")).get!)
+      assertEq (← unwrap (config.getObjValAs? ExecutionConfig "worker")) limits
+    let (_, again) ← checked ctx.deploy { world with processes := #[] }
+    assertTrue (!again.processes.any (fun call => call.args[0]? == some "stop" ||
+      call.args.toList.take 2 == ["run", "-d"])) "Unchanged limits replaced nodes again"⟩,
+  ⟨"console.effects.up-rejects-future-config-before-start", do
+    let config := Project.defaultConfig.setObjVal! "formatVersion" (toJson (999 : Nat))
+    let initial := deployed |>.json (Project.assets ctx / "config.json") config
+    let (result, world) := ConsoleModel.run ctx.up initial
+    assertTrue result.toOption.isNone "Future runtime configuration accepted by up"
+    assertTrue (!world.processes.any (fun call => call.args.contains "up" || call.args.contains "start" ||
+      call.args.toList.take 2 == ["run", "-d"])) "Unsupported configuration started services"
+    assertEq (world.file (Project.assets ctx / "config.json")) (some config.compress)
+      "Unsupported configuration was rewritten"⟩,
   ⟨"console.effects.ps-timestamps-and-offline-timing-snapshot", do
     let timing : LeanCloud.Timing.Run := {
       span := some ⟨86400000, some 86401234⟩, observedMs := 86490000 }
@@ -465,6 +492,45 @@ def consoleEffectCases : Array TestCase := #[
     for text in ["squares/v1", "completed", "LOCATION", "29", "CPU", "Source:"] do
       assertTrue (has world.stdout text) s!"Missing command output: {text}"
     assertTrue (!world.stdout.contains '\x1b' && !world.trace.contains "enterTerminal") "--once entered raw terminal"⟩,
+  ⟨"console.effects.waiting-reasons", do
+    for (phase, stopping, expected) in [
+        (Pool.Phase.noWorkers, #[], "waiting for workers"),
+        (.stopping, #["worker2"], "Waiting for stop acknowledgement: worker2"),
+        (.finalizing, #[], "publishing terminal result"),
+        (.queued, #[], "waiting for assignment")] do
+      let diagnostic : Pool.Diagnostics := ⟨phase, stopping, some 0, 2, 0, 1⟩
+      let status : LeanCloud.Timing.Status := { diagnostics := some diagnostic }
+      let initial := { (launched false) with
+        directories := #[ctx.runs.toString]
+        process := fun call => if call.args.contains "status" then response (toJson status).compress
+          else process false call }
+      let (_, world) ← checked (command ctx ["inspect", "one"]) initial
+      assertTrue (has world.stdout expected) s!"Missing waiting reason: {expected}"
+      assertTrue (has world.stdout "2 pending, 0 running, 1 replies collected") "Missing assignment counts"
+      let (_, world) ← checked (command ctx ["ps"]) initial
+      assertTrue (has world.stdout (phaseShortLabel phase)) "ps omitted scheduler waiting reason"
+      if phase == .stopping then
+        let paused := initial.json (ctx.directory "one" / "control.json") RunControl.paused
+        for unavailable in [false, true] do
+          let paused := { paused with
+            process := fun call => if unavailable && call.args.contains "outcome" then .error "Blobs unavailable"
+              else initial.process call }
+          let (_, paused) ← checked (command ctx ["ps"]) paused
+          assertTrue (has paused.stdout "waiting for stop") "Local pause intent hid the active stop barrier"⟩,
+  ⟨"console.effects.remove-retries-preserve-local-manifest", do
+    let initial := launched
+    let failed := { initial with
+      process := fun call => if call.args[0]? == some "remove" then .error "worker unavailable" else initial.process call }
+    let (result, after) := ConsoleModel.run (command ctx ["remove", "one"]) failed
+    assertTrue result.toOption.isNone "Remote cleanup failure was ignored"
+    assertEq (after.file (ctx.directory "one" / "run.json")) (initial.file (ctx.directory "one" / "run.json"))
+      "Failed cleanup lost retry information"
+    let ready := { after with
+      process := fun call => if call.args[0]? == some "remove" then response "" else initial.process call }
+    let (_, after) ← checked (command ctx ["remove", "one"]) ready
+    assertTrue (after.file (ctx.directory "one" / "run.json")).isNone "Completed removal retained local run"
+    assertTrue (after.file (ctx.home / "deployment.json")).isSome "Removal deleted deployment"
+    assertTrue after.locks.isEmpty "Removal leaked a lock"⟩,
   ⟨"console.effects.terminal-failure-in-every-view-and-offline-last-view", do
     let error : CloudError := ⟨.protocol, "Interpreter fuel exhausted"⟩
     let initial := { (launched false) with

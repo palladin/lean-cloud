@@ -25,6 +25,7 @@ private def service : Application.Service α → StateM World (Except String α)
   | .submit _ _ entry _ => do modify (fun w => { w with services := w.services.push entry }); return .ok ()
   | .health _ | .serveScheduler _ | .serveWorker _ | .control _ _ _
   | .configure _ _ | .workerStopped _ _ _ => return .ok ()
+  | .remove _ _ | .purge _ _ => return .ok ()
   | .membership _ => return .ok {}
   | .definition _ _ => return .ok ⟨program.info.entry, Json.null, program.info.resultSchema⟩
   | .outcome _ _ => return .ok (some (.success (toJson (42 : Nat))))
@@ -33,6 +34,50 @@ private def service : Application.Service α → StateM World (Except String α)
   | .readText _ _ => return .error "A Nat result must not be treated as a blob"
 
 def run : IO Unit := do
+  let key := "runs/example/records/" ++ String.ofList (List.replicate 64 'a')
+  let page (contents : String) := s!"<ListBucketResult><KeyCount>1</KeyCount><Contents><Key>{contents}</Key></Contents></ListBucketResult>"
+  assertEq (← unwrap (S3.runRecordKeys "example" (page key))) #[key]
+  assertEq (← unwrap (S3.runRecordKeys "example" (page (key.replace "/" "%2F")))) #[key]
+  for invalid in ["objects/" ++ String.ofList (List.replicate 64 'a'),
+      key.replace "example" "other", key ++ "/../objects", "runs/example/records/short"] do
+    assertTrue (S3.runRecordKeys "example" (page invalid)).toOption.isNone "Unsafe cleanup listing accepted"
+  assertTrue (S3.runRecordKeys "example" "<ListBucketResult></ListBucketResult>").toOption.isNone
+    "Malformed empty listing was accepted"
+  let json ← unwrap (Json.parse (include_str "../deploy/config.json"))
+  assertTrue (fromJson? (α := Config) (json.setObjVal! "formatVersion" (toJson (999 : Nat)))).toOption.isNone
+    "Future runtime configuration was accepted"
+  let legacy := Json.mkObj ((← unwrap json.getObj?).toList.filter (·.1 != "worker"))
+  let old : Config ← unwrap (fromJson? legacy)
+  assertEq old.worker ({} : ExecutionConfig) "Legacy config lost defaults"
+  assertTrue (fromJson? (α := Config) (json.setObjVal! "worker" Json.null)).toOption.isNone
+    "Invalid limits silently used defaults"
+  let entry : CloudProgram Nat Nat := { name := "fuel", version := "v1", run := fun n => do
+    let value ← Cloud.pure (fun _ => n + 1)
+    Cloud.pure (fun _ => value + 1) }
+  let registered := registerProgram entry #[]
+  let journal ← IO.mkRef ([] : List (String × ReplayRecord))
+  let store : ReplayStore IO := {
+    read := fun key => return (← journal.get).lookup key
+    create := fun key record => do
+      match (← journal.get).lookup key with
+      | some existing => return existing
+      | none => journal.modify ((key, record) :: ·); return record }
+  let blobs : BlobStorage IO := {
+    putBlob := fun _ => throw ⟨.unsupported, "unexpected blob"⟩
+    readBlob := fun _ => throw ⟨.unsupported, "unexpected blob"⟩
+    resolveBlob := fun _ => throw ⟨.unsupported, "unexpected blob"⟩ }
+  let definition : RunDefinition := ⟨entry.info.entry, toJson (5 : Nat), entry.info.resultSchema⟩
+  let trace ← Trace.create "config-test"
+  let assignment : Assignment := ⟨0, Location.root⟩
+  let limited ← registered.execute { interpreterFuel := 1 } definition "test" ⟨store, pure #[]⟩ blobs trace assignment
+  assertError limited.progress .protocol
+  assertTrue ((← journal.get).lookup (ReplayStore.returnKey Location.root)).isNone
+    "Fuel exhaustion published completion"
+  let completed ← registered.execute { interpreterFuel := 10 } definition "test" ⟨store, pure #[]⟩ blobs trace assignment
+  assertOutcome completed.progress (.ok .done)
+  let some root := (← journal.get).lookup (ReplayStore.returnKey Location.root)
+    | throw (IO.userError "Configured worker did not finish")
+  assertEq root.outcome (.success (toJson (7 : Nat)))
   let registry : Registry := ⟨#[program.register]⟩
   -- Registration at a different module bundles both imported workflow files.
   let some registered := LeanCloudRuntime.programs.programs[0]? | throw (IO.userError "No registered programs")
@@ -44,6 +89,8 @@ def run : IO Unit := do
   let saved : LeanCloudRuntime.Pool.Saved ← unwrap (fromJson? (Json.mkObj [
     ("state", Json.mkObj [("runs", toJson (#[] : Array LeanCloud.Pool.Run)), ("cursor", toJson (0 : Nat))]),
     ("replies", toJson (#[] : Array (String × Except String Json)))]))
+  assertTrue (fromJson? (α := LeanCloudRuntime.Pool.Saved)
+    ((toJson saved).setObjVal! "formatVersion" (toJson (999 : Nat)))).toOption.isNone "Future catalog was accepted"
   assertTrue saved.routes.isNone "Legacy scheduler state fabricated routes"
   assertTrue saved.timings.isEmpty "Legacy scheduler state fabricated timestamps"
   let timing : LeanCloud.Timing.Run := { span := some ⟨1000, some 3000⟩, observedMs := 3000 }

@@ -61,6 +61,19 @@ jobs:
       - name: Run tests
         run: lake test
 
+      - name: Measure workload stress
+        run: |
+          lake build cloud_stress_tests
+          /usr/bin/time -v .lake/build/bin/cloud_stress_tests > .lean-cloud/stress.jsonl 2> .lean-cloud/stress-resources.txt
+
+      - name: Save workload measurements
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-measurements
+          path: .lean-cloud/stress*
+          include-hidden-files: true
+          retention-days: 7
+
       - name: Check native process streaming and cleanup
         run: lake exe cloud_process_tests
 
@@ -164,7 +177,7 @@ jobs:
         timeout-minutes: 9
         env:
           BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
-        run: bash .github/scripts/check-runtime.sh lifecycle pool scaling chaos
+        run: bash .github/scripts/check-runtime.sh lifecycle pool scaling chaos maintenance
 
       - name: Upload runtime diagnostics on failure
         if: failure() || cancelled()
@@ -175,6 +188,8 @@ jobs:
           path: |
             .lean-cloud/ci-runtime-logs/*.log
             .lean-cloud/cli-command-logs-*/*.log
+            .lean-cloud/lean-cloud-maintenance-test-*/failure-*.log
+            .lean-cloud/lean-cloud-maintenance-test-*/logs/*.log
             .lean-cloud/lean-cloud-console-test-*/failure-*.log
             .lean-cloud/lean-cloud-console-test-*/logs/*.log
             .lean-cloud/lean-cloud-scaling-test-*/failure-*.log

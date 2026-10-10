@@ -138,4 +138,52 @@ def records (config : Config) (run : String) : ReplayStore IO where
   create key record := do
     IO.ofExcept (fromJson? (← createJson config run key (toJson record)))
 
+/-- Only flat ASCII record keys belong to this namespace. Validate the whole
+URL-encoded listing and its count before deleting any of its keys.
+See https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html. -/
+def runRecordKeys (run xml : String) : Except String (Array String) := do
+  unless !run.isEmpty && run.toList.all (fun c => c.toNat < 128 && (c.isAlphanum || c == '-' || c == '_')) do
+    throw "Invalid run ID"
+  unless (xml.splitOn "<ListBucketResult").length == 2 && (xml.splitOn "</ListBucketResult>").length == 2 do
+    throw "Invalid S3 listing"
+  let [_, counts] := xml.splitOn "<KeyCount>" | throw "Missing S3 key count"
+  let [count, _] := counts.splitOn "</KeyCount>" | throw "Invalid S3 key count"
+  let some count := count.toNat? | throw "Invalid S3 key count"
+  let recordPrefix := "runs/" ++ run ++ "/records/"
+  let keys ← (xml.splitOn "<Key>").drop 1 |>.mapM fun part => do
+    let [key, _] := part.splitOn "</Key>" | throw "Invalid S3 key"
+    let key := key.replace "%2F" "/" |>.replace "%2f" "/"
+    unless key.startsWith recordPrefix do throw "S3 listing escaped the run namespace"
+    let hash := key.drop recordPrefix.length |>.toString
+    unless hash.length == 64 && hash.toList.all (fun c => c.isDigit || ('a' ≤ c && c ≤ 'f')) do
+      throw "Unexpected key in the run namespace"
+    return key
+  unless keys.length == count do throw "S3 listing count does not match its keys"
+  return keys.toArray
+
+def isRemoved (config : Config) (run : String) : IO Bool := do
+  let (status, bytes) ← request config "GET" ("/removed/" ++ (← digest run.toUTF8))
+  if status == 404 then return false
+  unless status == 200 && bytes == run.toUTF8 do throw (IO.userError "Cannot read run removal marker")
+  return true
+
+/-- A worker deletes only a durably retired run. Relist the first bounded page
+after each deletion, so interrupted cleanup can restart without skipping keys.
+User blobs and names are separate and are never visited. -/
+def removeRun (config : Config) (run : String) : IO Unit := do
+  discard <| IO.ofExcept (runRecordKeys run "<ListBucketResult><KeyCount>0</KeyCount></ListBucketResult>")
+  writeImmutable config ("/removed/" ++ (← digest run.toUTF8)) run.toUTF8
+  let recordPrefix := "runs/" ++ run ++ "/records/"
+  repeat
+    let (status, bytes) ← request config "GET"
+      ("?list-type=2&encoding-type=url&max-keys=128&prefix=" ++ component recordPrefix)
+    unless status == 200 do throw (IO.userError s!"S3 listing failed (HTTP {status})")
+    let some text := String.fromUTF8? bytes | throw (IO.userError "Invalid S3 listing UTF-8")
+    let keys ← IO.ofExcept (runRecordKeys run text)
+    if keys.isEmpty then return
+    for key in keys do
+      let (status, _) ← request config "DELETE" ("/" ++ key)
+      unless status == 404 || (200 ≤ status && status < 300) do
+        throw (IO.userError s!"S3 record deletion failed (HTTP {status})")
+
 end LeanCloudRuntime.S3

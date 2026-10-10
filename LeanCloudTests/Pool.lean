@@ -5,6 +5,8 @@ import LeanCloudTests.Generated
 namespace LeanCloudTests
 open Lean LeanCloud
 
+private instance : Inhabited Pool.Run := ⟨{ id := "" }⟩
+
 private def change (state : Pool.State) (cmd : Pool.Command) : IO Pool.State := do
   return (← unwrap (Pool.command state cmd)).1
 
@@ -23,6 +25,44 @@ private def stopOld (state : Pool.State) : Pool.State :=
 private def initial : Pool.State := { runs := #[{ id := "first" }, { id := "second" }] }
 
 def poolCases : Array TestCase := #[
+  ⟨"pool.remove-terminal-run-reserves-id", do
+    let active ← change {} (.submit "old")
+    assertTrue (Pool.command active (.remove "old")).toOption.isNone "Removed unfinished work"
+    let (active, _, assignment) ← takeJob active "worker"
+    let report : Report := ⟨"worker", assignment.attempt, .ok .done, #[]⟩
+    let finished := Pool.report active "old" report
+    let finished ← change finished (.submit "keep")
+    let removed ← change finished (.remove "old")
+    assertTrue (!removed.runs.any (·.id == "old") && removed.runs.any (·.id == "keep")) "Removal crossed runs"
+    let again ← change removed (.remove "old")
+    assertEq again.removed #["old"] "Retry duplicated tombstone"
+    let catalog : Pool.Catalog ← unwrap (fromJson? (toJson again.catalog))
+    let restored := Pool.recover catalog.restore
+    for cmd in [Pool.Command.submit "old", .pause "old", .resume "old", .kill "old"] do
+      assertTrue (Pool.command restored cmd).toOption.isNone "Removed ID was resurrected"
+    assertTrue (!(Pool.report restored "old" report).runs.any (·.id == "old")) "Late report recreated the run"
+    assertTrue (!Pool.valid restored "old" "worker" assignment.attempt) "Removed assignment remained valid"⟩,
+  ⟨"pool.diagnostics-use-live-tickets", do
+    let state ← change {} (.submit "run")
+    let state ← change state (.configureWorkers #[])
+    assertEq (Pool.diagnostics state state.runs[0]!).phase .noWorkers
+    let state ← change state (.configureWorkers #["worker1"])
+    let (state, _, _) ← takeJob state "worker1"
+    let diagnostics := Pool.diagnostics state state.runs[0]!
+    assertEq diagnostics.phase .running
+    assertEq diagnostics.running 1
+    -- Removing the optional inspection tree cannot erase actual ownership.
+    let run := { state.runs[0]! with scheduler.jobs := #[] }
+    assertEq (Pool.diagnostics state run) diagnostics
+    let paused ← change state (.pause "run")
+    assertEq (Pool.diagnostics paused paused.runs[0]!).phase .stopping
+    assertEq (Pool.diagnostics paused paused.runs[0]!).stopping #["worker1"]
+    let stopped := stopOld paused
+    assertEq (Pool.diagnostics stopped stopped.runs[0]!).phase .paused
+    let (unchanged, json) ← unwrap (Pool.command stopped (.status "run"))
+    assertEq (toJson unchanged.catalog) (toJson stopped.catalog) "Inspection changed durable state"
+    let diagnostic : Pool.Diagnostics ← unwrap (json.getObjValAs? _ "diagnostics")
+    assertEq diagnostic.phase .paused⟩,
   ⟨"pool.catalog-recovery-remembers-terminal-writer", do
     let state ← change {} (.kill "cancelled")
     let (state, reply) := Pool.acquire 100 state "old-worker"

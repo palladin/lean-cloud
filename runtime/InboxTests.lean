@@ -16,6 +16,24 @@ private def rejects (action : IO α) (message : String) : IO Unit := do
 private def take (store : Inbox.Store) (now : Nat) (queue session : String) : IO (Option Inbox.Delivery) := do
   IO.ofExcept (fromJson? (← Inbox.apply store now ⟨queue, session, .receive⟩))
 
+private abbrev FormatSchema : LeanLinq.Schema := [("scope", .string), ("version", .int)]
+private abbrev FormatContext : LeanLinq.Ctx := { tables := [("cloud_format", FormatSchema)] }
+
+private def schemaVersions : IO Unit := IO.FS.withTempFile fun _ path => do
+  let conn ← LeanLinq.Sqlite.connect path.toString
+  try
+    let store ← Inbox.create conn
+    discard <| Inbox.apply store 0 ⟨"kept", "", .send "durable"⟩
+    let formats : LeanLinq.Table "cloud_format" FormatSchema := ⟨⟩
+    let update : LeanLinq.UpdateStmt FormatContext _ _ := formats.update
+      |>.set "version" (LeanLinq.SqlExpr.int 999)
+    discard (conn.execUpdate update)
+    rejects (Inbox.create conn) "Future inbox schema was accepted"
+    discard <| Inbox.apply store 0 ⟨"kept", "consumer", .open⟩
+    let delivery ← take store 0 "kept" "consumer"
+    assertEq (delivery.map (·.payload)) (some "durable") "Failed version check removed committed mail"
+  finally conn.close
+
 private def laws : IO Unit := IO.FS.withTempFile fun _ path => do
   let conn ← LeanLinq.Sqlite.connect path.toString
   try
@@ -129,6 +147,22 @@ private def http : IO Unit := IO.FS.withTempFile fun _ path => do
     try
       let some (.v4 bound) := server.localAddr | throw (IO.userError "No HTTP address")
       let endpoint : HttpMailbox.Config := ⟨"127.0.0.1", bound.port.toNat, "test-token"⟩
+      -- Bypass the version-aware client to exercise old and future senders.
+      let request := toJson (Inbox.Request.mk "compatibility" "" (.send "legacy"))
+      for version in [none, some (999 : Nat)] do
+        let body := match version with
+          | none => request
+          | some value => request.setObjVal! "protocolVersion" (toJson value)
+        let raw ← IO.Process.output { cmd := "curl", args := #["--silent", "--show-error", "--fail",
+          "--max-time", "5", "-H", "Authorization: Bearer test-token", "-H", "Content-Type: application/json",
+          "--data-binary", body.compress, s!"http://127.0.0.1:{bound.port}/mailbox"] }
+        assertEq raw.exitCode 0 "Raw protocol check failed"
+        let result : Except String Json ← IO.ofExcept (Json.parse raw.stdout >>= Version.responsePayload >>= fromJson?)
+        assertEq result.isOk version.isNone "Protocol compatibility check returned the wrong result"
+      discard <| Inbox.apply store 0 ⟨"compatibility", "reader", .open⟩
+      let some legacy ← take store 0 "compatibility" "reader" | throw (IO.userError "Legacy send was lost")
+      discard <| Inbox.apply store 0 ⟨"compatibility", "reader", .acknowledge legacy.receipt⟩
+      assertEq (← take store 0 "compatibility" "reader") none "Future protocol mutated the inbox"
       rejects (HttpMailbox.send { endpoint with token := "wrong" } "run" "actor" (7 : Nat)) "Unauthenticated send accepted"
       HttpMailbox.send endpoint "run" "actor" (7 : Nat)
       let first ← HttpMailbox.openMailbox endpoint "run" "actor"
@@ -311,6 +345,7 @@ def main (args : List String) : IO UInt32 := do
   try
     ApplicationTests.run
     IO.println "Application commands and registry passed"
+    schemaVersions
     laws
     for seed in [:32] do differential seed
     IO.println "SQLite laws and 6,400 model operations passed"

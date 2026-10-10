@@ -1,5 +1,6 @@
 import LeanCloudTests.ConsoleSupport
 import LeanCloudTests.PoolWorkload
+import LeanCloudTests.StressWorkload
 
 namespace LeanCloudTests.ConsoleRuntime
 open Lean LeanCloud LeanCloudCli
@@ -322,6 +323,7 @@ private def chaosFixture (owner : Context) : Cli Context := do
   request (.writeFile (directory / "ChaosFixture/GeneratedProgram.lean") (include_str "GeneratedProgram.lean"))
   request (.writeFile (directory / "ChaosFixture/PoolWorkload.lean")
     ((include_str "PoolWorkload.lean").replace "import LeanCloudTests.GeneratedProgram" "import ChaosFixture.GeneratedProgram"))
+  request (.writeFile (directory / "ChaosFixture/StressWorkload.lean") (include_str "StressWorkload.lean"))
   request (.writeFile (directory / "Main.lean") (include_str "Fixtures/PoolChaosMain.lean.in"))
   return ctx
 
@@ -392,6 +394,48 @@ def poolChaos (seed : Nat := 1) : Cli Unit := do
     discard <| observing (chaosEvent ctx "failed" [("error", toJson error)])
     discard <| observing (captureFailure ctx)
     throw s!"Pool chaos seed={seed}: {error}\nArtifacts: {ctx.home}"
+  finally cleanup ctx
+
+/-- An opt-in load test through the ordinary deployed application and CLI.
+Small smoke workloads run in every model test run; this suite measures HTTP,
+SQLite and S3 as well. Artifacts remain after container cleanup. -/
+def poolStress : Cli Unit := do
+  let root ← request (.realPath (← request .currentDir))
+  let ctx ← chaosFixture ⟨root, s!"lean-cloud-stress-test-{← request .pid}"⟩
+  let inputs := StressWorkload.smoke ++ (Array.range 12).map fun seed =>
+    ({ shape := .wide, size := 8, seed } : StressWorkload.Input)
+  try
+    ctx.deploy (workers := some 3)
+    let identities ← poolNodes ctx
+    let started ← request .now
+    let mut runs := #[]
+    for (input, index) in inputs.zipIdx do
+      let path := ctx.home / s!"input-{index}.json"
+      saveJson path input
+      ctx.launch "stress" (some path.toString) (some s!"stress-{index}")
+      runs := runs.push (← ctx.loadRun s!"stress-{index}")
+    let deadline := (← request .now) + 600000
+    for (run, input) in runs.zip inputs do
+      let expected := (DirectInterpreter.interpret (m := Id) {
+        putBlob := fun _ => throw ⟨.unsupported, "unexpected blob"⟩
+        readBlob := fun _ => throw ⟨.unsupported, "unexpected blob"⟩
+        resolveBlob := fun _ => throw ⟨.unsupported, "unexpected blob"⟩ } StressWorkload.workflow input).run
+      let expected := match expected with
+        | .ok value => Exit.success (toJson value)
+        | .error error => .failure error
+      require ((← awaitOutcome ctx run deadline) == expected) s!"Stress outcome mismatch: {run.id}"
+    settled ctx runs deadline
+    require ((← poolNodes ctx) == identities) "Load replaced the persistent worker pool"
+    let elapsed := (← request .now) - started
+    let results ← (runs.zip inputs).mapM fun (run, input) => do
+      return Json.mkObj [("run", toJson run.id), ("input", toJson input),
+        ("timing", toJson (← ctx.timing run))]
+    saveJson (ctx.home / "stress-results.json") (Json.mkObj [
+      ("elapsedMs", toJson elapsed), ("workers", toJson (3 : Nat)), ("runs", toJson results)])
+    printLine s!"Deployed stress passed: {runs.size} runs matched Direct; {elapsed} ms. Results: {ctx.home}/stress-results.json"
+  catch error =>
+    discard <| observing (captureFailure ctx)
+    throw s!"Stress failed: {error}\nArtifacts: {ctx.home}"
   finally cleanup ctx
 
 end LeanCloudTests.ConsoleRuntime

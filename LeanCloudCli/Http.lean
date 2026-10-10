@@ -1,4 +1,5 @@
 import Lean
+import LeanCloud.Version
 import Std.Sync.Mutex
 
 namespace LeanCloudCli.Http
@@ -16,6 +17,9 @@ private instance : Nonempty Client := ClientType.property
 initialize clients : Std.Mutex (Array (String × Std.Mutex Client)) ← Std.Mutex.new #[]
 
 def post (url token body : String) (timeoutMs : UInt32 := 30000) : IO String := do
+  let request ← IO.ofExcept (Lean.Json.parse body)
+  IO.ofExcept (LeanCloud.Version.check "protocolVersion" "HTTP protocol" request)
+  let body := (LeanCloud.Version.stamp "protocolVersion" request).compress
   let client ← clients.atomically do
     if let some (_, client) := (← get).find? (·.1 == url) then return client
     let client ← Std.Mutex.new (← newClient)
@@ -24,6 +28,6 @@ def post (url token body : String) (timeoutMs : UInt32 := 30000) : IO String := 
   let (status, response) ← client.atomically do postRaw (← get) url token body timeoutMs
   unless 200 ≤ status && status < 300 do
     throw (IO.userError s!"HTTP {status}: {response}")
-  return response
+  return (← IO.ofExcept (Lean.Json.parse response >>= LeanCloud.Version.responsePayload)).compress
 
 end LeanCloudCli.Http

@@ -22,11 +22,13 @@ structure Saved where
 tickets, leases or continuations. Attempt counters fence delayed old mail. -/
 instance : ToJson Saved where
   toJson saved := Json.mkObj [
+    ("formatVersion", toJson Version.current),
     ("state", toJson saved.state.catalog),
     ("routes", toJson saved.routes), ("replies", toJson saved.replies), ("timings", toJson saved.timings)]
 
 instance : FromJson Saved where
   fromJson? json := do
+    Version.check "formatVersion" "scheduler catalog" json
     let routes ← match json.getObjVal? "routes" with
       | .ok value => fromJson? value
       | .error _ => pure none
@@ -191,9 +193,9 @@ def scheduler (config : Config) : IO Unit := do
             let mailboxes := { config.mailboxes with workers := saved.routes.getD config.mailboxes.workers }
             match message with
             | .submit run =>
-              let (state, _) ← IO.ofExcept (LeanCloud.Pool.command saved.state (.submit run))
-              saved := { saved with state }
-              saved ← persist saved
+              unless saved.state.removed.contains run do
+                let (state, _) ← IO.ofExcept (LeanCloud.Pool.command saved.state (.submit run))
+                saved ← persist { saved with state }
             | .ready worker =>
               unless saved.state.membership.drained.contains worker do
               if let .ok endpoint := mailboxes.worker worker then
@@ -233,11 +235,15 @@ def scheduler (config : Config) : IO Unit := do
                   | .ok (state, response) => (state, .ok response)
                   | .error error => (saved.state, .error error)
               saved := { saved with state }
-              let cache := match command with | .check .. | .status .. | .health | .workers => false | _ => true
+              let cache := match command with | .check .. | .status .. | .health | .workers | .removed .. => false | _ => true
               if cache && cached.isNone then
                 saved := { saved with replies := saved.replies.push (replyTo, response) }
               if cache then saved ← persist saved
               let response ← match command, response with
+                | .workers, .ok json =>
+                  let routes := mailboxes.workers.filter fun route =>
+                    saved.state.membership.active.all (·.contains route.worker)
+                  pure (.ok (json.setObjVal! "routes" (toJson routes)))
                 | .status run, .ok json => do
                   let now ← wallTime
                   let timing := (saved.timings.find? (·.1 == run)).map fun (_, timing) =>

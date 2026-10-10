@@ -22,7 +22,9 @@ private def process (call : Invocation) : Except String ProcessOutput := do
   match call.args.toList with
   | "port" :: _ => output "127.0.0.1:18080"
   | ["--version"] | ["compose", "version"] | ["info", "--format", _] => output "version"
-  | "ps" :: _ => output (if call.args.any (·.startsWith "label=com.docker.compose.service=") then "" else "node\n")
+  | "ps" :: _ => output (if call.args.contains "label=com.docker.compose.service=blobs" then "blob-container"
+      else if call.args.any (·.startsWith "label=com.docker.compose.service=") then "" else "node\n")
+  | ["inspect", "--format", "{{.Image}}", _] => output "sha256:blob"
   | "inspect" :: _ => output (if call.args.contains "--format" then "healthy\nhealthy\nhealthy\nhealthy\n" else healthyNodes.compress)
   | "image" :: "inspect" :: _ => output (if call.args.contains "{{index .Config.Labels \"lean-cloud.node\"}}" then "http-inbox-v1" else "sha256:pinned")
   | ["volume", "inspect", _] => output

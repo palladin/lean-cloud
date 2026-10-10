@@ -159,8 +159,28 @@ recovered from SQLite on restart. Stopping does not drain arbitrary user IO.
 
 `Cloud.exec` can execute again if interrupted before its result is recorded.
 Pause/kill are cooperative at record boundaries; in-flight user IO may finish.
-Reference workers use 100,000 interpreter steps per assignment; the semantic
-proofs assume sufficient fuel rather than proving that this default always suffices.
+Workers default to 100,000 interpreter steps per attempt. Configure the `worker`
+object in your application's `lean-cloud.json`, then redeploy:
+
+```json
+"worker": {
+  "interpreterFuel": 200000,
+  "retryDelayMs": 500,
+  "retryMaxDelayMs": 5000
+}
+```
+
+For the static Compose example, set the same object in `deploy/config.json`.
+Applying changed worker limits replaces the compute nodes together, even when
+their image is unchanged. Active runs reconstruct from their existing records;
+ordinary scaling with unchanged limits keeps the existing nodes.
+Old configurations retain defaults. Fuel must be positive. Retry delays must be
+positive, ordered, and at most 60 seconds. Infrastructure failures retry locally
+with exponential backoff up to the cap, retaining replay records and checking
+ownership on the next attempt. They do not consume a permanent retry budget.
+Fuel exhaustion is a terminal interpreter error, not an infrastructure retry.
+The semantic proofs assume sufficient fuel rather than proving that a particular
+configured budget always suffices.
 
 An accepted interpreter error, such as fuel exhaustion or a replay protocol
 error, terminates that run. The pool revokes its other attempts and saves the
@@ -175,12 +195,36 @@ the last view with the failure reason, including from its offline cache.
 Worker crashes and IO/transport exceptions remain retryable and do not create
 terminal failure records. Recovery still requires available durable storage.
 
+## Compatibility and upgrades
+
+Version markers are checked at the storage and transport boundaries:
+
+| Boundary | Current version | Older data |
+| --- | --- | --- |
+| Runtime configuration, deployment/run manifests, scheduler catalog | `formatVersion: 1` | Missing marker means the existing HTTP/SQLite format (version 0). |
+| SQLite inbox and scheduler schemas | `cloud_format` row, version 1 | Existing unmarked databases gain a marker without replacing their domain tables. |
+| HTTP requests and responses | `protocolVersion: 1` | Unversioned requests and responses remain readable; legacy callers receive the legacy response shape. |
+| Backup manifest | `formatVersion: 1` | No older backup format is supported. |
+
+Malformed or newer versions are rejected. SQLite checks happen before domain
+schema setup or reply cleanup; protocol checks happen before command execution.
+The tagged HTTP result is carried inside a versioned envelope. Worker replay
+record formats and `Codec.schema` remain unchanged.
+
+Before a runtime upgrade, finish or kill active workflows, run `down`, and make
+a backup. Upgrade the SDK and application together, then `deploy`. Do not replace
+the executable for an unfinished workflow: its recorded requests belong to that
+program version. Compatibility with version 0 supports adopting existing local
+deployments; it is not a promise of arbitrary mixed-version operation or safe
+downgrades. Use the saved images and volumes when restoring an earlier deployment.
+
 TLS termination, cloud provisioning, and scheduler failover remain future work.
 The current local endpoint is HTTP on localhost; do not expose it publicly as-is.
 Existing deployments using the old broker format require a fresh deployment:
 finish or kill unfinished runs with their original image first, and retain old
 volumes for historical data. There is no broker-queue import or automatic schema
-migration.
+migration. See [backup and restore](Console.md#backup-and-restore) for the supported
+stopped-deployment snapshot procedure.
 
 ## Checks
 

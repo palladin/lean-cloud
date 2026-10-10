@@ -62,15 +62,20 @@ def observe (timing : Run) (before : Option Pool.Run) (after : Pool.Run) (now : 
 /-- The ordinary status JSON with optional timings. Old runtimes remain readable. -/
 structure Status extends Scheduler.Snapshot where
   timing : Option Run := none
+  diagnostics : Option Pool.Diagnostics := none
 
 instance : ToJson Status := ⟨fun status =>
-  (toJson status.toSnapshot).setObjVal! "timing" (toJson status.timing)⟩
+  let json := (toJson status.toSnapshot).setObjVal! "timing" (toJson status.timing)
+  json.setObjVal! "diagnostics" (toJson status.diagnostics)⟩
 
 instance : FromJson Status where
   fromJson? json := do
     let timing ← match json.getObjVal? "timing" with
       | .ok value => fromJson? value
       | .error _ => pure none
-    return { toSnapshot := ← fromJson? json, timing }
+    let diagnostics ← match json.getObjVal? "diagnostics" with
+      | .ok value => fromJson? value
+      | .error _ => pure none
+    return { toSnapshot := ← fromJson? json, timing, diagnostics }
 
 end LeanCloud.Timing

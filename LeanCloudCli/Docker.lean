@@ -34,7 +34,8 @@ private def Context.dockerLogged (ctx : Context) (stage title : String)
   request .flush
 
 def Context.composeFile (ctx : Context) : Cli System.FilePath := do
-  if ← request (.exists (Project.manifest ctx.root)) then
+  if (← request (.exists (Project.manifest ctx.root))) ||
+      (← request (.exists (Project.assets ctx / "compose.json"))) then
     pure (Project.assets ctx / "compose.json")
   else pure (ctx.root / "compose.yaml")
 
@@ -78,6 +79,12 @@ private def Context.startServices (ctx : Context) (verbose : Bool) : Cli Unit :=
   ctx.dockerLogged "services" "Starting blob storage"
     (#["compose", "-p", ctx.project, "-f", (← ctx.composeFile).toString,
       "--ansi", "never", "up", "-d", "--wait", "--no-build", "blobs"]) verbose
+  let containers ← docker #["ps", "-aq", "--filter", "label=com.docker.compose.project=" ++ ctx.project,
+    "--filter", "label=com.docker.compose.service=blobs"]
+  let [container] := containers.stdout.trimAscii.toString.splitOn "\n" | throw "Expected one blob-service container"
+  unless !container.isEmpty do throw "Blob-service container is missing"
+  let image ← docker #["inspect", "--format", "{{.Image}}", container]
+  saveJson (ctx.home / "blob-image.json") image.stdout.trimAscii.toString
 
 private def Context.checkVolumes (ctx : Context) (workers : Nat) : Cli Unit := do
   for volume in deploymentVolumes workers do
@@ -161,6 +168,8 @@ private def Context.saveTimings (ctx : Context) : Cli Unit := do
 
 private def Context.startNodes (ctx : Context) (deployment : Deployment) : Cli Unit := do
   let image := deployment.image
+  let config ← readJson (α := Json) (← ctx.configFile)
+  let limits : ExecutionConfig ← liftExcept (jsonFieldD config "worker" {})
   let roles := #["scheduler"] ++ workerNames deployment.workers
   let retained := #["scheduler"] ++ workerNames deployment.retainedCount
   let layout ← docker #["image", "inspect", image, "--format", "{{index .Config.Labels \"lean-cloud.node\"}}"]
@@ -182,7 +191,14 @@ private def Context.startNodes (ctx : Context) (deployment : Deployment) : Cli U
         throw s!"Container {name} is not a node of this deployment"
       existingNodes := existingNodes.push name
       replacing := replacing || (row.getObjValAs? String "Image").toOption != some image
-  -- Never leave workers with the old code consuming the new pool's assignments.
+      let nodeConfig := Project.assets ctx / s!"node-{role}.json"
+      -- Old nodes without a saved config used the original default limits.
+      let oldLimits : ExecutionConfig ← if ← request (.exists nodeConfig) then
+          liftExcept (jsonFieldD (← readJson nodeConfig) "worker" {})
+        else pure {}
+      replacing := replacing || oldLimits != limits
+  -- Replace the whole pool together when code or execution limits change.
+  -- Scheduler recovery fences the stopped attempts before root reconstruction.
   if replacing && !existingNodes.isEmpty then
     ctx.saveTimings
     discard <| docker (#["stop"] ++ existingNodes)
@@ -294,6 +310,8 @@ def Context.scale (ctx : Context) (count : Nat) : Cli Unit := do
 
 def Context.deploy (ctx : Context) (executable : Option String := none) (verbose := false)
     (workers : Option Nat := none) : Cli Unit := do
+  if ← request (.exists (ctx.home / "restore-incomplete.json")) then
+    throw "Restore is incomplete. Use 'clean', then retry 'restore'."
   Deployments.remember ctx
   request (.createDir ctx.home)
   ctx.withDeploymentLock do
@@ -304,15 +322,25 @@ def Context.deploy (ctx : Context) (executable : Option String := none) (verbose
     let count := workers.getD (app.map (·.workers) |>.getD (previous.map (·.workers) |>.getD defaultWorkerCount))
     let oldConfig ← if ← request (.exists (← ctx.configFile)) then
         readJson (α := Json) (← ctx.configFile) else pure Project.defaultConfig
+    let oldConfig := match app with
+      | some app => oldConfig.setObjVal! "worker" (toJson app.worker)
+      | none => oldConfig
     let config ← liftExcept (Project.runtimeConfig oldConfig (max count (previous.map (·.retainedCount) |>.getD 0)))
     if let some executable := executable then
-      let app : Project.App := { name := ctx.project, executable, workers := count }
+      let app : Project.App := {
+        name := ctx.project, executable, workers := count
+        worker := (app.map (·.worker)).getD {} }
       unless !executable.isEmpty && executable.toList.all (fun c =>
           c.toNat < 128 && (c.isAlphanum || c == '_')) do throw "Invalid Lake executable target"
       saveJson (Project.manifest ctx.root) app
     if ← request (.exists (Project.manifest ctx.root)) then Project.prepare ctx (some count) false
-    else unless ← request (.exists (ctx.root / "compose.yaml")) do
-      throw "Use 'init DIRECTORY' for a new app, or 'deploy EXECUTABLE' for an existing app"
+    else
+      unless ← request (.exists (ctx.root / "compose.yaml")) do
+        throw "Use 'init DIRECTORY' for a new app, or 'deploy EXECUTABLE' for an existing app"
+      -- A restored stack has a minimal Compose file for starting its saved
+      -- blobs. A fresh source build uses the project's original definition.
+      if ← request (.exists (Project.assets ctx / "compose.json")) then
+        request (.removeTree (Project.assets ctx / "compose.json"))
     let buildTag := ctx.project ++ "-app:build"
     let overlay := ctx.home / "build.json"
     saveJson overlay (Json.mkObj [("services", Json.mkObj [("worker", Json.mkObj [("image", toJson buildTag)])])])
@@ -356,6 +384,8 @@ def Context.deploy (ctx : Context) (executable : Option String := none) (verbose
 
 /-- Start existing services without rebuilding or silently replacing lost durable volumes. -/
 def Context.up (ctx : Context) (verbose := false) : Cli Unit := do
+  if ← request (.exists (ctx.home / "restore-incomplete.json")) then
+    throw "Restore is incomplete. Use 'clean', then retry 'restore'."
   discard ctx.deployment
   Deployments.remember ctx
   ctx.withDeploymentLock do
@@ -364,7 +394,7 @@ def Context.up (ctx : Context) (verbose := false) : Cli Unit := do
     unless ← request (.exists (← ctx.configFile)) do throw "Runtime configuration is missing; use 'doctor'"
     discard <| docker #["image", "inspect", deployment.image, "--format", "{{.Id}}"]
     ctx.checkVolumes deployment.retainedCount
-    let config ← readJson (α := Json) (← ctx.configFile)
+    let config ← liftExcept (Project.runtimeConfig (← readJson (← ctx.configFile)) deployment.retainedCount)
     request (.createDir (Project.assets ctx))
     saveJson (Project.assets ctx / "config.json") config
     ctx.startServices verbose

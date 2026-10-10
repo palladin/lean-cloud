@@ -41,6 +41,15 @@ def commands : Array Command := #[
   { name := "clean", summary := "Permanently remove the selected deployment and its data."
     details := "Stops and removes its containers, networks, storage volumes, application image tags, local history, generated deployment files, and catalog entry. This deletes all workflows, results, replay records, and locally hosted blobs.\nYour Lean project and shared Docker images/build cache remain. External storage services are not deleted. Retired worker volumes are included. Failed cleanup can be retried with the same command; no readable deployment manifest is required."
     examples := #["use my-app", "clean"] },
+  { name := "remove", arguments := "RUN", summary := "Remove a finished run and its replay records."
+    details := "Only completed, failed, or killed runs can be removed after finalization. User blobs and other runs are preserved. The ID remains reserved so late messages cannot recreate the run. Requires the scheduler and a worker; retry the same command after interrupted cleanup."
+    examples := #["remove example-1"] },
+  { name := "backup", arguments := "DIRECTORY", summary := "Back up a stopped local deployment."
+    details := "Run 'down' first. Saves exact application/blob images, all retained volumes, configuration and run manifests. The destination must be new and outside the deployment directory. The deployment remains stopped. Backups contain credentials and user data. External blob services are not included."
+    examples := #["down", "backup /backups/my-app-01", "up"] },
+  { name := "restore", arguments := "DIRECTORY", summary := "Restore a backup into fresh local storage."
+    details := "Verifies format and archive checksums before importing. Selects the saved deployment name in the current directory; existing deployment files, volumes and containers are never overwritten. Run 'up' afterward. Interrupted imports remain stopped; use 'clean', then retry 'restore'."
+    examples := #["restore /backups/my-app-01", "up"] },
   { name := "deployments", summary := "List known deployments, including stopped ones."
     details := "Shows the selected deployment, directories, and observed service state."
     examples := #["deployments"] },

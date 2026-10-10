@@ -1,5 +1,26 @@
 # Tests
 
+Size-controlled stress checks run with the normal model suite. The larger
+benchmark compares Direct, SequentialReplay, ParallelReplay and restarting
+parallel replay for 1,024 children, 48 nested forks and 4,096 recorded commands.
+Every branch is interrupted before a read and after its committed return. A
+32-run Pool workload also interleaves faults and administration on three workers.
+
+```sh
+lake exe cloud_stress_tests
+lake exe cloud_console_tests --stress-only
+```
+
+The first command emits JSON measurements: elapsed milliseconds, record counts,
+reads, creates and exercised crashes. CI saves these alongside `/usr/bin/time -v`
+peak process memory/CPU measurements. On macOS, use `/usr/bin/time -l` instead.
+Timings are observations, not pass/fail thresholds; zero milliseconds means less
+than the clock's resolution. These pure journal timings do not predict network
+throughput. The second command runs 15 workflows through the actual HTTP/SQLite/S3
+deployment, compares all outcomes with Direct, saves `stress-results.json` under
+its isolated deployment directory, and removes its containers afterward. It is
+opt-in so the ordinary CI recovery suites keep their time budget.
+
 ```sh
 lake test
 lake exe lean_cloud_tests --list
@@ -181,6 +202,10 @@ process recovery, and deployment behavior are checked by executable tests.
 Inbox properties compare real SQLite with `MailboxModel` over 32 generated traces
 of 200 operations. They also check SIGKILL recovery, termination signals, HTTP
 authentication, lease expiry and renewal, and rejection of stale consumers.
+Version tests reject future SQLite schemas without deleting committed mail, and
+send legacy and future requests through the real HTTP server. Unsupported requests
+must leave the inbox unchanged. Model tests check optional configuration defaults,
+bounded retry delays, versioned result envelopes, and future-format rejection.
 The native suite also runs the real Pool scheduler over HTTP and SQLite: busy
 work retains its assignment, pause revokes it, failed computations stop renewing,
 and stale heartbeats cannot renew replacement attempts. A two-worker scheduler
@@ -208,6 +233,15 @@ The native inbox suite checks confirmed publications across SIGKILL separately.
 Container tests exercise actual mailbox transport, multiple worker processes, and
 restarts of combined HTTP/SQLite/actor nodes. Chaos plans are generated before
 execution and recorded with logs; the seed reproduces the plan, not OS timing.
+
+Run removal tests cover terminal-only admission, durable ID tombstones, late
+messages, retry after partial cleanup, and preservation of neighboring runs and
+shared user blobs. The real S3 adapter deletes a run with more than one listing
+page. Backup model tests reject changing deployments, existing destinations,
+corrupt archives, invalid paths, and unsupported versions before importing.
+The `--maintenance-only` console suite exercises these commands through the
+compiled CLI with real images and volumes, including a paused workflow that
+resumes after restore. Its logs are retained with the other CLI command logs.
 
 Console tests cover pause/resume and permanent kill, including interrupted
 commands, restart policies, and isolation between runs. Real runtime tests check

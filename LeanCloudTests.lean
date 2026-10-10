@@ -21,10 +21,13 @@ import LeanCloudTests.Help
 import LeanCloudTests.Pool
 import LeanCloudTests.PoolModel
 import LeanCloudTests.Source
+import LeanCloudTests.Stress
+import LeanCloudTests.ExecutionConfig
+import LeanCloudTests.Backup
 
 namespace LeanCloudTests
 
 def allCases : Array TestCase := codecCases ++ mailboxCases ++ coordinationCases ++ simulationBoundaryCases ++
-  crashBoundaryCases ++ generatedCases ++ compositionCases ++ blobFailureCases ++ replayDriverCases ++ RestartingReplay.cases ++ replayCases ++ consoleCases ++ BranchTree.cases ++ Timing.cases ++ styledCases ++ consoleEffectCases ++ shellCases ++ projectCases ++ deploymentCommandCases ++ Clean.cases ++ streamingCases ++ processLoggingCases ++ topCases ++ helpCases ++ poolCases ++ PoolModel.cases ++ Source.cases
+  crashBoundaryCases ++ generatedCases ++ compositionCases ++ blobFailureCases ++ replayDriverCases ++ RestartingReplay.cases ++ replayCases ++ consoleCases ++ BranchTree.cases ++ Timing.cases ++ styledCases ++ consoleEffectCases ++ shellCases ++ projectCases ++ deploymentCommandCases ++ Clean.cases ++ streamingCases ++ processLoggingCases ++ topCases ++ helpCases ++ poolCases ++ PoolModel.cases ++ Source.cases ++ Stress.cases ++ ExecutionConfig.cases ++ Backup.cases
 
 end LeanCloudTests

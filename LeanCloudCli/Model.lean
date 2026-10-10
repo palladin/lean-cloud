@@ -2,6 +2,7 @@ import LeanCloudCli.Effects
 import LeanCloud.Program
 import LeanCloud.Scheduler
 import LeanCloud.Telemetry
+import LeanCloud.Version
 
 namespace LeanCloudCli
 open Lean LeanCloud
@@ -25,6 +26,16 @@ def deploymentVolumes (workers := defaultWorkerCount) : Array String :=
   #["scheduler-data", "blob-data", "scheduler-mailbox-data"] ++
     (workerNames workers).map (· ++ "-mailbox-data")
 
+/-- Include retired workers even when their deployment manifest is missing. -/
+def isDeploymentVolume (project name : String) : Bool :=
+  let start := project ++ "_"
+  if !name.startsWith start then false else
+    let localName := name.drop start.length |>.toString
+    if ["scheduler-data", "scheduler-mailbox-data", "blob-data"].contains localName then true else
+      match localName.splitOn "-mailbox-data" with
+      | [worker, ""] => (workerIndex? worker).isSome
+      | _ => false
+
 /-- Defaults apply to absent fields, never to malformed values. -/
 def jsonFieldD [FromJson α] (json : Json) (field : String) (fallback : α) : Except String α :=
   match json.getObjVal? field with
@@ -38,10 +49,16 @@ structure Deployment where
   workers : Nat := defaultWorkerCount
   /-- Retired mailbox volumes remain durable and may be reused on a later grow. -/
   retainedWorkers : Nat := 0
-  deriving ToJson
+
+instance : ToJson Deployment where
+  toJson value := Version.stamp "formatVersion" (Json.mkObj [
+    ("project", toJson value.project), ("image", toJson value.image),
+    ("programs", toJson value.programs), ("workers", toJson value.workers),
+    ("retainedWorkers", toJson value.retainedWorkers)])
 
 instance : FromJson Deployment where
   fromJson? json := do
+    Version.check "formatVersion" "deployment" json
     return {
       project := ← json.getObjValAs? String "project"
       image := ← json.getObjValAs? String "image"
@@ -59,10 +76,15 @@ structure Run where
   input : Json
   /-- Initial pool size; recorded events extend the roster when workers join. -/
   workers : Nat := defaultWorkerCount
-  deriving ToJson
+
+instance : ToJson Run where
+  toJson value := Version.stamp "formatVersion" (Json.mkObj [
+    ("id", toJson value.id), ("image", toJson value.image), ("program", toJson value.program),
+    ("input", value.input), ("workers", toJson value.workers)])
 
 instance : FromJson Run where
   fromJson? json := do
+    Version.check "formatVersion" "run manifest" json
     return {
       id := ← json.getObjValAs? String "id"
       image := ← json.getObjValAs? String "image"

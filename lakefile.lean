@@ -54,3 +54,6 @@ lean_exe cloud_console_tests where
 
 lean_exe cloud_process_tests where
   root := `LeanCloudTests.ProcessRuntime
+
+lean_exe cloud_stress_tests where
+  root := `LeanCloudTests.StressMain

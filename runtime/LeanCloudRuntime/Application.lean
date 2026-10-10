@@ -20,6 +20,8 @@ inductive Service : Type → Type where
   | cancel (config : Config) (run : String) : Service (Option Exit)
   | status (config : Config) (run : String) : Service Timing.Status
   | readText (config : Config) (ref : BlobRef) : Service String
+  | remove (config : Config) (run : String) : Service Unit
+  | purge (config : Config) (run : String) : Service Unit
 
 inductive Runtime : Effect where
   | request (service : Service α) : Runtime (Except String α)
@@ -45,8 +47,7 @@ def run (registry : Registry) (args : List String) : App UInt32 := do
       pure 0
     | [command, path] =>
       let config : Config ← liftExcept (Json.parse (← host (.readFile path)) >>= fromJson?)
-      liftExcept config.mailboxes.validate
-      unless config.scheduler.assignmentMs > 0 do throw "Assignment timeout must be positive"
+      liftExcept config.validate
       match command with
       | "pool-health" => service (.health config); pure 0
       | "pool-configure" =>
@@ -61,8 +62,7 @@ def run (registry : Registry) (args : List String) : App UInt32 := do
     | command :: path :: id :: rest =>
       unless LeanCloudCli.validId id do throw "Invalid run ID"
       let config : Config ← liftExcept (Json.parse (← host (.readFile path)) >>= fromJson?)
-      liftExcept config.mailboxes.validate
-      unless config.scheduler.assignmentMs > 0 do throw "Assignment timeout must be positive"
+      liftExcept config.validate
       match command, rest with
       | "pool-stopped", [generation] =>
         let some generation := generation.toNat? | throw "Expected membership generation"
@@ -93,6 +93,8 @@ def run (registry : Registry) (args : List String) : App UInt32 := do
       | "status", [] => say (toJson (← service (.status config id))).compress; pure 0
       | "outcome", [] => say (toJson (← service (.outcome config id))).compress; pure 0
       | "cancel", [] => say (toJson (← service (.cancel config id))).compress; pure 0
+      | "remove", [] => service (.remove config id); pure 0
+      | "purge-run", [] => service (.purge config id); pure 0
       | "result", [] =>
         match ← service (.outcome config id) with
         | none => say "pending"; pure 2
@@ -127,6 +129,8 @@ partial def runWith [Monad m]
 
 private def handle (registry : Registry) (prepare : Config → String → Json → IO Unit) : Service α → IO α
   | .submit config id entry input => do
+    let removed : Bool ← IO.ofExcept (fromJson? (← Pool.request config (.removed id)))
+    if removed then throw (IO.userError "Run was removed; use a new run ID")
     S3.initializeBucket config.blobs
     prepare config entry input
     registry.submit config id entry input
@@ -146,6 +150,26 @@ private def handle (registry : Registry) (prepare : Config → String → Json �
     discard (Pool.request config (.kill id))
     completed config id
   | .status config id => Pool.observation config id
+  | .purge config id => do
+    let removed : Bool ← IO.ofExcept (fromJson? (← Pool.request config (.removed id)))
+    unless removed do throw (IO.userError "Run has not been retired; refusing to delete records")
+    S3.removeRun config.blobs id
+  | .remove config id => do
+    discard <| Pool.request config (.remove id)
+    let membership ← Pool.request config .workers
+    let routes : Array HttpMailbox.WorkerEndpoint ← IO.ofExcept (membership.getObjValAs? _ "routes")
+    let mut lastError := "No workers available. Add a worker, then retry removal."
+    for route in routes do
+      try
+        let body := Json.mkObj [("args", toJson #["purge-run", "config", id]), ("input", Json.null)]
+        let response ← LeanCloudCli.Http.post s!"http://{route.endpoint.host}:{route.endpoint.port}/app"
+          route.endpoint.token body.compress
+        let result : Except String Json ← IO.ofExcept (Json.parse response >>= fromJson?)
+        let output : ProcessOutput ← IO.ofExcept (result >>= fromJson?)
+        unless output.exitCode == 0 do throw (IO.userError (output.stderr ++ output.stdout))
+        return
+      catch error => lastError := error.toString
+    throw (IO.userError s!"Run retired; record cleanup incomplete. Retry removal. {lastError}")
   | .readText config ref => do
     let bytes ← match ← (S3.readBytes config.blobs ref).run with
       | .ok bytes => pure bytes
@@ -161,13 +185,13 @@ private def handleService (registry : Registry) (prepare : Config → String →
 /-- HTTP exposes the same effect program as the executable, with a restricted
 host interpreter: no filesystem paths or executable commands from the caller. -/
 def api (registry : Registry) (config : Config) (prepare : Config → String → Json → IO Unit)
-    (json : Json) : IO Json := do
+    (json : Json) (worker := false) : IO Json := do
   let args ← IO.ofExcept (json.getObjValAs? (Array String) "args")
   let input ← IO.ofExcept (json.getObjValAs? (Option String) "input")
-  let allowed := match args.toList with
+  let allowed := if worker then args.toList matches ["purge-run", _, _] else match args.toList with
     | ["programs"] | ["validate", _] => true
     | [command, _] => ["pool-health", "pool-configure", "pool-workers"].contains command
-    | [command, _, _] => ["pause", "resume", "status", "outcome", "result", "cancel"].contains command
+    | [command, _, _] => ["pause", "resume", "status", "outcome", "result", "cancel", "remove"].contains command
     | ["pool-stopped", _, _, _] | ["submit-entry", _, _, _, "-"] => true
     | _ => false
   unless allowed do throw (IO.userError "Unsupported HTTP application command")
@@ -201,8 +225,7 @@ def main (registry : Registry) (args : List String)
       let config ← Config.load path
       let endpoint ← if command == "serve-worker" then IO.ofExcept (config.mailboxes.worker (← workerId))
         else pure config.mailboxes.scheduler
-      let api := if command == "serve-scheduler" then api registry config prepare
-        else fun _ => throw (IO.userError "Application commands belong to the scheduler")
+      let api := fun json => api registry config prepare json (worker := command == "serve-worker")
       let database := (← IO.getEnv "CLOUD_INBOX_DATABASE").getD "/mailbox/inbox.sqlite"
       HttpMailbox.withServer endpoint database api execute (handleSignals := true)
     else execute

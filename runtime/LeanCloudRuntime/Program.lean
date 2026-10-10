@@ -8,18 +8,18 @@ open Lean LeanCloud
 structure RegisteredProgram where
   info : ProgramInfo
   validate : Json → Except String Unit
-  execute : RunDefinition → String → Worker.ObservedStore IO → BlobStorage IO → Trace.Sink → Assignment → IO Report
+  execute : ExecutionConfig → RunDefinition → String → Worker.ObservedStore IO → BlobStorage IO → Trace.Sink → Assignment → IO Report
 
 def registerProgram [Codec ι] [Codec α] (program : LeanCloud.CloudProgram ι α)
     (sources : Array ProgramSource := by exact cloud_sources%) : RegisteredProgram where
   info := { program.info with sources }
   validate input := (Codec.decode (α := ι) input).map (fun _ => ())
-  execute definition worker records blobs trace assignment := do
+  execute limits definition worker records blobs trace assignment := do
     unless definition.entry == program.info.entry && definition.resultSchema == program.info.resultSchema do
       throw (IO.userError "Deployed program/codec does not match the submitted run")
     let input ← IO.ofExcept (Codec.decode (α := ι) definition.input)
-    Worker.execute worker records blobs 100000
-      (fun input => trace.instrument 100000 (program.run input)) input assignment (some trace.visit)
+    Worker.execute worker records blobs limits.interpreterFuel
+      (fun input => trace.instrument limits.interpreterFuel (program.run input)) input assignment (some trace.visit)
 
 structure Registry where
   programs : Array RegisteredProgram
@@ -48,6 +48,7 @@ def Registry.submit (registry : Registry) (config : Config) (run entry : String)
   IO.ofExcept registry.validate
   let program ← IO.ofExcept (registry.find entry)
   IO.ofExcept (program.validate input)
+  if ← S3.isRemoved config.blobs run then throw (IO.userError "Run was removed; use a new run ID")
   LeanCloudRuntime.submit config run ⟨entry, input, program.info.resultSchema⟩
 
 /-- Retry one inbox assignment locally. Transport failures never become Cloud
@@ -56,6 +57,8 @@ returns only after the active attempt and its heartbeat task have stopped. -/
 private def executeAssignment (registry : Registry) (config : Config) (id run : String)
     (assignment : Assignment) (finalize : Option Exit := none) : IO Unit := do
   let trace ← Trace.create id run
+  trace.assign assignment
+  let mut retries := 0
   repeat
     let revoked ← IO.mkRef false
     try
@@ -67,7 +70,6 @@ private def executeAssignment (registry : Registry) (config : Config) (id run : 
             revoked.set true
             throw (IO.userError "Assignment revoked")
         check
-        trace.assign assignment
         if finalize.isSome then S3.initializeBucket config.blobs
         let records := trace.records (S3.records config.blobs run)
         let guarded : ReplayStore IO := {
@@ -79,7 +81,7 @@ private def executeAssignment (registry : Registry) (config : Config) (id run : 
           | none => do
             let definition ← loadRun config run
             let program ← IO.ofExcept (registry.find definition.entry)
-            program.execute definition id observed (trace.blobs (S3.storage config.blobs)) trace assignment
+            program.execute config.worker definition id observed (trace.blobs (S3.storage config.blobs)) trace assignment
         match report.progress with
         | .ok (.fork ..) => trace.emit "suspended" ""
         | .ok .done => trace.emit (if finalize.isSome then "sealed" else "returned") ""
@@ -90,8 +92,11 @@ private def executeAssignment (registry : Registry) (config : Config) (id run : 
       if ← revoked.get then
         trace.emit "revoked" ""
         break
-      IO.eprintln s!"worker {id}: {error}; retrying assignment locally"
-      IO.sleep 500
+      let wait := config.worker.retryWaitMs retries
+      retries := retries + 1
+      trace.emit "retrying" s!"retry {retries}; waiting {wait} ms"
+      IO.eprintln s!"worker {id}: {error}; local retry {retries} in {wait} ms"
+      IO.sleep wait
   trace.emit "idle" ""
 
 /-- One serial inbox loop serves every registered workflow. A cancellation reply

@@ -1,5 +1,6 @@
 import LeanCloudRuntime.HttpMailbox
 import LeanCloudRuntime.S3
+import LeanCloud.ExecutionConfig
 
 namespace LeanCloudRuntime
 open Lean LeanCloud
@@ -13,12 +14,34 @@ structure Config where
   mailboxes : HttpMailbox.Mailboxes
   scheduler : SchedulerConfig
   blobs : S3.Config
-  deriving FromJson, ToJson
+  worker : ExecutionConfig := {}
+
+instance : ToJson Config where
+  toJson value := Version.stamp "formatVersion" (Json.mkObj [
+    ("mailboxes", toJson value.mailboxes), ("scheduler", toJson value.scheduler),
+    ("blobs", toJson value.blobs), ("worker", toJson value.worker)])
+
+instance : FromJson Config where
+  fromJson? json := do
+    Version.check "formatVersion" "runtime configuration" json
+    let object ← json.getObj?
+    let worker ← match object["worker"]? with
+      | none => pure ({} : ExecutionConfig)
+      | some value => fromJson? value
+    return {
+      mailboxes := ← json.getObjValAs? _ "mailboxes"
+      scheduler := ← json.getObjValAs? _ "scheduler"
+      blobs := ← json.getObjValAs? _ "blobs"
+      worker }
+
+def Config.validate (config : Config) : Except String Unit := do
+  config.mailboxes.validate
+  unless config.scheduler.assignmentMs > 0 do throw "Assignment timeout must be positive"
+  config.worker.validate
 
 def Config.load (path : System.FilePath) : IO Config := do
   let config ← IO.ofExcept (Json.parse (← IO.FS.readFile path) >>= fromJson? (α := Config))
-  IO.ofExcept config.mailboxes.validate
-  unless config.scheduler.assignmentMs > 0 do throw (IO.userError "Assignment timeout must be positive")
+  IO.ofExcept config.validate
   return config
 
 structure RunDefinition where

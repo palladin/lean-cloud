@@ -164,17 +164,21 @@ instance : Std.Http.Server.Handler ServerHandler where
       return ← Response.new |>.status .unauthorized |>.text "Unauthorized"
     unless request.line.method == .post do
       return ← Response.new |>.status .methodNotAllowed |>.text "Expected POST"
-    let result : Except String Json ← try
+    let response ← try
       let text : String ← request.body.readAll (maximumSize := some (8 * 1024 * 1024))
       let json ← IO.ofExcept (Json.parse text)
-      match (toString request.line.uri.path) with
-      | "/mailbox" =>
-        let command ← IO.ofExcept (fromJson? json)
-        pure (.ok (← Inbox.apply handler.store (← IO.monoMsNow) command))
-      | "/app" => pure (.ok (← handler.api json))
-      | _ => pure (.error "Unknown endpoint")
-    catch error => pure (.error error.toString)
-    Response.ok |>.json (toJson result).compress
+      let result : Except String Json ← try
+        IO.ofExcept (LeanCloud.Version.check "protocolVersion" "HTTP protocol" json)
+        match (toString request.line.uri.path) with
+        | "/mailbox" =>
+          let command ← IO.ofExcept (fromJson? json)
+          pure (.ok (← Inbox.apply handler.store (← IO.monoMsNow) command))
+        | "/app" => pure (.ok (← handler.api json))
+        | _ => pure (.error "Unknown endpoint")
+      catch error => pure (.error error.toString)
+      pure (LeanCloud.Version.response json (toJson result))
+    catch error => pure (toJson (Except.error (α := Json) error.toString))
+    Response.ok |>.json response.compress
 
 /-- The HTTP server and actor live in this same process. Durable queue rows
 survive a process crash; volatile consumer reservations do not. -/

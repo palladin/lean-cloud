@@ -84,7 +84,8 @@ def candidates (catalog : Catalog) (ctx : Context) : Array Item :=
         command.aliases.map fun name => Item.mk name s!"Alias for {command.name}")
     | ["run"] => catalog.programs
     | ["use"] => catalog.deployments
-    | ["inspect"] | ["result"] | ["watch"] | ["logs"] | ["resume"] | ["pause"] | ["kill"] => catalog.runs
+    | ["inspect"] | ["result"] | ["watch"] | ["logs"] | ["resume"] | ["pause"] | ["kill"] | ["remove"] => catalog.runs
+    | ["backup"] | ["restore"] => catalog.files
     | ["logs", _] => catalog.actors
     | ["watch", _] => #[⟨"--once", "Print one frame"⟩]
     | ["top"] => #[⟨"--once", "Print a snapshot of all workers and schedulers"⟩]
@@ -111,7 +112,8 @@ def candidates (catalog : Catalog) (ctx : Context) : Array Item :=
 /-- File candidates follow the typed directory, including quoted paths. -/
 def refreshFiles (ctx : LeanCloudCli.Context) (catalog : Catalog) (line : String) (cursor : Nat) : Cli Catalog := do
   let part := context line cursor
-  unless part.before[0]? == some "run" && part.before.back? == some "--input" do return catalog
+  unless (part.before[0]? == some "run" && part.before.back? == some "--input") ||
+      part.before == #["backup"] || part.before == #["restore"] do return catalog
   let parent := String.intercalate "/" (part.fragment.splitOn "/").dropLast
   let directory := if (part.fragment.splitOn "/").length > 1 then parent ++ "/" else ""
   let path : System.FilePath := if directory == "/" then "/" else if parent.isEmpty then ctx.root else ctx.root / parent

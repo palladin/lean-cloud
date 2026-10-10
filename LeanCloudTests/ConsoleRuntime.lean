@@ -418,8 +418,91 @@ def commandLifecycle : Cli Unit := do
     cleanup ctx
     discard <| docker #["volume", "rm", retired] false
 
+/-- Exercise maintenance through the shipped CLI, including stopped SQLite and
+blob volumes. No source rebuild is used between backup and restored execution. -/
+def maintenance : Cli Unit := do
+  let root ← request (.realPath (← request .currentDir))
+  let ctx : Context := ⟨root, s!"lean-cloud-maintenance-test-{← request .pid}"⟩
+  isolate ctx
+  let archive := root / ".lean-cloud" / s!"maintenance-backup-{← request .pid}"
+  let result ← observing do
+    discard <| cliCommand ctx #["deploy", "--workers", "0"]
+    discard <| cliCommand ctx #["scale", "1"]
+    let originalNodes ← poolNodes ctx
+    let configFile ← ctx.configFile
+    let config : Json ← readJson configFile
+    saveJson configFile (config.setObjVal! "worker" (toJson ({ interpreterFuel := 1 } : ExecutionConfig)))
+    discard <| cliCommand ctx #["deploy"]
+    require ((← poolNodes ctx) != originalNodes) "Changed limits reused the old nodes"
+    discard <| cliCommand ctx #["run", "sum-squares", "--id", "limited"]
+    let limited ← awaitOutcome ctx (← ctx.loadRun "limited") ((← request .now) + 90000)
+    require (match limited with
+      | .failure error => error.kind == .protocol && error.message == "Interpreter fuel exhausted"
+      | _ => false) "New interpreter fuel was not applied by redeploy"
+    saveJson configFile config
+    discard <| cliCommand ctx #["deploy"]
+    let nodes ← poolNodes ctx
+    for id in #["keep", "drop"] do
+      discard <| cliCommand ctx #["run", "sum-squares", "--id", id]
+      waitFor ctx (← ctx.loadRun id) 55
+    discard <| cliCommand ctx #["remove", "drop"]
+    require (!(← request (.exists (ctx.directory "drop")))) "Removal retained the local manifest"
+    require ((← poolNodes ctx) == nodes) "Removal replaced shared nodes"
+    waitFor ctx (← ctx.loadRun "keep") 55
+    let rejected ← cliCommand ctx #["run", "sum-squares", "--id", "drop"] false
+    require (rejected.exitCode != 0) "Removed ID was reused"
+    discard <| cliCommand ctx #["remove", "drop"]
+    let deployment ← ctx.deployment
+    let some logs := deployment.programs.find? (·.entry == "log-summary/v1") | throw "Missing log example"
+    let some input := logs.sampleInput | throw "Missing log input"
+    let inputFile := ctx.home / "pause-input.json"
+    saveJson inputFile (input.setObjVal! "pauseMs" (toJson (3000 : Nat)))
+    discard <| cliCommand ctx #["run", "log-summary", "--input", inputFile.toString, "--id", "paused"]
+    discard <| cliCommand ctx #["pause", "paused"]
+    let refused ← cliCommand ctx #["remove", "paused"] false
+    require (refused.exitCode != 0) "Removal accepted a nonterminal run"
+    let liveBackup ← cliCommand ctx #["backup", archive.toString] false
+    require (liveBackup.exitCode != 0 && !(← request (.exists archive))) "Backup accepted changing volumes"
+    discard <| cliCommand ctx #["down"]
+    discard <| cliCommand ctx #["backup", archive.toString]
+    discard <| cliCommand ctx #["clean"]
+    require (!(← request (.exists ctx.home))) "Clean did not remove the original deployment"
+    let retired := ctx.project ++ "_worker99-mailbox-data"
+    discard <| docker #["volume", "create", retired]
+    let occupied ← cliCommand ctx #["restore", archive.toString] false
+    require (occupied.exitCode != 0) "Restore accepted an old retired-worker volume"
+    discard <| docker #["volume", "rm", retired]
+    discard <| cliCommand ctx #["restore", archive.toString]
+    let second ← cliCommand ctx #["restore", archive.toString] false
+    require (second.exitCode != 0) "Restore overwrote existing data"
+    -- A partial import may never launch a node.
+    saveJson (ctx.home / "restore-incomplete.json") true
+    let incomplete ← cliCommand ctx #["up"] false
+    require (incomplete.exitCode != 0) "Incomplete restore started nodes"
+    request (.removeTree (ctx.home / "restore-incomplete.json"))
+    discard <| cliCommand ctx #["up"]
+    waitFor ctx (← ctx.loadRun "keep") 55
+    require ((← ctx.control "paused") == .paused) "Restore lost pause intent"
+    let paused ← ctx.loadRun "paused"
+    require (← ctx.outcome paused).isNone "Restore resumed a paused run"
+    let reused ← cliCommand ctx #["run", "sum-squares", "--id", "drop"] false
+    require (reused.exitCode != 0) "Restore lost the removed-ID tombstone"
+    discard <| cliCommand ctx #["remove", "drop"]
+    discard <| cliCommand ctx #["resume", "paused"]
+    discard <| awaitOutcome ctx paused ((← request .now) + 120000)
+    require ((← ctx.remote paused "result") == "files=16, errors=24") "Restored workflow or user blobs changed"
+    printLine "CLI maintenance passed: remove → down → backup → clean → restore → up → resume."
+  if result.toOption.isNone then captureFailure ctx
+  cleanup ctx
+  match result with
+  | .ok () => request (.removeTree archive)
+  | .error error =>
+    printLine s!"Maintenance diagnostics retained; any completed backup is at {archive}"
+    throw error
+
 def run : Cli Unit := do
   commandLifecycle
+  maintenance
   demo
   scaling
   poolChaos
@@ -433,13 +516,15 @@ def main (args : List String) : IO UInt32 := do
     | ["--pool-only"] => LeanCloudTests.ConsoleRuntime.demo
     | ["--scaling-only"] => LeanCloudTests.ConsoleRuntime.scaling
     | ["--chaos-only"] => LeanCloudTests.ConsoleRuntime.poolChaos
+    | ["--stress-only"] => LeanCloudTests.ConsoleRuntime.poolStress
+    | ["--maintenance-only"] => LeanCloudTests.ConsoleRuntime.maintenance
     | ["--prepare-chaos-image"] => LeanCloudTests.ConsoleRuntime.prepareChaosImage
     | ["--chaos-only", "--seed", seed] => do
       let some seed := seed.toNat? | throw "--seed requires a natural number"
       LeanCloudTests.ConsoleRuntime.poolChaos seed
     | ["--app-only"] => LeanCloudTests.ConsoleRuntime.generatedApp
     | ["--lifecycle-only"] => LeanCloudTests.ConsoleRuntime.commandLifecycle
-    | _ => throw "Usage: cloud_console_tests [--pool-only|--scaling-only|--chaos-only [--seed N]|--prepare-chaos-image|--app-only|--lifecycle-only]"
+    | _ => throw "Usage: cloud_console_tests [--pool-only|--scaling-only|--stress-only|--maintenance-only|--chaos-only [--seed N]|--prepare-chaos-image|--app-only|--lifecycle-only]"
   -- Keep test registrations out of the user's deployment catalog.
   let catalog := (← IO.Process.getCurrentDir) / ".lean-cloud" / s!"console-catalog-test-{← IO.Process.getPID}"
   let result ← LeanCloudCli.withHostIO fun handle =>

@@ -76,6 +76,7 @@ structure Store where
 def create (conn : Sqlite.Conn) (leaseMs := 15000) : IO Store := do
   -- Configuration only; all schema and data operations use typed lean-linq.
   conn.execRaw "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;"
+  LocalDb.ensureVersion conn "inbox"
   conn.createTable messages (primaryKey := [.column "queue", .column "id"])
   conn.createTable counters (primaryKey := [.column "queue"])
   -- A service restart abandons temporary exchanges, but preserves actor mail.

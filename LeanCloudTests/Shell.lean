@@ -36,9 +36,9 @@ def shellCases : Array TestCase := #[
     let start : Shell.State := { line := "r", cursor := 1 }
     let first := Shell.complete {} start
     let second := Shell.complete {} first
-    assertEq first.line "run"
-    assertEq second.line "result"
-    assertEq (Shell.complete {} second true).line "run"
+    assertEq first.line "remove"
+    assertEq second.line "restore"
+    assertEq (Shell.complete {} second true).line "remove"
     let unique := Shell.complete {} { line := "wat", cursor := 3 }
     assertEq unique.line "watch "
     let middle := Shell.complete {} { line := "wat demo", cursor := 2 }

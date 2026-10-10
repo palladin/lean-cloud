@@ -11,7 +11,7 @@ pids=()
 suites=()
 for suite in "$@"; do
   case "$suite" in
-    lifecycle|pool|scaling|chaos) ;;
+    lifecycle|pool|scaling|chaos|maintenance) ;;
     *) echo "Unknown runtime suite: $suite" >&2; exit 1 ;;
   esac
 done

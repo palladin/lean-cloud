@@ -275,10 +275,10 @@ private def event (model : Model) (random : Nat) (allowKill : Bool) : Except Str
     return ("processing window", after)
   | _ => return (s!"advance worker {worker}", ← advance model worker)
 
-private def setup (seed : Nat) : Except String (Array Workflow × Pool.State) := do
+private def setup (seed : Nat) (count : Nat := 3) : Except String (Array Workflow × Pool.State) := do
   let mut workflows : Array Workflow := #[]
   let mut pool : Pool.State := {}
-  for run in [:3] do
+  for run in [:count] do
     let id := s!"run-{run}"
     let generated := (generate (2 + seed % 2) (seed * 17 + run * 71)).1
     let source := Tree.parallel [.effect (seed + run), .parallel [generated, .value (run + 1)]]
@@ -291,21 +291,21 @@ private def setup (seed : Nat) : Except String (Array Workflow × Pool.State) :=
     pool := next
   return (workflows, pool)
 
-private def initial (seed : Nat) : Except String Model :=
-  match setup seed with
+private def initial (seed : Nat) (count : Nat := 3) : Except String Model :=
+  match setup seed count with
   | .error error => .error error
   | .ok (workflows, pool) =>
-    control { pool, workflows, worlds := Array.replicate 3 {} } (.configureWorkers workers)
+    control { pool, workflows, worlds := Array.replicate count {} } (.configureWorkers workers)
 
-private def runSeed (seed : Nat) : Except String PUnit.{2} := do
-  let mut model ← initial seed
+private def runSeed (seed : Nat) (count : Nat := 3) : Except String PUnit.{2} := do
+  let mut model ← initial seed count
   -- First reach a real parallel suspension in every run. Thus every generated
   -- trace starts with children, durable records, and reports to redeliver.
-  for _ in [:100] do
+  for _ in [:100 * count] do
     if model.pool.runs.all (·.scheduler.jobs.size > 1) then break
     model ← progress model
   ensure (model.pool.runs.all (·.scheduler.jobs.size > 1)) "Warmup did not fork every run"
-  ensure (model.delivered.size ≥ 3) "Warmup did not deliver all root reports"
+  ensure (model.delivered.size ≥ count) "Warmup did not deliver all root reports"
   let mut random := seed + 1
   let mut history : Array String := #[]
   for index in [:400] do
@@ -329,14 +329,19 @@ private def runSeed (seed : Nat) : Except String PUnit.{2} := do
     let after := settleOrphan model 0 true
     check model after
     model := after
-  for _ in [:10000] do
+  for _ in [:10000 * count] do
     if model.pool.runs.all (fun run => if run.mode == .killed then run.finalization == .done else run.scheduler.finished) then
       check model model
       return
     model ← progress model
   throw s!"seed={seed}: Pool failed to finish after faults stopped"
 
-def cases : Array TestCase := (Array.range 64).map fun seed =>
+def stress (count : Nat := 32) : IO Unit := do
+  match runSeed 42 count with
+  | .ok _ => pure ()
+  | .error error => throw (IO.userError s!"runs={count}: {error}")
+
+def cases : Array TestCase := #[(⟨"stress/pool/16-runs", stress 16⟩ : TestCase)] ++ (Array.range 64).map fun seed =>
   ⟨s!"pool/model/{seed}", do
     match runSeed seed with
     | .ok _ => pure ()

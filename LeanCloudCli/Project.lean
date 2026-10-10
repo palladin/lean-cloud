@@ -1,4 +1,5 @@
 import LeanCloudCli.Model
+import LeanCloud.ExecutionConfig
 
 namespace LeanCloudCli.Project
 open Lean
@@ -7,6 +8,7 @@ structure App where
   name : String
   executable : String := "cloud_app"
   workers : Nat := defaultWorkerCount
+  worker : LeanCloud.ExecutionConfig := {}
   deriving ToJson
 
 instance : FromJson App where
@@ -14,7 +16,8 @@ instance : FromJson App where
     return {
       name := ← json.getObjValAs? String "name"
       executable := ← jsonFieldD json "executable" "cloud_app"
-      workers := ← jsonFieldD json "workers" defaultWorkerCount }
+      workers := ← jsonFieldD json "workers" defaultWorkerCount
+      worker := ← jsonFieldD json "worker" {} }
 
 def manifest (root : System.FilePath) := root / "lean-cloud.json"
 def localConfig (root : System.FilePath) := root / "lean-cloud.local.json"
@@ -77,6 +80,9 @@ def defaultConfig : Json := Json.parse (include_str "../deploy/config.json") |>.
 /-- Preserve existing routes and credentials; instantiate new mailbox routes
 from the first worker's HTTP endpoint configuration. -/
 def runtimeConfig (config : Json) (workers : Nat) : Except String Json := do
+  LeanCloud.Version.check "formatVersion" "runtime configuration" config
+  let limits : LeanCloud.ExecutionConfig ← jsonFieldD config "worker" {}
+  limits.validate
   let mailboxes ← config.getObjVal? "mailboxes"
   let existing ← mailboxes.getObjValAs? (Array Json) "workers"
   if existing.any (fun route => (route.getObjVal? "broker").isOk) then
@@ -88,7 +94,8 @@ def runtimeConfig (config : Json) (workers : Nat) : Except String Json := do
     (existing.find? (fun route => (route.getObjValAs? String "worker").toOption == some name)).getD
       (Json.mkObj [("worker", toJson name),
         ("endpoint", prototype.setObjVal! "host" (toJson (name ++ "-mailbox")))])
-  return config.setObjVal! "mailboxes" (mailboxes.setObjVal! "workers" (toJson routes))
+  return LeanCloud.Version.stamp "formatVersion"
+    (config.setObjVal! "mailboxes" (mailboxes.setObjVal! "workers" (toJson routes)))
 
 private def sdkCopy : String := "COPY --from=sdk lean-toolchain lakefile.lean lake-manifest.json /opt/lean-cloud/\n" ++
   "COPY --from=sdk runtime/lakefile.lean runtime/lake-manifest.json /opt/lean-cloud/runtime/\n" ++
@@ -158,6 +165,7 @@ def prepare (ctx : Context) (workers : Option Nat := none) (writeConfig := true)
       ("compose.json", (compose ctx app version localSdk).pretty)] do
     request (.writeFile (home / name) text)
   if writeConfig then
-    saveJson (home / "config.json") (← liftExcept (runtimeConfig defaultConfig app.workers))
+    saveJson (home / "config.json") (← liftExcept (runtimeConfig
+      (defaultConfig.setObjVal! "worker" (toJson app.worker)) app.workers))
 
 end LeanCloudCli.Project

@@ -5,6 +5,26 @@ namespace LeanCloudTests
 open Lean LeanCloudCli
 
 def projectCases : Array TestCase := #[
+  ⟨"console.project.reject-future-formats", do
+    let future := Project.defaultConfig.setObjVal! "formatVersion" (toJson (999 : Nat))
+    assertTrue (Project.runtimeConfig future 3).toOption.isNone "Future configuration was rewritten"
+    let deployment : Deployment := ⟨"app", "image", #[], 3, 0⟩
+    assertEq (← unwrap (fromJson? (α := Deployment) (toJson deployment))).project deployment.project
+    assertTrue (fromJson? (α := Deployment)
+      ((toJson deployment).setObjVal! "formatVersion" (toJson (999 : Nat)))).toOption.isNone
+      "Future deployment was accepted"⟩,
+  ⟨"console.project.worker-limits-reach-deployment", do
+    let ctx : Context := ⟨"/work/my-app", "my-app"⟩
+    let app : Project.App := { name := "my-app", worker := ⟨321, 25, 200⟩ }
+    let initial := ({} : ConsoleModel.World).json (Project.manifest ctx.root) app
+      |>.save (ctx.root / "lean-toolchain") "leanprover/lean4:v4.34.1\n"
+    let (result, world) := ConsoleModel.run (Project.prepare ctx) initial
+    discard (unwrap result)
+    let config ← unwrap (Json.parse (world.file (Project.assets ctx / "config.json")).get!)
+    let limits : LeanCloud.ExecutionConfig ← unwrap (config.getObjValAs? _ "worker")
+    assertEq limits app.worker
+    let resized ← unwrap (Project.runtimeConfig config 8)
+    assertEq (← unwrap (resized.getObjValAs? LeanCloud.ExecutionConfig "worker")) app.worker⟩,
   ⟨"console.project.program-source-metadata-compatibility", do
     let legacySource := Json.mkObj [("file", toJson "Old.lean"), ("text", toJson "cloud { return 1 }"),
       ("sites", toJson #[Json.mkObj [("operation", toJson "exec"), ("line", toJson (1 : Nat))]])]
@@ -47,7 +67,7 @@ def projectCases : Array TestCase := #[
           (some s!"worker{i + 1}-mailbox")
       let resized ← unwrap (Project.runtimeConfig config (count + 2))
       assertEq ((← unwrap (resized.getObjVal? "blobs")).compress) ((← unwrap (config.getObjVal? "blobs")).compress)
-      let volumes ← unwrap ((Project.compose ⟨"/work", "app"⟩ ⟨"app", "app", count⟩ "4.34.1" none).getObjVal? "volumes" >>= Json.getObj?)
+      let volumes ← unwrap ((Project.compose ⟨"/work", "app"⟩ { name := "app", executable := "app", workers := count } "4.34.1" none).getObjVal? "volumes" >>= Json.getObj?)
       assertEq volumes.size (count + 3)⟩,
   ⟨"console.project.legacy-default-worker-count", do
     let app : Project.App ← unwrap (fromJson? (Json.mkObj [("name", toJson "app"), ("executable", toJson "app")]))
@@ -63,7 +83,7 @@ def projectCases : Array TestCase := #[
     assertTrue running "Creating an app closed the console"
     assertTrue world.processes.isEmpty "Creating an app started containers"⟩,
   ⟨"console.project.open-selects-app", do
-    let initial := ({ directories := #["/work", "/work/app"] } : ConsoleModel.World).json "/work/app/lean-cloud.json" (Project.App.mk "custom-name" "my_worker" defaultWorkerCount)
+    let initial := ({ directories := #["/work", "/work/app"] } : ConsoleModel.World).json "/work/app/lean-cloud.json" (Project.App.mk "custom-name" "my_worker" defaultWorkerCount {})
     let (result, _) := ConsoleModel.run (dispatch ⟨"/work", "test"⟩ ["open", "app"]) initial
     let (ctx, running) ← unwrap result
     assertEq ctx.root.toString "/work/app"
@@ -100,7 +120,7 @@ def projectCases : Array TestCase := #[
     assertEq after.files world.files⟩,
   ⟨"console.project.generated-services", do
     let ctx : Context := ⟨"/work/my-app", "my-app"⟩
-    let initial := ({} : ConsoleModel.World).json (Project.manifest ctx.root) (Project.App.mk "my-app" "cloud_app" defaultWorkerCount)
+    let initial := ({} : ConsoleModel.World).json (Project.manifest ctx.root) (Project.App.mk "my-app" "cloud_app" defaultWorkerCount {})
       |>.save (ctx.root / "lean-toolchain") "leanprover/lean4:v4.34.1\n"
       |>.save (ctx.root / ".dockerignore") "private-data/\n"
     let (result, world) := ConsoleModel.run (Project.prepare ctx) initial
@@ -121,13 +141,13 @@ def projectCases : Array TestCase := #[
     assertTrue world.processes.isEmpty "Preparing assets started containers"⟩,
   ⟨"console.project.validate-target-before-build", do
     for target in ["../other", "app;touch", "app\nRUN bad", "", "app --help"] do
-      let app : Project.App := ⟨"test", target, defaultWorkerCount⟩
+      let app : Project.App := ⟨"test", target, defaultWorkerCount, {}⟩
       let initial := ({} : ConsoleModel.World).json "/work/lean-cloud.json" app
       let (result, world) := ConsoleModel.run (Project.load "/work") initial
       assertTrue result.toOption.isNone s!"Invalid target accepted: {target}"
       assertTrue world.processes.isEmpty "Invalid target executed a process"⟩,
   ⟨"console.project.name-selects-deployment", do
-    let initial := ({} : ConsoleModel.World).json "/work/lean-cloud.json" (Project.App.mk "my-app" "cloud_app" defaultWorkerCount)
+    let initial := ({} : ConsoleModel.World).json "/work/lean-cloud.json" (Project.App.mk "my-app" "cloud_app" defaultWorkerCount {})
     let (result, world) := ConsoleModel.run (application []) { initial with keys := [4] }
     assertEq (← unwrap result) 0
     assertTrue ((world.stdout.splitOn "lean-cloud  /  my-app").length > 1) "Wrong project selected"⟩

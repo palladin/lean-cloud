@@ -1,5 +1,6 @@
 import LeanCloudRuntime
 import ChaosFixture.PoolWorkload
+import ChaosFixture.StressWorkload
 
 open LeanCloud LeanCloudRuntime LeanCloudTests
 
@@ -8,6 +9,9 @@ def program : CloudProgram PoolWorkload.Input Nat := {
   version := "v1"
   run := PoolWorkload.workflow
 }
+
+def stressProgram : CloudProgram StressWorkload.Input Nat := {
+  name := "stress", version := "v1", run := StressWorkload.workflow }
 
 /-- Test-only inspection through the production S3 reader. It neither executes
 a workflow nor opens scheduler/inbox storage, and is not exposed by HTTP. -/
@@ -27,4 +31,4 @@ private def readRecords (path : String) : IO UInt32 := do
 def main (args : List String) : IO UInt32 :=
   match args with
   | ["read-records", path] => readRecords path
-  | _ => Application.main ⟨#[program.register #[]]⟩ args
+  | _ => Application.main ⟨#[program.register #[], stressProgram.register #[]]⟩ args

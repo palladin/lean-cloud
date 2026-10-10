@@ -9,16 +9,15 @@ private def listed (args : Array String) : Cli (Array String) := do
 private def unique (values : Array String) : Array String :=
   values.foldl (fun result value => if result.contains value then result else result.push value) #[]
 
-/-- Pool-created volumes have reserved names but predate ownership labels.
-Recognize every retired worker without depending on a readable manifest. -/
-private def poolVolume (project name : String) : Bool :=
-  let start := project ++ "_"
-  if !name.startsWith start then false else
-    let localName := name.drop start.length |>.toString
-    if ["scheduler-data", "scheduler-mailbox-data", "blob-data"].contains localName then true else
-      match localName.splitOn "-mailbox-data" with
-      | [worker, ""] => (workerIndex? worker).isSome
-      | _ => false
+/-- Keep the local manifest until remote cleanup has completed. The scheduler
+retains the removed ID permanently, so stale submissions cannot resurrect it. -/
+def Context.removeRun (ctx : Context) (id : String) : Cli Unit := do
+  validateId id
+  ctx.withDeploymentLock do
+    printLine s!"Removing finished run {id} and its replay records; user blobs are preserved…"
+    discard <| ctx.execApp #["remove", "/etc/lean-cloud/config.json", id]
+    request (.removeTree (ctx.directory id))
+    printLine s!"Removed {id}. Its ID cannot be reused."
 
 /-- Complete removal of one deployment. Discover before deleting; retain the
 local recovery information until all Docker removals have succeeded. Retrying
@@ -35,7 +34,7 @@ def Context.clean (ctx : Context) : Cli Unit := do
       let containers := unique (actors ++ composed)
       let networks ← listed #["network", "ls", "-q", "--filter", label]
       let composedVolumes ← listed #["volume", "ls", "-q", "--filter", label]
-      let poolVolumes := (← listed #["volume", "ls", "-q"]).filter (poolVolume ctx.project)
+      let poolVolumes := (← listed #["volume", "ls", "-q"]).filter (isDeploymentVolume ctx.project)
       let volumes := unique (composedVolumes ++ poolVolumes)
       let repository := ctx.project ++ "-app"
       let images := (← listed #["image", "ls", "--format", "{{.Repository}}:{{.Tag}}", repository]).filter

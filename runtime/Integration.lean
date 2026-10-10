@@ -69,6 +69,24 @@ private def checkAdapters (config : Config) (runPrefix : String) : IO Unit := do
   let .ok actual ← (S3.readBytes config.blobs ref).run
     | throw (IO.userError "Cannot read test blob")
   assertEq actual.data bytes.data
+  let removed := runPrefix ++ "-remove"
+  let retained := removed ++ "-keep"
+  discard <| S3.createJson config.blobs retained "keep" (toJson (99 : Nat))
+  -- More than one listing page, plus a neighboring run and shared user blobs.
+  for i in [:129] do discard <| S3.createJson config.blobs removed s!"key-{i}" (toJson i)
+  S3.removeRun config.blobs removed
+  S3.removeRun config.blobs removed
+  assertTrue (← S3.isRemoved config.blobs removed) "Cleanup lost its durable removal marker"
+  for i in [:129] do assertEq (← S3.readJson config.blobs removed s!"key-{i}") none
+  assertEq (← S3.readJson config.blobs retained "keep") (some (toJson (99 : Nat)))
+  let .ok preserved ← (S3.readBytes config.blobs ref).run
+    | throw (IO.userError "Run cleanup removed a user blob")
+  assertEq preserved.data bytes.data
+  let recreated ← try
+    programs.submit config removed sumSquares.info.entry (toJson (#[1] : Array Nat))
+    pure true
+    catch _ => pure false
+  assertTrue (!recreated) "Removed run accepted a new definition"
   for invalid in #[{ ref with size := ref.size + 1 }, { ref with checksum := ref.checksum + 1 }] do
     assertError (← (S3.readBytes config.blobs invalid).run) .integrity
   assertError (← (S3.resolve config.blobs (runPrefix ++ "/missing")).run) .missingBlob
@@ -214,9 +232,13 @@ def main (args : List String) : IO UInt32 := do
       let config := { config with mailboxes := ⟨endpoints[0]!,
         (endpoints.extract 1 4).mapIdx fun i endpoint => ⟨s!"worker{i + 1}", endpoint⟩⟩ }
       let runPrefix := s!"properties-{← IO.Process.getPID}-{← IO.monoMsNow}"
+      IO.println "Checking storage adapters and paginated run removal"
       checkAdapters config runPrefix
+      IO.println "Checking pool recovery"
       PoolTests.run config runPrefix
+      IO.println "Checking registered programs"
       checkPrograms config runPrefix
+      IO.println "Checking mailbox isolation and redelivery"
       checkIsolation config runPrefix
       for endpoint in #[config.mailboxes.scheduler] ++ config.mailboxes.workers.map (·.endpoint) do
         checkMailboxes endpoint runPrefix
