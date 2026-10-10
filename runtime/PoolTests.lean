@@ -21,6 +21,25 @@ private def waitOutcome (process : CloudProcess Nat) : IO (Except CloudError Nat
     unless (← IO.monoMsNow) < deadline do throw (IO.userError "Terminal failure stayed pending")
     IO.sleep 50
 
+/-- The test owns this worker and calls this only after its controlled action
+has returned. Receiving cancellation alone is not evidence that work stopped. -/
+private def stopWorker (config : Config) (handle : HttpMailbox.Handle) (worker run : String) : IO Unit := do
+  LeanCloudRuntime.Pool.send config (.ready worker)
+  let inbox : Mailbox IO LeanCloud.Pool.Reply := HttpMailbox.inbox handle
+  let deadline := (← IO.monoMsNow) + 10000
+  repeat
+    unless (← IO.monoMsNow) < deadline do throw (IO.userError "Missing worker cancellation")
+    let some delivery ← inbox.receive | continue
+    inbox.acknowledge delivery.receipt
+    match delivery.message with
+    | .cancel id barrier =>
+      assertEq id run
+      LeanCloudRuntime.Pool.send config (.stopped id worker barrier)
+      discard <| LeanCloudRuntime.Pool.request config .health
+      return
+    | .acknowledged => pure ()
+    | other => throw (IO.userError s!"Expected cancellation, got {reprStr other}")
+
 private def assignment (config : Config) (handle : HttpMailbox.Handle) (worker run : String) : IO Assignment := do
   LeanCloudRuntime.Pool.send config (.ready worker)
   let inbox : Mailbox IO LeanCloud.Pool.Reply := HttpMailbox.inbox handle
@@ -79,6 +98,20 @@ private def liveFailure (config : Config) (runPrefix : String) : IO Unit := do
     assertEq error fuelError
     report config failed.id failure
     assertTrue (← failed.poll).isNone "Scheduler wrote the failure result"
+    -- A held sibling must stop before any terminal intent can be published.
+    LeanCloudRuntime.Pool.send config (.ready "worker1")
+    let inbox : Mailbox IO LeanCloud.Pool.Reply := HttpMailbox.inbox first
+    let deadline := (← IO.monoMsNow) + 10000
+    repeat
+      unless (← IO.monoMsNow) < deadline do throw (IO.userError "No barrier response")
+      let some delivery ← inbox.receive | continue
+      inbox.acknowledge delivery.receipt
+      match delivery.message with
+      | .acknowledged => continue
+      | .idle => break
+      | other => throw (IO.userError s!"Failure overlapped a sibling: {reprStr other}")
+    let late ← execute config failed.id "worker2" 1000 #[2, 3] right
+    stopWorker config second "worker2" failed.id
     finalize config first "worker1" failed.id
     assertOutcome (← waitOutcome failed) (.error fuelError)
     assertOutcome (← failed.await) (.error fuelError)
@@ -90,7 +123,7 @@ private def liveFailure (config : Config) (runPrefix : String) : IO Unit := do
       assertTrue (!valid) "Failure left a sibling assignment valid"
     -- A duplicate failure and a late completed sibling cannot replace the root.
     report config failed.id failure
-    report config failed.id (← execute config failed.id "worker2" 1000 #[2, 3] right)
+    report config failed.id late
     rejects (LeanCloudRuntime.Pool.request config (.resume failed.id))
     rejects (LeanCloudRuntime.Pool.request config (.pause failed.id))
     discard <| LeanCloudRuntime.Pool.request config (.kill failed.id)
@@ -128,7 +161,7 @@ def run (original : Config) (runPrefix : String) : IO Unit :=
     IO.FS.withTempFile fun _ database => IO.FS.withTempFile fun _ configPath => do
   let config := { original with scheduler := { original.scheduler with database := database.toString } }
   IO.FS.writeFile configPath (toJson config).compress
-  -- Durable snapshots at two crash boundaries: before root publication, and
+  -- Durable catalogs at two crash boundaries: before root publication, and
   -- after publication but before report acknowledgement. Also preserve a root
   -- success that committed before the failure intent was accepted.
   let scenarios := #[
@@ -152,15 +185,20 @@ def run (original : Config) (runPrefix : String) : IO Unit :=
     args := #[configPath.toString, "pool-scheduler"], stdout := .piped }
   let logs ← IO.asTask child.stdout.readToEnd .dedicated
   try
-    let handle ← HttpMailbox.openMailbox (← IO.ofExcept (config.mailboxes.worker "worker1"))
-      LeanCloudRuntime.Pool.address "worker.worker1"
+    let handles ← config.mailboxes.workers.mapM fun route => do
+      return (route.worker, ← HttpMailbox.openMailbox route.endpoint
+        LeanCloudRuntime.Pool.address ("worker." ++ route.worker))
     try
+      let some (_, first) := handles.find? (·.1 == "worker1") | throw (IO.userError "Missing worker1")
+      for (id, _, _) in scenarios do
+        for (worker, handle) in handles do stopWorker config handle worker id
       for (id, _, expected) in scenarios do
-        finalize config handle "worker1" id
+        finalize config first "worker1" id
         let process : CloudProcess Nat := ⟨config, id, sumSquares.info.entry⟩
         let actual ← waitOutcome process
         assertOutcome actual ((ReplayInterpreter.result (m := Id) expected).run)
-    finally handle.close
+    finally
+      for (_, handle) in handles do handle.close
     liveFailure config runPrefix
   finally
     try child.kill catch _ => pure ()

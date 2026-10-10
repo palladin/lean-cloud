@@ -70,6 +70,9 @@ private def acquire (model : Model) (worker : Nat) : Except String Model := do
     let task : Task := ⟨run, ⟨attempt, Location.root⟩, .ofProgram action, some outcome⟩
     return { model with tasks := model.tasks.set! worker (some task) }
   | .drain generation => return { model with pool := Pool.drained pool workers[worker]! generation }
+  | .cancel id barrier =>
+    ensure (model.tasks[worker]!.isNone) "Cancellation acknowledged while a worker was still active"
+    return { model with pool := Pool.stopped pool id workers[worker]! barrier }
   | .idle => return model
   | .acknowledged => throw "Acquisition returned a report acknowledgement"
 
@@ -126,10 +129,16 @@ private def settleOrphan (model : Model) (index : Nat) (commit : Bool) : Model :
 
 private def restart (model : Model) : Except String Model := do
   -- Restart starts from the wire/storage representation, not an in-memory alias.
-  let .ok saved := Json.parse (toJson model.pool).compress >>= fromJson? (α := Pool.State)
-    | throw "Cannot restore saved Pool state"
+  let .ok catalog := Json.parse (toJson model.pool.catalog).compress >>= fromJson? (α := Pool.Catalog)
+    | throw "Cannot restore saved Pool catalog"
+  let saved := catalog.restore
   let pool := Pool.recover saved
-  ensure (same (Pool.recover pool) pool) "Recovery is not idempotent"
+  for run in pool.runs do
+    let required := (saved.membership.active.getD #[] ++ run.scheduler.workers.map (·.worker))
+      |>.filter (!saved.membership.drained.contains ·)
+    ensure (required.all run.scheduler.stopping.contains) "Recovery skipped worker cancellation"
+    ensure (run.scheduler.stopping.all (!saved.membership.drained.contains ·))
+      "Recovery waits for a worker already confirmed stopped"
   for run in pool.runs do
     ensure (run.scheduler.jobs.all fun job => match job.status with | .running .. => false | _ => true)
       "Recovery retained a live attempt"
@@ -147,10 +156,8 @@ private def check (before after : Model) : Except String PUnit.{2} := do
     ensure (previous.mode != .killed || run.mode == .killed) "A killed run was reactivated"
     ensure (run.scheduler.error.isNone) "Generated workflow acquired an interpreter error"
     ensure (decide ((run.scheduler.jobs.map (·.branch)).toList.Pairwise (· ≠ ·))) "Duplicate branch jobs"
-    for job in previous.scheduler.jobs do
-      if job.status == .done then
-        ensure (run.scheduler.jobs.any fun next => next.branch == job.branch && next.status == .done)
-          "Completed branch reopened or disappeared"
+    -- The inspection tree is reconstructed after cancellation. Durable records,
+    -- checked below, must survive even while their branches disappear/reappear.
     for job in run.scheduler.jobs do
       match job.status with
       | .running worker attempt _ =>

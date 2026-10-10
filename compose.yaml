@@ -95,10 +95,7 @@ services:
     volumes:
       - ./deploy/config.json:/etc/lean-cloud/config.json:ro
     depends_on:
-      scheduler: {condition: service_healthy}
-      worker: {condition: service_healthy}
-      worker2: {condition: service_healthy}
-      worker3: {condition: service_healthy}
+      blobs: {condition: service_healthy}
 
 volumes:
   scheduler-data:

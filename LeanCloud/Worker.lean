@@ -8,6 +8,9 @@ reports across process failure, so the worker needs no local durable outbox. -/
 structure State where
   stopped : Bool := false
   retryIn : Nat := 0
+  cancelledThrough : Option Nat := none
+  reported : Option Nat := none
+  awaitingAck : Bool := false
 
 /-- Observe successful global reads/writes; report only their keys. -/
 structure ObservedStore (m : Type → Type u) where
@@ -47,10 +50,19 @@ def turn [Monad m] [Codec α] (ports : Ports m) (fuel : Nat)
   if let some delivery := delivery then
     match delivery.message with
     | .execute assignment =>
-      let report ← execute ports.id ports.observe ports.blobs fuel program input assignment observer
-      ports.send (.report report)
+      unless (state.cancelledThrough.any (assignment.attempt ≤ ·) || state.reported.any (assignment.attempt ≤ ·) : Bool) do
+        let report ← execute ports.id ports.observe ports.blobs fuel program input assignment observer
+        ports.send (.report report)
+        state := { state with reported := some assignment.attempt, awaitingAck := true }
       state := { state with retryIn := max 1 ports.retryPolls }
-    | .acknowledged _ => state := { state with retryIn := 0 }
+    | .cancel barrier =>
+      state := { state with
+        retryIn := 0
+        cancelledThrough := some (max barrier (state.cancelledThrough.getD 0)) }
+      ports.send (.stopped ports.id barrier)
+    | .acknowledged attempt =>
+      if state.awaitingAck && state.reported == some attempt then
+        state := { state with retryIn := 0, awaitingAck := false }
     | .finished | .failed _ => state := { state with stopped := true }
     | _ => pure ()
     -- Publish any immediate successor before dropping the current delivery.

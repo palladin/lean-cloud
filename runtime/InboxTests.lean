@@ -5,6 +5,7 @@ import LeanCloud.MailboxModel
 import LeanCloudTests.Support
 import ApplicationTests
 import ReplyTests
+import SchedulerTests
 
 open Lean LeanCloud LeanCloudRuntime LeanCloudTests
 
@@ -214,6 +215,9 @@ private def poolLeases : IO Unit := IO.FS.withTempFile fun _ inboxPath =>
               let some item ← inbox.receive | continue
               inbox.acknowledge item.receipt
               if let .execute "lease-test" assignment := item.message then return assignment
+              if let .cancel run barrier := item.message then
+                LeanCloudRuntime.Pool.send config (.stopped run "worker1" barrier)
+                LeanCloudRuntime.Pool.send config (.ready "worker1")
           let valid (assignment : Assignment) : IO Bool := do
             IO.ofExcept (fromJson? (← LeanCloudRuntime.Pool.request config
               (.check "lease-test" "worker1" assignment.attempt)))
@@ -315,6 +319,7 @@ def main (args : List String) : IO UInt32 := do
     processSignals
     http
     poolLeases
+    SchedulerTests.run
     ReplyTests.run
     IO.println "Pool assignment renewal, pause fencing, expiry, and heartbeat cleanup passed"
     IO.println "SQLite inbox laws, 32 × 200 model operations, SIGKILL recovery, termination signals, HTTP transport, renewal, fencing, and registry API passed."

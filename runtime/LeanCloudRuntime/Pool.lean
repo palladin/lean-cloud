@@ -2,6 +2,9 @@ import LeanCloud.Pool
 import LeanCloud.Timing
 import Std.Time.DateTime.Timestamp
 import LeanCloudRuntime.Run
+import LeanCloudRuntime.LocalDb
+import LeanCloudRuntime.ProcessLock
+import LeanCloudRuntime.Trace
 
 namespace LeanCloudRuntime.Pool
 open Lean LeanCloud
@@ -14,7 +17,13 @@ structure Saved where
   routes : Option (Array HttpMailbox.WorkerEndpoint) := none
   replies : Array (String × Except String Json) := #[]
   timings : Array (String × Timing.Run) := #[]
-  deriving ToJson
+
+/-- Persist the catalog and administrative intent, not the scheduling tree,
+tickets, leases or continuations. Attempt counters fence delayed old mail. -/
+instance : ToJson Saved where
+  toJson saved := Json.mkObj [
+    ("state", toJson saved.state.catalog),
+    ("routes", toJson saved.routes), ("replies", toJson saved.replies), ("timings", toJson saved.timings)]
 
 instance : FromJson Saved where
   fromJson? json := do
@@ -24,7 +33,7 @@ instance : FromJson Saved where
     let timings ← match json.getObjVal? "timings" with
       | .ok value => fromJson? value
       | .error _ => pure #[]
-    return { state := ← json.getObjValAs? _ "state", routes
+    return { state := (← json.getObjValAs? LeanCloud.Pool.Catalog "state").restore, routes
              replies := ← json.getObjValAs? _ "replies", timings }
 
 private def wallTime : IO Nat := do
@@ -94,16 +103,16 @@ private def reconfigure (config : Config) (saved : Saved)
     (all.filter (·.worker != route.worker)).push route) retained
   return { saved with state, routes := some retained }
 
-/-- An offline worker must not block pool administration. Its assignment/report
-is already durable. Workers repeat readiness and recover the same assignment;
-report acknowledgements carry no state needed by the worker. -/
+/-- An offline worker must not block pool administration. Readiness retries
+recover the current assignment or cancellation; process restart reconstructs
+from the root. Report acknowledgements carry no state needed by the worker. -/
 private def reply (endpoint : HttpMailbox.Config) (worker : String) (message : LeanCloud.Pool.Reply) : IO Unit := do
   try HttpMailbox.send endpoint address ("worker." ++ worker) message
   catch _ => IO.eprintln s!"Mailbox for {worker} unavailable; waiting for worker readiness."
 
-/-- Sole owner of the deployment's SQLite database. State is durable before
-replies and input acknowledgements. Administrative replies are cached until the
-caller's address retires; offline workers recover replies by repeating readiness. -/
+/-- Sole owner of the deployment's SQLite database. The catalog is durable before
+replies and input acknowledgements; scheduling continuations are volatile.
+Administrative replies are cached until the caller's address retires. -/
 def scheduler (config : Config) : IO Unit := do
   let lock ← ProcessLock.acquire (config.scheduler.database ++ ".lock")
   try
@@ -121,7 +130,7 @@ def scheduler (config : Config) : IO Unit := do
           (run.id, Timing.observe timing (before.find? (·.id == run.id)) run now)
         let value := { value with timings }
         LocalDb.saveValue conn "pool-v1" value
-        -- Only committed scheduler transitions appear in the branch tree.
+        -- Emit observations only after the associated catalog commit succeeds.
         let before ← emitted.get
         for run in value.state.runs do
           let previous := (before.find? (·.id == run.id)).map (·.scheduler.jobs) |>.getD #[]
@@ -132,7 +141,9 @@ def scheduler (config : Config) : IO Unit := do
         return value
       if saved.routes.isNone then
         saved ← IO.ofExcept (reconfigure config saved config.mailboxes.workers)
-      saved := { saved with state := LeanCloud.Pool.recover saved.state }
+      let workers := (saved.routes.getD config.mailboxes.workers).map (·.worker)
+        |>.filter (!saved.state.membership.drained.contains ·)
+      saved := { saved with state := LeanCloud.Pool.recover saved.state workers }
       saved ← persist saved
       let handle ← HttpMailbox.openMailbox config.mailboxes.scheduler address "scheduler"
       try
@@ -197,6 +208,9 @@ def scheduler (config : Config) : IO Unit := do
             | .drained worker generation =>
               saved := { saved with state := LeanCloud.Pool.drained saved.state worker generation }
               saved ← persist saved
+            | .stopped run worker barrier =>
+              saved := { saved with state := LeanCloud.Pool.stopped saved.state run worker barrier }
+              saved ← persist saved
             | .renew run worker attempt =>
               let state := LeanCloud.Pool.renew config.scheduler.assignmentMs saved.state run worker attempt
               saved := { saved with state }
@@ -247,7 +261,7 @@ cannot replace the program/input or reactivate a paused/killed process. -/
 def submit (config : Config) (run : String) : IO Unit := do
   send config (.submit run)
 
-def status (config : Config) (run : String) : IO Scheduler.State := do
+def status (config : Config) (run : String) : IO Scheduler.Snapshot := do
   IO.ofExcept (fromJson? (← request config (.status run)))
 
 def observation (config : Config) (run : String) : IO Timing.Status := do

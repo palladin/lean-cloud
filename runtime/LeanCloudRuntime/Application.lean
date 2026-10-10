@@ -15,12 +15,9 @@ inductive Service : Type → Type where
   | serveScheduler (config : Config) : Service Unit
   | serveWorker (config : Config) : Service Unit
   | control (config : Config) (run : String) (mode : LeanCloud.Pool.Mode) : Service Unit
-  | scheduler (config : Config) (run : String) : Service Unit
-  | worker (config : Config) (run : String) : Service Unit
   | definition (config : Config) (run : String) : Service RunDefinition
   | outcome (config : Config) (run : String) : Service (Option Exit)
   | cancel (config : Config) (run : String) : Service (Option Exit)
-  | referenceStatus (config : Config) (run : String) : Service Scheduler.State
   | status (config : Config) (run : String) : Service Timing.Status
   | readText (config : Config) (ref : BlobRef) : Service String
 
@@ -93,12 +90,6 @@ def run (registry : Registry) (args : List String) : App UInt32 := do
         pure 0
       | "pause", [] => service (.control config id .paused); pure 0
       | "resume", [] => service (.control config id .active); pure 0
-      | "scheduler", [] => service (.scheduler config id); pure 0
-      | "worker", [] =>
-        service (.worker config id)
-        say s!"completed {id}"
-        pure 0
-      | "reference-status", [] => say (toJson (← service (.referenceStatus config id))).compress; pure 0
       | "status", [] => say (toJson (← service (.status config id))).compress; pure 0
       | "outcome", [] => say (toJson (← service (.outcome config id))).compress; pure 0
       | "cancel", [] => say (toJson (← service (.cancel config id))).compress; pure 0
@@ -149,14 +140,11 @@ private def handle (registry : Registry) (prepare : Config → String → Json �
   | .control config id mode => do
     discard (Pool.request config (match mode with
       | .active => .resume id | .paused => .pause id | .killed => .kill id))
-  | .scheduler config id => runScheduler config id
-  | .worker config id => registry.runWorker config id
   | .definition config id => loadRun config id
   | .outcome config id => completed config id
   | .cancel config id => do
     discard (Pool.request config (.kill id))
     completed config id
-  | .referenceStatus config id => LeanCloudRuntime.status config id
   | .status config id => Pool.observation config id
   | .readText config ref => do
     let bytes ← match ← (S3.readBytes config.blobs ref).run with
@@ -209,18 +197,14 @@ def main (registry : Registry) (args : List String)
     return result.toOption.getD 1
   match args with
   | [command, path] =>
-    if command == "serve-scheduler" || command == "serve-worker" || command == "serve-mailbox" then
+    if command == "serve-scheduler" || command == "serve-worker" then
       let config ← Config.load path
       let endpoint ← if command == "serve-worker" then IO.ofExcept (config.mailboxes.worker (← workerId))
         else pure config.mailboxes.scheduler
       let api := if command == "serve-scheduler" then api registry config prepare
         else fun _ => throw (IO.userError "Application commands belong to the scheduler")
       let database := (← IO.getEnv "CLOUD_INBOX_DATABASE").getD "/mailbox/inbox.sqlite"
-      let actor := if command == "serve-mailbox" then do
-          repeat IO.sleep 1000
-          pure (0 : UInt32)
-        else execute
-      HttpMailbox.withServer endpoint database api actor (handleSignals := true)
+      HttpMailbox.withServer endpoint database api execute (handleSignals := true)
     else execute
   | _ => execute
 

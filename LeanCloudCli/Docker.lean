@@ -394,8 +394,8 @@ def Context.down (ctx : Context) : Cli Unit := do
 def Context.outcome (ctx : Context) (run : Run) : Cli (Option Exit) := do
   liftExcept (Json.parse (← ctx.remote run "outcome") >>= fromJson?)
 
-def Context.scheduler (ctx : Context) (run : Run) : Cli Scheduler.State := do
-  return (← ctx.observation run).toState
+def Context.scheduler (ctx : Context) (run : Run) : Cli Scheduler.Snapshot := do
+  return (← ctx.observation run).toSnapshot
 
 /-- Idempotent recovery after interrupted launch. Existing definitions must agree. -/
 private def Context.resumeLocked (ctx : Context) (id : String) : Cli Unit := do

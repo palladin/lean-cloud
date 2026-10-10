@@ -18,13 +18,13 @@ private def healthy (ctx : Context) (role : String) : Cli Unit := do
     require ((← request .now) < deadline) s!"{role} did not recover HTTP and its actor"
     request (.sleep 250)
 
-private def states (ctx : Context) (runs : Array Run) : Cli (Array Scheduler.State) :=
+private def states (ctx : Context) (runs : Array Run) : Cli (Array Scheduler.Snapshot) :=
   runs.mapM ctx.scheduler
 
 /-- Wait for reported assignments rather than injecting faults into an idle pool.
 The pre-fault snapshot is evidence of activity, not an exact instruction boundary. -/
 private def busy (ctx : Context) (runs : Array Run) (completedBranches : Nat) (overlap : Bool) :
-    Cli (Array Scheduler.State × Array String) := do
+    Cli (Array Scheduler.Snapshot × Array String) := do
   let deadline := (← request .now) + 60000
   repeat
     let snapshots ← states ctx runs
@@ -98,7 +98,7 @@ private structure Interrupted where
   worker : String
   assignment : Assignment
 
-private def owns (state : Scheduler.State) (old : Interrupted) : Bool :=
+private def owns (state : Scheduler.Snapshot) (old : Interrupted) : Bool :=
   state.jobs.any fun job => job.branch == old.assignment.branchStart &&
     (Scheduler.Internal.assignedTo old.worker job).any (·.attempt == old.assignment.attempt)
 
@@ -128,7 +128,7 @@ private def lateMessages (ctx : Context) (old : Interrupted) : Cli Unit := do
   chaosEvent ctx "stale-messages-rejected" [("run", toJson old.run.id),
     ("worker", toJson old.worker), ("attempt", toJson old.assignment.attempt)]
 
-private def completedCount (snapshots : Array Scheduler.State) : Nat :=
+private def completedCount (snapshots : Array Scheduler.Snapshot) : Nat :=
   snapshots.foldl (fun n state => n + (state.jobs.filter (·.status == .done)).size) 0
 
 /-- Health alone cannot establish recovery: require fresh completed branches
@@ -218,7 +218,7 @@ private def blobOutage (ctx : Context) (runs : Array Run) : Cli SavedRecords := 
 /-- Disconnect a busy worker, then capture the assignment still owned by it.
 It may have advanced since the initial observation. If it has no outstanding
 work, reconnect and choose again instead of claiming to test expiry. -/
-private def isolateWorker (ctx : Context) (runs : Array Run) : Cli (Interrupted × Nat) := do
+private def isolateWorker (ctx : Context) (runs : Array Run) : Cli Interrupted := do
   for _ in [:10] do
     let (_, workers) ← busy ctx runs 0 true
     let worker := workers[0]!
@@ -230,7 +230,7 @@ private def isolateWorker (ctx : Context) (runs : Array Run) : Cli (Interrupted 
         | return none
       chaosEvent ctx "worker-isolated" [("run", toJson run.id), ("worker", toJson worker),
         ("assignment", toJson assignment), ("runs", toJson after)]
-      return some (⟨run, worker, assignment⟩, completedCount after)
+      return some (⟨run, worker, assignment⟩ : Interrupted)
     match captured with
     | .ok (some result) => return result
     | _ =>
@@ -241,45 +241,60 @@ private def isolateWorker (ctx : Context) (runs : Array Run) : Cli (Interrupted 
       | _ => chaosEvent ctx "missed-assignment" [("worker", toJson worker)]
   throw "Could not disconnect an active assignment before its report arrived"
 
-/-- Scheduler observations retain brief assignments which might complete between
-polls. Require positive evidence of reassignment; final correctness still comes
-from durable results, not telemetry. Missing observations fail this test. -/
-private def awaitReplacement (ctx : Context) (runs : Array Run) (old : Interrupted)
-    (before : Nat) (lease : Nat) : Cli Unit := do
+/-- Expiry requests cancellation but cannot establish that an isolated worker
+has stopped. The affected run must stay unassigned until that worker returns. -/
+private def awaitCancellation (ctx : Context) (old : Interrupted) (lease : Nat) : Cli Unit := do
   let deadline := (← request .now) + lease + 60000
   repeat
-    let snapshots ← states ctx runs
+    let state ← ctx.scheduler old.run
+    if !owns state old then break
+    require ((← request .now) < deadline) "Disconnected assignment did not expire"
+    request (.sleep 500)
+  let observeUntil := (← request .now) + 2000
+  repeat
+    let state ← ctx.scheduler old.run
+    require state.error.isNone "Partition became a terminal workflow error"
+    require (!(state.jobs.any fun job => match job.status with | .running .. => true | _ => false))
+      "Replacement started before the disconnected worker acknowledged stopping"
+    if (← request .now) ≥ observeUntil then break
+    request (.sleep 250)
+  chaosEvent ctx "waiting-for-worker-stop" [("run", toJson old.run.id), ("worker", toJson old.worker)]
+
+/-- Traces retain short root assignments that can finish between status polls.
+Recovery must reconstruct from the root after cancellation, on any free worker. -/
+private def awaitReplacement (ctx : Context) (old : Interrupted) : Cli Unit := do
+  let deadline := (← request .now) + 90000
+  repeat
     let output ← docker #["logs", "--tail", "2000", ctx.node "scheduler"]
     let replacement := (output.stdout ++ output.stderr).splitOn "\n" |>.findSome? fun line => do
       let step ← LeanCloudCli.Trace.parse line
       guard (step.event.run == old.run.id)
       let job ← step.job
-      guard (job.branch == old.assignment.branchStart)
+      guard (job.branch == Location.root)
       let .running worker attempt := job.status | none
-      guard (worker != old.worker && attempt > old.assignment.attempt)
+      guard (attempt > old.assignment.attempt)
       return (worker, attempt)
     if let some (worker, attempt) := replacement then
-      if completedCount snapshots > before then
-        chaosEvent ctx "reassigned" [("run", toJson old.run.id), ("from", toJson old.worker),
-          ("to", toJson worker), ("oldAttempt", toJson old.assignment.attempt),
-          ("attempt", toJson attempt), ("branch", toJson old.assignment.branchStart),
-          ("completedBefore", toJson before), ("completedAfter", toJson (completedCount snapshots))]
-        return
-    require ((← request .now) < deadline) "Disconnected work was not reassigned while healthy workers progressed"
+      chaosEvent ctx "reconstructed-from-root" [("run", toJson old.run.id),
+        ("worker", toJson worker), ("oldAttempt", toJson old.assignment.attempt), ("attempt", toJson attempt)]
+      return
+    require ((← request .now) < deadline) "Reconnected worker did not release the restart barrier"
     request (.sleep 500)
 
 private def networkFaults (ctx : Context) (runs : Array Run) : Cli Interrupted := do
   let config ← readJson (α := Json) (← ctx.configFile)
   let lease ← liftExcept (config.getObjVal? "scheduler" >>= (·.getObjValAs? Nat "assignmentMs"))
   let before ← docker #["inspect", "--format", "{{.State.StartedAt}}", ctx.node "scheduler"]
-  let (old, completed) ← isolateWorker ctx runs
+  let old ← isolateWorker ctx runs
   try
-    awaitReplacement ctx runs old completed lease
+    awaitCancellation ctx old lease
     lateMessages ctx old
     let after ← docker #["inspect", "--format", "{{.State.StartedAt}}", ctx.node "scheduler"]
     require (before.stdout == after.stdout) "An isolated worker caused the scheduler to restart"
   finally connection ctx old.worker true
   healthy ctx old.worker
+  awaitReplacement ctx old
+  awaitProgress ctx runs "worker-recovered"
   -- Do not stop or restart the scheduler explicitly: only remove its network.
   -- Runtime transport failures may naturally trigger Docker's restart policy.
   let (snapshots, _) ← busy ctx runs 0 false
@@ -322,7 +337,7 @@ def poolChaos (seed : Nat := 1) : Cli Unit := do
   saveJson (ctx.home / "chaos-plan.json") (Json.mkObj [
     ("generator", toJson "pool-chaos/v3"), ("seed", toJson seed), ("faults", toJson faults),
     ("networkFaults", toJson #["blobs-until-worker-transport-failures",
-      "busy-worker-until-reassigned", "scheduler-beyond-assignment-lease"]),
+      "busy-worker-stop-before-replacement", "scheduler-beyond-assignment-lease"]),
     ("programs", toJson (inputs.map fun input => Json.mkObj [
       ("input", toJson input), ("tree", toJson (reprStr (PoolWorkload.tree input))),
       ("expected", toJson (PoolWorkload.expected input))]))])
@@ -367,7 +382,7 @@ def poolChaos (seed : Nat := 1) : Cli Unit := do
     checkRecords ctx saved "completion"
     require ((← poolNodes ctx) == identities) "Recovery replaced deployed nodes"
     chaosEvent ctx "passed" [("seed", toJson seed), ("crashes", toJson faults.size), ("partitions", toJson (3 : Nat))]
-    printLine "Pool chaos passed: blob outage, preserved records, network partitions, reassignment, stale reports, scheduler/worker crashes, and direct outcomes."
+    printLine "Pool chaos passed: blob outage, preserved records, network partitions, cancellation barriers, stale reports, scheduler/worker crashes, and direct outcomes."
   catch error =>
     discard <| observing (chaosEvent ctx "failed" [("error", toJson error)])
     discard <| observing (captureFailure ctx)

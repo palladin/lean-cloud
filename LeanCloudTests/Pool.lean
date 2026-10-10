@@ -14,9 +14,38 @@ private def takeJob (state : Pool.State) (worker : String) : IO (Pool.State × S
   | .execute run assignment => return (next, run, assignment)
   | _ => throw (IO.userError "Expected a pool assignment")
 
+/-- Test actors explicitly stop before acknowledging cancellation. No timeout
+or ordinary readiness message is treated as proof of termination. -/
+private def stopOld (state : Pool.State) : Pool.State :=
+  state.runs.foldl (fun state run => run.scheduler.stopping.foldl
+    (fun state worker => Pool.stopped state run.id worker run.scheduler.barrier) state) state
+
 private def initial : Pool.State := { runs := #[{ id := "first" }, { id := "second" }] }
 
 def poolCases : Array TestCase := #[
+  ⟨"pool.cancellation-awaits-every-owner-and-restarts-at-root", do
+    let state ← change {} (.submit "nested")
+    let (state, id, root) ← takeJob state "a"
+    let state := Pool.report state id ⟨"a", root.attempt, .ok (.fork Location.root.next 2), #[]⟩
+    let (state, _, left) ← takeJob state "a"
+    let (state, _, right) ← takeJob state "b"
+    let stopped ← change (← change state (.pause id)) (.resume id)
+    let some run := stopped.runs[0]? | throw (IO.userError "Missing run")
+    let barrier := run.scheduler.barrier
+    let (_, reply) := Pool.acquire 100 stopped "a"
+    assertEq (toJson reply) (toJson (Pool.Reply.cancel id barrier))
+    let half := Pool.stopped stopped id "a" barrier
+    let (_, waiting) := Pool.acquire 100 half "replacement"
+    assertEq (toJson waiting) (toJson Pool.Reply.idle) "One stop acknowledgement released the whole batch"
+    let stale := Pool.stopped half id "b" (barrier + 1)
+    assertEq (toJson stale) (toJson half)
+    let ready := Pool.stopped half id "b" barrier
+    let (ready, _, root) ← takeJob ready "replacement"
+    assertEq root.branchStart Location.root "Resume restored a saved child instead of reconstructing the root"
+    assertTrue (root.attempt > right.attempt) "Restart reused an old attempt"
+    let late := Pool.report ready id ⟨"a", left.attempt, .ok .done, #[]⟩
+    assertTrue (Pool.valid late id "replacement" root.attempt) "Late reply satisfied a replacement ticket"
+    assertTrue (late.runs[0]?.all (!·.scheduler.finished)) "Late child reply completed the root"⟩,
   ⟨"pool.terminal-publication-retries-after-worker-and-scheduler-crash", do
     let state ← change {} (.submit "cancelled")
     let state ← change state (.configureWorkers #[])
@@ -33,7 +62,7 @@ def poolCases : Array TestCase := #[
     let renewed := Pool.renew 100 (Pool.tick 50 state) id "worker1" first
     assertTrue (Pool.valid (Pool.tick 75 renewed) id "worker1" first) "Finalizer renewal was ignored"
     let expired := Pool.tick 100 state
-    let (state, replacement) := Pool.acquire 100 expired "worker2"
+    let (state, replacement) := Pool.acquire 100 (stopOld expired) "worker2"
     let .finalize _ second _ := replacement | throw (IO.userError "Expired finalizer was not retried")
     assertTrue (second > first) "Finalizer reused an expired attempt"
     assertEq (toJson (Pool.report state id ⟨"worker1", first, .ok .done, #[]⟩)) (toJson state)
@@ -43,7 +72,7 @@ def poolCases : Array TestCase := #[
     -- Publication survived; the report was lost and the scheduler restarted.
     let recovered := Pool.recover state
     assertTrue (!Pool.valid recovered id "worker2" second) "Restart retained finalization ownership"
-    let (state, retry) := Pool.acquire 100 recovered "worker1"
+    let (state, retry) := Pool.acquire 100 (stopOld recovered) "worker1"
     let .finalize _ third _ := retry | throw (IO.userError "Restart lost terminal intent")
     assertTrue (third > second) "Restart reused finalization attempt"
     let (report, after) ← unwrap (evaluate 10000
@@ -53,9 +82,11 @@ def poolCases : Array TestCase := #[
     assertEq (finished.runs[0]?.map (·.finalization)) (some .done)
     assertEq (toJson (Pool.acquire 100 finished "worker1").2) (toJson Pool.Reply.idle)⟩,
   ⟨"pool.legacy-run-defaults-to-pending-finalization", do
-    let run : Pool.Run ← unwrap (fromJson? (Json.mkObj [
+    let catalog : Pool.RunCatalog ← unwrap (fromJson? (Json.mkObj [
       ("id", toJson "old"), ("mode", toJson Pool.Mode.killed),
       ("scheduler", toJson ({} : Scheduler.State))]))
+    let some run := ({ runs := #[catalog] } : Pool.Catalog).restore.runs[0]?
+      | throw (IO.userError "Missing restored run")
     assertEq run.finalization Scheduler.Status.pending
     let (_, reply) := Pool.acquire 100 { runs := #[run] } "worker1"
     assertTrue (match reply with | .finalize .. => true | _ => false) "Saved terminal intent was lost"⟩,
@@ -81,14 +112,14 @@ def poolCases : Array TestCase := #[
     for report in [failure, ⟨"worker2", right.attempt, .ok .done, #[]⟩,
         ⟨"worker2", right.attempt, .error ⟨.protocol, "Later failure"⟩, #[]⟩] do
       assertEq (toJson (Pool.report state id report)) (toJson state)
-    let saved : Pool.State ← unwrap (Json.parse (toJson state).compress >>= fromJson?)
+    let saved := (← unwrap (Json.parse (toJson state.catalog).compress >>= fromJson? (α := Pool.Catalog))).restore
     let recovered := Pool.recover saved
     assertEq (recovered.runs[0]?.bind Pool.Run.terminalOutcome) (some (.failure error))
     assertTrue (Pool.command recovered (.resume id)).toOption.isNone "Failure resumed"
     assertTrue (Pool.command recovered (.pause id)).toOption.isNone "Failure became paused"
     let killed ← change recovered (.kill id)
     assertEq (killed.runs[0]?.bind Pool.Run.terminalOutcome) (some (.failure error))
-    let (sealing, reply) := Pool.acquire 100 recovered "worker1"
+    let (sealing, reply) := Pool.acquire 100 (stopOld recovered) "worker1"
     let .finalize failed attempt outcome := reply | throw (IO.userError "Missing terminal assignment")
     assertEq failed id
     assertEq outcome (.failure error)
@@ -104,7 +135,7 @@ def poolCases : Array TestCase := #[
     assertEq (toJson next.runs[0]?) (toJson recovered.runs[0]?)⟩,
   ⟨"pool.stale-failure-cannot-terminate-replacement-or-killed-run", do
     let (state, id, old) ← takeJob initial "worker1"
-    let resumed ← change (← change state (.pause id)) (.resume id)
+    let resumed ← change (stopOld (← change state (.pause id))) (.resume id)
     let (resumed, _, _) ← takeJob resumed "worker2"
     let (resumed, replacementRun, current) ← takeJob resumed "worker1"
     assertEq replacementRun id
@@ -118,8 +149,9 @@ def poolCases : Array TestCase := #[
     assertEq (toJson (Pool.report killed id stale)) (toJson killed)
     assertEq (killed.runs[0]?.bind Pool.Run.terminalOutcome) (some (.cancelled "Killed by user"))⟩,
   ⟨"pool.legacy-state-defaults-to-unconfigured-membership", do
-    let state : Pool.State ← unwrap (fromJson? (Json.mkObj [
+    let catalog : Pool.Catalog ← unwrap (fromJson? (Json.mkObj [
       ("runs", toJson initial.runs), ("cursor", toJson initial.cursor)]))
+    let state := catalog.restore
     assertTrue state.membership.active.isNone "Legacy state acquired an empty pool"
     discard (takeJob state "worker1")⟩,
   ⟨"pool.elastic-drain-preserves-running-work", do
@@ -134,7 +166,7 @@ def poolCases : Array TestCase := #[
     let retired := Pool.drained finished "worker2" generation
     assertTrue (retired.membership.drained.contains "worker2") "Drain acknowledgement lost"
     assertEq (toJson (Pool.drained retired "worker2" generation)).compress (toJson retired).compress
-    let restored : Pool.State ← unwrap (fromJson? (toJson (Pool.recover retired)))
+    let restored := (← unwrap (fromJson? (α := Pool.Catalog) (toJson (Pool.recover retired).catalog))).restore
     assertTrue (restored.membership.drained.contains "worker2") "Restart forgot retired worker"⟩,
   ⟨"pool.elastic-stale-drain-cannot-retire-rejoined-worker", do
     let old ← change initial (.configureWorkers #["worker1"])
@@ -185,7 +217,7 @@ def poolCases : Array TestCase := #[
     assertEq (toJson stale).compress (toJson state).compress
     let restored := Pool.recover state
     assertTrue (restored.runs[0]?.any (·.mode == .paused)) "Restart lost pause"
-    let state ← change state (.resume "first")
+    let state ← change (stopOld state) (.resume "first")
     let (state, run, retry) ← takeJob state "worker1"
     assertEq run "first"
     assertTrue (retry.attempt > first.attempt) "Resume reused a revoked attempt"
@@ -213,16 +245,17 @@ def poolCases : Array TestCase := #[
     let recovered := Pool.recover state
     assertTrue (!Pool.valid recovered "first" "worker1" first.attempt) "Old attempt survived restart"
     assertTrue (!Pool.valid recovered "second" "worker2" second.attempt) "Old attempt survived restart"
-    let (state, _, retry) ← takeJob recovered "worker2"
+    let (state, _, retry) ← takeJob (stopOld recovered) "worker2"
     assertTrue (retry.attempt > first.attempt) "Restart reused attempt number"
-    let encoded := (toJson state).compress
-    let restored : Pool.State ← unwrap (Json.parse encoded >>= fromJson?)
-    assertEq (toJson restored).compress encoded⟩,
+    let encoded := (toJson state.catalog).compress
+    let restored := (← unwrap (Json.parse encoded >>= fromJson? (α := Pool.Catalog))).restore
+    assertEq (toJson restored.catalog).compress encoded
+    assertTrue (restored.runs.all (·.scheduler.pending.isEmpty)) "Catalog restored live tickets"⟩,
   ⟨"pool.expiry-and-fair-run-selection", do
     let (state, _, first) ← takeJob initial "worker1"
     let expired := Pool.tick 100 state
     assertTrue (!Pool.valid expired "first" "worker1" first.attempt) "Expired assignment still valid"
-    let (state, run, _) ← takeJob expired "worker1"
+    let (state, run, _) ← takeJob (stopOld expired) "worker1"
     assertEq run "second"
     let (_, run, _) ← takeJob state "worker2"
     assertEq run "first"⟩,

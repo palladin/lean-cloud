@@ -26,13 +26,10 @@ private def service : Application.Service α → StateM World (Except String α)
   | .health _ | .serveScheduler _ | .serveWorker _ | .control _ _ _
   | .configure _ _ | .workerStopped _ _ _ => return .ok ()
   | .membership _ => return .ok {}
-  | .scheduler _ _ => do modify (fun w => { w with services := w.services.push "scheduler" }); return .ok ()
-  | .worker _ _ => do modify (fun w => { w with services := w.services.push "worker" }); return .ok ()
   | .definition _ _ => return .ok ⟨program.info.entry, Json.null, program.info.resultSchema⟩
   | .outcome _ _ => return .ok (some (.success (toJson (42 : Nat))))
   | .cancel _ _ => return .ok (some (.cancelled "Killed by user"))
   | .status _ _ => return .ok {}
-  | .referenceStatus _ _ => return .ok {}
   | .readText _ _ => return .error "A Nat result must not be treated as a blob"
 
 def run : IO Unit := do
@@ -57,7 +54,7 @@ def run : IO Unit := do
       (["pool-workers", "config"], 0), (["pool-stopped", "config", "worker1", "2"], 0),
       (["pause", "config", "one"], 0), (["resume", "config", "one"], 0),
       (["submit-entry", "config", "one", "user-program/v1", "-"], 0),
-      (["worker", "config", "one"], 0), (["scheduler", "config", "one"], 0),
+      (["worker", "config", "one"], 1), (["scheduler", "config", "one"], 1), (["reference-status", "config", "one"], 1),
       (["result", "config", "one"], 0), (["cancel", "config", "one"], 0), (["submit", "config", "one"], 0),
       (["worker", "config", "../invalid"], 1), (["worker", "config", "one", "unexpected"], 1)] do
     let (actual, world) := (Application.runWith host service (Application.run registry args)).run {}

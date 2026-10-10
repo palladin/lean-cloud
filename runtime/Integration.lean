@@ -2,6 +2,7 @@ import LeanCloudRuntime
 import LeanCloudRuntime.Programs
 import LeanCloudTests.Generated
 import PoolTests
+import TestServices
 
 open Lean LeanCloud LeanCloudRuntime LeanCloudTests
 
@@ -79,10 +80,14 @@ private def checkAdapters (config : Config) (runPrefix : String) : IO Unit := do
     let state := (Scheduler.handle 10 {} (.ready "adapter-worker")).1
     try
       LocalDb.initializeSchema conn
-      LocalDb.save conn runPrefix state
+      LocalDb.saveValue conn runPrefix state.catalog
     finally conn.close
     let reopened ← LeanLinq.Sqlite.connect path.toString
-    try assertEq (← LocalDb.load reopened runPrefix) state "Scheduler state did not survive reopen"
+    try
+      let catalog ← LocalDb.loadValue (α := Scheduler.Catalog) reopened runPrefix {}
+      let restored := catalog.restore
+      assertEq restored.nextAttempt state.nextAttempt "Attempt counter did not survive reopen"
+      assertTrue restored.pending.isEmpty "Restored scheduling tickets from storage"
     finally reopened.close
 
 /-- A confirmed publication can still take time to reach a consumer. Require
@@ -148,7 +153,7 @@ private def checkIsolation (config : Config) (run : String) : IO Unit := do
   assertTrue (match invalid.validate with | .error _ => true | .ok _ => false)
     "Invalid inbox service ports must be rejected"
 
-/-- Separate HttpMailbox inbox services, SQLite, and S3 run the same actor turns as Sim. -/
+/-- Real HTTP/SQLite ports and S3 exercise the same scheduling core and replay step as Sim. -/
 private def compareProgram (config : Config) (run : String) (tree : Tree) (input : Nat) : IO Unit := do
   let program (_ : Unit) : Cloud IO Nat := lower tree input
   let expected ← (DirectInterpreter.interpret (S3.storage config.blobs) program ()).run
@@ -169,8 +174,10 @@ private def compareProgram (config : Config) (run : String) (tree : Tree) (input
         blobs := S3.storage config.blobs : Worker.Ports IO }
       let scheduler : SchedulerPorts IO := {
         inbox := HttpMailbox.inbox schedulerHandle
-        localDb := LocalDb.store conn run
-        send := config.mailboxes.sendWorker run }
+        localDb := ← TestServices.schedulerStore conn run
+        send := fun delivery => do
+          let endpoint ← IO.ofExcept (config.mailboxes.worker delivery.worker)
+          HttpMailbox.send endpoint run ("worker." ++ delivery.worker) delivery.message }
       try
         let mut states := Array.replicate 3 ({} : Worker.State)
         let mut done := false
@@ -193,19 +200,6 @@ private def compareProgram (config : Config) (run : String) (tree : Tree) (input
         for handle in handles do handle.close
     finally conn.close
 
-private def stagedMailbox (config : Config) (run : String) (index : Nat) (publish : Bool) : IO Unit := do
-  let endpoints := #[config.mailboxes.scheduler] ++ config.mailboxes.workers.map (·.endpoint)
-  let some endpoint := endpoints[index]? | throw (IO.userError "Invalid inbox service index")
-  if publish then
-    HttpMailbox.send endpoint run "inbox-restart" (WorkerMessage.acknowledged 73)
-    return
-  let handle ← HttpMailbox.openMailbox endpoint run "inbox-restart"
-  try
-    let inbox : Mailbox IO WorkerMessage := HttpMailbox.inbox handle
-    inbox.acknowledge (← receiveAcknowledged handle 73)
-    handle.delete
-  finally handle.close
-
 def main (args : List String) : IO UInt32 := do
   try
     let path := args.headD "/etc/lean-cloud/config.json"
@@ -214,27 +208,22 @@ def main (args : List String) : IO UInt32 := do
     | ["pool-scheduler"] =>
       LeanCloudRuntime.Pool.scheduler config
       return 0
-    | ["mailbox-seed", run, index] =>
-      let some index := index.toNat? | throw (IO.userError "Invalid inbox service index")
-      stagedMailbox config run index true
-      return 0
-    | ["mailbox-check", run, index] =>
-      let some index := index.toNat? | throw (IO.userError "Invalid inbox service index")
-      stagedMailbox config run index false
-      return 0
     | [] => pure ()
     | _ => throw (IO.userError "Invalid integration test arguments")
-    let runPrefix := s!"properties-{← IO.Process.getPID}-{← IO.monoMsNow}"
-    checkAdapters config runPrefix
-    PoolTests.run config runPrefix
-    checkPrograms config runPrefix
-    checkIsolation config runPrefix
-    for endpoint in #[config.mailboxes.scheduler] ++ config.mailboxes.workers.map (·.endpoint) do
-      checkMailboxes endpoint runPrefix
-    for seed in [:16] do
-      let tree := (generate 3 seed).1
-      try compareProgram config s!"{runPrefix}-{seed}" tree (seed % 7)
-      catch error => throw (IO.userError s!"seed={seed}, program={reprStr tree}\n{error}")
-    IO.println "Real adapters: pool terminal failure/recovery and retryable IO, independent inbox services, durable redelivery, immutable writes, blob integrity, SQLite recovery, and 16 differential programs passed."
+    TestServices.withMailboxes 4 fun endpoints => do
+      let config := { config with mailboxes := ⟨endpoints[0]!,
+        (endpoints.extract 1 4).mapIdx fun i endpoint => ⟨s!"worker{i + 1}", endpoint⟩⟩ }
+      let runPrefix := s!"properties-{← IO.Process.getPID}-{← IO.monoMsNow}"
+      checkAdapters config runPrefix
+      PoolTests.run config runPrefix
+      checkPrograms config runPrefix
+      checkIsolation config runPrefix
+      for endpoint in #[config.mailboxes.scheduler] ++ config.mailboxes.workers.map (·.endpoint) do
+        checkMailboxes endpoint runPrefix
+      for seed in [:16] do
+        let tree := (generate 3 seed).1
+        try compareProgram config s!"{runPrefix}-{seed}" tree (seed % 7)
+        catch error => throw (IO.userError s!"seed={seed}, program={reprStr tree}\n{error}")
+      IO.println "Real adapters: pool terminal failure/recovery and retryable IO, independent inbox services, durable redelivery, immutable writes, blob integrity, SQLite recovery, and 16 differential programs passed."
     return 0
   catch error => IO.eprintln error.toString; return 1

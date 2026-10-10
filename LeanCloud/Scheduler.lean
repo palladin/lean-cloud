@@ -1,12 +1,12 @@
-import LeanCloud.Coordination
+import LeanCloud.Scheduler.Program
 
-/-! The scheduler is the sole writer of coordination state. It never executes
-Cloud code or reads replay values. Its state is saved locally before replying.
-Each actor has its own durable mailbox. Redelivery may repeat requests and
-reports. Attempt numbers reject stale reports after reassignment. -/
+/-! The inbox handler drives the recursive scheduling program. Tickets and its
+continuation are volatile. Jobs are an inspection view, never the source of
+scheduling decisions. Recovery discards the continuation and starts at the root
+only after the pool has cancelled and drained the old attempts. -/
 
 namespace LeanCloud.Scheduler
-open Lean
+open Lean LeanEff
 
 inductive Status where
   | pending
@@ -22,14 +22,13 @@ structure Job where
   status : Status := .pending
   deriving Repr, BEq, Inhabited, ToJson, FromJson
 
-/-- Confirmed global records written/read by a worker process. These are hints
-for placement and observability, not a second authority for replay values. -/
 structure WorkerInfo where
   worker : WorkerId
   recorded : Array String := #[]
   deriving Repr, BEq, Inhabited, ToJson, FromJson
 
-structure State where
+/-- An observational snapshot for status, traces and timings. -/
+structure Snapshot where
   jobs : Array Job := #[⟨Location.root, Location.root, false, .pending⟩]
   workers : Array WorkerInfo := #[]
   nextAttempt : Nat := 0
@@ -37,10 +36,46 @@ structure State where
   error : Option CloudError := none
   deriving Repr, BEq, ToJson, FromJson
 
-def State.finished (state : State) : Bool :=
-  state.jobs.any fun job => job.branch == Location.root && job.status == .done
+structure Pending where
+  ticket : Ticket
+  branchStart : Location
+  status : Status := .pending
+  reply : Option (Except CloudError Progress) := none
+  deriving Inhabited
 
--- Stable internal names allow proofs to use the deployed state transitions.
+structure State extends Snapshot where
+  continuation : Waiting := suspend (run [Location.root]).run
+  pending : Array Pending := #[]
+  nextTicket : Nat := 0
+  stopping : Array WorkerId := #[]
+  barrier : Nat := 0
+
+/-- The durable part contains no traversal, tickets, leases or branch tree. -/
+structure Catalog where
+  nextAttempt : Nat := 0
+  workers : Array WorkerInfo := #[]
+  error : Option CloudError := none
+  deriving ToJson, FromJson
+
+def State.catalog (state : State) : Catalog :=
+  ⟨state.nextAttempt, state.workers.map (fun worker => { worker with recorded := #[] }), state.error⟩
+
+def Catalog.restore (catalog : Catalog) : State :=
+  { nextAttempt := catalog.nextAttempt, workers := catalog.workers, error := catalog.error }
+
+-- JSON carries observations only, never executable continuations or tickets.
+instance : ToJson State := ⟨fun state => toJson state.toSnapshot⟩
+instance : Repr State := ⟨fun state prec => reprPrec state.toSnapshot prec⟩
+
+/-- Completion as shown to clients; snapshots contain no executable state. -/
+def Snapshot.finished (snapshot : Snapshot) : Bool :=
+  snapshot.jobs.any fun job => job.branch == Location.root && job.status == .done
+
+def State.finished (state : State) : Bool :=
+  match state.continuation with
+  | .done (.ok _) => true
+  | _ => false
+
 namespace Internal
 
 def observe (state : State) (worker : WorkerId) (keys : Array String) : State := Id.run do
@@ -53,80 +88,127 @@ def observe (state : State) (worker : WorkerId) (keys : Array String) : State :=
     workers := workers.set! index { info with recorded }
   return { state with workers }
 
-def awaken (state : State) : State :=
-  { state with jobs := state.jobs.map fun job =>
-      match job.status with
-      | .waiting children =>
-        if children.all (fun child => state.jobs.any (fun j => j.branch == child && j.status == .done)) then
-          { job with status := .pending, joining := true }
-        else job
-      | _ => job }
+private def view (state : State) (branch : Location) (update : Job → Job) : State :=
+  let index := state.jobs.findIdx? (·.branch == branch)
+  let job := update (index.map (state.jobs[·]!) |>.getD ⟨branch, branch, false, .pending⟩)
+  { state with jobs := match index with
+      | some index => state.jobs.set! index job
+      | none => state.jobs.push job }
 
-def assignment (job : Job) (attempt : Nat) : Assignment :=
-  ⟨attempt, job.branch⟩
+/-- Run pure scheduling code until it awaits a missing reply. The mailbox loop
+remains free to serve other runs and administrative requests. -/
+partial def advance (state : State) : State :=
+  match state.continuation with
+  | .done result => { state with error := match result with | .ok _ => none | .error error => some error }
+  | .spawn branch next =>
+    let ticket := state.nextTicket
+    let state := view state branch fun job => { job with status := .pending }
+    advance { state with
+      pending := state.pending.push ⟨ticket, branch, .pending, none⟩
+      nextTicket := ticket + 1
+      continuation := next ticket }
+  | .await ticket next =>
+    match state.pending.find? (·.ticket == ticket) with
+    | some task => match task.reply with
+      | some reply => advance { state with
+          continuation := next reply
+          pending := state.pending.filter (·.ticket != ticket) }
+      | none => state
+    | none => { state with error := some ⟨.protocol, "Unknown scheduling ticket"⟩ }
 
-/-- Locate an existing assignment when a worker repeats its request. -/
 def assignedTo (worker : WorkerId) (job : Job) : Option Assignment :=
   match job.status with
-  | .running owner attempt _ =>
-    if owner == worker then some (assignment job attempt) else none
+  | .running owner attempt _ => if owner == worker then some ⟨attempt, job.branch⟩ else none
   | _ => none
 
+def owned (state : State) (worker : WorkerId) : Option Assignment :=
+  state.pending.findSome? fun task => match task.status with
+    | .running owner attempt _ => if owner == worker then some ⟨attempt, task.branchStart⟩ else none
+    | _ => none
+
 def acquire (state : State) (worker : WorkerId) (duration : Nat) : State × WorkerMessage := Id.run do
+  if state.stopping.contains worker then return (state, .cancel state.barrier)
+  if !state.stopping.isEmpty then return (state, .idle)
+  if let some error := state.error then return (state, .failed error)
+  let state := advance state
   if let some error := state.error then return (state, .failed error)
   if state.finished then return (state, .finished)
-  -- The same request can be delivered twice, including after a lost reply.
-  if let some existing := state.jobs.findSome? (assignedTo worker) then
-    return (state, .execute existing)
-  let some index := state.jobs.findIdx? (fun job => job.status == .pending)
+  if let some existing := owned state worker then return (state, .execute existing)
+  let some index := state.pending.findIdx? (fun task => task.status == .pending)
     | return (state, .idle)
-  let job := state.jobs[index]!
+  let task := state.pending[index]!
   let attempt := state.nextAttempt
-  let jobs := state.jobs.set! index { job with status := .running worker attempt (state.now + max 1 duration) }
-  return ({ state with jobs, nextAttempt := attempt + 1 }, .execute (assignment job attempt))
-
-/-- Add each child at most once. Existing jobs retain their state and new jobs
-start pending; inserting children never manufactures a completed branch. -/
-def addChildren (jobs : Array Job) (children : Array Location) : Array Job :=
-  children.foldl (fun jobs child =>
-    if jobs.any (fun job => job.branch == child) then jobs
-    else jobs.push ⟨child, child, false, .pending⟩) jobs
+  let status := Status.running worker attempt (state.now + max 1 duration)
+  let state := view state task.branchStart fun job => { job with status }
+  return ({ state with pending := state.pending.set! index { task with status }, nextAttempt := attempt + 1 },
+    .execute ⟨attempt, task.branchStart⟩)
 
 def accept (state : State) (report : Report) : State := Id.run do
-  let state := observe state report.worker report.recorded
-  let some index := state.jobs.findIdx? (fun job => match job.status with
+  if !state.stopping.isEmpty then return state
+  let some index := state.pending.findIdx? (fun task => match task.status with
       | .running worker attempt _ => worker == report.worker && attempt == report.attempt
       | _ => false) | return state
-  let job := state.jobs[index]!
+  let task := state.pending[index]!
+  let state := observe state report.worker report.recorded
+  let state := view state task.branchStart fun job => match report.progress with
+    | .error _ => job
+    | .ok .done => { job with status := .done }
+    | .ok (.fork location count) =>
+      { job with location, joining := true, status := .waiting ((Array.range count).map location.child) }
+  -- Arrival order does not change the recursive program's result order.
+  let state := { state with
+    pending := state.pending.set! index { task with status := .done, reply := some report.progress } }
   match report.progress with
   | .error error => return { state with error := some error }
-  | .ok .done =>
-    return awaken { state with jobs := state.jobs.set! index { job with status := .done } }
-  | .ok (.fork location count) =>
-    -- A resumed branch may reach a later fork. Child keys contain that fork's
-    -- full location; retries can never allocate a second copy of the children.
-    let children := (Array.range count).map location.child
-    let jobs := state.jobs.set! index { job with location, joining := false, status := .waiting children }
-    return awaken { state with jobs := addChildren jobs children }
+  | .ok _ => return advance state
 
 end Internal
-open Internal
 
-/-- One serial mailbox transition, with no backend operations. Persist the
-returned state before delivering its messages. A lost reply is safe to retry. -/
+/-- Recovery uses no saved traversal. Attempt IDs remain monotone so old reports
+cannot satisfy a new ticket. The caller must first stop the old workers. -/
+private def restart (state : State) : State :=
+  { nextAttempt := state.nextAttempt, now := state.now, error := state.error, workers := state.workers }
+
+def runningWorkers (state : State) : Array WorkerId :=
+  state.pending.foldl (fun all task => match task.status with
+    | .running worker _ _ => if all.contains worker then all else all.push worker
+    | _ => all) #[]
+
+/-- Cancellation is a barrier, not lease expiry. No replacement is dispatched
+until every old owner has acknowledged stopping (or its process was stopped). -/
+def cancel (state : State) (workers : Array WorkerId := #[]) : State :=
+  let stopping := (workers ++ runningWorkers state ++ state.stopping).foldl
+    (fun all worker => if all.contains worker then all else all.push worker) (#[] : Array WorkerId)
+  let state := { state with stopping, barrier := state.nextAttempt, nextAttempt := state.nextAttempt + 1 }
+  let state := { state with jobs := state.jobs.map fun job => match job.status with
+    | .running .. => { job with status := .pending }
+    | _ => job }
+  if stopping.isEmpty then restart state else state
+
+def stopped (state : State) (worker : WorkerId) (barrier : Nat) : State :=
+  if barrier != state.barrier || !state.stopping.contains worker then state else
+  let state := { state with stopping := state.stopping.filter (· != worker) }
+  if state.stopping.isEmpty then restart state else state
+
+def expired (state : State) : Bool := state.pending.any fun task => match task.status with
+  | .running _ _ deadline => deadline ≤ state.now
+  | _ => false
+
+/-- Renew transport assignments without touching the scheduling program. -/
+def mapAssignments (state : State) (update : Status → Status) : State :=
+  { state with pending := state.pending.map fun task => { task with status := update task.status }
+               jobs := state.jobs.map fun job => { job with status := update job.status } }
+
 def handle (duration : Nat) (state : State) (message : SchedulerMessage) : State × Array Delivery :=
   match message with
   | .ready worker =>
-    let (state, response) := acquire (observe state worker #[]) worker duration
+    let (state, response) := Internal.acquire (Internal.observe state worker #[]) worker duration
     (state, #[⟨worker, response⟩])
   | .report report =>
-    (accept state report, #[⟨report.worker, .acknowledged report.attempt⟩])
-  | .inspect replyTo => (state, #[⟨replyTo, .status (toJson state)⟩])
+    (Internal.accept state report, #[⟨report.worker, .acknowledged report.attempt⟩])
+  | .stopped worker barrier => (stopped state worker barrier, #[])
   | .tick elapsed =>
-    let now := state.now + elapsed
-    ({ state with now, jobs := state.jobs.map fun job =>
-        match job.status with
-        | .running _ _ deadline => if deadline ≤ now then { job with status := .pending } else job
-        | _ => job }, #[])
+    let state := { state with now := state.now + elapsed }
+    (if state.stopping.isEmpty && expired state then cancel state else state, #[])
 
 end LeanCloud.Scheduler

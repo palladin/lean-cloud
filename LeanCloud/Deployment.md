@@ -42,10 +42,18 @@ flowchart LR
 
 ## Responsibilities
 
-The scheduler persists assignments, attempts, dependencies, and confirmed record
-keys. It is the sole writer of its coordination database. It does not evaluate
-workflow code or access replay records. Administrative kill revokes work and
-assigns a worker to publish the root cancellation record.
+The scheduler follows the same recursive structure as `RestartingParallelReplay`:
+dispatch a batch, await its replies in assignment order, finish each fork's
+children, then resume its parent. In [Scheduler.run](Scheduler/Program.lean),
+`spawn` sends work to a worker inbox and `await` suspends until the corresponding
+reply arrives. Each workflow has its own in-memory continuation, so waiting does
+not block other workflows or administrative commands.
+
+SQLite stores the run catalog, administrative intent, worker membership and
+attempt counters. The traversal, pending tickets and branch tree are not saved;
+after restart, workers reconstruct progress from their replay records. The
+scheduler does not evaluate workflow code or access those records. Administrative
+kill stops old attempts before assigning a worker to publish the root cancellation.
 
 Assignments contain only an attempt number and a stable `branchStart`. Workers
 reconstruct captured variables from the root program, then replay records in
@@ -117,10 +125,18 @@ worker volumes for rejoining and recovery.
 * Losing a send response can cause a duplicate publication. Actor protocols must
   tolerate duplicates; HTTP does not provide exactly-once delivery.
 
-The scheduler saves its state before confirming outgoing messages and
+The scheduler commits its catalog before confirming outgoing messages and
 acknowledging input. Workers persist replay records, confirm their reports, and
 then acknowledge assignments. Failure between these steps causes retry or
 redelivery. Attempt numbers fence reports from superseded assignments.
+
+A scheduler restart discards its traversal and requests cancellation from all
+configured workers. Each serial worker acknowledges only after its current
+attempt has returned and its heartbeat task has stopped. Only after every old
+owner has stopped may the scheduler dispatch the root again. Pause, kill and
+assignment expiry use the same barrier. An expired lease alone never authorizes
+an overlapping replacement. An unreachable worker holds up its affected runs
+until it reconnects or its process is confirmed stopped through pool retirement.
 
 Busy pool workers also send assignment heartbeats every third of
 `scheduler.assignmentMs` (30 seconds by default). This lease is separate from
@@ -132,10 +148,11 @@ returns or throws; crashed workers stop sending them and their work expires.
 
 A process crash stops both HTTP and the actor. Docker restarts the same node
 against its persistent volumes. During downtime, senders cannot obtain acceptance;
-failed actor operations restart and recover their unacknowledged inputs. The
-pool coordinator can also reconstruct worker replies from saved assignments and
-repeated readiness requests. Recovery assumes eventual restarts, restored network
-connectivity, and surviving local disks. It does not cover permanent volume loss
+unacknowledged inbox deliveries survive. A worker retries storage/transport errors
+locally within its current assignment, checking ownership before every replay
+record operation. A scheduler restart cancels old owners and reconstructs from
+the root, without loading a saved scheduling tree. Recovery assumes eventual
+restarts, restored network connectivity, and surviving local disks. It does not cover permanent volume loss
 or multiple schedulers using different copies of the coordination database.
 `docker stop` explicitly terminates the Lean process; unacknowledged work is
 recovered from SQLite on restart. Stopping does not drain arbitrary user IO.
@@ -147,14 +164,14 @@ proofs assume sufficient fuel rather than proving that this default always suffi
 
 An accepted interpreter error, such as fuel exhaustion or a replay protocol
 error, terminates that run. The pool revokes its other attempts and saves the
-error in SQLite before publishing a failure in the ordinary immutable root
+error in SQLite before a worker publishes a failure in the ordinary immutable root
 record. Restart retries an interrupted publication. An existing root result
 is preserved; duplicate reports and a later kill cannot replace it. Failed runs
 cannot resume: fix the cause and submit a new run.
 
 `CloudProcess.poll`/`await` and the console read that same root outcome.
-`result` and `inspect` show the reason; `ps` shows `failed`, and `watch` displays
-recorded history with the failure reason, including from its offline cache.
+`result` and `inspect` show the reason; `ps` shows `failed`, and `watch` retains
+the last view with the failure reason, including from its offline cache.
 Worker crashes and IO/transport exceptions remain retryable and do not create
 terminal failure records. Recovery still requires available durable storage.
 
@@ -172,8 +189,7 @@ lake test
 (cd runtime && lake exe cloud_inbox_tests)
 lake exe cloud_console_tests
 lake exe cloud_console_tests --chaos-only --seed 1
-lake exe cloud_runtime_tests
-lake exe cloud_chaos --seed 1 --crashes 8 --workers 3
+docker compose run --build --rm checks
 ```
 
 The native inbox suite also runs the application-command and registry unit tests.
@@ -181,8 +197,10 @@ It checks real SQLite against the simulator's mailbox model over generated
 operation traces, plus session expiry, renewal, duplicate publication,
 stale acknowledgements, HTTP authentication, registry access, and committed mail
 surviving a SIGKILL. It also checks Pool assignment renewal and revocation using
-the real HTTP scheduler and private SQLite. Reply cleanup tests cover abandoned
-inboxes, restarts, legacy reply rows, cached errors, and delayed duplicate controls
+the real HTTP scheduler and private SQLite. A two-worker SIGKILL test checks that
+only the catalog survives, a missing stop acknowledgement blocks replacement,
+late reports are rejected, and root replay returns the direct result. Reply cleanup
+tests cover abandoned inboxes, restarts, legacy reply rows, cached errors, and delayed duplicate controls
 after cache retirement. Repeated requests return the temporary row and cache
 counts to their baseline without removing workflow state. Generated Pool model tests interleave
 multiple workflows, restarts, controls, scaling, and delayed worker operations,
@@ -191,15 +209,16 @@ Console tests cover the production layout, shared processes,
 controls, scaling, generated applications, and node restarts. The pool chaos suite
 runs generated pure workflows together on those combined nodes, crashes and
 restarts workers and the scheduler, and disconnects nodes and shared blob storage
-while work is active. It checks reassignment, healthy-worker progress during worker
-isolation, rejection of late reports, and automatic recovery after reconnecting.
+while work is active. It checks that isolated owners block replacement, late
+reports are rejected, and root reconstruction resumes after workers reconnect.
 Blob transport failures must remain retryable; records confirmed before the outage
 must retain their values after recovery and completion. Durable outcomes must
-match direct evaluation. Component tests run
-HTTP inboxes separately to inject transport faults and compare generated cloud
-programs with the direct interpreter. These standalone inboxes are test fixtures;
-production nodes keep HTTP, SQLite, and their actor in one process.
+match direct evaluation. Component tests host separate HTTP inboxes and SQLite
+databases in the test process and use a container for S3 storage. They check
+durable redelivery and compare generated cloud programs with the direct
+interpreter. Production nodes keep HTTP, SQLite, and their actor in one process.
 
-The semantic proofs compare direct evaluation with sequential and parallel
-replay over a pure journal. Scheduler and worker coordination, crashes, recovery,
-SQLite, libcurl, and HTTP are covered by model, adapter, and container tests.
+The three semantic proofs compare direct evaluation with sequential replay,
+parallel replay, and parallel replay with worker-local restarts over a pure journal.
+Scheduler and worker coordination, crashes, recovery, SQLite, libcurl, and HTTP
+are covered by model, adapter, and container tests.

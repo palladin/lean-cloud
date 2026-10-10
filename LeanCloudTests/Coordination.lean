@@ -59,18 +59,22 @@ def coordinationCases : Array TestCase := #[
     let (initial, first) := Scheduler.handle 10 {} (.ready "a/0")
     let assignment ← assigned first
     let (repeated, second) := Scheduler.handle 10 initial (.ready "a/0")
-    assertEq initial repeated
+    assertEq initial.toSnapshot repeated.toSnapshot
     assertEq (← assigned second) assignment
     let report : Report := ⟨"a/0", assignment.attempt, .ok (.fork Location.root 2), #["prefix"]⟩
     let (forked, _) := Scheduler.handle 10 repeated (.report report)
     let (duplicate, _) := Scheduler.handle 10 forked (.report report)
-    assertEq duplicate forked
+    assertEq (duplicate).toSnapshot (forked).toSnapshot
     assertEq forked.jobs.size 3
     assertEq (forked.workers[0]?.map (·.recorded)) (some #["prefix"])⟩,
   ⟨"scheduler/stale-attempt-cannot-complete-new-assignment", do
     let (state, old) := Scheduler.handle 10 {} (.ready "a/0")
     let old ← assigned old
     let (state, _) := Scheduler.handle 10 state (.tick 10)
+    let (_, blocked) := Scheduler.handle 10 state (.ready "a/1")
+    assertTrue (blocked.all (fun delivery => match delivery.message with | .idle => true | _ => false))
+      "Expiry dispatched a replacement before cancellation completed"
+    let (state, _) := Scheduler.handle 10 state (.stopped "a/0" state.barrier)
     let (state, fresh) := Scheduler.handle 10 state (.ready "a/1")
     let fresh ← assigned fresh
     assertTrue (fresh.attempt > old.attempt) "Reused an attempt number"
@@ -98,6 +102,30 @@ def coordinationCases : Array TestCase := #[
     let (state, _) := Scheduler.handle 10 state (.report ⟨"a", root.attempt, .ok (.fork Location.root 0), #[]⟩)
     let (_, resumed) := Scheduler.handle 10 state (.ready "a")
     assertEq (← assigned resumed).branchStart Location.root⟩,
+  ⟨"scheduler/recursive-batch-awaits-siblings-before-descending", do
+    let (state, root) := Scheduler.handle 100 {} (.ready "a")
+    let root ← assigned root
+    let (state, _) := Scheduler.handle 100 state (.report ⟨"a", root.attempt, .ok (.fork Location.root 2), #[]⟩)
+    let (state, left) := Scheduler.handle 100 state (.ready "a")
+    let left ← assigned left
+    let (state, right) := Scheduler.handle 100 state (.ready "b")
+    let right ← assigned right
+    let fork := left.branchStart.next
+    let (state, _) := Scheduler.handle 100 state (.report ⟨"a", left.attempt, .ok (.fork fork 1), #[]⟩)
+    let (_, waiting) := Scheduler.handle 100 state (.ready "c")
+    assertTrue (waiting.all (fun d => match d.message with | .idle => true | _ => false))
+      "Descended into a fork before awaiting the rest of its batch"
+    let (state, _) := Scheduler.handle 100 state (.report ⟨"b", right.attempt, .ok .done, #[]⟩)
+    let (state, child) := Scheduler.handle 100 state (.ready "c")
+    let child ← assigned child
+    assertEq child.branchStart (fork.child 0)
+    let (state, _) := Scheduler.handle 100 state (.report ⟨"c", child.attempt, .ok .done, #[]⟩)
+    let (state, parent) := Scheduler.handle 100 state (.ready "a")
+    let parent ← assigned parent
+    assertEq parent.branchStart left.branchStart
+    let (state, _) := Scheduler.handle 100 state (.report ⟨"a", parent.attempt, .ok .done, #[]⟩)
+    let (_, root) := Scheduler.handle 100 state (.ready "b")
+    assertEq (← assigned root).branchStart Location.root⟩,
   ⟨"records/first-successful-create-wins", do
     let old : Fin 2 := ⟨0, by decide⟩
     let fresh : Fin 2 := ⟨1, by decide⟩
@@ -118,8 +146,8 @@ def coordinationCases : Array TestCase := #[
   ⟨"protocol/json-roundtrip", do
     let report : Report := ⟨"worker/3", 17, .ok (.fork #[(0, 2), (1, 5)] 3), #["x", "y"]⟩
     let state : Scheduler.State := { workers := #[⟨"worker/3", #["x", "y"]⟩], nextAttempt := 18 }
-    let decoded ← unwrap (Json.parse (toJson state).compress >>= fromJson? (α := Scheduler.State))
-    assertEq decoded state
+    let decoded ← unwrap (Json.parse (toJson state).compress >>= fromJson? (α := Scheduler.Snapshot))
+    assertEq decoded (state).toSnapshot
     let decoded ← unwrap (Json.parse (toJson report).compress >>= fromJson? (α := Report))
     assertEq (toJson decoded) (toJson report)
     let error : Report := ⟨"worker/3", 17, .error ⟨.divergence, "changed"⟩, #[]⟩
@@ -215,11 +243,6 @@ private def recoveringScheduler : Scheduler.State := {
   nextAttempt := 12
   now := 7 }
 
-private def recoveredScheduler : Scheduler.State :=
-  { recoveringScheduler with
-    jobs := recoveringScheduler.jobs.set! 1
-      ({ recoveringScheduler.jobs[1]! with status := .pending }) }
-
 def simulationBoundaryCases : Array TestCase := #[
   ⟨"simulation/scheduler-startup-recovers-assignments", do
     -- No actor turns: startup itself must reload and release old attempts,
@@ -227,13 +250,20 @@ def simulationBoundaryCases : Array TestCase := #[
     let start := SimulationBackend.start (workers := 0) 0 100 10 workflow ()
     let (_, world) ← unwrap (evaluate 100 (start ⟨0, by decide⟩ 1)
       { scheduler := recoveringScheduler })
-    assertEq world.scheduler recoveredScheduler
+    assertEq world.scheduler.stopping #["worker-1"]
+    assertEq world.scheduler.nextAttempt 13
+    let (_, blocked) := Scheduler.handle 10 world.scheduler (.ready "replacement")
+    assertTrue (blocked.all (fun d => match d.message with | .idle => true | _ => false))
+      "Recovery dispatched before the old worker stopped"
     let (_, again) ← unwrap (evaluate 100 (start ⟨0, by decide⟩ 2) world)
-    assertEq again.scheduler recoveredScheduler "Recovery was not idempotent"
-    let (_, deliveries) := Scheduler.handle 10 world.scheduler (.ready "replacement")
+    assertTrue (again.scheduler.barrier > world.scheduler.barrier) "Restart reused a cancellation token"
+    let (stale, _) := Scheduler.handle 10 again.scheduler (.stopped "worker-1" world.scheduler.barrier)
+    assertEq stale.stopping #["worker-1"] "Old stop reply crossed the restart boundary"
+    let (ready, _) := Scheduler.handle 10 stale (.stopped "worker-1" stale.barrier)
+    let (_, deliveries) := Scheduler.handle 10 ready (.ready "replacement")
     let assignment ← assigned deliveries
-    assertEq assignment.branchStart (Location.root.child 0)
-    assertEq assignment.attempt 12⟩,
+    assertEq assignment.branchStart Location.root "Recovery restored a saved child instead of replaying the root"
+    assertEq assignment.attempt 14⟩,
   ⟨"simulation/recovery-local-save-crash-boundaries", do
     let actor : Fin 1 := ⟨0, by decide⟩
     let start : Simulation.Start SimulationBackend.World Unit 1 := fun _ generation =>
@@ -247,9 +277,10 @@ def simulationBoundaryCases : Array TestCase := #[
       let (world, noOrphans) ← unwrap (crashed.map (fun state => (state.world, state.orphans.isEmpty))
         |>.mapError reprStr)
       assertTrue noOrphans "Recovery save survived its process as an orphan"
-      assertEq world.scheduler (if afterCommit then recoveredScheduler else recoveringScheduler)
+      assertEq world.scheduler.nextAttempt (if afterCommit then 13 else 12)
       let (_, recovered) ← unwrap (evaluate 100 (start actor 1) world)
-      assertEq recovered.scheduler recoveredScheduler⟩,
+      assertEq recovered.scheduler.nextAttempt (world.scheduler.nextAttempt + 1)
+      assertEq recovered.scheduler.stopping #["worker-1"]⟩,
   ⟨"simulation/worker-crash-discards-only-local-observations", do
     let start := SimulationBackend.start (workers := 3) 0 100 10 workflow ()
     let record := rootRecord 7
@@ -261,7 +292,7 @@ def simulationBoundaryCases : Array TestCase := #[
       (Simulation.State.initial world start)).map (·.world))
     assertEq (crashed.observations.lookup "worker-1") none
     assertEq (crashed.observations.lookup "worker-2") (some #["other"])
-    assertEq crashed.scheduler world.scheduler "Worker crash changed durable scheduler metadata"
+    assertEq (crashed.scheduler).toSnapshot (world.scheduler).toSnapshot "Worker crash changed durable scheduler metadata"
     assertEq crashed.records world.records "Worker crash removed global records"⟩,
   ⟨"simulation/remote-request-commits-after-crash", do
     let start : Simulation.Start Nat Nat 1 := fun _ _ => SimM.atomic (fun n => (n, n + 1))

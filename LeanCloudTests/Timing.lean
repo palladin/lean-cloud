@@ -65,9 +65,9 @@ def cases : Array TestCase := #[
       "Recovery fabricated old start times"
     let legacy ← unwrap (fromJson? (α := LeanCloud.Timing.Status) (toJson initial.scheduler))
     assertTrue legacy.timing.isNone "Legacy status acquired a timing"
-    let status : LeanCloud.Timing.Status := { toState := waiting.scheduler, timing := some timing }
+    let status : LeanCloud.Timing.Status := { toSnapshot := waiting.scheduler.toSnapshot, timing := some timing }
     let restored ← unwrap (fromJson? (α := LeanCloud.Timing.Status) (toJson status))
-    assertEq restored.toState waiting.scheduler
+    assertEq restored.toSnapshot waiting.scheduler.toSnapshot
     assertEq restored.timing (some timing)⟩,
   ⟨"timing.format-and-tree-column", do
     for (ms, text) in [(0, "0ms"), (999, "999ms"), (1234, "1.234s"), (60000, "1m00s"),

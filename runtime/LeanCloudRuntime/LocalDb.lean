@@ -1,8 +1,7 @@
-import LeanCloud.Mailbox
 import LeanLinq.Driver.Sqlite
 
 namespace LeanCloudRuntime.LocalDb
-open Lean LeanCloud LeanLinq
+open Lean LeanLinq
 
 private abbrev Row : Schema := [("run", .string), ("state", .string)]
 private abbrev Context : Ctx := { tables := [("scheduler", Row)] }
@@ -34,12 +33,5 @@ def saveValue [ToJson α] (conn : Sqlite.Conn) (run : String) (state : α) : IO 
         |>.value "run" (SqlExpr.str run)
         |>.value "state" (SqlExpr.str (toJson state).compress)
       discard (conn.execInsert insert)
-
-def load (conn : Sqlite.Conn) (run : String) : IO Scheduler.State := loadValue conn run {}
-
-def save (conn : Sqlite.Conn) (run : String) (state : Scheduler.State) : IO Unit := saveValue conn run state
-
-def store (conn : Sqlite.Conn) (run : String) : SchedulerStore IO :=
-  ⟨load conn run, save conn run⟩
 
 end LeanCloudRuntime.LocalDb

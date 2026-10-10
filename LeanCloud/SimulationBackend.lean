@@ -133,10 +133,12 @@ def start [Codec α] (turns fuel duration : Nat)
         ((), { world with workerInboxes := setEntry world.workerInboxes id inbox })) "worker.connect"
       workerLoop turns fuel (workerPorts id generation) program input
 
-/-- The broker observes consumer failure independently of the actor continuation.
+/-- The mailbox observes consumer failure independently of the actor continuation.
 Already confirmed publications survive; old receive/ack requests are session-fenced. -/
 def disconnect (actor generation : Nat) (world : World) : World :=
-  if actor == 0 then { world with schedulerInbox := MailboxModel.disconnect generation world.schedulerInbox }
+  if actor == 0 then { world with
+    scheduler := world.scheduler.catalog.restore
+    schedulerInbox := MailboxModel.disconnect generation world.schedulerInbox }
   else
     let id := s!"worker-{actor}"
     let inbox := MailboxModel.disconnect generation ((world.workerInboxes.lookup id).getD {})

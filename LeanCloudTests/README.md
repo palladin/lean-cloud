@@ -13,8 +13,7 @@ lake exe cloud_console_tests
 lake exe cloud_console_tests --pool-only
 lake exe cloud_console_tests --scaling-only
 lake exe cloud_console_tests --chaos-only --seed 1
-lake exe cloud_runtime_tests
-lake exe cloud_chaos --seed 1
+docker compose run --build --rm checks
 ```
 
 CI runs library/proof checks on pull requests and pushes to `main`, then passes
@@ -71,12 +70,13 @@ scheduler restarts, and compares the saved records with their original values.
 A test-only command reads them through the production S3 adapter; it never runs
 a workflow or opens coordination databases and is not exposed by the HTTP API.
 
-Next, Docker disconnects a busy worker from the
-deployment network. The test requires a newer assignment on a different worker
-and completed branches while the victim remains isolated. It then delivers
-synthetic late failure reports and a heartbeat for the expired attempt through
-the real HTTP/SQLite inbox; neither may fail the run or revive that attempt.
-The worker reconnects with its original DNS alias. Next, the scheduler loses its
+Next, Docker disconnects a busy worker from the deployment network. After expiry,
+the affected run must have no replacement assignments while that worker remains
+isolated: timeout does not prove it stopped. Synthetic late failure reports and
+a heartbeat pass through the real HTTP/SQLite inbox; neither may fail the run
+or revive that attempt. The worker reconnects with its original DNS alias,
+acknowledges cancellation, and the test requires a fresh root assignment and
+further progress. Next, the scheduler loses its
 network connection for longer than the configured assignment lease. No explicit
 node restart accompanies these network faults; transport errors may trigger the
 normal Docker restart policy. All three partitions must recover automatically.
@@ -91,11 +91,11 @@ the workflows. The test fails if it cannot find active work to exercise.
 
 The retained test directory contains `chaos-plan.json` with inputs, program trees,
 expected outcomes, and the fault plan, plus `chaos-events.jsonl` with observed
-assignments, network disconnections/reconnections, reassignment evidence,
+assignments, network disconnections/reconnections, stop barriers and root reconstruction,
 late-message checks, storage failures, actual victims, restart evidence, and
 results. `chaos-records-before.json`, `chaos-records-recovery.json`, and
 `chaos-records-completion.json` retain the compared record sets. Scheduler
-observations establish that reassignment happened even if a short assignment
+observations establish that root reconstruction happened even if a short assignment
 finishes between polls; missing evidence fails the test. Durable results remain
 the correctness oracle. CI retains these on
 failure along with node logs. `--seed N` reproduces generated programs and fault
@@ -177,11 +177,16 @@ of 200 operations. They also check SIGKILL recovery, termination signals, HTTP
 authentication, lease expiry and renewal, and rejection of stale consumers.
 The native suite also runs the real Pool scheduler over HTTP and SQLite: busy
 work retains its assignment, pause revokes it, failed computations stop renewing,
-and stale heartbeats cannot renew replacement attempts.
+and stale heartbeats cannot renew replacement attempts. A two-worker scheduler
+SIGKILL test checks catalog-only persistence, blocks replacement until both stop
+acknowledgements arrive, rejects stale reports/tokens, and resumes actual replay
+from the root. Existing records survive and the result equals direct evaluation.
 
 Real adapter properties compare 16 generated programs using HTTP/SQLite inboxes,
 private scheduler SQLite, and S3 with direct evaluation.
-They also run the real Pool scheduler from durable snapshots before and after
+The fixture hosts separate HTTP servers and SQLite databases inside the test
+process; only S3 storage runs in a separate container.
+Tests also run the real Pool scheduler from durable catalogs before and after
 failure publication, preserve an earlier root result, and exercise a live child
 failure through the worker interpreter, typed process handles, and application
 API. Duplicate/late reports and kill must preserve the failure; an IO exception
@@ -193,12 +198,10 @@ every inbox service. Identically named queues on different inbox services must r
 payloads; unknown worker routes and duplicate configured identities are rejected.
 After acknowledgement, a new consumer must receive the next confirmed message
 instead of the old delivery; an empty poll on the original consumer is insufficient.
-A SIGKILL of each inbox service immediately after creating
-a mailbox and confirming its first publication must preserve that message.
-While that inbox service is down, another must still accept and deliver messages.
+The native inbox suite checks confirmed publications across SIGKILL separately.
 Container tests exercise actual mailbox transport, multiple worker processes, and
-restarts. Chaos plans are generated before execution and recorded with logs; the
-seed reproduces the plan, not OS timing.
+restarts of combined HTTP/SQLite/actor nodes. Chaos plans are generated before
+execution and recorded with logs; the seed reproduces the plan, not OS timing.
 
 Console tests cover pause/resume and permanent kill, including interrupted
 commands, restart policies, and isolation between runs. Real runtime tests check

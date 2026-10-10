@@ -1,5 +1,6 @@
 import LeanCloudTests.Generated
 import LeanCloud.ReplayModel
+import LeanCloud.ParallelReplay
 
 namespace LeanCloudTests
 open Lean LeanCloud LeanCloud.ReplayModel

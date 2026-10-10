@@ -40,21 +40,21 @@ structure Report where
   deriving Repr, ToJson, FromJson
 
 /-- Durable inboxes retain confirmed requests and reports until acknowledged. Expiry
-makes abandoned assignments available again; stale attempts cannot change jobs. -/
+requests cancellation of abandoned assignments; stale attempts cannot satisfy replies. -/
 inductive SchedulerMessage where
   | ready (worker : WorkerId)
+  | stopped (worker : WorkerId) (barrier : Nat)
   | report (report : Report)
   | tick (elapsed : Nat)
-  | inspect (replyTo : WorkerId)
   deriving Repr, ToJson, FromJson
 
 inductive WorkerMessage where
   | execute (assignment : Assignment)
+  | cancel (barrier : Nat)
   | acknowledged (attempt : Nat)
   | idle
   | finished
   | failed (error : CloudError)
-  | status (metadata : Json)
   deriving Repr, ToJson, FromJson
 
 structure Delivery where

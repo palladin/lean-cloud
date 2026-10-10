@@ -15,7 +15,8 @@ structure Mailbox (m : Type → Type u) (message : Type) where
   receive : m (Option (Received message))
   acknowledge : Nat → m Unit
 
-/-- Only the scheduler process accesses its private durable state. -/
+/-- Process-owned scheduling state. Saving must durably commit its catalog;
+the recursive continuation remains in memory only. -/
 structure SchedulerStore (m : Type → Type u) where
   load : m Scheduler.State
   save : Scheduler.State → m Unit
@@ -25,18 +26,14 @@ structure SchedulerPorts (m : Type → Type u) where
   localDb : SchedulerStore m
   send : Delivery → m Unit
 
-/-- Recover the private database before receiving mail in a fresh process.
-Abandoned attempts become pending; completed jobs and partial joins survive.
-This does not depend on the old process's clock or assignment timeout. -/
+/-- On startup, cancel every known worker before rebuilding from the root.
+Attempt counters survive; replay records reconstruct completed work. -/
 def Scheduler.recover [Monad m] (store : SchedulerStore m) : m Unit := do
   let state ← store.load
-  store.save { state with jobs := state.jobs.map fun job =>
-    match job.status with
-    | .running .. => { job with status := .pending }
-    | _ => job }
+  store.save (Scheduler.cancel state (state.workers.map (·.worker)))
 
-/-- Persist first, confirm outgoing messages next, acknowledge the input last.
-A crash at either boundary causes redelivery; handling duplicates is idempotent. -/
+/-- Commit the catalog first, confirm outgoing messages next, acknowledge input
+last. Redelivery is harmless; process recovery discards the old traversal. -/
 def Scheduler.turn [Monad m] (ports : SchedulerPorts m) (duration : Nat) : m Unit := do
   let some delivery ← ports.inbox.receive | return
   let state ← ports.localDb.load

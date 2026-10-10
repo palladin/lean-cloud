@@ -1,4 +1,5 @@
 import LeanCloud
+import LeanCloud.SimulationBackend
 import LeanCloudTests.GeneratedProgram
 
 namespace LeanCloudTests
@@ -112,7 +113,12 @@ def runSystem (start : Start) (initial : Machine) (seed : Nat) (chaos : Bool) : 
       state := { state with world := SimulationBackend.networkStep (.tick 1000) state.world }
     state := { state with world := SimulationBackend.networkStep (.deliver 0) state.world }
     for actor in Array.finRange 4 do state ← tick start actor state
-  throw s!"System did not finish; jobs={reprStr state.world.scheduler.jobs}"
+  let actors := (Array.finRange 4).map fun actor => match state.actors actor with
+    | .waiting _ label .. => label
+    | .responding .. => "responding"
+    | .stopped => "crashed"
+    | .finished _ => "finished"
+  throw s!"System did not finish; stopping={state.world.scheduler.stopping}; actors={actors}; jobs={reprStr state.world.scheduler.jobs}"
 
 /-- The very same Cloud program runs directly and through the scheduler/worker
 actors. Compare the durable final outcome, not just a worker's transient return. -/

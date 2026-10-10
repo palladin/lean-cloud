@@ -1,8 +1,8 @@
 import LeanCloud.Mailbox
 
-/-! A deployment owns a persistent pool. Each run retains the ordinary scheduler
-state machine; this coordinator only routes messages and chooses which run gets
-the next free worker. Replay values remain in the run's global blob namespace. -/
+/-! A deployment owns a persistent pool. Each run has its own volatile recursive
+scheduling program; the pool routes replies and chooses which run gets the next
+free worker. Replay values remain in the run's global blob namespace. -/
 namespace LeanCloud.Pool
 open Lean
 
@@ -18,17 +18,6 @@ structure Run where
   finalization : Scheduler.Status := .pending
   deriving Repr, ToJson
 
-instance : FromJson Run where
-  fromJson? json := do
-    let finalization ← match json.getObjVal? "finalization" with
-      | .ok value => fromJson? value
-      | .error _ => pure Scheduler.Status.pending
-    return {
-      id := ← json.getObjValAs? String "id"
-      mode := ← json.getObjValAs? Mode "mode"
-      scheduler := ← json.getObjValAs? Scheduler.State "scheduler"
-      finalization }
-
 /-- A generation fences delayed drain acknowledgements after a worker rejoins.
 `none` is the unrestricted, pre-configuration pool. -/
 structure Membership where
@@ -43,12 +32,50 @@ structure State where
   membership : Membership := {}
   deriving Repr, ToJson
 
-instance : FromJson State where
+/-- Persistence contains administrative intent and counters, never observations
+or the scheduler's executable continuation. -/
+structure RunCatalog where
+  id : String
+  mode : Mode
+  scheduler : Scheduler.Catalog
+  finalization : Scheduler.Status := .pending
+  deriving ToJson
+
+structure Catalog where
+  runs : Array RunCatalog := #[]
+  cursor : Nat := 0
+  membership : Membership := {}
+  deriving ToJson
+
+instance : FromJson RunCatalog where
+  fromJson? json := do
+    let finalization ← match json.getObjVal? "finalization" with
+      | .ok value => fromJson? value
+      | .error _ => pure Scheduler.Status.pending
+    return {
+      id := ← json.getObjValAs? String "id"
+      mode := ← json.getObjValAs? Mode "mode"
+      scheduler := ← json.getObjValAs? Scheduler.Catalog "scheduler"
+      finalization }
+
+instance : FromJson Catalog where
   fromJson? json := do
     let membership ← match json.getObjVal? "membership" with
       | .ok value => fromJson? value
       | .error _ => pure {}
     return { runs := ← json.getObjValAs? _ "runs", cursor := ← json.getObjValAs? Nat "cursor", membership }
+
+def State.catalog (state : State) : Catalog :=
+  { cursor := state.cursor, membership := state.membership
+    runs := state.runs.map fun run =>
+      { id := run.id, mode := run.mode, scheduler := run.scheduler.catalog
+        finalization := if run.finalization == .done then .done else .pending } }
+
+def Catalog.restore (catalog : Catalog) : State :=
+  { cursor := catalog.cursor, membership := catalog.membership
+    runs := catalog.runs.map fun run =>
+      { id := run.id, mode := run.mode, scheduler := run.scheduler.restore
+        finalization := if run.finalization == .done then .done else .pending } }
 
 inductive Command where
   | health
@@ -66,6 +93,7 @@ inductive Command where
 inductive Message where
   | submit (run : String)
   | ready (worker : String)
+  | stopped (run worker : String) (barrier : Nat)
   | renew (run worker : String) (attempt : Nat)
   | drained (worker : String) (generation : Nat)
   | report (run : String) (report : Report)
@@ -75,32 +103,39 @@ inductive Message where
 inductive Reply where
   | execute (run : String) (assignment : Assignment)
   | finalize (run : String) (attempt : Nat) (outcome : Exit)
+  | cancel (run : String) (barrier : Nat)
   | idle
   | acknowledged
   | drain (generation : Nat)
   deriving Repr, ToJson, FromJson
 
-def release (state : Scheduler.State) : Scheduler.State :=
-  { state with jobs := state.jobs.map fun job =>
-      match job.status with
-      | .running .. => { job with status := .pending }
-      | _ => job }
+private def Run.cancel (run : Run) (workers : Array WorkerId := #[]) : Run :=
+  let workers := match run.finalization with
+    | .running owner _ _ => workers.push owner
+    | _ => workers
+  { run with scheduler := Scheduler.cancel run.scheduler workers
+             finalization := match run.finalization with | .running .. => .pending | status => status }
 
-def recover (state : State) : State :=
-  { state with runs := state.runs.map fun run => { run with
-      scheduler := release run.scheduler
-      finalization := match run.finalization with | .running .. => .pending | status => status } }
+/-- Only the run catalog survives. Old attempts stop before any root is replayed. -/
+def recover (state : State) (workers : Array WorkerId := #[]) : State :=
+  { state with runs := state.runs.map fun run =>
+      run.cancel ((workers ++ state.membership.active.getD #[] ++ run.scheduler.workers.map (·.worker))
+        |>.filter (!state.membership.drained.contains ·)) }
+
+def stopped (state : State) (id worker : String) (barrier : Nat) : State :=
+  { state with runs := state.runs.map fun run =>
+      if run.id == id then { run with scheduler := Scheduler.stopped run.scheduler worker barrier } else run }
 
 def tick (elapsed : Nat) (state : State) : State :=
   { state with runs := state.runs.map fun run =>
-      { run with
-        scheduler := (Scheduler.handle 1 run.scheduler (.tick elapsed)).1
-        finalization := match run.finalization with
-          | .running _ _ deadline => if deadline ≤ run.scheduler.now + elapsed then .pending else run.finalization
-          | status => status } }
+      let run := { run with scheduler := { run.scheduler with now := run.scheduler.now + elapsed } }
+      let expired := Scheduler.expired run.scheduler || match run.finalization with
+        | .running _ _ deadline => deadline ≤ run.scheduler.now
+        | _ => false
+      if run.scheduler.stopping.isEmpty && expired then run.cancel else run }
 
 def Run.accepts (run : Run) : Bool :=
-  run.mode == .active && !run.scheduler.finished && run.scheduler.error.isNone
+  run.mode == .active && run.scheduler.stopping.isEmpty && !run.scheduler.finished && run.scheduler.error.isNone
 
 /-- Terminal outcomes requested by coordination. Workers publish these intents,
 retrying after restart until the root is sealed.
@@ -115,8 +150,8 @@ def valid (state : State) (id worker : String) (attempt : Nat) : Bool :=
       | .running owner current _ => owner == worker && current == attempt
       | _ => false
   !state.membership.drained.contains worker && state.runs.any fun run => run.id == id &&
-    (if run.terminalOutcome.isSome then owns run.finalization
-     else run.accepts && run.scheduler.jobs.any fun job => owns job.status)
+    (if !run.scheduler.stopping.isEmpty then false else if run.terminalOutcome.isSome then owns run.finalization
+     else run.accepts && run.scheduler.pending.any fun task => owns task.status)
 
 /-- A heartbeat extends only an existing attempt. It cannot revive expired or
 revoked work. Retiring workers can finish their current assignment before drain. -/
@@ -132,25 +167,26 @@ def renew (duration : Nat) (state : State) (id worker : String) (attempt : Nat) 
       | _ => status
     { run with
       finalization := extend run.finalization
-      scheduler := { run.scheduler with jobs := run.scheduler.jobs.map fun job =>
-        { job with status := extend job.status } } } }
+      scheduler := Scheduler.mapAssignments run.scheduler extend } }
 
 /-- Repeated readiness returns the existing assignment before allocating work
 in another run. Run selection rotates; result order stays the program's order. -/
 def acquire (duration : Nat) (state : State) (worker : String) : State × Reply := Id.run do
+  for run in state.runs do
+    if run.scheduler.stopping.contains worker then return (state, .cancel run.id run.scheduler.barrier)
   if let some active := state.membership.active then
     unless active.contains worker do return (state, .drain state.membership.generation)
   for run in state.runs do
-    if let some outcome := run.terminalOutcome then
+    if let some outcome := run.terminalOutcome.filter (fun _ => run.scheduler.stopping.isEmpty) then
       if let .running owner attempt _ := run.finalization then
         if owner == worker then return (state, .finalize run.id attempt outcome)
     if run.accepts then
-      if let some assignment := run.scheduler.jobs.findSome? (Scheduler.Internal.assignedTo worker) then
+      if let some assignment := Scheduler.Internal.owned run.scheduler worker then
         return (state, .execute run.id assignment)
   for offset in [:state.runs.size] do
     let index := (state.cursor + offset) % state.runs.size
     let some run := state.runs[index]? | continue
-    if let some outcome := run.terminalOutcome then
+    if let some outcome := run.terminalOutcome.filter (fun _ => run.scheduler.stopping.isEmpty) then
       if run.finalization == .pending then
         let attempt := run.scheduler.nextAttempt
         let run := { run with
@@ -159,7 +195,7 @@ def acquire (duration : Nat) (state : State) (worker : String) : State × Reply 
         return ({ state with runs := state.runs.set! index run, cursor := index + 1 },
           .finalize run.id attempt outcome)
     if run.accepts then
-      let (scheduler, message) := Scheduler.Internal.acquire run.scheduler worker duration
+      let (scheduler, message) := Scheduler.Internal.acquire (Scheduler.Internal.observe run.scheduler worker #[]) worker duration
       if let .execute assignment := message then
         return ({ state with
           runs := state.runs.set! index { run with scheduler }
@@ -176,18 +212,17 @@ def drained (state : State) (worker : String) (generation : Nat) : State :=
       else state.membership.drained.push worker
     { state with
     membership := { state.membership with drained := workers },
-    runs := state.runs.map fun run => { run with
-      finalization := match run.finalization with
-        | .running owner _ _ => if owner == worker then .pending else run.finalization
-        | status => status
-      scheduler := { run.scheduler with
-      jobs := run.scheduler.jobs.map fun job => match job.status with
-        | .running owner _ _ => if owner == worker then { job with status := .pending } else job
-        | _ => job } } }
+    runs := state.runs.map fun run =>
+      let owns := (Scheduler.runningWorkers run.scheduler).contains worker || match run.finalization with
+        | .running owner _ _ => owner == worker
+        | _ => false
+      let run := if owns && run.scheduler.stopping.isEmpty then run.cancel else run
+      { run with scheduler := Scheduler.stopped run.scheduler worker run.scheduler.barrier } }
 
 def report (state : State) (id : String) (value : Report) : State :=
   { state with runs := state.runs.map fun run =>
       if run.id != id then run
+      else if !run.scheduler.stopping.isEmpty then run
       else if run.terminalOutcome.isSome then
         match run.finalization, value.progress with
         | .running owner attempt _, .ok .done =>
@@ -198,7 +233,8 @@ def report (state : State) (id : String) (value : Report) : State :=
       else if run.accepts then
         let scheduler := Scheduler.Internal.accept run.scheduler value
         -- Revoke every sibling before publishing a terminal failure.
-        { run with scheduler := if scheduler.error.isSome then release scheduler else scheduler }
+        let run := { run with scheduler }
+        if scheduler.error.isSome then run.cancel else run
       else run }
 
 private def setMode (state : State) (id : String) (mode : Mode) : Except String State := do
@@ -209,8 +245,9 @@ private def setMode (state : State) (id : String) (mode : Mode) : Except String 
   if run.mode == .killed && mode != .killed then throw "Killed runs cannot be resumed or paused"
   if run.scheduler.error.isSome && mode != .killed then
     throw "Failed runs cannot be resumed or paused; submit a new run"
-  let scheduler := if mode == .active then run.scheduler else release run.scheduler
-  return { state with runs := state.runs.set! index { run with mode, scheduler } }
+  let run := { run with mode }
+  let run := if mode == .active || !run.scheduler.stopping.isEmpty then run else run.cancel
+  return { state with runs := state.runs.set! index run }
 
 /-- Administrative requests are serialized with assignment and report handling.
 Pausing revokes attempts; resuming never reuses an attempt number. -/

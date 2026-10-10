@@ -51,7 +51,7 @@ def observe (timing : Run) (before : Option Pool.Run) (after : Pool.Run) (now : 
           match old.status with | .waiting _ => true | _ => false) do
         timing := { timing with groups := timing.groups.push (job.location, ⟨now, none⟩) }
         knownGroups := knownGroups.insert job.location.key
-  let stopped := after.scheduler.finished || after.terminalOutcome.isSome
+  let stopped := done.contains Location.root.key || after.terminalOutcome.isSome
   let branches := timing.branches.map fun (location, span) =>
     (location, if stopped || done.contains location.key
       then span.finish now else span)
@@ -60,15 +60,17 @@ def observe (timing : Run) (before : Option Pool.Run) (after : Pool.Run) (now : 
   return { timing with branches, groups, span := timing.span.map fun span => if stopped then span.finish now else span }
 
 /-- The ordinary status JSON with optional timings. Old runtimes remain readable. -/
-structure Status extends Scheduler.State where
+structure Status extends Scheduler.Snapshot where
   timing : Option Run := none
-  deriving ToJson
+
+instance : ToJson Status := ⟨fun status =>
+  (toJson status.toSnapshot).setObjVal! "timing" (toJson status.timing)⟩
 
 instance : FromJson Status where
   fromJson? json := do
     let timing ← match json.getObjVal? "timing" with
       | .ok value => fromJson? value
       | .error _ => pure none
-    return { toState := ← fromJson? json, timing }
+    return { toSnapshot := ← fromJson? json, timing }
 
 end LeanCloud.Timing

@@ -110,8 +110,8 @@ The [tests](LeanCloudTests/README.md) compare direct and replay execution, inclu
 recovery after scheduler and worker crashes. Real adapter and container checks:
 
 ```sh
-lake exe cloud_runtime_tests
-lake exe cloud_chaos --seed 1
+docker compose run --build --rm checks
+lake exe cloud_console_tests --chaos-only --seed 1
 ```
 
 [The three main theorems](LeanCloud/Proofs/MainTheorems.lean) prove that sequential,

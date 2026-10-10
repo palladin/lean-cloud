@@ -148,12 +148,6 @@ ambiguous transport failure may be retried; duplicate messages are permitted. -/
 def send [ToJson α] (config : Config) (run actor : String) (message : α) : IO Unit :=
   discard (call config ⟨(toJson (run, actor)).compress, "", .send (toJson message).compress⟩)
 
-def Mailboxes.sendWorker (config : Mailboxes) (run : String) (delivery : Delivery) : IO Unit := do
-  let endpoint ← match delivery.message with
-    | .status _ => pure config.scheduler
-    | _ => IO.ofExcept (config.worker delivery.worker)
-  send endpoint run ("worker." ++ delivery.worker) delivery.message
-
 structure ServerHandler where
   store : Inbox.Store
   token : String

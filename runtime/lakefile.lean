@@ -16,8 +16,10 @@ require «lean-linq» from git
 lean_lib LeanCloudRuntime
 
 lean_lib ApplicationTests
+lean_lib TestServices
 lean_lib PoolTests
 lean_lib ReplyTests
+lean_lib SchedulerTests
 
 lean_exe cloud_inbox_tests where
   root := `InboxTests

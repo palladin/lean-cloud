@@ -8,18 +8,12 @@ open Lean LeanCloud
 structure RegisteredProgram where
   info : ProgramInfo
   validate : Json → Except String Unit
-  worker : Config → String → RunDefinition → IO Unit
   execute : RunDefinition → String → Worker.ObservedStore IO → BlobStorage IO → Trace.Sink → Assignment → IO Report
 
 def registerProgram [Codec ι] [Codec α] (program : LeanCloud.CloudProgram ι α)
     (sources : Array ProgramSource := by exact cloud_sources%) : RegisteredProgram where
   info := { program.info with sources }
   validate input := (Codec.decode (α := ι) input).map (fun _ => ())
-  worker config run definition := do
-    unless definition.entry == program.info.entry && definition.resultSchema == program.info.resultSchema do
-      throw (IO.userError "Worker program version or result codec does not match the submitted run")
-    let input ← IO.ofExcept (Codec.decode (α := ι) definition.input)
-    runWorker config run program.run input
   execute definition worker records blobs trace assignment := do
     unless definition.entry == program.info.entry && definition.resultSchema == program.info.resultSchema do
       throw (IO.userError "Deployed program/codec does not match the submitted run")
@@ -56,22 +50,60 @@ def Registry.submit (registry : Registry) (config : Config) (run entry : String)
   IO.ofExcept (program.validate input)
   LeanCloudRuntime.submit config run ⟨entry, input, program.info.resultSchema⟩
 
-def Registry.runWorker (registry : Registry) (config : Config) (run : String) : IO Unit := do
-  let definition ← loadRun config run
-  let program ← IO.ofExcept (registry.find definition.entry)
-  program.worker config run definition
+/-- Retry one inbox assignment locally. Transport failures never become Cloud
+errors. Every attempt checks ownership before touching records; cancellation
+returns only after the active attempt and its heartbeat task have stopped. -/
+private def executeAssignment (registry : Registry) (config : Config) (id run : String)
+    (assignment : Assignment) (finalize : Option Exit := none) : IO Unit := do
+  let trace ← Trace.create id run
+  repeat
+    let revoked ← IO.mkRef false
+    try
+      Pool.withHeartbeat config run id assignment.attempt fun healthy => do
+        let check : IO Unit := do
+          healthy
+          let allowed : Bool ← IO.ofExcept (fromJson? (← Pool.request config (.check run id assignment.attempt)))
+          unless allowed do
+            revoked.set true
+            throw (IO.userError "Assignment revoked")
+        check
+        trace.assign assignment
+        if finalize.isSome then S3.initializeBucket config.blobs
+        let records := trace.records (S3.records config.blobs run)
+        let guarded : ReplayStore IO := {
+          read := fun key => do check; records.read key
+          create := fun key value => do check; records.create key value }
+        let observed ← observe guarded
+        let report ← match finalize with
+          | some outcome => Worker.finalize id observed assignment.attempt outcome
+          | none => do
+            let definition ← loadRun config run
+            let program ← IO.ofExcept (registry.find definition.entry)
+            program.execute definition id observed (trace.blobs (S3.storage config.blobs)) trace assignment
+        match report.progress with
+        | .ok (.fork ..) => trace.emit "suspended" ""
+        | .ok .done => trace.emit (if finalize.isSome then "sealed" else "returned") ""
+        | .error error => trace.emit "failed" error.message
+        Pool.send config (.report run report)
+      break
+    catch error =>
+      if ← revoked.get then
+        trace.emit "revoked" ""
+        break
+      IO.eprintln s!"worker {id}: {error}; retrying assignment locally"
+      IO.sleep 500
+  trace.emit "idle" ""
 
-/-- A persistent worker executes one assignment at a time, selecting the entry
-from the deployed registry. IO failures escape CloudError and trigger inbox
-redelivery. Administrative revocation is cooperative at record boundaries. -/
+/-- One serial inbox loop serves every registered workflow. A cancellation reply
+is acknowledged only between attempts. The scheduler awaits that explicit reply
+before dispatching replacements. Late execute messages fail their ownership check. -/
 def Registry.serveWorker (registry : Registry) (config : Config) : IO Unit := do
   let id ← workerId
   let endpoint ← IO.ofExcept (config.mailboxes.worker id)
   let handle ← HttpMailbox.openMailbox endpoint Pool.address ("worker." ++ id)
   try
     let inbox : Mailbox IO LeanCloud.Pool.Reply := HttpMailbox.inbox handle
-    let send (message : LeanCloud.Pool.Message) :=
-      Pool.send config message
+    let send := Pool.send config
     let mut nextReady := 0
     IO.println s!"worker {id} ready for deployed programs"
     (← IO.getStdout).flush
@@ -81,59 +113,19 @@ def Registry.serveWorker (registry : Registry) (config : Config) : IO Unit := do
         nextReady := (← IO.monoMsNow) + 2000
       let some delivery ← inbox.receive | continue
       match delivery.message with
+      | .execute run assignment => executeAssignment registry config id run assignment
       | .finalize run attempt outcome =>
-        let trace ← Trace.create id run
-        Pool.withHeartbeat config run id attempt fun healthy => do
-          healthy
-          let allowed : Bool ← IO.ofExcept (fromJson? (← Pool.request config (.check run id attempt)))
-          if allowed then
-            trace.assign ⟨attempt, Location.root⟩
-            S3.initializeBucket config.blobs
-            let records ← observe (trace.records (S3.records config.blobs run))
-            let report ← Worker.finalize id records attempt outcome
-            send (.report run report)
-            trace.emit "sealed" ""
-        trace.emit "idle" ""
-        send (.ready id)
-        nextReady := (← IO.monoMsNow) + 2000
-      | .execute run assignment =>
-        let revoked ← IO.mkRef false
-        let trace ← Trace.create id run
-        try
-          Pool.withHeartbeat config run id assignment.attempt fun healthy => do
-          let check : IO Unit := do
-            healthy
-            let allowed : Bool ← IO.ofExcept (fromJson? (← Pool.request config (.check run id assignment.attempt)))
-            unless allowed do
-              revoked.set true
-              throw (IO.userError "Assignment revoked")
-          check
-          trace.assign assignment
-          let report ← if (← completed config run).isSome then
-              pure (Report.mk id assignment.attempt (.ok .done) #[])
-            else do
-              let definition ← loadRun config run
-              let program ← IO.ofExcept (registry.find definition.entry)
-              let records := trace.records (S3.records config.blobs run)
-              let guarded : ReplayStore IO := {
-                read := fun key => do check; records.read key
-                create := fun key value => do check; records.create key value }
-              let observed ← observe guarded
-              program.execute definition id observed (trace.blobs (S3.storage config.blobs)) trace assignment
-          match report.progress with
-          | .ok (.fork ..) => trace.emit "suspended" ""
-          | .ok .done => trace.emit "returned" ""
-          | .error error => trace.emit "failed" error.message
-          send (.report run report)
-        catch error =>
-          if ← revoked.get then trace.emit "revoked" "" else throw error
-        trace.emit "idle" ""
-        -- Confirm readiness before ack. A crash can duplicate assignments; the
-        -- coordinator and immutable records tolerate that redelivery.
-        send (.ready id)
-        nextReady := (← IO.monoMsNow) + 2000
+        executeAssignment registry config id run ⟨attempt, Location.root⟩ (some outcome)
+      | .cancel run barrier => send (.stopped run id barrier)
       | .drain generation => send (.drained id generation)
       | .idle | .acknowledged => pure ()
+      match delivery.message with
+      | .execute .. | .finalize .. | .cancel .. =>
+        -- Readiness and cancellation acknowledgements are confirmed before
+        -- dropping the delivery. A process crash can safely redeliver either.
+        send (.ready id)
+        nextReady := (← IO.monoMsNow) + 2000
+      | _ => pure ()
       inbox.acknowledge delivery.receipt
   finally handle.close
 
