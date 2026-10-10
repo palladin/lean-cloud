@@ -5,7 +5,8 @@ lake test
 lake exe lean_cloud_tests --list
 lake exe lean_cloud_tests generated/chaos
 lake exe lean_cloud_tests crash/
-lake exe lean_cloud_tests sequential/
+lake exe lean_cloud_tests replay-drivers/
+lake exe lean_cloud_tests restarting-replay/
 lake exe lean_cloud_tests pool
 (cd runtime && lake exe cloud_inbox_tests)
 lake exe cloud_console_tests
@@ -109,11 +110,26 @@ Generated parallel results use an order-sensitive fold. Targeted cases complete
 children in reverse order and check source-ordered values and errors after all
 children finish.
 
-The pure sequential driver is also compared directly against direct evaluation:
-256 generated programs plus targeted cases for nested and empty groups,
-captured inputs, delays, typed results, ordered errors, and insufficient fuel.
-These tests start with empty records, check the durable root, and replay the
-completed run with a minimal budget to check cache reuse.
+The pure sequential and `Task.spawn` parallel drivers are compared with direct
+evaluation over the same 256 generated programs. Targeted cases cover nested and
+empty groups, captured inputs, typed results, source-ordered errors, insufficient
+fuel, and resuming a partially recorded run. Tests compare every journal lookup,
+check root results, and replay completed runs with a minimal budget. Additional
+checks establish that workers return only new records, siblings see the same old
+journal, and disjoint union preserves records in either order. Every repeated
+key is rejected, including identical writes. See [ReplayDrivers.lean](ReplayDrivers.lean).
+
+[RestartingReplay.lean](RestartingReplay.lean) tests the semantic recovery driver
+at the worker-local boundary. It injects interruption before and after every
+distinct worker-storage boundary in a nested workflow. Another
+128 generated pure programs exercise worker crashes, with checks
+that the requested faults actually fire. Outcomes and durable journal records
+must match direct and sequential evaluation. Targeted cases ensure worker retries
+stay inside their spawned function, completed workers return the recorded outcome,
+suspension reports stay unchanged, and exhausted runs resume with their saved
+state and completed siblings. Duplicate worker assignments are rejected.
+Application errors retain source order and never cause crash retries. See
+the [recovery model](../LeanCloud/ReplayRecovery.md) for its storage assumptions.
 
 Sim tests include 256 generated programs with and without faults, small exhaustive
 compositions, and targeted before/after crash boundaries, including worker receives.
@@ -151,11 +167,10 @@ errors. Codec round trips serialize and parse JSON text. Blob cases cover missin
 names, integrity errors, and invalid UTF-8, with and without simulated crashes.
 
 The test build also checks [ProofExamples.lean](ProofExamples.lean), which applies
-all three public equivalence theorems to the same nested parallel workflow, and
-[ProgressWitness.lean](ProgressWitness.lean), which proves that an actual run
-from empty storage satisfies the completion theorem's processing-window premise.
-Its scheduler updates its private database while the worker is between replay
-operations, so the witness also checks interference inside a processing window.
+all three public equivalence theorems to the same nested parallel workflow,
+including arbitrary finite worker fault plans. The semantic proofs cover replay
+evaluation and worker-local restart. Runtime coordination, message delivery,
+process recovery, and deployment behavior are checked by executable tests.
 
 Inbox properties compare real SQLite with `MailboxModel` over 32 generated traces
 of 200 operations. They also check SIGKILL recovery, termination signals, HTTP

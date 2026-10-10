@@ -142,8 +142,8 @@ recovered from SQLite on restart. Stopping does not drain arbitrary user IO.
 
 `Cloud.exec` can execute again if interrupted before its result is recorded.
 Pause/kill are cooperative at record boundaries; in-flight user IO may finish.
-Reference workers use 100,000 interpreter steps per assignment; the completion
-proof assumes sufficient fuel rather than proving that this default always suffices.
+Reference workers use 100,000 interpreter steps per assignment; the semantic
+proofs assume sufficient fuel rather than proving that this default always suffices.
 
 An accepted interpreter error, such as fuel exhaustion or a replay protocol
 error, terminates that run. The pool revokes its other attempts and saves the
@@ -200,6 +200,6 @@ HTTP inboxes separately to inject transport faults and compare generated cloud
 programs with the direct interpreter. These standalone inboxes are test fixtures;
 production nodes keep HTTP, SQLite, and their actor in one process.
 
-The existing proofs concern the abstract per-run interpreter and scheduler.
-They do not verify SQLite, libcurl, the HTTP stack, or the shared-pool coordinator.
-Real adapter tests check those implementations against the abstract contracts.
+The semantic proofs compare direct evaluation with sequential and parallel
+replay over a pure journal. Scheduler and worker coordination, crashes, recovery,
+SQLite, libcurl, and HTTP are covered by model, adapter, and container tests.

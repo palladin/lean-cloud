@@ -2,8 +2,8 @@ import LeanCloudTests.Generated
 import LeanCloudTests.Coordination
 import LeanCloudTests.Codecs
 import LeanCloudTests.ProofExamples
-import LeanCloudTests.ProgressWitness
-import LeanCloudTests.SequentialReplay
+import LeanCloudTests.ReplayDrivers
+import LeanCloudTests.RestartingReplay
 import LeanCloudTests.Replay
 import LeanCloudTests.Console
 import LeanCloudTests.BranchTree
@@ -25,6 +25,6 @@ import LeanCloudTests.Source
 namespace LeanCloudTests
 
 def allCases : Array TestCase := codecCases ++ mailboxCases ++ coordinationCases ++ simulationBoundaryCases ++
-  crashBoundaryCases ++ generatedCases ++ compositionCases ++ blobFailureCases ++ sequentialReplayCases ++ replayCases ++ consoleCases ++ BranchTree.cases ++ Timing.cases ++ styledCases ++ consoleEffectCases ++ shellCases ++ projectCases ++ deploymentCommandCases ++ Clean.cases ++ streamingCases ++ processLoggingCases ++ topCases ++ helpCases ++ poolCases ++ PoolModel.cases ++ Source.cases
+  crashBoundaryCases ++ generatedCases ++ compositionCases ++ blobFailureCases ++ replayDriverCases ++ RestartingReplay.cases ++ replayCases ++ consoleCases ++ BranchTree.cases ++ Timing.cases ++ styledCases ++ consoleEffectCases ++ shellCases ++ projectCases ++ deploymentCommandCases ++ Clean.cases ++ streamingCases ++ processLoggingCases ++ topCases ++ helpCases ++ poolCases ++ PoolModel.cases ++ Source.cases
 
 end LeanCloudTests

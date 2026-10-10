@@ -114,14 +114,10 @@ lake exe cloud_runtime_tests
 lake exe cloud_chaos --seed 1
 ```
 
-[The main theorems](LeanCloud/Proofs/MainTheorems.lean) prove that sequential
-replay from empty storage agrees with direct evaluation of the same pure program.
-The concurrent proofs cover immutable records,
-durable mailbox operations, scheduler recovery, recorded-prefix reconstruction,
-and concurrent execution: whenever the scheduler finishes a pure workflow, its
-durable result equals direct evaluation, even after crashes and message redelivery.
-With sufficient interpreter fuel and recurring opportunities to execute an
-assignment and save its report before expiry, the workflow eventually finishes
-with that same result. These execution and delivery assumptions are explicit
-in the [proof guide](LeanCloud/Proofs/README.md). Administrative pause/kill commands
-are tested separately; the theorems describe workflow evaluation and recovery.
+[The three main theorems](LeanCloud/Proofs/MainTheorems.lean) prove that sequential,
+parallel, and locally restarting parallel replay from empty storage agree with
+direct evaluation of the same pure program, given sufficient fuel and correct
+codecs. The restart theorem covers any finite worker fault plan. Parallel replay runs children
+against a shared read-only journal, unions their disjoint new records, and resumes the parent.
+See the [proof guide](LeanCloud/Proofs/README.md). Runtime coordination, scheduler
+recovery, deployment availability, and pause/kill are covered by simulation and integration tests.

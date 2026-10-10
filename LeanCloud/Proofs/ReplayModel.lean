@@ -1,25 +1,6 @@
-import LeanCloud.ReplayInterpreter
+import LeanCloud.ReplayModel
 
-namespace LeanCloud.Proofs.ReplayModel
-
-/-- A pure model of global replay records. It has no user-effect world, scheduler,
-or queue. Proofs run the ordinary replay interpreter against these ports. -/
-abbrev Journal := List (String × ReplayRecord)
-abbrev M := StateM Journal
-
-/-- The pure reference model has no user blob effects. Pure evaluation never
-calls these operations; rejecting them also makes accidental use explicit. -/
-def noBlobs : BlobStorage M where
-  putBlob _ := throw ⟨.unsupported, "User blobs are outside the pure replay model"⟩
-  readBlob _ := throw ⟨.unsupported, "User blobs are outside the pure replay model"⟩
-  resolveBlob _ := throw ⟨.unsupported, "User blobs are outside the pure replay model"⟩
-
-def store : ReplayStore M where
-  read key := fun journal => (journal.lookup key, journal)
-  create key proposed := fun journal =>
-    match journal.lookup key with
-    | some existing => (existing, journal)
-    | none => (proposed, (key, proposed) :: journal)
+namespace LeanCloud.ReplayModel
 
 theorem read_then (key : String) (next : Option ReplayRecord → ExceptT CloudError M α)
     (journal : Journal) :
@@ -30,8 +11,8 @@ theorem lift_bind_run (action : M α) (next : α → ExceptT CloudError M β) (j
     ((do let value ← action; next value : ExceptT CloudError M β).run journal) =
       (next (action.run journal).1).run (action.run journal).2 := rfl
 
-theorem bind_run (action : ExceptT CloudError M α) (next : α → ExceptT CloudError M β)
-    (journal : Journal) :
+theorem bind_run (action : ExceptT CloudError (StateM σ) α) (next : α → ExceptT CloudError (StateM σ) β)
+    (journal : σ) :
     ((action >>= next).run journal) =
       match action.run journal with
       | (.ok value, after) => (next value).run after
@@ -41,29 +22,14 @@ theorem bind_run (action : ExceptT CloudError M α) (next : α → ExceptT Cloud
   cases action journal with
   | mk outcome after => cases outcome <;> rfl
 
-@[simp] theorem pure_run (value : α) (journal : Journal) :
-    ((pure value : ExceptT CloudError M α).run journal) = (.ok value, journal) := rfl
+@[simp] theorem pure_run (value : α) (journal : σ) :
+    ((pure value : ExceptT CloudError (StateM σ) α).run journal) = (.ok value, journal) := rfl
 
-private theorem list_mapM_readonly (items : List α) (action : α → ExceptT CloudError M β)
-    (expected : α → β) (journal : Journal)
-    (reads : ∀ item ∈ items, (action item).run journal = (.ok (expected item), journal)) :
-    ((items.mapM action).run journal) = (.ok (items.map expected), journal) := by
-  induction items with
-  | nil => rfl
-  | cons item rest ih =>
-    rw [List.mapM_cons]
-    simp only [bind_run, reads item (by simp)]
-    rw [ih (fun item member => reads item (by simp [member]))]
-    rfl
+@[simp] theorem get_run (journal : Journal) :
+    ((get : ExceptT CloudError M Journal).run journal) = (.ok journal, journal) := rfl
 
-/-- Reading a collection of existing results leaves the journal unchanged. -/
-theorem mapM_readonly (items : Array α) (action : α → ExceptT CloudError M β)
-    (expected : α → β) (journal : Journal)
-    (reads : ∀ item ∈ items, (action item).run journal = (.ok (expected item), journal)) :
-    ((items.mapM action).run journal) = (.ok (items.map expected), journal) := by
-  rw [Array.mapM_eq_mapM_toList, map_eq_pure_bind, bind_run]
-  rw [list_mapM_readonly _ _ _ _ (by simpa using reads)]
-  simp [← Array.toList_map]
+@[simp] theorem set_run (after journal : Journal) :
+    ((set after : ExceptT CloudError M Unit).run journal) = (.ok (), after) := rfl
 
 /-- Every previously committed record retains its value. New keys may appear. -/
 def Extends (before after : Journal) : Prop :=
@@ -161,4 +127,4 @@ theorem create_within (journal expected : Journal) (key : String) (record : Repl
     · simp only [List.lookup_cons, beq_eq_false_iff_ne.mpr same] at present
       exact consistent oldKey oldRecord present
 
-end LeanCloud.Proofs.ReplayModel
+end LeanCloud.ReplayModel

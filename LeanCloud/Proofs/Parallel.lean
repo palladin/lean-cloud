@@ -21,24 +21,12 @@ private theorem sequence_map (values : List (Except ε α)) (encode : α → β)
 private theorem sequence_length (outcomes : List (Except ε α)) (values : List α)
     (collected : outcomes.mapM id = .ok values) : values.length = outcomes.length := by
   induction outcomes generalizing values with
-  | nil =>
-    change Except.ok [] = Except.ok values at collected
-    cases collected
-    rfl
+  | nil => simpa using congrArg List.length (Except.ok.inj collected).symm
   | cons first rest ih =>
-    rw [List.mapM_cons] at collected
-    cases first with
-    | error error => contradiction
-    | ok value =>
-      cases tail : rest.mapM id with
-      | error error =>
-        rw [tail] at collected
-        contradiction
-      | ok remaining =>
-        rw [tail] at collected
-        change Except.ok (value :: remaining) = Except.ok values at collected
-        cases collected
-        simp [ih remaining tail]
+    cases first <;> cases tail : rest.mapM id <;>
+      simp_all [List.mapM_cons, bind, Except.bind, pure, Except.pure]
+    subst values
+    simp_all
 
 /-- Collecting successful children preserves the number of branches. -/
 theorem sequence_size (outcomes : Array (Except ε α)) (values : Array α)

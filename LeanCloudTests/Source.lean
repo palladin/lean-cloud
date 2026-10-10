@@ -1,9 +1,9 @@
 import LeanCloudTests.Support
-import LeanCloud.Proofs.ReplayModel
+import LeanCloud.ReplayModel
 import LeanCloudCli.Watch
 
 namespace LeanCloudTests.Source
-open Lean LeanEff LeanCloud LeanCloud.Proofs.ReplayModel
+open Lean LeanEff LeanCloud LeanCloud.ReplayModel
 
 private def repeated [Monad m] : Cloud m Nat := cloud {
   let first ← Cloud.pure (fun _ => 10) "same"

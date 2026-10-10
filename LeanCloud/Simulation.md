@@ -48,43 +48,8 @@ budget is not workflow completion. Tests require the scheduler to finish and the
 expected root record to exist. These tests are evidence, not a general liveness
 theorem.
 
-Separately, [completed_replay_matches_direct](Proofs/MainTheorems.lean) proves
-that scheduler completion implies a durable root result equal to direct
-evaluation for pure workflows. It covers all actual finite Sim traces from empty
-storage, including arbitrary crashes and message interleavings.
-
-`concurrent_replay_matches_direct` additionally proves eventual completion given
-sufficient interpreter fuel and recurring timely processing windows. A window
-allows a delivered assignment to execute, its report to arrive
-while the attempt is live, and the scheduler to save its transition. The proof
-derives report success from the worker code and a single source-dependent fuel
-bound. Other actors and broker events may interleave with the selected worker's
-atomic operations. No successful report or correct result is assumed of the environment.
-This is stronger than weak fairness or durable message delivery alone.
-
-[WorkerProgress.job_can_report](Proofs/WorkerProgress.lean) supplies one progress
-step: every reachable job can produce a fork or completion report in finitely
-many uninterrupted commit/reply events, given sufficient fuel. This includes
-reconstructing nested branches. Delivery and timely acceptance of reports are
-separate obligations; the lemma does not assume they happen automatically.
-
-[SchedulerDelivery](Proofs/SchedulerDelivery.lean) checks the receiving side:
-an uninterrupted turn saves a selected live report's completion or child jobs,
-confirms its reply, and acknowledges the input. The proof keeps those as
-separate atomic operations and leaves replay values in worker-owned operations.
-
-`ConcurrentSafety.completed_branch_persists` lifts completed-job preservation
-through all subsequent actor and network events. Retries and recovery cannot
-reopen completed work; `completion_persists` gives the same guarantee for the
-whole workflow's finished status.
-
-[CoordinationProgress.productive_intervals_bounded](Proofs/CoordinationProgress.lean)
-proves a finite bound on useful scheduling work from the original pure source.
-A live successful report increases a bounded measure; crashes and retries cannot
-decrease it. A fork whose child returns are durable cannot suspend again.
-[DeploymentProgress](Proofs/DeploymentProgress.lean) proves that the processing
-windows are productive and that an unfinished run cannot contain infinitely
-many of them. The run is sampled at finite batches of events; the window
-assumption must hold at those sample points. Endless crashes, reports that
-always expire before acceptance, and exhausted actor-loop budgets without
-further processing opportunities are excluded by that assumption.
+The [semantic theorems](Proofs/MainTheorems.lean) compare direct evaluation with
+sequential and parallel replay over a pure journal. They establish the meaning
+of recording, location-based resumption, and fork/join. Scheduler and worker
+coordination, crashes, delivery, and recovery are implementation concerns covered
+by these simulation tests and the real adapter and container tests.

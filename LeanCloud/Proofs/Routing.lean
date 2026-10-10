@@ -167,10 +167,4 @@ theorem skip_follows {source middle target : Location} (earlier : Follows source
       exact (entries index inside).trans (later.ancestry index (by omega)).symm
     simp [skip] at oldEnters
 
-theorem different_follows {source middle target : Location} (earlier : Follows source middle)
-    (later : Follows middle target) (different : source ≠ middle) : source ≠ target := by
-  intro same
-  subst target
-  exact different (earlier.antisymm later)
-
 end LeanCloud.Proofs.Routing

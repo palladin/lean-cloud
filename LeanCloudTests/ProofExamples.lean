@@ -3,7 +3,7 @@ import LeanCloud.Proofs.MainTheorems
 /-! Checked applications of the public equivalence theorems to a workflow with captured
 values, delayed pure execution, and nested parallel groups. -/
 
-open Lean LeanEff LeanCloud LeanCloud.Proofs SimulationBackend
+open Lean LeanEff LeanCloud LeanCloud.Proofs
 namespace LeanCloudTests.ProofExamples
 
 private theorem bool_roundtrip : Pure.RoundTrips (inferInstance : Codec Bool) := by
@@ -52,47 +52,33 @@ private theorem source_meaning [Monad m] : Pure.Evaluation (source (m := m) ()) 
     · simp [Array.ofFn_succ, Array.mapM_eq_mapM_toList, List.mapM_cons] <;> rfl
     · simpa [ArrsF.apply, ArrsF.viewL] using Pure.Evaluation.pure (info := none) (m := m) (toJson #[true, false])
 
--- The same actual source is evaluated directly: no transformation or world.
-example : (DirectInterpreter.interpret blobs source ()).run =
-    EffF.pure none (.ok (toJson #[true, false])) :=
-  PureDirect.evaluation_matches_direct blobs source_meaning
-
--- All actor starts and all valid traces, not a hand-selected scheduler path.
-example (workers turns fuel duration : Nat)
-    (final : Simulation.State World Unit (workers + 1))
-    (history : SchedulerOwnership.Trace (start turns fuel duration source ()) (fun _ => True)
-      (Simulation.State.initial {} (start turns fuel duration source ())) final)
-    (finished : final.world.scheduler.finished = true) :
-    match final.world.records.lookup (ReplayStore.returnKey Location.root) with
-    | none => False
-    | some record =>
-      (DirectInterpreter.interpret blobs source ()).run =
-        EffF.pure none ((ReplayInterpreter.result (m := Id) (α := Json) record.outcome).run) :=
-  completed_replay_matches_direct workers turns fuel duration source () ⟨_, source_meaning⟩
-    (fun _ => rfl) final history finished
-
--- Completion is obtained from the public theorem, not assumed here.
-example :
-    ∃ sufficientFuel, ∀ workers turns fuel duration, sufficientFuel ≤ fuel →
-      ∀ run : DeploymentProgress.Run (start (workers := workers) turns fuel duration source ()),
-      DeploymentProgress.MakesProgress workers turns fuel duration source () run →
-      ∃ index,
-        (run.state index).world.scheduler.finished = true ∧
-        (run.state index).world.records.lookup (ReplayStore.returnKey Location.root) =
-          some ⟨ReplayStore.returnRequest, .success (toJson #[true, false])⟩ := by
-  obtain ⟨bound, agrees⟩ := concurrent_replay_matches_direct source () ⟨_, source_meaning⟩ (fun _ => rfl)
-  refine ⟨bound, ?_⟩
-  intro workers turns fuel duration enough run progress
-  obtain ⟨index, finished, _⟩ := agrees workers turns fuel duration enough run progress
-  exact ⟨index, finished, ConcurrentSafety.completed_result workers turns fuel duration source ()
-    source_meaning (run.reachable index) finished⟩
-
--- The basic theorem requires no trace, processing window, or populated journal.
+-- All three theorem applications use the original program and input, from empty storage.
 example :
     ∃ sufficientFuel, ∀ fuel, sufficientFuel ≤ fuel →
-      ((LeanCloud.SequentialReplay.interpret ReplayModel.store ReplayModel.noBlobs fuel source ()).run []).1 =
+      ((SequentialReplay.interpret ReplayModel.store ReplayModel.noBlobs fuel source ()).run []).1 =
         ((DirectInterpreter.interpret ReplayModel.noBlobs source ()).run []).1 :=
   sequential_replay_matches_direct source () ⟨_, source_meaning⟩ (fun _ => rfl)
 
-end LeanCloudTests.ProofExamples
+example :
+    ∃ sufficientFuel, ∀ fuel, sufficientFuel ≤ fuel →
+      ((ParallelReplay.interpret fuel source ()).run []).1 =
+        ((DirectInterpreter.interpret ReplayModel.noBlobs source ()).run []).1 :=
+  parallel_replay_matches_direct source () ⟨_, source_meaning⟩ (fun _ => rfl)
 
+-- Faults may occur in any branch, before or after any journal operation.
+example (faults : ReplayFaults.Plan) :
+    ∃ sufficientFuel, ∀ fuel, sufficientFuel ≤ fuel →
+      let direct := ((DirectInterpreter.interpret ReplayFaults.noBlobs source ()).run.run ⟨[], {}⟩).1
+      let replay := ((RestartingParallelReplay.interpret fuel source ()).run
+        (ReplayFaults.Saved.initial faults)).1
+      match direct with
+      | .ok expected => replay = expected
+      | .error _ => False := by
+  obtain ⟨bound, agrees⟩ := restarting_parallel_replay_matches_direct source () ⟨_, source_meaning⟩ (fun _ => rfl) faults
+  refine ⟨bound, fun fuel enough => ?_⟩
+  have correct := agrees fuel enough
+  cases direct : ((DirectInterpreter.interpret ReplayFaults.noBlobs source ()).run.run ⟨[], {}⟩).1 with
+  | ok expected => simpa only [direct] using correct
+  | error side => simp only [direct] at correct
+
+end LeanCloudTests.ProofExamples

@@ -71,6 +71,41 @@ theorem After.child {parent branch command child key}
       simp at this
     · simpa using second
 
+/-- All writes owned by a branch, including its descendants. -/
+def Owns (branch : LeanCloud.Location) (key : String) : Prop :=
+  ∀ parent index, branch = parent.child index → Under parent index key
+
+theorem Owns.returned (branch : LeanCloud.Location) : Owns branch (ReplayStore.returnKey branch) := by
+  intro parent index same
+  exact ⟨0, #[], .inr (by simp [same, LeanCloud.Location.child])⟩
+
+private theorem current_shape {current parent : LeanCloud.Location} {index : Nat}
+    (same : Location.branchStart current = parent.child index) :
+    ∃ command, current = parent.push (index, command) := by
+  by_cases empty : current = #[]
+  · subst current
+    have sizes := congrArg Array.size same
+    simp [LeanCloud.Location.child] at sizes
+  · obtain ⟨ancestry, ⟨branch, command⟩, rfl⟩ := Array.exists_push_of_ne_empty empty
+    simp only [Location.branchStart_push, LeanCloud.Location.child, Array.push_eq_push, Prod.mk.injEq, and_true] at same
+    obtain ⟨rfl, rfl⟩ := same
+    exact ⟨command, rfl⟩
+
+theorem Owns.value {branch current : LeanCloud.Location}
+    (same : branch = Location.branchStart current) : Owns branch (ReplayStore.valueKey current) := by
+  intro parent index eq
+  obtain ⟨command, rfl⟩ := current_shape (same.symm.trans eq)
+  exact ⟨command, #[], .inl (by simp)⟩
+
+theorem Owns.child {branch current : LeanCloud.Location} {index : Nat} {key : String}
+    (same : branch = Location.branchStart current) (inside : Owns (current.child index) key) :
+    Owns branch key := by
+  intro parent branchIndex eq
+  obtain ⟨command, shape⟩ := current_shape (same.symm.trans eq)
+  have region := inside current index rfl
+  rw [shape] at region
+  exact (After.child region).under
+
 theorem After.not_earlier {parent branch command earlier key tail}
     (bound : earlier < command) (inside : After parent branch command key)
     (old : At (parent.push (branch, earlier) ++ tail) key) : False := by

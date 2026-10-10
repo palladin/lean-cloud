@@ -1,11 +1,20 @@
 import LeanCloud.Proofs.Specification
-import LeanCloud.Proofs.Worker
-import LeanCloud.Proofs.OptionalResults
+import LeanCloud.Proofs.Results
+import LeanCloud.Proofs.JournalMerge
 
 namespace LeanCloud.Proofs.Recording
-open Lean LeanEff ReplayModel ReplayInterpreter
+open Lean LeanEff ReplayModel ReplayInterpreter JournalMerge JournalRegion
 
 variable {info : Option SourceSiteId}
+
+private theorem mapM_present {items : List α} {f : α → Option β} {values : List β}
+    (complete : items.mapM f = some values) :
+    ∀ item ∈ items, (f item).isSome = true := by
+  induction items generalizing values with
+  | nil => simp
+  | cons item rest ih =>
+    cases first : f item <;> cases found : rest.mapM f <;>
+      simp_all [List.mapM_cons]
 
 /-- Every child return is available and their ordered combination agrees with
 the specified group. This is a proof fact, never an interpreter input. -/
@@ -17,13 +26,6 @@ def JoinReady (expected journal : Journal) (location : Location) : Prop :=
       (∀ index, index < count → journal.lookup (ReplayStore.returnKey (location.child index)) =
         some ⟨ReplayStore.returnRequest, children index⟩) ∧
       collect ((Array.range count).map children) = outcome
-
-theorem JoinReady.extend {expected before after location}
-    (ready : JoinReady expected before location) (extension : Extends before after) :
-    JoinReady expected after location := by
-  intro schema count outcome known
-  obtain ⟨children, present, collected⟩ := ready schema count outcome known
-  exact ⟨children, fun index inside => extension _ _ (present index inside), collected⟩
 
 /-- Completed child records establish the join obligation. Source order, not
 completion order, determines both the resulting array and the selected error. -/
@@ -68,14 +70,6 @@ theorem JoinReady.of_group {expected journal : Journal} {location : Location} {c
   obtain ⟨outcome, present⟩ := completed index
   exact present.trans ((consistent _ _ present).symm.trans (children index))
 
-/-- The complete specification already contains every child return. This is a
-fact about the mathematical journal, not an assumption that storage is full. -/
-theorem JoinReady.of_specification {expected : Journal} {location : Location} {count : Nat}
-    (group : Specification.Group expected location count) : JoinReady expected expected location := by
-  apply JoinReady.of_group group (.refl _)
-  obtain ⟨α, codec, outcomes, _, children⟩ := group
-  exact fun index => ⟨_, children index⟩
-
 /-- An incomplete group suspends without writing or executing any child. -/
 theorem tryJoin_incomplete (expected journal : Journal) (location : Location) (count : Nat)
     (group : Specification.Group expected location count) (consistent : Extends journal expected)
@@ -87,9 +81,9 @@ theorem tryJoin_incomplete (expected journal : Journal) (location : Location) (c
       (store.outcome (location.child index)).run journal = (.ok (found index), journal) := by
     intro index member
     have inside := List.mem_range.mp member
-    exact Worker.read_compatible journal expected _ _ consistent (children ⟨index, inside⟩)
+    exact Results.read_compatible journal expected _ _ consistent (children ⟨index, inside⟩)
   simp only [Internal.tryJoin, bind_run]
-  rw [Worker.read_children_snapshot journal location (List.range count) found reads]
+  rw [Results.read_children_snapshot journal location (List.range count) found reads]
   cases completed : (List.range count).mapM found with
   | none => simp
   | some values =>
@@ -97,7 +91,7 @@ theorem tryJoin_incomplete (expected journal : Journal) (location : Location) (c
     apply incomplete
     apply JoinReady.of_group ⟨α, codec, outcomes, known, children⟩ consistent
     intro index
-    have entry := OptionalResults.mapM_present completed index.val (List.mem_range.mpr index.isLt)
+    have entry := mapM_present completed index.val (List.mem_range.mpr index.isLt)
     dsimp [found] at entry
     cases record : journal.lookup (ReplayStore.returnKey (location.child index)) with
     | none => simp [record] at entry
@@ -112,10 +106,11 @@ theorem finish_within (journal expected : Journal) (branch : Location) (outcome 
     (consistent : Extends journal expected)
     (known : expected.lookup (ReplayStore.returnKey branch) = some ⟨ReplayStore.returnRequest, outcome⟩) :
     ∃ after, Extends journal after ∧ Extends after expected ∧
+      Writes (Owns branch) journal after ∧
       after.lookup (ReplayStore.returnKey branch) = some ⟨ReplayStore.returnRequest, outcome⟩ ∧
       ((Internal.finish store branch outcome).run journal) = (.ok .done, after) := by
   have accepted := create_within journal expected _ _ consistent known
-  refine ⟨_, create_extends journal _ _, accepted.2, ?_, ?_⟩
+  refine ⟨_, create_extends journal _ _, accepted.2, Writes.create _ _ _ _ (Owns.returned branch), ?_, ?_⟩
   · exact (create_visible journal _ _).trans (congrArg some accepted.1)
   · simp only [Internal.finish, ReplayStore.finish, bind_assoc]
     erw [lift_bind_run]
@@ -174,12 +169,13 @@ theorem exec_within (journal expected : Journal) (blobs : BlobStorage M) (branch
     let operation : Operation M α := .exec label (fun _ => pure (body ()))
     let record : ReplayRecord := ⟨Internal.request codec operation, .success (codec.encode (body ()))⟩
     ∃ after, Extends journal after ∧ Extends after expected ∧
+      Writes (fun key => key = ReplayStore.valueKey current) journal after ∧
       after.lookup (ReplayStore.valueKey current) = some record ∧
       ∀ fuel, (replay store blobs branch (fuel + 1) encode (.impure info (.command codec operation) next) current).run journal =
         (replay store blobs branch fuel encode (next.apply (body ())) current.next).run after := by
   dsimp only
   have accepted := create_within journal expected _ _ consistent known
-  refine ⟨_, create_extends journal _ _, accepted.2, ?_, ?_⟩
+  refine ⟨_, create_extends journal _ _, accepted.2, Writes.create _ _ _ _ rfl, ?_, ?_⟩
   · have visible := create_visible journal (ReplayStore.valueKey current)
       ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → M α)),
         .success (codec.encode (body ()))⟩
@@ -215,7 +211,7 @@ theorem join_missing_is_cached (journal : Journal) (blobs : BlobStorage M) (bran
   rw [replay]
   erw [read_then]
   simp [missing]
-  rw [bind_run, Worker.join_reads_children journal current count outcomes completed]
+  rw [bind_run, Results.join_reads_children journal current count outcomes completed]
   erw [lift_bind_run]
   simp [store, StateT.run, Internal.check]
   erw [lift_bind_run]

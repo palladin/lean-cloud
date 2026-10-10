@@ -6,6 +6,8 @@ import LeanCloud.Coordination
 import LeanCloud.DirectInterpreter
 import LeanCloud.ReplayInterpreter
 import LeanCloud.SequentialReplay
+import LeanCloud.ParallelReplay
+import LeanCloud.RestartingParallelReplay
 import LeanCloud.Scheduler
 import LeanCloud.Pool
 import LeanCloud.Mailbox
