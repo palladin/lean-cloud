@@ -116,11 +116,6 @@ partial def advance (state : State) : State :=
       | none => state
     | none => { state with error := some ⟨.protocol, "Unknown scheduling ticket"⟩ }
 
-def assignedTo (worker : WorkerId) (job : Job) : Option Assignment :=
-  match job.status with
-  | .running owner attempt _ => if owner == worker then some ⟨attempt, job.branch⟩ else none
-  | _ => none
-
 def owned (state : State) (worker : WorkerId) : Option Assignment :=
   state.pending.findSome? fun task => match task.status with
     | .running owner attempt _ => if owner == worker then some ⟨attempt, task.branchStart⟩ else none

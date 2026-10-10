@@ -10,7 +10,7 @@ structure Received (message : Type) where
 /-- A durable actor inbox, with one unacknowledged delivery at a time. Receiving
 reserves a message; only acknowledgement removes it. On consumer failure it is
 redelivered. Receipt identities are scoped to this mailbox session. Outgoing
-`send` operations return only after the broker confirms durable publication. -/
+`send` operations return only after the mailbox service confirms durable publication. -/
 structure Mailbox (m : Type → Type u) (message : Type) where
   receive : m (Option (Received message))
   acknowledge : Nat → m Unit

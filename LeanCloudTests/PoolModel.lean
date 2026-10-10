@@ -177,7 +177,7 @@ private def check (before after : Model) : Except String PUnit.{2} := do
       ensure ((world.records.lookup (ReplayStore.returnKey Location.root)).isSome) "Kill lost its terminal result"
   for worker in workers do
     let assignments := after.pool.runs.foldl (fun count run => count +
-      (run.scheduler.jobs.filter fun job => match job.status with
+      (run.scheduler.pending.filter fun task => match task.status with
         | .running owner attempt _ => owner == worker && Pool.valid after.pool run.id worker attempt
         | _ => false).size +
       (match run.finalization with | .running owner _ _ => if owner == worker then 1 else 0 | _ => 0)) 0

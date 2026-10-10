@@ -23,6 +23,22 @@ private def stopOld (state : Pool.State) : Pool.State :=
 private def initial : Pool.State := { runs := #[{ id := "first" }, { id := "second" }] }
 
 def poolCases : Array TestCase := #[
+  ⟨"pool.catalog-recovery-remembers-terminal-writer", do
+    let state ← change {} (.kill "cancelled")
+    let (state, reply) := Pool.acquire 100 state "old-worker"
+    let .finalize id attempt _ := reply | throw (IO.userError "Missing terminal assignment")
+    let catalog : Pool.Catalog ← unwrap (Json.parse (toJson state.catalog).compress >>= fromJson?)
+    let recovered := Pool.recover catalog.restore
+    let (_, reply) := Pool.acquire 100 recovered "replacement"
+    assertEq (toJson reply) (toJson Pool.Reply.idle)
+      "Catalog recovery forgot an active terminal writer"
+    let some run := recovered.runs[0]? | throw (IO.userError "Missing restored run")
+    assertTrue (run.scheduler.stopping.contains "old-worker") "Terminal owner was not cancelled"
+    let ready := Pool.stopped recovered id "old-worker" run.scheduler.barrier
+    let (_, reply) := Pool.acquire 100 ready "replacement"
+    let .finalize nextId nextAttempt _ := reply | throw (IO.userError "Finalization did not resume")
+    assertEq nextId id
+    assertTrue (nextAttempt > attempt) "Finalization reused the old attempt"⟩,
   ⟨"pool.cancellation-awaits-every-owner-and-restarts-at-root", do
     let state ← change {} (.submit "nested")
     let (state, id, root) ← takeJob state "a"

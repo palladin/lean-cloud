@@ -104,7 +104,8 @@ choices; concurrent timing and the set of busy workers may differ.
 The generator produces finite Cloud programs containing values, recorded pure
 computations, blobs, delays, failures, captured inputs, dependent binds, and nested
 parallel groups, including empty groups. Every generated program runs through the
-direct interpreter and through the same scheduler/worker actors used in deployment.
+direct interpreter and through the shared scheduler transitions and replay worker
+under simulation. The deployed pool adds multi-run routing and ownership checks.
 The comparison checks the durable final value or error and completed-branch replay.
 Generated parallel results use an order-sensitive fold. Targeted cases complete
 children in reverse order and check source-ordered values and errors after all
@@ -153,10 +154,15 @@ HTTP delivery and SQLite durability are checked separately by the adapter tests.
 Targeted failure cases exhaust the actual replay interpreter's fuel inside a
 parallel child, then check sibling revocation, stale reports, restart, terminal
 controls, and continued use of shared workers by another run.
+Catalog recovery also remembers terminal writers in an unconfigured pool and
+blocks replacement finalization until their stop acknowledgements arrive.
 
 Protocol tests check repeated assignment requests, duplicate and stale reports,
 empty and partial joins, immutable record creation, JSON codecs, and the different
 lifetimes of local database operations and remote requests.
+Clearing the inspection tree during a fork/join must leave assignment ownership,
+child selection, joining and completion intact: tickets and the recursive
+continuation drive execution.
 Nested-child replay also runs with a store that rejects ancestor-join reads:
 descending into a child must not depend on those records.
 Replay tests reject missing prefixes, premature joins, changed requests, malformed

@@ -126,6 +126,31 @@ def coordinationCases : Array TestCase := #[
     let (state, _) := Scheduler.handle 100 state (.report ⟨"a", parent.attempt, .ok .done, #[]⟩)
     let (_, root) := Scheduler.handle 100 state (.ready "b")
     assertEq (← assigned root).branchStart Location.root⟩,
+  ⟨"scheduler/inspection-tree-does-not-drive-execution", do
+    let (state, root) := Scheduler.handle 100 {} (.ready "a")
+    let root ← assigned root
+    let (state, _) := Scheduler.handle 100 state (.report ⟨"a", root.attempt,
+      .ok (.fork Location.root 2), #[]⟩)
+    -- The obsolete scheduler used this tree as its work table. Discarding the
+    -- view must not lose tickets, outstanding ownership or the join continuation.
+    let (state, left) := Scheduler.handle 100 { state with jobs := #[] } (.ready "a")
+    let left ← assigned left
+    assertEq left.branchStart (Location.root.child 0)
+    let (state, right) := Scheduler.handle 100 { state with jobs := #[] } (.ready "b")
+    let right ← assigned right
+    assertEq right.branchStart (Location.root.child 1)
+    let (state, repeated) := Scheduler.handle 100 { state with jobs := #[] } (.ready "a")
+    assertEq (← assigned repeated) left
+    let (state, _) := Scheduler.handle 100 state (.report ⟨"b", right.attempt, .ok .done, #[]⟩)
+    let (state, _) := Scheduler.handle 100 { state with jobs := #[] }
+      (.report ⟨"a", left.attempt, .ok .done, #[]⟩)
+    let (state, resumed) := Scheduler.handle 100 { state with jobs := #[] } (.ready "c")
+    let resumed ← assigned resumed
+    assertEq resumed.branchStart Location.root
+    let (state, _) := Scheduler.handle 100 { state with jobs := #[] }
+      (.report ⟨"c", resumed.attempt, .ok .done, #[]⟩)
+    assertTrue ({ state with jobs := #[] } : Scheduler.State).finished
+      "Completion still depends on the inspection tree"⟩,
   ⟨"records/first-successful-create-wins", do
     let old : Fin 2 := ⟨0, by decide⟩
     let fresh : Fin 2 := ⟨1, by decide⟩

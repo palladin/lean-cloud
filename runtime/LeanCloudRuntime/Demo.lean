@@ -35,9 +35,7 @@ def sampleFiles : Array (String × String) := (Array.range 16).map fun i =>
     (if i % 2 == 0 then "ERROR second\n" else "INFO finished\n"))
 
 def input : Input := ⟨sampleFiles.map Prod.fst, 2, 500⟩
-def expected : String := "files=16, errors=24\n"
 
 instance : Codec Input := jsonCodec Input "log-summary-input/v1"
-
 
 end LeanCloudRuntime.Demo

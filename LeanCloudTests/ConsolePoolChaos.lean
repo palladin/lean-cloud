@@ -98,9 +98,14 @@ private structure Interrupted where
   worker : String
   assignment : Assignment
 
+private def assignedTo (worker : WorkerId) (job : Scheduler.Job) : Option Assignment :=
+  match job.status with
+  | .running owner attempt _ => if owner == worker then some ⟨attempt, job.branch⟩ else none
+  | _ => none
+
 private def owns (state : Scheduler.Snapshot) (old : Interrupted) : Bool :=
   state.jobs.any fun job => job.branch == old.assignment.branchStart &&
-    (Scheduler.Internal.assignedTo old.worker job).any (·.attempt == old.assignment.attempt)
+    (assignedTo old.worker job).any (·.attempt == old.assignment.attempt)
 
 /-- Deliver an explicitly synthetic late failure and heartbeat through the real
 HTTP inbox. If the old attempt is still accepted, this poisons the run. Repeating
@@ -226,7 +231,7 @@ private def isolateWorker (ctx : Context) (runs : Array Run) : Cli Interrupted :
     let captured ← observing do
       let after ← states ctx runs
       let some (run, assignment) := (runs.zip after).findSome? fun (run, state) =>
-          (state.jobs.findSome? (Scheduler.Internal.assignedTo worker)).map (run, ·)
+          (state.jobs.findSome? (assignedTo worker)).map (run, ·)
         | return none
       chaosEvent ctx "worker-isolated" [("run", toJson run.id), ("worker", toJson worker),
         ("assignment", toJson assignment), ("runs", toJson after)]

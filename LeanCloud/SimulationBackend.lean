@@ -2,9 +2,10 @@ import LeanCloud.Simulation
 import LeanCloud.Worker
 import LeanCloud.MailboxModel
 
-/-! The scheduler and workers use their production actor turns and interpreter.
-Only their ports differ. Mailbox delivery, process scheduling and crashes remain
-external choices; the shared world is a model, not a service deployed in production. -/
+/-! The single-run model uses the shared scheduler transitions and replay worker.
+The deployed pool adds multi-run routing, heartbeats and ownership checks.
+Mailbox delivery, process scheduling and crashes remain external choices;
+the shared world is a model, not a service deployed in production. -/
 
 namespace LeanCloud.SimulationBackend
 open Lean
@@ -153,7 +154,7 @@ def step (start : Simulation.Start World α count) (event : Simulation.Event cou
   | .crash actor => return { next with world := disconnect actor.val (state.generations actor) next.world }
   | _ => return next
 
-/-- Publication confirmation puts a message in durable broker state. Delivery can
+/-- Publication confirmation puts a message in durable mailbox state. Delivery can
 be delayed or duplicated, but a confirmed message cannot simply be dropped. -/
 inductive NetworkEvent where
   | deliver (index : Nat)

@@ -24,15 +24,6 @@ services:
       timeout: 3s
       retries: 30
 
-  submit:
-    <<: *worker
-    profiles: ["submit"]
-    restart: "no"
-    healthcheck: {disable: true}
-    command: ["submit", "/etc/lean-cloud/config.json", "${RUN_ID:-demo}"]
-    depends_on:
-      scheduler: {condition: service_healthy}
-
   scheduler:
     <<: *worker
     ports: ["127.0.0.1::8080"]

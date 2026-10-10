@@ -189,9 +189,11 @@ def acquire (duration : Nat) (state : State) (worker : String) : State × Reply 
     if let some outcome := run.terminalOutcome.filter (fun _ => run.scheduler.stopping.isEmpty) then
       if run.finalization == .pending then
         let attempt := run.scheduler.nextAttempt
+        -- Recovery must stop terminal writers even without configured routes.
+        let scheduler := Scheduler.Internal.observe run.scheduler worker #[]
         let run := { run with
           finalization := .running worker attempt (run.scheduler.now + max 1 duration)
-          scheduler := { run.scheduler with nextAttempt := attempt + 1 } }
+          scheduler := { scheduler with nextAttempt := attempt + 1 } }
         return ({ state with runs := state.runs.set! index run, cursor := index + 1 },
           .finalize run.id attempt outcome)
     if run.accepts then

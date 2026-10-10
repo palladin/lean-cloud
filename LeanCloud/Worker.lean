@@ -3,7 +3,7 @@ import LeanCloud.Mailbox
 
 namespace LeanCloud.Worker
 
-/-- Volatile state. The broker retains unacknowledged assignments and confirmed
+/-- Volatile state. The mailbox retains unacknowledged assignments and confirmed
 reports across process failure, so the worker needs no local durable outbox. -/
 structure State where
   stopped : Bool := false
@@ -38,8 +38,8 @@ def finalize [Monad m] (id : WorkerId) (store : ObservedStore m)
   let progress ← (ReplayInterpreter.Internal.finish store.records Location.root outcome).run
   return ⟨id, attempt, progress, ← store.confirmed⟩
 
-/-- Finish an assignment by recording its values, publishing its report with a
-broker confirmation, and only then acknowledging its delivery. A crash before
+/-- Record assignment results, confirm report publication, then acknowledge
+the delivery. A crash before
 acknowledgement replays the assignment; duplicates reuse the immutable records. -/
 def turn [Monad m] [Codec α] (ports : Ports m) (fuel : Nat)
     (program : ι → Cloud m α) (input : ι) (state : State)

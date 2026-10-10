@@ -56,6 +56,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=node-build /usr/local/bin/cloud-node /usr/local/bin/cloud-node
 LABEL lean-cloud.node="http-inbox-v1"
 HEALTHCHECK --interval=3s --timeout=5s --start-period=10s --retries=40 CMD ["cloud-node", "health"]
-COPY --from=build /out/cloud_demo /usr/local/bin/cloud-demo
 COPY --from=build /out/cloud_demo /usr/local/bin/cloud-app
 ENTRYPOINT ["cloud-node"]

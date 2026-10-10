@@ -44,11 +44,6 @@ def delay (body : Unit → Cloud m α) : Cloud m α := send Control.delay >>= bo
 
 def fail (message : String) : Cloud m α := send (.fail ⟨.application, message⟩)
 
-def decode [Codec α] (value : Json) : Cloud m α :=
-  match Codec.decode value with
-  | .ok value => pure value
-  | .error error => send (.fail ⟨.codec, error⟩)
-
 def exec [Codec α] (body : Unit → m α) (label : String := "") : Cloud m α :=
   send (.command inferInstance (.exec label body))
 

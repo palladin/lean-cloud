@@ -50,7 +50,7 @@ def Sink.assign (sink : Sink) (assignment : Assignment) : IO Unit := do
   sink.emit "assigned" ""
 
 /-- Lease renewal changes no visible branch state. Emit deltas, not the entire
-job table on every heartbeat. These diagnostics never drive scheduling. -/
+inspection tree on every heartbeat. These diagnostics never drive scheduling. -/
 def Sink.branches (sink : Sink) (before after : Array Scheduler.Job) : IO Unit := do
   let previous := before.foldl (fun (found : Std.HashMap String BranchObservation) job =>
     found.insert job.branch.key (BranchObservation.ofJob job)) {}

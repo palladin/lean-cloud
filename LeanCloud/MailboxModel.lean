@@ -2,7 +2,7 @@ import LeanCloud.Mailbox
 
 namespace LeanCloud.MailboxModel
 
-/-- Broker-owned state for one durable mailbox. Session numbers model new
+/-- Service-owned state for one durable mailbox. Session numbers model new
 consumer channels; delivery tags are never sufficient without that session. -/
 structure Inbox (α : Type) where
   pending : Array α := #[]
