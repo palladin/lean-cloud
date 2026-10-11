@@ -1,0 +1,10 @@
+{
+  "name": "lean-cloud-dev",
+  "subscription": "YOUR_SUBSCRIPTION_ID",
+  "region": "northeurope",
+  "machines": 2,
+  "machine_size": "Standard_D4ps_v6",
+  "kubernetes_version": "YOUR_SUPPORTED_VERSION",
+  "administrator_cidrs": ["YOUR_PUBLIC_IP/32"],
+  "namespace": "lean-cloud"
+}

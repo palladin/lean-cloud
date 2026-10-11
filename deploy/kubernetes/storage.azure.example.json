@@ -1,0 +1,6 @@
+{
+  "provider": "azure",
+  "endpoint": "https://YOUR_ACCOUNT.blob.core.windows.net",
+  "container": "cloud",
+  "authentication": {"kind": "workload"}
+}

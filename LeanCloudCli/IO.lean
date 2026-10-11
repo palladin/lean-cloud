@@ -7,31 +7,19 @@ namespace LeanCloudCli
 private structure Resources where
   locks : Array (Option Native.Lock) := #[]
   terminal : Bool := false
-  processes : Array (Option Native.Process) := #[]
 
-/-- Only this handler touches the host. Process arguments remain separate argv entries. -/
+private def randomHex (count : Nat) : IO String := IO.FS.withFile "/dev/urandom" .read fun file => do
+  let bytes ← file.read count.toUSize
+  unless bytes.size == count do throw (IO.userError "Could not obtain secure random bytes")
+  let digits := "0123456789abcdef".toList.toArray
+  return String.ofList (bytes.data.toList.flatMap fun byte =>
+    [digits[byte.toNat / 16]!, digits[byte.toNat % 16]!])
+
+/-- Only this handler touches HTTP, local client files, and the terminal. -/
 private def handle (resources : IO.Ref Resources) : HostOp α → IO α
   | .httpPost url token body => Http.post url token body
-  | .process command args input => do
-    let output ← IO.Process.output { cmd := command, args } input
-    return ⟨output.exitCode, output.stdout, output.stderr⟩
-  | .startProcess command args => do
-    let child ← Native.startProcess command args
-    let state ← resources.get
-    resources.set { state with processes := state.processes.push (some child) }
-    return ⟨state.processes.size⟩
-  | .pollProcess token timeout => do
-    let some child := (← resources.get).processes[token.value]? >>= id
-      | throw (IO.userError "Unknown or closed process")
-    Native.pollProcess child timeout
-  | .closeProcess token => do
-    let some child := (← resources.get).processes[token.value]? >>= id
-      | throw (IO.userError "Unknown or closed process")
-    Native.closeProcess child
-    resources.modify fun state => { state with processes := state.processes.set! token.value none }
   | .readFile path => IO.FS.readFile path
   | .writeFile path text => IO.FS.writeFile path text
-  | .appendFile path text => IO.FS.withFile path .append (fun file => file.putStr text)
   | .rename source target => IO.FS.rename source target
   | .removeTree path => do
     let metadata ← try some <$> path.symlinkMetadata catch
@@ -48,6 +36,7 @@ private def handle (resources : IO.Ref Resources) : HostOp α → IO α
   | .currentDir => IO.Process.getCurrentDir
   | .getEnv name => IO.getEnv name
   | .pid => IO.Process.getPID
+  | .randomId => randomHex 16
   | .now => IO.monoMsNow
   | .sleep milliseconds => IO.sleep milliseconds
   | .write text stderr => do
@@ -65,6 +54,12 @@ private def handle (resources : IO.Ref Resources) : HostOp α → IO α
     resources.modify fun state => { state with terminal := false }
   | .key timeout => Native.key timeout
   | .dimensions => return ((← Native.columns).toNat, (← Native.rows).toNat)
+  | .copyClipboard text => do
+    let (command, args) ← if System.Platform.isOSX then pure ("pbcopy", #[])
+      else if (← IO.getEnv "WAYLAND_DISPLAY").isSome then pure ("wl-copy", #[])
+      else pure ("xclip", #["-selection", "clipboard"])
+    let output ← IO.Process.output { cmd := command, args } (some text)
+    unless output.exitCode == 0 do throw (IO.userError s!"Clipboard copy failed: {output.stderr.trimAscii}")
   | .lock path => do
     let lock ← Native.lock path.toString
     let state ← resources.get
@@ -87,8 +82,6 @@ def withHostIO (use : ({α : Type} → HostOp α → IO (Except String α)) → 
       catch error => return .error error.toString)
   finally
     let state ← resources.get
-    for child in state.processes do
-      if let some child := child then Native.closeProcess child
     if state.terminal then Native.leave
     for lock in state.locks do
       if let some lock := lock then Native.unlock lock

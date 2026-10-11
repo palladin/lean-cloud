@@ -1,4 +1,5 @@
 import LeanCloudCli.Effects
+import LeanCloudCli.Client
 import LeanCloud.Program
 import LeanCloud.Scheduler
 import LeanCloud.Telemetry
@@ -7,54 +8,20 @@ import LeanCloud.Version
 namespace LeanCloudCli
 open Lean LeanCloud
 
-def defaultWorkerCount : Nat := 3
-
-def workerNames (count : Nat) : Array String :=
-  (Array.range count).map fun i => s!"worker{i + 1}"
-
 def workerIndex? (role : String) : Option Nat := do
   unless role.startsWith "worker" do none
   let index ← (role.drop 6 |>.toString).toNat?
   if index > 0 && role == s!"worker{index}" then some (index - 1) else none
 
-def isActor (role : String) : Bool := role == "scheduler" || (workerIndex? role).isSome
-
-def deploymentServices (workers := defaultWorkerCount) : Array String :=
-  #["blobs", "scheduler"] ++ workerNames workers
-
-def deploymentVolumes (workers := defaultWorkerCount) : Array String :=
-  #["scheduler-data", "blob-data", "scheduler-mailbox-data"] ++
-    (workerNames workers).map (· ++ "-mailbox-data")
-
-/-- Include retired workers even when their deployment manifest is missing. -/
-def isDeploymentVolume (project name : String) : Bool :=
-  let start := project ++ "_"
-  if !name.startsWith start then false else
-    let localName := name.drop start.length |>.toString
-    if ["scheduler-data", "scheduler-mailbox-data", "blob-data"].contains localName then true else
-      match localName.splitOn "-mailbox-data" with
-      | [worker, ""] => (workerIndex? worker).isSome
-      | _ => false
-
-/-- Defaults apply to absent fields, never to malformed values. -/
-def jsonFieldD [FromJson α] (json : Json) (field : String) (fallback : α) : Except String α :=
-  match json.getObjVal? field with
-  | .ok value => fromJson? value
-  | .error _ => pure fallback
-
 structure Deployment where
   project : String
   image : String
   programs : Array ProgramInfo
-  workers : Nat := defaultWorkerCount
-  /-- Retired mailbox volumes remain durable and may be reused on a later grow. -/
-  retainedWorkers : Nat := 0
 
 instance : ToJson Deployment where
   toJson value := Version.stamp "formatVersion" (Json.mkObj [
     ("project", toJson value.project), ("image", toJson value.image),
-    ("programs", toJson value.programs), ("workers", toJson value.workers),
-    ("retainedWorkers", toJson value.retainedWorkers)])
+    ("programs", toJson value.programs)])
 
 instance : FromJson Deployment where
   fromJson? json := do
@@ -62,25 +29,18 @@ instance : FromJson Deployment where
     return {
       project := ← json.getObjValAs? String "project"
       image := ← json.getObjValAs? String "image"
-      programs := ← json.getObjValAs? _ "programs"
-      workers := ← jsonFieldD json "workers" defaultWorkerCount
-      retainedWorkers := ← jsonFieldD json "retainedWorkers" 0 }
-
-def Deployment.retainedCount (deployment : Deployment) : Nat :=
-  max deployment.workers deployment.retainedWorkers
+      programs := ← json.getObjValAs? _ "programs" }
 
 structure Run where
   id : String
   image : String
   program : ProgramInfo
   input : Json
-  /-- Initial pool size; recorded events extend the roster when workers join. -/
-  workers : Nat := defaultWorkerCount
 
 instance : ToJson Run where
   toJson value := Version.stamp "formatVersion" (Json.mkObj [
     ("id", toJson value.id), ("image", toJson value.image), ("program", toJson value.program),
-    ("input", value.input), ("workers", toJson value.workers)])
+    ("input", value.input)])
 
 instance : FromJson Run where
   fromJson? json := do
@@ -89,19 +49,11 @@ instance : FromJson Run where
       id := ← json.getObjValAs? String "id"
       image := ← json.getObjValAs? String "image"
       program := ← json.getObjValAs? _ "program"
-      input := ← json.getObjVal? "input"
-      workers := ← jsonFieldD json "workers" defaultWorkerCount }
+      input := ← json.getObjVal? "input" }
 
-/-- Intent is saved before requesting scheduler controls, so interrupted commands can be retried. -/
-inductive RunControl where
-  | active | pausing | paused | killing | killed
-  deriving BEq, FromJson, ToJson
-
-def RunControl.label : RunControl → String
+def controlLabel : Pool.Mode → String
   | .active => "running"
-  | .pausing => "pausing (retry pause)"
   | .paused => "paused"
-  | .killing => "killing (retry kill)"
   | .killed => "killed"
 
 structure Context where
@@ -118,14 +70,6 @@ def validId (id : String) : Bool :=
 
 def validateId (id : String) : Cli Unit :=
   unless validId id do throw "IDs require 1–80 ASCII letters, digits, '-' or '_'"
-
-/-- Keep the lock outside the removable deployment directory. Unlinking a held
-lock would allow another console to create a new lock and enter concurrently. -/
-def Context.withDeploymentLock (ctx : Context) (action : Cli α) : Cli α := do
-  validateId ctx.project
-  let directory := ctx.root / ".lean-cloud"
-  request (.createDir directory)
-  withLock (directory / s!".{ctx.project}.lock") action
 
 /-- Escape all terminal controls in remote labels, code, and diagnostics. -/
 def safe (value : String) : String := Styled.sanitize value
@@ -159,10 +103,6 @@ def words (line : String) : Except String (List String) := do
   if started then result := result ++ [current]
   return result
 
-def event? (line : String) : Option ExecutionEvent := do
-  if !line.startsWith "@lean-cloud " then none else
-    (Json.parse (line.drop 12 |>.toString) >>= fromJson?).toOption
-
 def readJson [FromJson α] (path : System.FilePath) : Cli α := do
   liftExcept (Json.parse (← request (.readFile path)) >>= fromJson?)
 
@@ -170,5 +110,17 @@ def saveJson [ToJson α] (path : System.FilePath) (value : α) : Cli Unit := do
   let temporary := path.toString ++ s!".{← request .pid}.tmp"
   request (.writeFile temporary (toJson value).pretty)
   request (.rename temporary path)
+
+def Context.connection (ctx : Context) : Cli (Option Client.Connection) := do
+  let path := ctx.home / "connection.json"
+  unless ← request (.exists path) do return none
+  let connection ← readJson (α := Client.Connection) path
+  liftExcept connection.validate
+  return some connection
+
+def Context.requireConnection (ctx : Context) : Cli Client.Connection := do
+  let some connection ← ctx.connection
+    | throw "Not connected. Use 'connect NAME URL --token-file FILE' (or --token-env VARIABLE)."
+  return connection
 
 end LeanCloudCli

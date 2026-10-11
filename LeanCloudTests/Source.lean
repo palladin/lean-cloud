@@ -91,7 +91,7 @@ def cases : Array TestCase := #[
   ⟨"source.console-multiple-files-and-unknown-sites", do
     let a : ProgramSource := ⟨"A.lean", "first\nread a", #[⟨"a", 2, 0, 2, 6⟩]⟩
     let b : ProgramSource := ⟨"B.lean", "read b\nlast", #[⟨"b", 1, 0, 1, 6⟩]⟩
-    let run : LeanCloudCli.Run := ⟨"run", "image", ⟨"app/v1", "unit", "nat", "", none, #[a, b]⟩, Json.null, 2⟩
+    let run : LeanCloudCli.Run := ⟨"run", "image", ⟨"app/v1", "unit", "nat", "", none, #[a, b]⟩, Json.null⟩
     let first : LeanCloudCli.Trace.Step := {
       timestamp := "1", event := ⟨"boot", 0, 0, "worker1", some 0, "0:0", "execute", "readBlob", "run", some "a"⟩ }
     let second := { first with timestamp := "2", event := { first.event with worker := "worker2", source := some "b" } }

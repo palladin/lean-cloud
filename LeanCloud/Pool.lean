@@ -86,6 +86,8 @@ inductive Command where
   | health
   | configureWorkers (workers : Array String)
   | workers
+  | runs (after : Option String) (limit : Nat)
+  | mode (run : String)
   | workerStopped (worker : String) (generation : Nat)
   | submit (run : String)
   | pause (run : String)
@@ -299,6 +301,14 @@ Pausing revokes attempts; resuming never reuses an attempt number. -/
 def command (state : State) : Command → Except String (State × Json)
   | .health => .ok (state, Json.null)
   | .workers => .ok (state, toJson state.membership)
+  | .runs after limit => do
+    unless 0 < limit && limit ≤ 100 do throw "Page size must be between 1 and 100"
+    let runs := state.runs.filter (fun run => after.all (· < run.id))
+      |>.qsort (fun a b => a.id < b.id)
+    return (state, toJson ((runs.extract 0 limit).map fun run => (run.id, run.mode)))
+  | .mode id => do
+    let some run := state.runs.find? (·.id == id) | throw s!"Unknown run: {id}"
+    return (state, toJson run.mode)
   | .workerStopped worker generation => .ok (drained state worker generation, Json.null)
   | .configureWorkers workers =>
     let membership := if state.membership.active == some workers then state.membership else

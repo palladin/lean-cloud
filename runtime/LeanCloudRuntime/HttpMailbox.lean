@@ -148,10 +148,16 @@ ambiguous transport failure may be retried; duplicate messages are permitted. -/
 def send [ToJson α] (config : Config) (run actor : String) (message : α) : IO Unit :=
   discard (call config ⟨(toJson (run, actor)).compress, "", .send (toJson message).compress⟩)
 
+structure ClientHandler where
+  token : String
+  api : Json → IO Json
+
 structure ServerHandler where
   store : Inbox.Store
   token : String
   api : Json → IO Json
+  client : Option ClientHandler := none
+  telemetry : Option (Json → IO Json) := none
 
 open Std.Http in
 instance : Std.Http.Server.Handler ServerHandler where
@@ -160,7 +166,9 @@ instance : Std.Http.Server.Handler ServerHandler where
     if (toString request.line.uri.path) == "/health" then
       return ← Response.ok |>.text "ok"
     let authorized := request.line.headers.get? (.mk "authorization")
-    unless authorized.map toString == some ("Bearer " ++ handler.token) do
+    let path := toString request.line.uri.path
+    let token := if path == "/deployment" then handler.client.map (·.token) else some handler.token
+    unless token.any (fun token => authorized.map toString == some ("Bearer " ++ token)) do
       return ← Response.new |>.status .unauthorized |>.text "Unauthorized"
     unless request.line.method == .post do
       return ← Response.new |>.status .methodNotAllowed |>.text "Expected POST"
@@ -174,6 +182,12 @@ instance : Std.Http.Server.Handler ServerHandler where
           let command ← IO.ofExcept (fromJson? json)
           pure (.ok (← Inbox.apply handler.store (← IO.monoMsNow) command))
         | "/app" => pure (.ok (← handler.api json))
+        | "/deployment" => match handler.client with
+          | some client => pure (.ok (← client.api json))
+          | none => pure (.error "Deployment API is not configured")
+        | "/telemetry" => match handler.telemetry with
+          | some api => pure (.ok (← api json))
+          | none => pure (.error "Node telemetry is not configured")
         | _ => pure (.error "Unknown endpoint")
       catch error => pure (.error error.toString)
       pure (LeanCloud.Version.response json (toJson result))
@@ -183,13 +197,14 @@ instance : Std.Http.Server.Handler ServerHandler where
 /-- The HTTP server and actor live in this same process. Durable queue rows
 survive a process crash; volatile consumer reservations do not. -/
 def withServer (config : Config) (database : String) (api : Json → IO Json)
-    (actor : IO α) (handleSignals := false) : IO α := do
+    (actor : IO α) (handleSignals := false) (client : Option ClientHandler := none)
+    (telemetry : Option (Json → IO Json) := none) : IO α := do
   if let some parent := (System.FilePath.mk database).parent then IO.FS.createDirAll parent
   let lock ← ProcessLock.acquire (database ++ ".lock")
   try
     let conn ← LeanLinq.Sqlite.connect database
     try
-      let handler : ServerHandler := ⟨← Inbox.create conn, config.token, api⟩
+      let handler : ServerHandler := { store := ← Inbox.create conn, token := config.token, api, client, telemetry }
       let address : Std.Net.SocketAddress := .v4 ⟨.ofParts 0 0 0 0, config.port.toUInt16⟩
       let server ← (HttpServer.start address handler).block
       try

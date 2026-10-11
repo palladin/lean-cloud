@@ -5,48 +5,16 @@ import LeanCloudCli.Styled
 namespace LeanCloudCli
 open LeanEff
 
-structure ProcessOutput where
-  exitCode : UInt32 := 0
-  stdout : String := ""
-  stderr : String := ""
-  deriving Inhabited, BEq, Repr
-
-instance : Lean.ToJson ProcessOutput where
-  toJson out := Lean.Json.mkObj [("exitCode", Lean.toJson out.exitCode.toNat),
-    ("stdout", Lean.toJson out.stdout), ("stderr", Lean.toJson out.stderr)]
-
-instance : Lean.FromJson ProcessOutput where
-  fromJson? json := do
-    let code ← json.getObjValAs? Nat "exitCode"
-    unless code ≤ 4294967295 do throw "Invalid process exit code"
-    return ⟨code.toUInt32, ← json.getObjValAs? String "stdout", ← json.getObjValAs? String "stderr"⟩
-
 /-- A handle owned by the host handler, not an IO value in the CLI program. -/
 structure LockId where
   value : Nat
   deriving BEq, Repr
 
-structure ProcessId where
-  value : Nat
-  deriving BEq, Repr
-
-/-- Bounded byte chunks; completion is reported after both output pipes drain. -/
-structure ProcessChunk where
-  stdout : ByteArray := ByteArray.empty
-  stderr : ByteArray := ByteArray.empty
-  exitCode : Option UInt32 := none
-
-
 /-- The CLI's host boundary. Requests contain data, never arbitrary IO actions. -/
 inductive HostOp : Type → Type where
   | httpPost (url token body : String) : HostOp String
-  | process (command : String) (args : Array String) (input : Option String) : HostOp ProcessOutput
-  | startProcess (command : String) (args : Array String) : HostOp ProcessId
-  | pollProcess (id : ProcessId) (timeoutMs : UInt32) : HostOp ProcessChunk
-  | closeProcess (id : ProcessId) : HostOp Unit
   | readFile (path : System.FilePath) : HostOp String
   | writeFile (path : System.FilePath) (text : String) : HostOp Unit
-  | appendFile (path : System.FilePath) (text : String) : HostOp Unit
   | rename (source target : System.FilePath) : HostOp Unit
   | removeTree (path : System.FilePath) : HostOp Unit
   | exists (path : System.FilePath) : HostOp Bool
@@ -57,6 +25,7 @@ inductive HostOp : Type → Type where
   | currentDir : HostOp System.FilePath
   | getEnv (name : String) : HostOp (Option String)
   | pid : HostOp UInt32
+  | randomId : HostOp String
   | now : HostOp Nat
   | sleep (milliseconds : UInt32) : HostOp Unit
   | write (text : String) (stderr : Bool := false) : HostOp Unit
@@ -67,6 +36,8 @@ inductive HostOp : Type → Type where
   | leaveTerminal : HostOp Unit
   | key (timeoutMs : UInt32) : HostOp UInt32
   | dimensions : HostOp (Nat × Nat)
+  /-- Requested only by an explicit selection/copy gesture. -/
+  | copyClipboard (text : String) : HostOp Unit
   | lock (path : System.FilePath) : HostOp LockId
   | unlock (id : LockId) : HostOp Unit
 

@@ -14,21 +14,7 @@ lean_lib LeanCloud where
 
 lean_lib LeanCloudTests
 
-input_dir cliTemplates where
-  path := "LeanCloudCli/Templates"
-  text := true
-
-input_dir deploymentDefaults where
-  path := "deploy"
-  text := true
-
-input_file cliToolchain where
-  path := "lean-toolchain"
-  text := true
-
-lean_lib LeanCloudCli where
-  needs := #[.mk (.packageTarget .anonymous `cliTemplates),
-    .mk (.packageTarget .anonymous `deploymentDefaults), .mk (.packageTarget .anonymous `cliToolchain)]
+lean_lib LeanCloudCli
 
 lean_exe lean_cloud where
   root := `LeanCloudCli.Main
@@ -39,11 +25,9 @@ extern_lib cloud_console_native pkg := do
   let terminalObj ← buildO (pkg.buildDir / "native" / "terminal.o") terminal includeArgs #["-O2", "-Wall", "-Wextra"] "cc"
   let lock ← inputTextFile (pkg.dir / "runtime" / "native" / "process_lock.c")
   let lockObj ← buildO (pkg.buildDir / "native" / "process_lock.o") lock includeArgs #["-O2", "-Wall", "-Wextra"] "cc"
-  let process ← inputTextFile (pkg.dir / "native" / "process.c")
-  let processObj ← buildO (pkg.buildDir / "native" / "process.o") process includeArgs #["-O2", "-Wall", "-Wextra"] "cc"
   let http ← inputTextFile (pkg.dir / "native" / "http.c")
   let httpObj ← buildO (pkg.buildDir / "native" / "http.o") http includeArgs #["-O2", "-Wall", "-Wextra"] "cc"
-  buildStaticLib (pkg.staticLibDir / nameToStaticLib "cloud_console_native") #[terminalObj, lockObj, processObj, httpObj]
+  buildStaticLib (pkg.staticLibDir / nameToStaticLib "cloud_console_native") #[terminalObj, lockObj, httpObj]
 
 @[test_driver]
 lean_exe lean_cloud_tests where
@@ -51,9 +35,6 @@ lean_exe lean_cloud_tests where
 
 lean_exe cloud_console_tests where
   root := `LeanCloudTests.ConsoleRuntime
-
-lean_exe cloud_process_tests where
-  root := `LeanCloudTests.ProcessRuntime
 
 lean_exe cloud_stress_tests where
   root := `LeanCloudTests.StressMain

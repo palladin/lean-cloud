@@ -1,4 +1,4 @@
-import LeanCloudCli.Docker
+import LeanCloudCli.Runtime
 import LeanCloudCli.Help
 
 namespace LeanCloudCli.Completion
@@ -16,20 +16,23 @@ structure Catalog where
   runs : Array Item := #[]
   files : Array Item := #[]
   deployments : Array Item := #[]
-  actors : Array Item := (#["scheduler"] ++ workerNames defaultWorkerCount).map (fun name => ⟨name, ""⟩)
+  actors : Array Item := #[]
 
-/-- Completion reads the local catalog, never polling Docker while typing. -/
+/-- Completion reads cached catalogs, never polling services while typing. -/
 def load (ctx : Context) : Cli Catalog := do
-  let deployment ← try some <$> ctx.deployment catch _ => pure none
+  let deployment ← try some <$> readJson (α := Deployment) (ctx.home / "deployment.json") catch _ => pure none
   let programs := (deployment.map (·.programs) |>.getD #[]).map fun p => Item.mk p.entry p.description
   let runs ← try
-    pure ((← ctx.allRuns).map fun r => Item.mk r.id r.program.entry)
+    let runs ← readJson (α := Array Run) (ctx.home / "runs.json")
+    pure (runs.map fun r => Item.mk r.id r.program.entry)
     catch _ => pure #[]
   let deployments ← try
-    pure ((← Deployments.load).entries.map fun e => Item.mk e.project e.root)
+    pure ((← Profiles.load).entries.map fun e => Item.mk e.project e.root)
     catch _ => pure #[]
-  let count := deployment.map (·.retainedCount) |>.getD defaultWorkerCount
-  let actors := (#["scheduler"] ++ workerNames count).map fun name => Item.mk name "Node logs"
+  let actors ← try
+    let nodes ← readJson (α := Array LeanCloud.DeploymentApi.Node) (ctx.home / "nodes.json")
+    pure (nodes.map fun node => Item.mk node.id "Node observations")
+    catch _ => pure #[]
   return { programs, runs, deployments, actors }
 
 structure Token where
@@ -84,45 +87,39 @@ def candidates (catalog : Catalog) (ctx : Context) : Array Item :=
         command.aliases.map fun name => Item.mk name s!"Alias for {command.name}")
     | ["run"] => catalog.programs
     | ["use"] => catalog.deployments
+    | ["connect", _, _] => #[⟨"--token-env", "Client credential environment variable"⟩, ⟨"--token-file", "Client credential file"⟩]
+    | ["connect", _, _, "--token-file"] => catalog.files
     | ["inspect"] | ["result"] | ["watch"] | ["logs"] | ["resume"] | ["pause"] | ["kill"] | ["remove"] => catalog.runs
-    | ["backup"] | ["restore"] => catalog.files
     | ["logs", _] => catalog.actors
     | ["watch", _] => #[⟨"--once", "Print one frame"⟩]
     | ["top"] => #[⟨"--once", "Print a snapshot of all workers and schedulers"⟩]
-    | "deploy" :: rest =>
-      if rest.getLast? == some "--workers" then #[] else
-      (if rest.contains "--workers" then #[] else #[⟨"--workers", "Initial worker count"⟩]) ++
-      (if rest.contains "-v" || rest.contains "--verbose" then #[] else
-        #[⟨"--verbose", "Stream full build/startup output (-v)"⟩, ⟨"-v", "Stream full build/startup output"⟩])
-    | "up" :: rest =>
-      if rest.contains "-v" || rest.contains "--verbose" then #[]
-      else #[⟨"--verbose", "Stream full build/startup output (-v)"⟩, ⟨"-v", "Stream full build/startup output"⟩]
     | "run" :: _ :: rest =>
       if rest.getLast? == some "--input" then catalog.files
       else if rest.getLast? == some "--id" then #[]
       else (#[⟨"--input", "Read input from a JSON file"⟩, ⟨"--id", "Choose a run ID"⟩] : Array Item).filter
         (fun item => !rest.contains item.value)
     | _ => #[]
-  let expectsValue := [some "--input", some "--id", some "--sdk", some "--workers"].contains ctx.before.back?
+  let expectsValue := [some "--input", some "--id", some "--token-env", some "--token-file"].contains ctx.before.back?
   let help := if ctx.fragment.startsWith "-" && !expectsValue &&
       (ctx.before[0]? >>= Help.find?).isSome && !ctx.before.any Help.isFlag then
     #[Item.mk "--help" "Show usage, options, and examples", Item.mk "-h" "Show command help"] else #[]
   (available ++ help).filter (fun item => item.value.startsWith ctx.fragment)
 
 /-- File candidates follow the typed directory, including quoted paths. -/
-def refreshFiles (ctx : LeanCloudCli.Context) (catalog : Catalog) (line : String) (cursor : Nat) : Cli Catalog := do
+def refreshFiles (_ctx : LeanCloudCli.Context) (catalog : Catalog) (line : String) (cursor : Nat) : Cli Catalog := do
   let part := context line cursor
   unless (part.before[0]? == some "run" && part.before.back? == some "--input") ||
-      part.before == #["backup"] || part.before == #["restore"] do return catalog
+      (part.before[0]? == some "connect" && part.before.back? == some "--token-file") do return catalog
   let parent := String.intercalate "/" (part.fragment.splitOn "/").dropLast
   let directory := if (part.fragment.splitOn "/").length > 1 then parent ++ "/" else ""
-  let path : System.FilePath := if directory == "/" then "/" else if parent.isEmpty then ctx.root else ctx.root / parent
+  let root ← request .currentDir
+  let path : System.FilePath := if directory == "/" then "/" else if parent.isEmpty then root else root / parent
   let files ← try
     let mut items := #[]
     for name in ← request (.readDir path) do
       let isDirectory ← request (.isDir (path / name))
       items := items.push (Item.mk (directory ++ name ++ (if isDirectory then "/" else ""))
-        (if isDirectory then "Directory" else "Input file"))
+        (if isDirectory then "Directory" else "File"))
     pure (items.qsort (fun a b => a.value < b.value))
     catch _ => pure #[]
   return { catalog with files }

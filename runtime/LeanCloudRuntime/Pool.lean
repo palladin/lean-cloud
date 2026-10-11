@@ -1,5 +1,6 @@
 import LeanCloud.Pool
 import LeanCloud.Timing
+import LeanCloud.ControlReceipts
 import Std.Time.DateTime.Timestamp
 import LeanCloudRuntime.Run
 import LeanCloudRuntime.LocalDb
@@ -17,6 +18,7 @@ structure Saved where
   routes : Option (Array HttpMailbox.WorkerEndpoint) := none
   replies : Array (String × Except String Json) := #[]
   timings : Array (String × Timing.Run) := #[]
+  receipts : Array ControlReceipts.Receipt := #[]
 
 /-- Persist the catalog and administrative intent, not the scheduling tree,
 tickets, leases or continuations. Attempt counters fence delayed old mail. -/
@@ -24,7 +26,8 @@ instance : ToJson Saved where
   toJson saved := Json.mkObj [
     ("formatVersion", toJson Version.current),
     ("state", toJson saved.state.catalog),
-    ("routes", toJson saved.routes), ("replies", toJson saved.replies), ("timings", toJson saved.timings)]
+    ("routes", toJson saved.routes), ("replies", toJson saved.replies), ("timings", toJson saved.timings),
+    ("receipts", toJson saved.receipts)]
 
 instance : FromJson Saved where
   fromJson? json := do
@@ -35,8 +38,11 @@ instance : FromJson Saved where
     let timings ← match json.getObjVal? "timings" with
       | .ok value => fromJson? value
       | .error _ => pure #[]
+    let receipts ← match json.getObjVal? "receipts" with
+      | .ok value => fromJson? value
+      | .error _ => pure #[]
     return { state := (← json.getObjValAs? LeanCloud.Pool.Catalog "state").restore, routes
-             replies := ← json.getObjValAs? _ "replies", timings }
+             replies := ← json.getObjValAs? _ "replies", timings, receipts }
 
 private def wallTime : IO Nat := do
   return (← Std.Time.Timestamp.now).toMillisecondsSinceUnixEpoch.val.toNat
@@ -44,6 +50,7 @@ private def wallTime : IO Nat := do
 inductive Envelope where
   | event (message : LeanCloud.Pool.Message)
   | configure (replyTo : String) (routes : Array HttpMailbox.WorkerEndpoint)
+  | control (replyTo requestId : String) (command : LeanCloud.Pool.Command)
   deriving ToJson, FromJson
 
 def send (config : Config) (message : LeanCloud.Pool.Message) : IO Unit :=
@@ -74,7 +81,7 @@ def withHeartbeat (config : Config) (run worker : String) (attempt : Nat)
 
 /-- One request/reply exchange. A timeout is ambiguous: the command may already
 be committed. Its retired reply address cannot be reused to execute it again. -/
-private def exchange (config : Config) (message : String → Envelope) : IO Json := do
+private def exchange (config : Config) (message : String → Envelope) : IO (Except String Json) := do
   let handle ← HttpMailbox.openReply config.mailboxes.scheduler
   try
     let inbox : Mailbox IO (Except String Json) := HttpMailbox.inbox handle
@@ -86,15 +93,19 @@ private def exchange (config : Config) (message : String → Envelope) : IO Json
         throw (IO.userError "Deployment scheduler request timed out; the command may already have completed")
       let some delivery ← inbox.receive | continue
       inbox.acknowledge delivery.receipt
-      return ← IO.ofExcept delivery.message
+      return delivery.message
   finally handle.close
 
-def request (config : Config) (command : LeanCloud.Pool.Command) : IO Json :=
-  exchange config (fun replyTo => .event (.request replyTo command))
+def request (config : Config) (command : LeanCloud.Pool.Command) : IO Json := do
+  IO.ofExcept (← exchange config (fun replyTo => .event (.request replyTo command)))
+
+def control (config : Config) (requestId : String) (command : LeanCloud.Pool.Command) : IO (Except String Unit) := do
+  validateRun requestId
+  return (← exchange config (fun replyTo => .control replyTo requestId command)).map (fun _ => ())
 
 def configure (config : Config) (routes : Array HttpMailbox.WorkerEndpoint) : IO Json := do
   IO.ofExcept ({ config.mailboxes with workers := routes }.validate)
-  exchange config (fun replyTo => .configure replyTo routes)
+  IO.ofExcept (← exchange config (fun replyTo => .configure replyTo routes))
 
 private def reconfigure (config : Config) (saved : Saved)
     (routes : Array HttpMailbox.WorkerEndpoint) : Except String Saved := do
@@ -115,7 +126,7 @@ private def reply (endpoint : HttpMailbox.Config) (worker : String) (message : L
 /-- Sole owner of the deployment's SQLite database. The catalog is durable before
 replies and input acknowledgements; scheduling continuations are volatile.
 Administrative replies are cached until the caller's address retires. -/
-def scheduler (config : Config) : IO Unit := do
+def scheduler (config : Config) (record : Trace.Recorder := fun _ => pure ()) : IO Unit := do
   let lock ← ProcessLock.acquire (config.scheduler.database ++ ".lock")
   try
     let conn ← LeanLinq.Sqlite.connect config.scheduler.database
@@ -137,7 +148,7 @@ def scheduler (config : Config) : IO Unit := do
         for run in value.state.runs do
           let previous := (before.find? (·.id == run.id)).map (·.scheduler.jobs) |>.getD #[]
           if previous != run.scheduler.jobs then
-            (← Trace.create "scheduler" run.id).branches previous run.scheduler.jobs
+            (← Trace.create "scheduler" run.id record).branches previous run.scheduler.jobs
         observed.set value.state.runs
         emitted.set value.state.runs
         return value
@@ -168,7 +179,7 @@ def scheduler (config : Config) : IO Unit := do
             nextCleanup := now + 1000
           let some delivery ← inbox.receive | continue
           let replyTo := match delivery.message with
-            | .configure replyTo _ | .event (.request replyTo _) => some replyTo
+            | .configure replyTo _ | .control replyTo .. | .event (.request replyTo _) => some replyTo
             | _ => none
           if let some replyTo := replyTo then
             -- Reject delayed duplicates even after their cached reply is gone.
@@ -177,6 +188,12 @@ def scheduler (config : Config) : IO Unit := do
               inbox.acknowledge delivery.receipt
               continue
           match delivery.message with
+          | .control replyTo requestId command =>
+            let (state, receipts, response) := ControlReceipts.apply saved.state saved.receipts requestId command
+            -- The intent and its receipt commit in one SQLite transaction. The
+            -- receipt outlives this exchange's temporary response inbox.
+            saved ← persist { saved with state, receipts }
+            discard <| HttpMailbox.reply config.mailboxes.scheduler replyTo response
           | .configure replyTo routes =>
             let cached := saved.replies.find? (·.1 == replyTo)
             let (updated, response) := match cached with
@@ -204,7 +221,7 @@ def scheduler (config : Config) : IO Unit := do
                 saved ← persist saved
                 LeanCloudRuntime.Pool.reply endpoint worker reply
                 if let .execute run assignment := reply then
-                  let trace ← Trace.create "scheduler" run
+                  let trace ← Trace.create "scheduler" run record
                   trace.assign assignment
                   trace.emit "dispatch" worker
             | .drained worker generation =>
@@ -224,9 +241,9 @@ def scheduler (config : Config) : IO Unit := do
                 saved ← persist saved
                 if let some state := saved.state.runs.find? (·.id == run) then
                   if let some error := state.scheduler.error then
-                    (← Trace.create "scheduler" run).emit "failed" error.message
+                    (← Trace.create "scheduler" run record).emit "failed" error.message
                 reply endpoint report.worker .acknowledged
-                (← Trace.create "scheduler" run).emit "report" report.worker
+                (← Trace.create "scheduler" run record).emit "report" report.worker
             | .request replyTo command =>
               let cached := saved.replies.find? (·.1 == replyTo)
               let (state, response) := match cached with
@@ -235,7 +252,9 @@ def scheduler (config : Config) : IO Unit := do
                   | .ok (state, response) => (state, .ok response)
                   | .error error => (saved.state, .error error)
               saved := { saved with state }
-              let cache := match command with | .check .. | .status .. | .health | .workers | .removed .. => false | _ => true
+              let cache := match command with
+                | .check .. | .status .. | .health | .workers | .runs .. | .mode .. | .removed .. => false
+                | _ => true
               if cache && cached.isNone then
                 saved := { saved with replies := saved.replies.push (replyTo, response) }
               if cache then saved ← persist saved
@@ -252,9 +271,9 @@ def scheduler (config : Config) : IO Unit := do
                 | _, response => pure response
               if response.isOk then
                 match command with
-                | .pause run => (← Trace.create "scheduler" run).emit "paused" ""
-                | .resume run => (← Trace.create "scheduler" run).emit "resumed" ""
-                | .kill run => (← Trace.create "scheduler" run).emit "killed" ""
+                | .pause run => (← Trace.create "scheduler" run record).emit "paused" ""
+                | .resume run => (← Trace.create "scheduler" run record).emit "resumed" ""
+                | .kill run => (← Trace.create "scheduler" run record).emit "killed" ""
                 | _ => pure ()
               discard <| HttpMailbox.reply config.mailboxes.scheduler replyTo response
           inbox.acknowledge delivery.receipt

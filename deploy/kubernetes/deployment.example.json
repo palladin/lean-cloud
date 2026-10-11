@@ -1,0 +1,13 @@
+{
+  "name": "lean-cloud",
+  "context": "YOUR_KUBECTL_CONTEXT",
+  "namespace": "lean-cloud",
+  "image": "YOUR_REGISTRY/cloud-app@sha256:REPLACE_WITH_IMAGE_DIGEST",
+  "workers": 3,
+  "storageClass": "managed-csi",
+  "diskGiB": 8,
+  "cpuMillis": 250,
+  "memoryMiB": 512,
+  "serviceAccountAnnotations": {},
+  "podLabels": {}
+}

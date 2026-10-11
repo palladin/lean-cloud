@@ -1,0 +1,8 @@
+{
+  "provider": "s3",
+  "endpoint": "https://s3.eu-west-1.amazonaws.com",
+  "bucket": "your-bucket",
+  "region": "eu-west-1",
+  "authentication": {"kind": "workload"},
+  "provisioned": true
+}

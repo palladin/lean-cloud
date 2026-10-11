@@ -1,6 +1,8 @@
 import LeanCloud.Worker
 import LeanCloud.Scheduler
 import LeanCloud.Telemetry
+import LeanCloud.Observations
+import Std.Time.DateTime.Timestamp
 
 namespace LeanCloudRuntime.Trace
 open Lean LeanCloud LeanEff
@@ -10,6 +12,14 @@ open Lean LeanCloud LeanEff
 
 initialize incarnation : String ← do
   return s!"{← IO.Process.getPID}-{← IO.monoNanosNow}"
+
+def resources : IO (Option ResourceSample) := do
+  try
+    let json ← IO.ofExcept (Json.parse (← resourceCounters))
+    return (fromJson? (json.setObjVal! "incarnation" (toJson incarnation))).toOption
+  catch _ => return none
+
+abbrev Recorder := Observations.Step → IO Unit
 
 structure State where
   seq : Nat := 0
@@ -24,10 +34,11 @@ structure Sink where
   started : Nat
   state : IO.Ref State
   run : String := ""
+  record : Recorder := fun _ => pure ()
 
-def create (worker : String) (run : String := "") : IO Sink := do
+def create (worker : String) (run : String := "") (record : Recorder := fun _ => pure ()) : IO Sink := do
   let started ← IO.monoMsNow
-  return ⟨worker, s!"{← IO.Process.getPID}-{← IO.monoNanosNow}", started, ← IO.mkRef {}, run⟩
+  return ⟨worker, s!"{← IO.Process.getPID}-{← IO.monoNanosNow}", started, ← IO.mkRef {}, run, record⟩
 
 /-- Diagnostics never turn a successful operation into a workflow error.
 Docker's bounded log driver retains recent events; gaps are allowed. -/
@@ -37,9 +48,11 @@ def Sink.emit (sink : Sink) (activity operation : String) (job : Option BranchOb
     sink.state.set { state with seq := state.seq + 1 }
     let event : ExecutionEvent := ⟨sink.session, state.seq, (← IO.monoMsNow) - sink.started,
       sink.worker, state.attempt, state.location, activity, operation, sink.run, state.source⟩
-    let resources ← try pure ((Json.parse (← resourceCounters)).toOption) catch _ => pure none
-    let resources := resources.map fun json => json.setObjVal! "incarnation" (toJson incarnation)
-    let json := (toJson event).setObjVal! "resources" (resources.getD Json.null)
+    let resources ← Trace.resources
+    let now := toString (← Std.Time.Timestamp.now).toMillisecondsSinceUnixEpoch.val
+    let timestamp := String.ofList (List.replicate (20 - now.length) '0') ++ now
+    sink.record { timestamp, event, resources, branch := state.branch, job }
+    let json := (toJson event).setObjVal! "resources" (toJson resources)
     let json := json.setObjVal! "branch" (toJson state.branch)
     let json := json.setObjVal! "job" (toJson job)
     emitLine ("@lean-cloud " ++ json.compress ++ "\n")

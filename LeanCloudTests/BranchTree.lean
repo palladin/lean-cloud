@@ -51,8 +51,9 @@ public def cases : Array TestCase := #[
       (workerStep 5 sibling sibling "ancestor").event with worker := "worker3" } }
     let active := (steps.extract 0 5) ++ #[jobStep 5 ⟨sibling, sibling, false, .running "worker3" 1 100⟩, other]
     let ctx : Context := ⟨"/work", "test"⟩
+    let histories : Array History := (Array.range 3).map fun i => ⟨ctx.node s!"worker{i+1}", #[], true⟩
     let view (selection : String) (trace := active) := String.intercalate "\n"
-      (Watch.frame ctx run trace #[] { tree := { selected := some selection } } 220 50 "result pending").toList
+      (Watch.frame ctx run trace histories { tree := { selected := some selection } } 220 50 "result pending").toList
     let group := view "parallel/0:2"
     for worker in ["worker1", "worker2", "worker3"] do
       assertTrue (has group worker) s!"Parallel group omitted {worker}"
@@ -60,7 +61,7 @@ public def cases : Array TestCase := #[
       has group "worker3 · branch 0:2/1:0") "Worker cards lost current assignments"
     assertTrue (has group "Example.lean:3" && has group "Example.lean:2") "Workers did not show their own source locations"
     for page in [:3] do
-      let narrow := String.intercalate "\n" (Watch.frame ctx run active #[]
+      let narrow := String.intercalate "\n" (Watch.frame ctx run active histories
         { tree := { selected := some "parallel/0:2" }, workers := page } 120 35 "result pending").toList
       assertTrue (has narrow s!"worker{page + 1} ·") "Paging did not make every worker reachable"
     let selected := view "branch/0:2/0:0"
@@ -125,13 +126,7 @@ public def cases : Array TestCase := #[
     assertTrue (Trace.location? "0:nope").isNone "Invalid location accepted"⟩,
   ⟨"console.tree.metadata-roundtrip", do
     let sample := steps[1]!
-    let json := (toJson sample.event).setObjVal! "branch" (toJson sample.branch)
-      |>.setObjVal! "job" (toJson sample.job)
-    let some parsed := Trace.parse ("time @lean-cloud " ++ json.compress)
-      | throw (IO.userError "Branch observation did not parse")
-    assertEq parsed.branch sample.branch
-    assertEq parsed.job sample.job
-    let cached ← unwrap (fromJson? (α := Trace.Step) (toJson parsed))
+    let cached ← unwrap (fromJson? (α := Trace.Step) (toJson sample))
     assertEq cached.branch sample.branch
     assertEq cached.job sample.job⟩,
   ⟨"console.tree.large-parallel-observation", do

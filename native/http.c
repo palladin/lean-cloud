@@ -66,12 +66,12 @@ LEAN_EXPORT lean_obj_res lc_http_client(lean_obj_arg world) {
     if (!client) return fail("Cannot allocate HTTP client");
     return lean_io_result_mk_ok(lean_alloc_external(client_class, client));
 }
-struct buffer { char *data; size_t size; };
+struct buffer { char *data; size_t size, limit; };
 static size_t receive(char *data, size_t size, size_t count, void *context) {
     struct buffer *b = context;
     if (count && size > SIZE_MAX / count) return 0;
     size_t n = size * count;
-    if (n > 16 * 1024 * 1024 - b->size) return 0;
+    if (n > b->limit - b->size) return 0;
     char *next = realloc(b->data, b->size + n + 1);
     if (!next) return 0;
     b->data = next;
@@ -79,22 +79,22 @@ static size_t receive(char *data, size_t size, size_t count, void *context) {
     b->size += n; b->data[b->size] = 0;
     return n;
 }
-LEAN_EXPORT lean_obj_res lc_http_post(b_lean_obj_arg handle, b_lean_obj_arg url,
-    b_lean_obj_arg token, b_lean_obj_arg body, uint32_t timeout, lean_obj_arg world) {
-    (void)world;
+static lean_obj_res request_http(b_lean_obj_arg handle, b_lean_obj_arg url,
+    const char *secret, b_lean_obj_arg body, uint32_t timeout) {
     CURL *c = lean_get_external_data(handle);
-    const char *secret = lean_string_cstr(token);
-    if (strchr(secret, '\r') || strchr(secret, '\n')) return fail("Invalid HTTP token");
-    size_t auth_len = strlen(secret) + 23;
-    char *auth = malloc(auth_len);
-    if (!auth) return fail("HTTP allocation failed");
-    snprintf(auth, auth_len, "Authorization: Bearer %s", secret);
     struct curl_slist *headers = NULL;
-    headers = p_curl_slist_append(headers, "Content-Type: application/json");
-    headers = p_curl_slist_append(headers, "Expect:");
-    headers = p_curl_slist_append(headers, auth);
-    free(auth);
-    struct buffer b = {0};
+    if (secret) {
+        if (strchr(secret, '\r') || strchr(secret, '\n')) return fail("Invalid HTTP token");
+        size_t auth_len = strlen(secret) + 23;
+        char *auth = malloc(auth_len);
+        if (!auth) return fail("HTTP allocation failed");
+        snprintf(auth, auth_len, "Authorization: Bearer %s", secret);
+        headers = p_curl_slist_append(headers, "Content-Type: application/json");
+        headers = p_curl_slist_append(headers, "Expect:");
+        headers = p_curl_slist_append(headers, auth);
+        free(auth);
+    }
+    struct buffer b = { .limit = 16 * 1024 * 1024 };
     char error[CURL_ERROR_SIZE] = {0};
     p_curl_easy_reset(c);
     p_curl_easy_setopt(c, CURLOPT_URL, lean_string_cstr(url));
@@ -104,8 +104,10 @@ LEAN_EXPORT lean_obj_res lc_http_post(b_lean_obj_arg handle, b_lean_obj_arg url,
     p_curl_easy_setopt(c, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
 #endif
     p_curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers);
-    p_curl_easy_setopt(c, CURLOPT_POSTFIELDS, lean_string_cstr(body));
-    p_curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)(lean_string_size(body) - 1));
+    if (body) {
+        p_curl_easy_setopt(c, CURLOPT_POSTFIELDS, lean_string_cstr(body));
+        p_curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)(lean_string_size(body) - 1));
+    }
     p_curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, receive);
     p_curl_easy_setopt(c, CURLOPT_WRITEDATA, &b);
     p_curl_easy_setopt(c, CURLOPT_ERRORBUFFER, error);
@@ -126,4 +128,10 @@ LEAN_EXPORT lean_obj_res lc_http_post(b_lean_obj_arg handle, b_lean_obj_arg url,
     lean_ctor_set(result, 1, lean_mk_string_from_bytes(b.data ? b.data : "", b.size));
     free(b.data);
     return lean_io_result_mk_ok(result);
+}
+
+LEAN_EXPORT lean_obj_res lc_http_post(b_lean_obj_arg handle, b_lean_obj_arg url,
+    b_lean_obj_arg token, b_lean_obj_arg body, uint32_t timeout, lean_obj_arg world) {
+    (void)world;
+    return request_http(handle, url, lean_string_cstr(token), body, timeout);
 }

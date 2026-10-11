@@ -58,14 +58,13 @@ private def sourceStart (run : Run) (steps : Array Trace.Step) (nav : Navigation
     pure site.line
   max 1 (line.getD 1 - 1)
 
-/-- Running views sample Docker; stopped views use the frozen meter window. -/
+/-- Running views use deployment counters; stopped views use the frozen window. -/
 def metrics (ctx : Context) (worker : String) (steps : Array Trace.Step)
-    (histories : Array History) (disks : Array (String × DiskUsage)) (live : Bool)
+    (histories : Array History) (live : Bool)
     (width : Nat) : Array Styled.Line :=
   if live then
     let history := histories.find? (fun h => h.name == ctx.node worker && h.fresh)
-    let disk := (disks.find? (·.1 == ctx.node worker)).map (·.2)
-    metricLines (history.map (·.points) |>.getD #[]) width disk
+    SnapshotMetrics.lines (history.map (·.resources) |>.getD #[]) width
   else SnapshotMetrics.lines (SnapshotMetrics.samples steps worker) width
 
 private def sourceRows (run : Run) (steps : Array Trace.Step)
@@ -106,7 +105,7 @@ def executing (steps : Array Trace.Step) (entries : Array BranchTree.Entry)
 
 private def workerCard (ctx : Context) (run : Run) (steps : Array Trace.Step)
     (entries : Array BranchTree.Entry) (worker : String) (histories : Array History)
-    (disks : Array (String × DiskUsage)) (live : Bool) (width height : Nat) : Array Styled.Line := Id.run do
+    (live : Bool) (width height : Nat) : Array Styled.Line := Id.run do
   let current := entries.find? (fun entry => (assignment entry).map (·.1) == some worker)
   let code := if live then executing steps entries worker else steps.filter (·.event.worker == worker)
   let label := if live then current.map (fun entry => s!"branch {entry.branch.key}") |>.getD "idle for this workflow"
@@ -116,12 +115,14 @@ private def workerCard (ctx : Context) (run : Run) (steps : Array Trace.Step)
     lines := lines.push (Styled.text (sourceLabel run code) .muted)
     lines := lines ++ sourceRows run code (if height ≥ 10 then 2 else 1) 0
   else lines := lines.push (Styled.text "No branch executing" .muted)
-  return (lines ++ metrics ctx worker steps histories disks live width).extract 0 height
+  return (lines ++ metrics ctx worker steps histories live width).extract 0 height
 
-private def workerCount (ctx : Context) (run : Run) (steps : Array Trace.Step) (histories : Array History) : Nat :=
-  histories.foldl (fun count h =>
-    max count ((workerIndex? (h.name.drop (ctx.project.length + 1) |>.toString)).map (· + 1) |>.getD 0))
-      (steps.foldl (fun count s => max count ((workerIndex? s.event.worker).map (· + 1) |>.getD 0)) run.workers)
+/-- Use reported node identities, including names chosen by external deployers. -/
+def workerRoster (ctx : Context) (steps : Array Trace.Step) (histories : Array History) : Array String :=
+  let names := histories.map (fun h => h.name.drop (ctx.project.length + 1) |>.toString) ++
+    steps.map (·.event.worker)
+  names.foldl (fun result name =>
+    if name.isEmpty || name == "scheduler" || result.contains name then result else result.push name) #[]
 
 private def workerColumns (count width : Nat) := min count (max 1 (min 3 (width / 44)))
 
@@ -129,9 +130,10 @@ private def workerCapacity (count width height : Nat) :=
   max 1 (workerColumns count width * max 1 ((height - 1) / max 1 (min 12 (height - 1))))
 
 private def workerGrid (ctx : Context) (run : Run) (steps : Array Trace.Step)
-    (entries : Array BranchTree.Entry) (histories : Array History) (disks : Array (String × DiskUsage))
+    (entries : Array BranchTree.Entry) (histories : Array History)
     (live : Bool) (page width height : Nat) : Array Styled.Line := Id.run do
-  let count := workerCount ctx run steps histories
+  let roster := workerRoster ctx steps histories
+  let count := roster.size
   if count == 0 then return #[Styled.text "No workers" .muted]
   let columns := workerColumns count width
   let cellWidth := (width - (columns - 1) * 3) / columns
@@ -139,8 +141,8 @@ private def workerGrid (ctx : Context) (run : Run) (steps : Array Trace.Step)
   let perPage := workerCapacity count width height
   let pages := max 1 ((count + perPage - 1) / perPage)
   let page := min page (pages - 1)
-  let workers := (workerNames count).extract (page * perPage) ((page + 1) * perPage)
-  let cards := workers.map fun worker => workerCard ctx run steps entries worker histories disks live cellWidth cellHeight
+  let workers := roster.extract (page * perPage) ((page + 1) * perPage)
+  let cards := workers.map fun worker => workerCard ctx run steps entries worker histories live cellWidth cellHeight
   let mut lines := #[Styled.text s!"Workers · {count} total · {page + 1}/{pages} · PgUp/PgDn" .cyan]
   for row in [:((cards.size + columns - 1) / columns)] do
     let mut combined := cards[row * columns]?.getD #[]
@@ -151,7 +153,7 @@ private def workerGrid (ctx : Context) (run : Run) (steps : Array Trace.Step)
 
 private def branchPanel (ctx : Context) (run : Run) (steps : Array Trace.Step)
     (entries : Array BranchTree.Entry) (row : BranchTree.Row)
-    (histories : Array History) (disks : Array (String × DiskUsage))
+    (histories : Array History)
     (live : Bool) (width height : Nat) (nav : Navigation) : Array Styled.Line := Id.run do
   let own := BranchTree.observations steps row.branch
   let assigned := (entries.find? (·.branch == row.branch)) >>= assignment
@@ -164,17 +166,17 @@ private def branchPanel (ctx : Context) (run : Run) (steps : Array Trace.Step)
     Styled.text row.status .cyan, Styled.text s!"Source: {sourceLabel run code}" .muted]
   lines := lines ++ sourceRows run code codeRows nav.offset
   if row.fork.isSome then
-    lines := lines ++ workerGrid ctx run steps entries histories disks live nav.workers width (height - lines.size)
+    lines := lines ++ workerGrid ctx run steps entries histories live nav.workers width (height - lines.size)
   else if let some worker := worker then
     lines := lines ++ #[Styled.text s!"{worker} · {if live then "executing" else "last view"}" .cyan] ++
-      metrics ctx worker (if live then steps else own) histories disks live width
+      metrics ctx worker (if live then steps else own) histories live width
   else lines := lines.push (Styled.text "No worker executing this branch" .muted)
   return lines.extract 0 height
 
 /-- Live tree and code. Completion freezes the last view; no event list or cursor. -/
 def frame (ctx : Context) (run : Run) (steps : Array Trace.Step)
     (histories : Array History) (nav : Navigation) (width height : Nat)
-    (status := "") (disks : Array (String × DiskUsage) := #[]) (color := false) (warning := "")
+    (status := "") (color := false) (warning := "")
     (timing : Option Timing.Run := none)
     : Array String := Id.run do
   let width := width - 1
@@ -192,7 +194,7 @@ def frame (ctx : Context) (run : Run) (steps : Array Trace.Step)
     let bodyWidth := if sidebar then width - treeWidth - 3 else width
     let bodyHeight := height - 5 - (if sidebar then 0 else 5)
     let body := match BranchTree.selected entries nav.tree with
-      | some row => branchPanel ctx run steps entries row histories disks live bodyWidth bodyHeight nav
+      | some row => branchPanel ctx run steps entries row histories live bodyWidth bodyHeight nav
       | none => #[Styled.text "Source: waiting for branch observations" .muted]
     let tree := BranchTree.lines entries nav.tree (if sidebar then height - 5 else 5) treeWidth timing
     lines := lines ++ (if sidebar then beside tree body treeWidth else tree ++ body)
@@ -205,7 +207,7 @@ private def exitLabel : Exit → String
   | .cancelled _ => "cancelled"
 
 private def status (ctx : Context) (run : Run) : Cli String := do
-  let control ← ctx.control run.id
+  let control ← observing (ctx.control run.id)
   let path := ctx.directory run.id / "watch-status.json"
   let outcome ← observing (ctx.outcome run)
   if let .ok (some outcome) := outcome then
@@ -214,8 +216,15 @@ private def status (ctx : Context) (run : Run) : Cli String := do
     return label
   if !outcome.isOk && (← request (.exists path)) then
     return (← readJson (α := String) path) ++ " (saved)"
-  if control != .active then return control.label
-  if outcome.isOk then return "result pending"
+  if let .ok control := control then
+    if control != .active then
+      saveJson path (controlLabel control)
+      return (controlLabel control)
+    if outcome.isOk then
+      saveJson path "result pending"
+      return "result pending"
+  if ← request (.exists path) then
+    return (← readJson (α := String) path) ++ " (saved)"
   return "result unavailable"
 
 private def terminal (status : String) : Bool :=
@@ -240,16 +249,11 @@ private partial def loop (ctx : Context) (run : Run) (interactive color : Bool)
   let (timing, timingAvailable) ← ctx.timingSnapshot run
   let live := status == "result pending"
   let nodes ← if live then try ctx.nodes catch _ => pure #[] else pure #[]
-  let nodes := nodes.filter (fun node => (workerIndex? node.role).isSome)
-  let values ← if live then try samples nodes catch _ => pure #[] else pure #[]
-  let history := if live then remember history values else history
-  let mut disks := #[]
-  for node in nodes do
-    let disk ← try filesystem node catch _ => pure none
-    if let some disk := disk then disks := disks.push (node.name, disk)
+  let nodes := nodes.filter (fun node => node.role != "scheduler")
+  let history := if live then rememberNodes nodes else history
   let (width, height) ← if interactive then request .dimensions else pure (120, 35)
   let draw (nav : Navigation) (width height : Nat) : Cli Unit := do
-    let lines := frame ctx run snapshot.steps history nav width height status disks color snapshot.warning timing
+    let lines := frame ctx run snapshot.steps history nav width height status color snapshot.warning timing
     if interactive then request (.write "\x1b[H\x1b[2J")
     request (.write (String.intercalate "\n" lines.toList ++ "\n"))
     request .flush
@@ -263,7 +267,7 @@ private partial def loop (ctx : Context) (run : Run) (interactive color : Bool)
     let sidebar := width ≥ 100
     let bodyWidth := if sidebar then width - min 52 (max 38 (width / 4)) - 3 else width
     let bodyHeight := height - 5 - (if sidebar then 0 else 5)
-    let count := workerCount ctx run snapshot.steps history
+    let count := (workerRoster ctx snapshot.steps history).size
     let capacity := workerCapacity count bodyWidth (bodyHeight - 3 - min 5 (max 2 (bodyHeight / 5)))
     (count + capacity - 1) / capacity - 1
   let some nav ← wait draw lastPage run snapshot.steps refresh nav (width, height) | return
@@ -271,7 +275,14 @@ private partial def loop (ctx : Context) (run : Run) (interactive color : Bool)
 
 /-- Watching is an Eff program and never submits or resumes a workflow. -/
 def run (ctx : Context) (id : String) (once := false) : Cli Unit := do
-  let run ← ctx.loadRun id
+  validateId id
+  let run ← try ctx.loadRun id catch error => do
+    let path := ctx.directory id / "run.json"
+    unless (← ctx.connection).isSome && (← request (.exists path)) do throw error
+    let saved ← readJson (α := Run) path
+    unless saved.id == id do throw "Run manifest mismatch"
+    printLine "Deployment unavailable; showing the saved workflow view."
+    pure saved
   let interactive ← if once then pure false else request .enterTerminal
   try
     if interactive then request (.write "\x1b[?1049h\x1b[?25l")

@@ -48,15 +48,17 @@ def Registry.submit (registry : Registry) (config : Config) (run entry : String)
   IO.ofExcept registry.validate
   let program ← IO.ofExcept (registry.find entry)
   IO.ofExcept (program.validate input)
-  if ← S3.isRemoved config.blobs run then throw (IO.userError "Run was removed; use a new run ID")
-  LeanCloudRuntime.submit config run ⟨entry, input, program.info.resultSchema⟩
+  if ← config.objects.isRemoved run then throw (IO.userError "Run was removed; use a new run ID")
+  LeanCloudRuntime.submit config run {
+    entry, input, resultSchema := program.info.resultSchema
+    image := config.client.map (·.image), program := some program.info }
 
 /-- Retry one inbox assignment locally. Transport failures never become Cloud
 errors. Every attempt checks ownership before touching records; cancellation
 returns only after the active attempt and its heartbeat task have stopped. -/
 private def executeAssignment (registry : Registry) (config : Config) (id run : String)
-    (assignment : Assignment) (finalize : Option Exit := none) : IO Unit := do
-  let trace ← Trace.create id run
+    (assignment : Assignment) (finalize : Option Exit := none) (record : Trace.Recorder := fun _ => pure ()) : IO Unit := do
+  let trace ← Trace.create id run record
   trace.assign assignment
   let mut retries := 0
   repeat
@@ -70,8 +72,8 @@ private def executeAssignment (registry : Registry) (config : Config) (id run : 
             revoked.set true
             throw (IO.userError "Assignment revoked")
         check
-        if finalize.isSome then S3.initializeBucket config.blobs
-        let records := trace.records (S3.records config.blobs run)
+        if finalize.isSome then config.objects.ensureContainer
+        let records := trace.records (config.objects.records run)
         let guarded : ReplayStore IO := {
           read := fun key => do check; records.read key
           create := fun key value => do check; records.create key value }
@@ -80,8 +82,10 @@ private def executeAssignment (registry : Registry) (config : Config) (id run : 
           | some outcome => Worker.finalize id observed assignment.attempt outcome
           | none => do
             let definition ← loadRun config run
+            unless definition.image.all (fun image => config.client.any (·.image == image)) do
+              throw (IO.userError "Worker image does not match the submitted run")
             let program ← IO.ofExcept (registry.find definition.entry)
-            program.execute config.worker definition id observed (trace.blobs (S3.storage config.blobs)) trace assignment
+            program.execute config.worker definition id observed (trace.blobs (config.objects.storage)) trace assignment
         match report.progress with
         | .ok (.fork ..) => trace.emit "suspended" ""
         | .ok .done => trace.emit (if finalize.isSome then "sealed" else "returned") ""
@@ -102,7 +106,7 @@ private def executeAssignment (registry : Registry) (config : Config) (id run : 
 /-- One serial inbox loop serves every registered workflow. A cancellation reply
 is acknowledged only between attempts. The scheduler awaits that explicit reply
 before dispatching replacements. Late execute messages fail their ownership check. -/
-def Registry.serveWorker (registry : Registry) (config : Config) : IO Unit := do
+def Registry.serveWorker (registry : Registry) (config : Config) (record : Trace.Recorder := fun _ => pure ()) : IO Unit := do
   let id ← workerId
   let endpoint ← IO.ofExcept (config.mailboxes.worker id)
   let handle ← HttpMailbox.openMailbox endpoint Pool.address ("worker." ++ id)
@@ -118,9 +122,9 @@ def Registry.serveWorker (registry : Registry) (config : Config) : IO Unit := do
         nextReady := (← IO.monoMsNow) + 2000
       let some delivery ← inbox.receive | continue
       match delivery.message with
-      | .execute run assignment => executeAssignment registry config id run assignment
+      | .execute run assignment => executeAssignment registry config id run assignment (record := record)
       | .finalize run attempt outcome =>
-        executeAssignment registry config id run ⟨attempt, Location.root⟩ (some outcome)
+        executeAssignment registry config id run ⟨attempt, Location.root⟩ (some outcome) record
       | .cancel run barrier => send (.stopped run id barrier)
       | .drain generation => send (.drained id generation)
       | .idle | .acknowledged => pure ()

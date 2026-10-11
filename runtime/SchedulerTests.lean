@@ -50,7 +50,7 @@ def run : IO Unit := IO.FS.withTempFile fun _ inboxPath =>
   let conn ← LeanLinq.Sqlite.connect inboxPath.toString
   let observer ← LeanLinq.Sqlite.connect database.toString
   try
-    let handler : HttpMailbox.ServerHandler := ⟨← Inbox.create conn 400, "restart", fun _ => pure Json.null⟩
+    let handler : HttpMailbox.ServerHandler := { store := ← Inbox.create conn 400, token := "restart", api := fun _ => pure Json.null }
     let server ← (HttpServer.start (.v4 ⟨.ofParts 127 0 0 1, 0⟩) handler).block
     try
       let some (.v4 bound) := server.localAddr | throw (IO.userError "No HTTP address")

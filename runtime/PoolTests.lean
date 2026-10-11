@@ -69,7 +69,7 @@ private def finalize (config : Config) (handle : HttpMailbox.Handle) (worker run
     let some delivery ← inbox.receive | continue
     if let .finalize id attempt outcome := delivery.message then
       assertEq id run
-      let value ← Worker.finalize worker (← observe (S3.records config.blobs id)) attempt outcome
+      let value ← Worker.finalize worker (← observe (config.objects.records id)) attempt outcome
       assertOutcome value.progress (.ok .done)
       report config id value
       inbox.acknowledge delivery.receipt
@@ -78,7 +78,7 @@ private def finalize (config : Config) (handle : HttpMailbox.Handle) (worker run
 
 private def execute (config : Config) (run worker : String) (fuel : Nat) (input : Array Nat)
     (job : Assignment) : IO Report := do
-  Worker.execute worker (← observe (S3.records config.blobs run)) (S3.storage config.blobs)
+  Worker.execute worker (← observe (config.objects.records run)) (config.objects.storage)
     fuel Squares.workflow input job
 
 private def liveFailure (config : Config) (runPrefix : String) : IO Unit := do
@@ -129,7 +129,7 @@ private def liveFailure (config : Config) (runPrefix : String) : IO Unit := do
     discard <| LeanCloudRuntime.Pool.request config (.kill failed.id)
     assertOutcome (← failed.await) (.error fuelError)
     for command in ["outcome", "result"] do
-      let output : LeanCloudCli.ProcessOutput ← IO.ofExcept (fromJson? (← Application.api programs config
+      let output : Application.CommandOutput ← IO.ofExcept (fromJson? (← Application.api programs config
         (fun _ _ _ => pure ()) (Json.mkObj [("args", toJson #[command, "config", failed.id]), ("input", Json.null)])))
       if command == "result" then
         assertEq output.exitCode 1
@@ -140,9 +140,9 @@ private def liveFailure (config : Config) (runPrefix : String) : IO Unit := do
     -- can retry, and the shared worker can still complete another workflow.
     let healthy ← sumSquares.submit config (runPrefix ++ "-healthy") #[2, 3]
     let job ← assignment config first "worker1" healthy.id
-    let broken : ReplayStore IO := { (S3.records config.blobs healthy.id) with
+    let broken : ReplayStore IO := { (config.objects.records healthy.id) with
       read := fun _ => throw (IO.userError "Temporary connection failure") }
-    rejects (Worker.execute "worker1" ⟨broken, pure #[]⟩ (S3.storage config.blobs)
+    rejects (Worker.execute "worker1" ⟨broken, pure #[]⟩ (config.objects.storage)
       1000 Squares.workflow #[2, 3] job)
     assertTrue (← healthy.poll).isNone "IO exception became a workflow result"
     assertTrue (← LeanCloudRuntime.Pool.status config healthy.id).error.isNone "IO exception terminated the run"
@@ -171,7 +171,7 @@ def run (original : Config) (runPrefix : String) : IO Unit :=
   for (id, existing, _) in scenarios do
     programs.submit config id sumSquares.info.entry (toJson (#[2, 3, 4] : Array Nat))
     if let some outcome := existing then
-      let value ← Worker.finalize "test-worker" ⟨S3.records config.blobs id, pure #[]⟩ 0 outcome
+      let value ← Worker.finalize "test-worker" ⟨config.objects.records id, pure #[]⟩ 0 outcome
       assertOutcome value.progress (.ok .done)
   let conn ← LeanLinq.Sqlite.connect database.toString
   try

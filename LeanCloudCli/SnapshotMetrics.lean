@@ -1,3 +1,4 @@
+import LeanCloudCli.Trace
 import LeanCloudCli.Monitor
 
 namespace LeanCloudCli.SnapshotMetrics

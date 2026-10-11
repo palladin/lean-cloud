@@ -7,8 +7,8 @@ open Lean LeanCloud LeanCloudRuntime
 private def prepare (config : Config) (entry : String) (_ : Json) : IO Unit := do
   if entry == logSummary.info.entry then
     for (name, text) in Demo.sampleFiles do
-      let ref ← S3.putBytes config.blobs text.toUTF8
-      S3.name config.blobs name ref
+      let ref ← config.objects.putBytes text.toUTF8
+      config.objects.name name ref
 
 def main (args : List String) : IO UInt32 :=
   Application.main programs args prepare

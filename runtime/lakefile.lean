@@ -20,6 +20,9 @@ lean_lib TestServices
 lean_lib PoolTests
 lean_lib ReplyTests
 lean_lib SchedulerTests
+lean_lib MonitoringTests
+lean_lib ObjectStoreTests
+lean_lib StorageProviderTests
 
 lean_exe cloud_inbox_tests where
   root := `InboxTests
@@ -32,6 +35,9 @@ lean_exe cloud_demo where
 lean_exe cloud_integration_tests where
   root := `Integration
   moreLinkArgs := if System.Platform.isOSX then #[] else #["-Wl,--allow-shlib-undefined"]
+
+lean_exe cloud_storage_tests where
+  root := `StorageIntegration
 
 extern_lib cloud_process_lock pkg := do
   let src ← inputTextFile (pkg.dir / "native" / "process_lock.c")

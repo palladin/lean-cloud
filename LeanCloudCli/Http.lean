@@ -11,7 +11,6 @@ private instance : Nonempty Client := ClientType.property
 @[extern "lc_http_client"] private opaque newClient : IO Client
 @[extern "lc_http_post"] private opaque postRaw (client : @&Client)
   (url token body : @&String) (timeoutMs : UInt32) : IO (UInt32 × String)
-
 -- One reusable client per destination. A libcurl handle is never used
 -- concurrently; separate destinations can proceed independently.
 initialize clients : Std.Mutex (Array (String × Std.Mutex Client)) ← Std.Mutex.new #[]

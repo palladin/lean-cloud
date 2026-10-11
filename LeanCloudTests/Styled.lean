@@ -40,29 +40,26 @@ def styledCases : Array TestCase := #[
     assertTrue (has (Styled.render (meter 75 100 4) 20 true) "\x1b[0;33m") "High usage lacks amber color"
     assertTrue (has (Styled.render (meter 95 100 4) 20 true) "\x1b[0;1;31m") "Full usage lacks red color"⟩,
   ⟨"console.style.filesystem-and-multicore-cpu", do
-    let some disk := decodeFilesystem "/data" "Filesystem 1024-blocks Used Available Capacity Mounted\ndisk 2048 1024 1024 50% /\n"
-      | throw (IO.userError "Filesystem could not be decoded")
-    assertEq disk.used 1048576
-    assertEq disk.capacity 2097152
-    assertTrue (decodeFilesystem "/" "not a capacity").isNone "Malformed filesystem became zero usage"
-    assertTrue (decodeFilesystem "/" "disk 0 0 0 0% /").isNone "Missing capacity became a valid meter"
-    let current : Sample := ⟨1000, "boot", 250000, 1048576, 2097152, 0, 0, 0, 0⟩
-    let lines := (metricLines #[current] 56 (some disk)).map Styled.plain
+    let points : Array ResourceSample := #[
+      { incarnation := "boot", timeNs := 1000000000, cpuNs := some 0 },
+      { incarnation := "boot", timeNs := 2000000000, cpuNs := some 2500000000,
+        memory := some 1048576, memoryLimit := some 2097152,
+        diskUsed := some 1048576, diskCapacity := some 2097152 }]
+    let lines := (SnapshotMetrics.lines points 56).map Styled.plain
     assertTrue (lines.any (fun line => has line "250.00%" && has line "+")) "CPU was silently capped at one core"
     assertTrue (lines.any (fun line => has line "1.0 MiB / 2.0 MiB")) "Memory capacity missing"
-    assertTrue (lines.any (fun line => has line "filesystem /data")) "Filesystem scope missing"
-    assertTrue (lines.any (fun line => has line "Net RX" && has line "—")) "First counter sample became a false zero rate"⟩,
+    assertTrue (lines.any (fun line => has line "Disk")) "Filesystem scope missing"
+    assertTrue (lines.any (fun line => has line "Net RX" && has line "unavailable")) "First counter sample became a false zero rate"⟩,
   ⟨"console.style.live-frame-resizes", do
     let ctx : Context := ⟨"/work", "test"⟩
     let run : Run := ⟨"one", "image", ⟨"demo/v1", "unit", "nat", "", none,
-      #[⟨"Demo.lean", "cloud {\n  return 42\n}", #[]⟩]⟩, Json.null, defaultWorkerCount⟩
-    let node : Node := { name := ctx.node "worker1", state := "running", started := "boot" }
-    let points : Array Sample := #[⟨1000, "boot", 12000, 1048576, 2097152, 0, 0, 0, 0⟩,
-      ⟨2000, "boot", 92000, 1048576, 2097152, 10000, 20000, 30000, 40000⟩]
+      #[⟨"Demo.lean", "cloud {\n  return 42\n}", #[]⟩]⟩, Json.null⟩
+    let node : Node := { name := ctx.node "worker1", state := "running" }
+    let resources : Array ResourceSample := #[{ incarnation := "boot", timeNs := 1000, memory := some 1048576 }]
     for width in [5, 40, 80, 120, 180] do
       for height in [12, 24, 35] do
-        let plain := Watch.frame ctx run #[] #[⟨node.name, points, true⟩] {} width height
-        let colored := Watch.frame ctx run #[] #[⟨node.name, points, true⟩] {} width height "" #[] true
+        let plain := Watch.frame ctx run #[] #[{ name := node.name, resources }] {} width height
+        let colored := Watch.frame ctx run #[] #[{ name := node.name, resources }] {} width height "" true
         assertEq (colored.map uncolor) plain
         assertTrue (plain.size < height && plain.all (·.length ≤ width)) "Resource frame escaped terminal dimensions"⟩,
   ⟨"console.style.shared-theme-and-no-color", do
@@ -71,12 +68,10 @@ def styledCases : Array TestCase := #[
       printHeading "RUN    STATUS"
       printStyled (Styled.text "one    " .cyan ++ Styled.text "running" .green)
       return (ctx, true)
-    let (result, _) := ConsoleModel.run (Shell.execute ctx {} {} program) {}
-    let (_, state) ← unwrap result
-    assertEq (state.transcript.map Styled.plain) #["RUN    STATUS", "one    running"]
-    let view := Shell.frame "test" {} state 80 24 false true
-    assertTrue (view.lines.any (fun line => has line "\x1b[0;30;46mRUN")) "Table header lost its theme in the shell"
-    assertTrue (view.lines.any (fun line => has line "\x1b[0;32mrunning")) "Status lost its theme in the shell"
+    let (result, world) := ConsoleModel.run (Shell.execute ctx {} {} program) {}
+    discard <| unwrap result
+    assertTrue (has world.stdout "\x1b[0;30;46mRUN") "Table header lost its theme in the shell"
+    assertTrue (has world.stdout "\x1b[0;32mrunning") "Status lost its theme in the shell"
     for envs in [#[("NO_COLOR", "1")], #[("TERM", "dumb")]] do
       let (result, world) := ConsoleModel.run (Shell.execute ctx {} {} program) { envs }
       discard <| unwrap result

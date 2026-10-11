@@ -1,51 +1,31 @@
 import LeanCloudCli.Monitor
 
 namespace LeanCloudCli
-open Lean
 
-def serviceState (nodes : Array Node) (service : String) : String :=
-  match nodes.find? (·.role == service) with
-  | none => "absent"
-  | some node => if node.state == "running" then
-      node.health.getD "running (health unknown)" else node.state
-
-def deploymentState (nodes : Array Node) (workers := defaultWorkerCount) : String :=
-  if nodes.isEmpty then "down"
-  else if (deploymentServices workers).all (fun name => serviceState nodes name == "healthy") then "up"
-  else if nodes.all (·.state != "running") then "stopped"
-  else "partial / check status"
-
-def listDeployments (ctx : Context) : Cli Unit := do
-  Deployments.discover ctx
-  let catalog ← Deployments.load
-  printHeading "  DEPLOYMENT                    STATE                     DIRECTORY"
+def listConnections (ctx : Context) : Cli Unit := do
+  let catalog ← Profiles.load
+  printHeading "  CONNECTION                    ENDPOINT"
   for entry in catalog.entries.qsort (fun a b => a.project < b.project) do
-    let target := entry.context
-    let state ← if !(← request (.isDir target.root)) then pure "directory missing"
-      else if !(← request (.exists (target.home / "deployment.json"))) then pure "not deployed"
-      else try pure (deploymentState (← target.nodes) (← target.deployment).workers) catch _ => pure "Docker unavailable"
+    let connection ← entry.context.requireConnection
     let marker := if entry.project == ctx.project && entry.root == ctx.root.toString then "* " else "  "
     printStyled (Styled.text (marker ++ pad 30 entry.project) (if marker == "* " then .selected else .cyan) ++
-      Styled.text (pad 26 state) (Styled.statusColor state) ++ Styled.text entry.root)
-  if catalog.entries.isEmpty then printLine "No known deployments. Use 'deploy' or 'open DIRECTORY'."
-  printLine "* selected · local catalog for the current Docker context"
+      Styled.text (safe connection.url))
+  if catalog.entries.isEmpty then printLine "No saved connections. Use 'connect NAME URL'."
+  printLine "* selected · use 'status' to check the selected endpoint"
 
 def Context.status (ctx : Context) : Cli Unit := do
+  let connection ← ctx.requireConnection
   printHeading s!"Deployment: {safe ctx.project}"
-  printLine s!"Directory:  {safe ctx.root.toString}"
   let deployment ← ctx.deployment
+  printLine s!"Endpoint:   {safe connection.url}"
+  printLine s!"Identity:   {safe connection.deployment}"
   printLine s!"Image:      {safe deployment.image}"
-  printLine s!"Workers:    {deployment.workers} desired; use 'scale N' to change capacity"
   printLine s!"Programs:   {deployment.programs.size}"
-  printLine s!"Runs:       {(← ctx.allRuns).size} recorded; use 'ps' for workflow results"
-  let nodes ← try ctx.nodes catch _ => throw "Docker unavailable; use 'doctor' to diagnose connectivity"
-  printStyled (Styled.text "Services:   " ++ Styled.text (deploymentState nodes deployment.workers) (Styled.statusColor (deploymentState nodes deployment.workers)))
-  for service in deploymentServices deployment.workers do
-    printStyled (Styled.text ("  " ++ pad 22 service) .cyan ++
-      Styled.text (serviceState nodes service) (Styled.statusColor (serviceState nodes service)))
-  let actors := nodes.filter (fun node => isActor node.role)
-  printLine s!"Actors:     {(actors.filter (·.state == "running")).size} running / {actors.size} containers"
-  if nodes.isEmpty then printLine "Use 'up' to start the node pool and recover active runs."
+  printLine s!"Runs:       {(← ctx.allRuns).size}; use 'ps' for workflow status"
+  let nodes ← ctx.nodes
+  printLine s!"Nodes:      {(nodes.filter (·.state == "running")).size}/{nodes.size} endpoints reachable; use 'top' for metrics"
+  for node in nodes do
+    printLine s!"  {safe node.role}: {safe node.state}"
 
 private def check (label : String) (action : Cli Unit) : Cli Bool := do
   let result ← observing action
@@ -53,64 +33,17 @@ private def check (label : String) (action : Cli Unit) : Cli Bool := do
   | .ok () => printStyled (Styled.text "[ok]   " .green ++ Styled.text label); return true
   | .error error => printStyled (Styled.text "[fail] " .red ++ Styled.text s!"{label}: {safe error}"); return false
 
-private def checkProcess (args : Array String) (hint : String) : Cli Unit := do
-  let result ← docker args false
-  unless result.exitCode == 0 do throw hint
-
-/-- Read-only host and deployment diagnostics. Health checks are not end-to-end probes. -/
+/-- Read-only diagnostics of the same API used by every workflow command. -/
 def Context.doctor (ctx : Context) : Cli Unit := do
+  let connection ← ctx.requireConnection
   printHeading s!"Checking {safe ctx.project}…"
-  let mut failures := 0
-  let record (passed : Bool) := if passed then 0 else 1
-  failures := failures + record (← check "Deployment catalog" (discard Deployments.load))
-  failures := failures + record (← check "Application directory" do
-    unless ← request (.isDir ctx.root) do throw "Directory is missing; use 'open DIRECTORY'")
-  failures := failures + record (← check "Runtime configuration (JSON structure)" do
-    let config ← readJson (α := Json) (← ctx.configFile)
-    for key in ["scheduler", "mailboxes", "blobs"] do
-      discard <| liftExcept (config.getObjVal? key >>= Json.getObj?))
-  let deployed ← observing ctx.deployment
-  failures := failures + record (← check "Deployment manifest" (discard (liftExcept deployed)))
-  let cli ← check "Docker CLI" (checkProcess #["--version"] "Install Docker")
-  failures := failures + record cli
-  let compose ← if cli then check "Docker Compose" (checkProcess #["compose", "version"] "Install the Compose plugin")
-    else pure false
-  if cli then failures := failures + record compose
-  if compose then
-    failures := failures + record (← check "Compose configuration" do
-      unless ← request (.exists (← ctx.composeFile)) do throw "Configuration is missing; use 'deploy'"
-      checkProcess #["compose", "-p", ctx.project, "-f", (← ctx.composeFile).toString, "config", "--quiet"]
-        "Compose configuration is invalid; inspect the deployment files")
-  let daemon ← if cli then check "Docker daemon" (checkProcess #["info", "--format", "{{.ServerVersion}}"]
-    "Start Docker and check your Docker context") else pure false
-  if cli then failures := failures + record daemon
-  if daemon then
-    if let .ok deployment := deployed then
-      let runs ← observing ctx.allRuns
-      failures := failures + record (← check "Run catalog" (discard (liftExcept runs)))
-      let images := (runs.toOption.getD #[]).foldl (fun images run =>
-        if images.contains run.image then images else images.push run.image) #[deployment.image]
-      for image in images do
-        failures := failures + record (← check s!"Image {safe image}" (checkProcess
-          #["image", "inspect", image, "--format", "{{.Id}}"]
-          "Saved image is unavailable; restore it before resuming existing runs"))
-      for volume in deploymentVolumes deployment.retainedCount do
-        failures := failures + record (← check s!"Volume {volume}" (checkProcess
-          #["volume", "inspect", ctx.project ++ "_" ++ volume]
-          "Cannot access durable volume; verify Docker context and restore missing data"))
-      let inventory ← observing ctx.nodes
-      failures := failures + record (← check "Container inventory" (discard (liftExcept inventory)))
-      if let .ok nodes := inventory then
-        for service in deploymentServices deployment.workers do
-          failures := failures + record (← check service do
-            let state := serviceState nodes service
-            unless state == "healthy" do
-              throw s!"{state}; use 'up' for stopped services or inspect the service's Docker logs")
-        for node in nodes.filter (fun node => isActor node.role) do
-          if node.state != "running" then
-            printStyled (Styled.text s!"[note] {safe node.name}: {safe node.state}; check 'ps' before resuming" .yellow)
-  printLine "Checks cover local files, images, volumes and container health; runtime credentials and workflow execution are not probed."
-  unless failures == 0 do throw s!"Doctor found {failures} failed check(s)."
-  printStyled (Styled.text "All checks passed." .green)
+  let api ← check "Authenticated deployment API" (discard (Client.call connection .describe))
+  let catalog ← check "Program catalog" (discard (Client.call connection .programs))
+  let runs ← check "Run catalog" (discard (Client.call connection (.runs none 1)))
+  let nodes ← check "Node endpoints" do
+    let nodes ← Client.call connection .nodes
+    unless !nodes.isEmpty && nodes.all (·.online) do throw "Some node endpoints are unavailable; use 'top'"
+  printLine "Checks cover authentication and API access; no workflow was submitted."
+  unless api && catalog && runs && nodes do throw "Remote API checks failed."
 
 end LeanCloudCli

@@ -3,13 +3,7 @@ import LeanCloudCli.Application
 namespace LeanCloudTests.ConsoleModel
 open Lean LeanCloud LeanCloudCli
 
-structure Invocation where
-  command : String
-  args : Array String
-  input : Option String
-  deriving Inhabited, BEq, Repr
-
-/-- A pure host for the real CLI, with scripted processes, input, time and failures. -/
+/-- A pure host for the real CLI, with scripted HTTP, input, time and failures. -/
 structure World where
   files : Array (String × String) := #[]
   directories : Array String := #["/work"]
@@ -19,21 +13,19 @@ structure World where
   keys : List UInt32 := []
   stdout : String := ""
   stderr : String := ""
+  clipboard : String := ""
   time : Nat := 0
   terminalAvailable : Bool := true
   terminal : Bool := false
   size : Nat × Nat := (120, 35)
   sizes : List (Nat × Nat) := []
   nextLock : Nat := 0
+  nextId : Nat := 0
   locks : Array (LockId × String) := #[]
   trace : Array String := #[]
-  processes : Array Invocation := #[]
-  nextProcess : Nat := 0
-  children : Array (ProcessId × List ProcessChunk) := #[]
-  stream : Option (Invocation → Except String (List ProcessChunk)) := none
   failAt : Option Nat := none
-  process : Invocation → Except String ProcessOutput := fun call =>
-    .error s!"Unexpected process: {reprStr call}"
+  http : Option (String → String → Json → Except String Json) := none
+  httpRequests : Array Json := #[]
 
 def World.file (world : World) (path : System.FilePath) : Option String :=
   (world.files.find? (·.1 == path.toString)).map (·.2)
@@ -46,52 +38,24 @@ def World.json [ToJson α] (world : World) (path : System.FilePath) (value : α)
 
 private def label : HostOp α → String
   | .httpPost .. => "httpPost"
-  | .process .. => "process" | .readFile .. => "readFile" | .writeFile .. => "writeFile"
-  | .appendFile .. => "appendFile"
-  | .startProcess .. => "startProcess" | .pollProcess .. => "pollProcess" | .closeProcess .. => "closeProcess"
+  | .readFile .. => "readFile" | .writeFile .. => "writeFile"
   | .rename .. => "rename" | .exists .. => "exists" | .readDir .. => "readDir"
   | .removeTree .. => "removeTree"
   | .isDir .. => "isDir"
   | .createDir .. => "createDir" | .realPath .. => "realPath" | .currentDir => "currentDir"
   | .getEnv .. => "getEnv" | .pid => "pid" | .now => "now" | .sleep .. => "sleep"
+  | .randomId => "randomId"
   | .write .. | .writeStyled .. => "write" | .flush => "flush" | .readLine => "readLine"
   | .enterTerminal => "enterTerminal" | .leaveTerminal => "leaveTerminal"
   | .key .. => "key" | .dimensions => "dimensions" | .lock .. => "lock" | .unlock .. => "unlock"
+  | .copyClipboard .. => "copyClipboard"
 
 private def operation : HostOp α → ExceptT String (StateM World) α
-  | .httpPost _ _ body => do
+  | .httpPost url token body => do
     let json ← liftExcept (Json.parse body)
-    let args ← liftExcept (json.getObjValAs? (Array String) "args")
-    let input ← liftExcept (json.getObjValAs? (Option String) "input")
-    let call := Invocation.mk "http" args input
-    modify fun w => { w with processes := w.processes.push call }
-    let output ← liftExcept ((← get).process call)
-    return (toJson (Except.ok (toJson output) : Except String Json)).compress
-  | .process command args input => do
-    let call := Invocation.mk command args input
-    modify fun w => { w with processes := w.processes.push call }
-    liftExcept ((← get).process call)
-  | .startProcess command args => do
-    let call := Invocation.mk command args none
-    modify fun w => { w with processes := w.processes.push call }
-    let world ← get
-    let chunks ← liftExcept <| match world.stream with
-      | some stream => stream call
-      | none => world.process call |>.map fun output =>
-        [{ stdout := output.stdout.toUTF8, stderr := output.stderr.toUTF8, exitCode := some output.exitCode }]
-    let token := ProcessId.mk world.nextProcess
-    modify fun w => { w with nextProcess := w.nextProcess + 1, children := w.children.push (token, chunks) }
-    return token
-  | .pollProcess token timeout => do
-    let some (_, chunks) := (← get).children.find? (·.1 == token) | throw "Unknown process"
-    let chunk := chunks.headD { exitCode := some 0 }
-    modify fun w => { w with
-      time := w.time + timeout.toNat
-      children := w.children.map fun (id, rest) => (id, if id == token then rest.drop 1 else rest) }
-    return chunk
-  | .closeProcess token => do
-    unless (← get).children.any (·.1 == token) do throw "Unknown process"
-    modify fun w => { w with children := w.children.filter (·.1 != token) }
+    let some http := (← get).http | throw "Unexpected HTTP request"
+    modify fun w => { w with httpRequests := w.httpRequests.push json }
+    return (← liftExcept (http url token json)).compress
   | .readFile path => do
     let some text := (← get).file path | throw s!"Missing file: {path}"
     return text
@@ -99,7 +63,6 @@ private def operation : HostOp α → ExceptT String (StateM World) α
     let retained (name : String) := name != path.toString && !name.startsWith (path.toString ++ "/")
     { world with files := world.files.filter (retained ∘ Prod.fst), directories := world.directories.filter retained }
   | .writeFile path text => modify (·.save path text)
-  | .appendFile path text => modify fun world => world.save path ((world.file path).getD "" ++ text)
   | .rename source target => do
     let some text := (← get).file source | throw s!"Missing source: {source}"
     modify fun w => { (w.save target text) with files :=
@@ -125,6 +88,10 @@ private def operation : HostOp α → ExceptT String (StateM World) α
     if name == "HOME" then return some "/home/test"
     return none
   | .pid => return 42
+  | .randomId => do
+    let value := (← get).nextId
+    modify fun w => { w with nextId := value + 1 }
+    return s!"request-{value}"
   | .now => return (← get).time
   | .sleep ms => modify fun w => { w with time := w.time + ms.toNat }
   | .write text stderr => modify fun w =>
@@ -148,6 +115,7 @@ private def operation : HostOp α → ExceptT String (StateM World) α
     let size := (← get).sizes.headD (← get).size
     modify fun w => { w with size, sizes := w.sizes.drop 1 }
     return size
+  | .copyClipboard text => modify fun w => { w with clipboard := text }
   | .lock path => do
     unless !(← get).locks.any (·.2 == path.toString) do throw "Already locked"
     let token := LockId.mk (← get).nextLock

@@ -28,7 +28,7 @@ jobs:
       - name: Install native build tools
         timeout-minutes: 5
         run: |
-          bash .github/scripts/install-native.sh build-essential pkg-config tzdata libcurl4-openssl-dev libsqlite3-dev libpq-dev freetds-dev default-libmysqlclient-dev
+          bash .github/scripts/install-native.sh build-essential jq ripgrep shellcheck pkg-config tzdata libcurl4-openssl-dev libsqlite3-dev libpq-dev freetds-dev default-libmysqlclient-dev
 
       - uses: ./.github/actions/setup-lean
         id: lean
@@ -38,10 +38,10 @@ jobs:
       - name: Check library and proofs
         run: lake build
 
-      - name: Build the console and native process tests
+      - name: Build the console and HTTP runtime tests
         run: |
-          lake build lean_cloud cloud_process_tests cloud_console_tests
-          cc -std=c11 -O2 -Wall -Wextra -Werror LeanCloudCli/Templates/node.c -o /tmp/cloud-node
+          lake build lean_cloud cloud_console_tests
+          cc -std=c11 -O2 -Wall -Wextra -Werror deploy/node.c -o /tmp/cloud-node
 
       - name: Package runtime test executables
         run: |
@@ -74,12 +74,14 @@ jobs:
           include-hidden-files: true
           retention-days: 7
 
-      - name: Check native process streaming and cleanup
-        run: lake exe cloud_process_tests
+      - name: Check deployment helpers
+        run: bash deploy/test-helpers.sh
 
       - name: Check application commands and HTTP inbox durability
         working-directory: runtime
-        run: lake exe cloud_inbox_tests
+        run: |
+          lake build cloud_storage_tests
+          lake exe cloud_inbox_tests
 
   runtime:
     name: Runtime
@@ -109,6 +111,9 @@ jobs:
         timeout-minutes: 2
         uses: docker/setup-buildx-action@v4
 
+      - name: Check private files stay outside image builds
+        run: bash deploy/test-build-context.sh
+
       - name: Restore Docker layers
         id: layers
         uses: actions/cache/restore@v5
@@ -120,10 +125,10 @@ jobs:
 
       - name: Prepare generated chaos application
         timeout-minutes: 1
-        run: .lake/build/bin/cloud_console_tests --prepare-chaos-image
+        run: bash deploy/tests-prepare-app.sh
 
       # Bake schedules both builds together and deduplicates their identical
-      # toolchain steps. Normal CLI deploy calls reuse the resulting builder.
+      # toolchain steps. The external deployment fixtures use the loaded images.
       - name: Build runtime images together
         id: images
         timeout-minutes: 5
@@ -177,7 +182,7 @@ jobs:
         timeout-minutes: 9
         env:
           BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
-        run: bash .github/scripts/check-runtime.sh lifecycle pool scaling chaos maintenance
+        run: bash .github/scripts/check-runtime.sh pool scaling chaos maintenance
 
       - name: Upload runtime diagnostics on failure
         if: failure() || cancelled()
@@ -187,15 +192,7 @@ jobs:
           retention-days: 7
           path: |
             .lean-cloud/ci-runtime-logs/*.log
-            .lean-cloud/cli-command-logs-*/*.log
-            .lean-cloud/lean-cloud-maintenance-test-*/failure-*.log
-            .lean-cloud/lean-cloud-maintenance-test-*/logs/*.log
-            .lean-cloud/lean-cloud-console-test-*/failure-*.log
-            .lean-cloud/lean-cloud-console-test-*/logs/*.log
-            .lean-cloud/lean-cloud-scaling-test-*/failure-*.log
-            .lean-cloud/lean-cloud-scaling-test-*/logs/*.log
-            .lean-cloud/lean-cloud-pool-chaos-test-*/application/.lean-cloud/*/chaos-*
-            .lean-cloud/lean-cloud-pool-chaos-test-*/application/.lean-cloud/*/failure-*.log
-            .lean-cloud/lean-cloud-pool-chaos-test-*/application/.lean-cloud/*/logs/*.log
+            .lean-cloud/lean-cloud-*/failure.log
+            .lean-cloud/lean-cloud-*/chaos-events.jsonl
           include-hidden-files: true
           if-no-files-found: ignore

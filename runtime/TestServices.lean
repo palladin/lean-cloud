@@ -19,7 +19,7 @@ private def withMailbox (body : HttpMailbox.Config → IO α) : IO α :=
     IO.FS.withTempFile fun _ path => do
   let conn ← LeanLinq.Sqlite.connect path.toString
   try
-    let handler : HttpMailbox.ServerHandler := ⟨← Inbox.create conn, "adapter-test", fun _ => pure Lean.Json.null⟩
+    let handler : HttpMailbox.ServerHandler := { store := ← Inbox.create conn, token := "adapter-test", api := fun _ => pure Lean.Json.null }
     let server ← (HttpServer.start (.v4 ⟨.ofParts 127 0 0 1, 0⟩) handler).block
     try
       let some (.v4 address) := server.localAddr | throw (IO.userError "Missing test inbox address")

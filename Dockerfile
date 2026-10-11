@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends libcurl4-openss
 WORKDIR /src
 
 FROM toolchain AS node-build
-COPY LeanCloudCli/Templates/node.c /tmp/node.c
+COPY deploy/node.c /tmp/node.c
 RUN cc -O2 -Wall -Wextra -Werror /tmp/node.c -o /usr/local/bin/cloud-node
 
 FROM toolchain AS dependencies

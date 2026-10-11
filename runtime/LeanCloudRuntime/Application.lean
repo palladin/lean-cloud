@@ -1,9 +1,26 @@
 import LeanCloudRuntime.Program
+import LeanCloudRuntime.Monitoring
 import LeanCloudCli.IO
 import LeanCloudCli.Model
 
 namespace LeanCloudRuntime.Application
 open Lean LeanCloud LeanEff LeanCloudCli
+
+/-- Text output of the node's restricted administrative command endpoint. -/
+structure CommandOutput where
+  exitCode : UInt32 := 0
+  stdout : String := ""
+  stderr : String := ""
+
+instance : ToJson CommandOutput where
+  toJson out := Json.mkObj [("exitCode", toJson out.exitCode.toNat),
+    ("stdout", toJson out.stdout), ("stderr", toJson out.stderr)]
+
+instance : FromJson CommandOutput where
+  fromJson? json := do
+    let code ← json.getObjValAs? Nat "exitCode"
+    unless code ≤ 4294967295 do throw "Invalid exit code"
+    return ⟨code.toUInt32, ← json.getObjValAs? String "stdout", ← json.getObjValAs? String "stderr"⟩
 
 /-- Runtime services used by the application protocol. User code stays in the registry. -/
 inductive Service : Type → Type where
@@ -11,6 +28,9 @@ inductive Service : Type → Type where
   | health (config : Config) : Service Unit
   | configure (config : Config) (routes : Array HttpMailbox.WorkerEndpoint) : Service Unit
   | membership (config : Config) : Service LeanCloud.Pool.Membership
+  | runs (config : Config) (after : Option String) (limit : Nat) : Service (Array (String × LeanCloud.Pool.Mode))
+  | mode (config : Config) (run : String) : Service LeanCloud.Pool.Mode
+  | durableControl (config : Config) (requestId : String) (command : LeanCloud.Pool.Command) : Service (Except String Unit)
   | workerStopped (config : Config) (worker : String) (generation : Nat) : Service Unit
   | serveScheduler (config : Config) : Service Unit
   | serveWorker (config : Config) : Service Unit
@@ -22,6 +42,8 @@ inductive Service : Type → Type where
   | readText (config : Config) (ref : BlobRef) : Service String
   | remove (config : Config) (run : String) : Service Unit
   | purge (config : Config) (run : String) : Service Unit
+  | nodes (config : Config) : Service (Array DeploymentApi.Node)
+  | observations (config : Config) (run worker : String) (after : Option String) (limit : Nat) : Service DeploymentApi.ObservationPage
 
 inductive Runtime : Effect where
   | request (service : Service α) : Runtime (Except String α)
@@ -31,6 +53,63 @@ abbrev App := ExceptT String (Eff [Host, Runtime])
 private def host (op : HostOp α) : App α := ExceptT.mk (send (Host.request op))
 private def service (op : Service α) : App α := ExceptT.mk (send (Runtime.request op))
 private def say (text : String) : App Unit := host (.write (text ++ "\n"))
+
+private def runInfo (config : Config) (id : String) (mode : LeanCloud.Pool.Mode) : App DeploymentApi.RunInfo := do
+  let definition ← service (.definition config id)
+  return { id, entry := definition.entry, input := definition.input, resultSchema := definition.resultSchema, mode
+           image := definition.image, program := definition.program }
+
+/-- The public API shares the application's service effects and typed registry.
+It cannot invoke the private mailbox/host administration protocol. -/
+private def deploymentRequest (registry : Registry) (config : Config) (client : ClientConfig) :
+    (request : DeploymentApi.Request) → App (DeploymentApi.Response request)
+  | .describe => pure { deployment := client.deployment, image := client.image }
+  | .programs => pure (registry.programs.map (·.info))
+  | .nodes => service (.nodes config)
+  | .observations run worker after limit => service (.observations config run worker after limit)
+  | .runs after limit => do
+    let entries ← service (.runs config after limit)
+    let items ← entries.mapM fun (id, mode) => do
+      let info ← runInfo config id mode
+      -- Source is fetched for one selected run. Catalog pages stay small even
+      -- when an application bundles a large source tree.
+      return { info with program := info.program.map fun program => { program with sources := #[] } }
+    return { items, next := if items.size == limit then items.back?.map (·.id) else none }
+  | .run id => do runInfo config id (← service (.mode config id))
+  | .submit id entry input => do
+    let program ← liftExcept (registry.find entry)
+    liftExcept (program.validate input)
+    service (.submit config id program.info.entry input)
+  | .control requestId id action => do
+    if action == .resume then
+      let definition ← service (.definition config id)
+      unless definition.image.all (· == client.image) do throw "This run belongs to a different application image"
+    service (.durableControl config requestId (action.command id))
+  | .remove requestId id => do
+    let receipt ← service (.durableControl config requestId (.remove id))
+    if let .error error := receipt then return .error error
+    -- Cleanup is idempotent and must be retried even when retirement was
+    -- already committed by a request whose HTTP response was lost.
+    service (.remove config id)
+    return .ok ()
+  | .inspect id => service (.status config id)
+  | .outcome id => service (.outcome config id)
+  | .result id => do
+    let some outcome ← service (.outcome config id) | throw "Workflow result is pending"
+    match outcome with
+    | .failure error => throw error.message
+    | .cancelled reason => throw reason
+    | .success value =>
+      let definition ← service (.definition config id)
+      if definition.resultSchema == (inferInstance : Codec BlobRef).schema then
+        service (.readText config (← liftExcept (Codec.decode value)))
+      else return value.pretty
+
+def deploymentRun (registry : Registry) (config : Config) (client : ClientConfig)
+    (request : DeploymentApi.Request) : App (DeploymentApi.Response request) := do
+  liftExcept request.validate
+  liftExcept registry.validate
+  deploymentRequest registry config client request
 
 /-- One protocol for every compiled application, independent of the actual services. -/
 def run (registry : Registry) (args : List String) : App UInt32 := do
@@ -127,20 +206,32 @@ partial def runWith [Monad m]
     runWith handleHost handleService (ExceptT.mk (ArrsF.apply next value))
   | .impure (.there (.there rest)) _ => nomatch rest
 
-private def handle (registry : Registry) (prepare : Config → String → Json → IO Unit) : Service α → IO α
+private def handle (registry : Registry) (prepare : Config → String → Json → IO Unit)
+    (observations : Option ObservationStore.Store) : Service α → IO α
   | .submit config id entry input => do
     let removed : Bool ← IO.ofExcept (fromJson? (← Pool.request config (.removed id)))
     if removed then throw (IO.userError "Run was removed; use a new run ID")
-    S3.initializeBucket config.blobs
+    config.objects.ensureContainer
     prepare config entry input
     registry.submit config id entry input
     Pool.submit config id
   | .health config => discard (Pool.request config .health)
   | .configure config routes => discard (Pool.configure config routes)
   | .membership config => do IO.ofExcept (fromJson? (← Pool.request config .workers))
+  | .runs config after limit => do IO.ofExcept (fromJson? (← Pool.request config (.runs after limit)))
+  | .mode config id => do IO.ofExcept (fromJson? (← Pool.request config (.mode id)))
+  | .durableControl config requestId command => Pool.control config requestId command
   | .workerStopped config worker generation => discard (Pool.request config (.workerStopped worker generation))
-  | .serveScheduler config => Pool.scheduler config
-  | .serveWorker config => registry.serveWorker config
+  | .serveScheduler config => Pool.scheduler (config.localInbox none) (observations.map (·.record) |>.getD (fun _ => pure ()))
+  | .serveWorker config => do
+    registry.serveWorker (config.localInbox (some (← workerId)))
+      (observations.map (·.record) |>.getD (fun _ => pure ()))
+  | .nodes config => do
+    let some store := observations | throw (IO.userError "Node telemetry is not configured")
+    Monitoring.nodes config store
+  | .observations config run worker after limit => do
+    let some store := observations | throw (IO.userError "Node telemetry is not configured")
+    Monitoring.observations config store run worker after limit
   | .control config id mode => do
     discard (Pool.request config (match mode with
       | .active => .resume id | .paused => .pause id | .killed => .kill id))
@@ -153,7 +244,8 @@ private def handle (registry : Registry) (prepare : Config → String → Json �
   | .purge config id => do
     let removed : Bool ← IO.ofExcept (fromJson? (← Pool.request config (.removed id)))
     unless removed do throw (IO.userError "Run has not been retired; refusing to delete records")
-    S3.removeRun config.blobs id
+    config.objects.removeRun id
+    if let some store := observations then store.remove id
   | .remove config id => do
     discard <| Pool.request config (.remove id)
     let membership ← Pool.request config .workers
@@ -165,27 +257,42 @@ private def handle (registry : Registry) (prepare : Config → String → Json �
         let response ← LeanCloudCli.Http.post s!"http://{route.endpoint.host}:{route.endpoint.port}/app"
           route.endpoint.token body.compress
         let result : Except String Json ← IO.ofExcept (Json.parse response >>= fromJson?)
-        let output : ProcessOutput ← IO.ofExcept (result >>= fromJson?)
+        let output : CommandOutput ← IO.ofExcept (result >>= fromJson?)
         unless output.exitCode == 0 do throw (IO.userError (output.stderr ++ output.stdout))
+        if let some store := observations then store.remove id
         return
       catch error => lastError := error.toString
     throw (IO.userError s!"Run retired; record cleanup incomplete. Retry removal. {lastError}")
   | .readText config ref => do
-    let bytes ← match ← (S3.readBytes config.blobs ref).run with
+    let bytes ← match ← (config.objects.readBytes ref).run with
       | .ok bytes => pure bytes
       | .error error => throw (IO.userError error.message)
     let some text := String.fromUTF8? bytes | throw (IO.userError "Result blob is not UTF-8 text")
     pure text
 
 private def handleService (registry : Registry) (prepare : Config → String → Json → IO Unit)
+    (observations : Option ObservationStore.Store := none)
     (op : Service α) : IO (Except String α) := do
-  try return .ok (← handle registry prepare op)
+  try return .ok (← handle registry prepare observations op)
   catch error => return .error error.toString
+
+def deploymentApi (registry : Registry) (config : Config) (client : ClientConfig)
+    (prepare : Config → String → Json → IO Unit) (json : Json)
+    (observations : Option ObservationStore.Store := none) : IO Json := do
+  let request ← IO.ofExcept (DeploymentApi.Request.decode json)
+  match request with
+  | .describe => pure ()
+  | _ =>
+    unless (json.getObjValAs? String "deployment").toOption == some client.deployment do
+      throw (IO.userError "Deployment identity mismatch; reconnect before sending commands")
+  let result ← runWith (fun _ => pure (.error "Deployment API cannot access the CLI host"))
+    (handleService registry prepare observations) (deploymentRun registry config client request)
+  return toJson (← IO.ofExcept result)
 
 /-- HTTP exposes the same effect program as the executable, with a restricted
 host interpreter: no filesystem paths or executable commands from the caller. -/
 def api (registry : Registry) (config : Config) (prepare : Config → String → Json → IO Unit)
-    (json : Json) (worker := false) : IO Json := do
+    (json : Json) (worker := false) (observations : Option ObservationStore.Store := none) : IO Json := do
   let args ← IO.ofExcept (json.getObjValAs? (Array String) "args")
   let input ← IO.ofExcept (json.getObjValAs? (Option String) "input")
   let allowed := if worker then args.toList matches ["purge-run", _, _] else match args.toList with
@@ -197,7 +304,7 @@ def api (registry : Registry) (config : Config) (prepare : Config → String →
   unless allowed do throw (IO.userError "Unsupported HTTP application command")
   let args := if args.size ≥ 2 && args[0]? != some "validate" then
     args.set! 1 "/etc/lean-cloud/config.json" else args
-  let output ← IO.mkRef ({} : ProcessOutput)
+  let output ← IO.mkRef ({} : CommandOutput)
   let host : {α : Type} → HostOp α → IO (Except String α) := fun {α} op =>
     match op with
     | .readFile path => do
@@ -209,15 +316,15 @@ def api (registry : Registry) (config : Config) (prepare : Config → String →
         else { out with stdout := out.stdout ++ text }
       return .ok ()
     | _ => pure (.error "Unsupported HTTP host operation")
-  let result ← runWith host (handleService registry prepare) (run registry args.toList)
+  let result ← runWith host (handleService registry prepare observations) (run registry args.toList)
   return toJson { (← output.get) with exitCode := result.toOption.getD 1 }
 
 /-- Users only supply their registry. A node runs its HTTP API, embedded SQLite
 inbox, and actor concurrently in this process; Docker restarts the whole node. -/
 def main (registry : Registry) (args : List String)
     (prepare : Config → String → Json → IO Unit := fun _ _ _ => pure ()) : IO UInt32 := do
-  let execute := withHostIO fun handleHost => do
-    let result ← runWith handleHost (handleService registry prepare) (run registry args)
+  let execute (observations : Option ObservationStore.Store := none) := withHostIO fun handleHost => do
+    let result ← runWith handleHost (handleService registry prepare observations) (run registry args)
     return result.toOption.getD 1
   match args with
   | [command, path] =>
@@ -225,10 +332,16 @@ def main (registry : Registry) (args : List String)
       let config ← Config.load path
       let endpoint ← if command == "serve-worker" then IO.ofExcept (config.mailboxes.worker (← workerId))
         else pure config.mailboxes.scheduler
-      let api := fun json => api registry config prepare json (worker := command == "serve-worker")
       let database := (← IO.getEnv "CLOUD_INBOX_DATABASE").getD "/mailbox/inbox.sqlite"
-      HttpMailbox.withServer endpoint database api execute (handleSignals := true)
-    else execute
-  | _ => execute
+      let worker ← if command == "serve-worker" then workerId else pure "scheduler"
+      ObservationStore.withStore (database ++ ".telemetry.sqlite") worker fun store => do
+        let api := fun json => api registry config prepare json (worker := command == "serve-worker") (observations := some store)
+        let client := if command == "serve-scheduler" then config.client.map fun client =>
+          { token := client.token, api := fun json => deploymentApi registry config client prepare json (some store) : HttpMailbox.ClientHandler }
+          else none
+        HttpMailbox.withServer endpoint database api (execute (some store)) (handleSignals := true) (client := client)
+          (telemetry := some (Monitoring.api store))
+    else execute none
+  | _ => execute none
 
 end LeanCloudRuntime.Application

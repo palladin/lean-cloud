@@ -42,46 +42,32 @@ The three files are split into two batches: one contains the first two files and
 the other contains the third. `Cloud.parallel` returns one count per batch. The
 workflow sums the counts, saves the report, and returns its `BlobRef`.
 
-Run the [complete example](runtime/LeanCloudRuntime/Demo.lean) with three worker
-containers, one scheduler container, and shared S3 blob storage. Each node runs its HTTP API, SQLite inbox, and actor in one Lean process:
+Run the [complete example](runtime/LeanCloudRuntime/Demo.lean) with three workers,
+one scheduler and shared blob storage:
 
 ```sh
-docker compose up --build -d scheduler worker worker2 worker3
-docker compose exec scheduler cloud-app submit /etc/lean-cloud/config.json example-1
-docker compose logs -f scheduler worker worker2 worker3
-```
-
-Create your own application from the interactive console:
-
-```sh
+./deploy/build.sh . lean-cloud-demo:dev
+./deploy/local.sh init .deployment lean-cloud-demo:dev local 3 8080
+./deploy/local.sh up .deployment
 lake exe lean_cloud
 ```
 
 ```text
-cloud> init my-app
+cloud> connect local http://127.0.0.1:8080 --token-file .deployment/client.token
+cloud> programs
+cloud> run sum-squares --id my-example
+cloud> ps
+cloud> watch my-example
+cloud> result my-example
 ```
 
-Edit `my-app/Main.lean`, then run `deploy` and `run my-app` in the same console.
-Use `deploy --workers 4` to choose capacity and `scale N` to resize a running pool.
-Use `deployments` and `use NAME` to switch applications, `status` or `doctor` to
-inspect them, and `down` / `up` to stop and restart services while preserving data.
+The console uses the same scheduler HTTP API for local and remote deployments.
+`watch` shows the branch tree, source and workers; finished runs retain their
+last view. Use `pause`, `resume` and `kill` to control a workflow.
 
-The CLI generates the deployment configuration and builds your executable in
-Docker. `ps` lists runs; `watch RUN` shows the live branch tree, code, and workers.
-Completed, paused, and killed runs show their last view.
-Use `pause RUN` / `resume RUN` to stop and continue a run, or `kill RUN` to cancel it permanently.
-See the [console guide](LeanCloud/Console.md) for inputs, registration, and recovery.
-
-Once the workers finish, read the saved report:
-
-```sh
-docker compose exec scheduler cloud-app result /etc/lean-cloud/config.json example-1
-# files=16, errors=24
-```
-
-The [deployment guide](LeanCloud/Deployment.md) explains configuration, submission,
-restarts, and integration tests. `docker compose down` stops the stack while
-preserving its data.
+Deployment stays outside the console. The optional [shell helpers](deploy/README.md)
+provide inspectable Docker, Kubernetes and OpenTofu files. Users can use their
+own deployment scripts and existing clusters. See the [console guide](LeanCloud/Console.md).
 
 `||` combines the results of two computations into a pair. Use
 `Cloud.pure (fun _ => analyze input)` to record the result of a delayed pure
@@ -111,7 +97,9 @@ recovery after scheduler and worker crashes. Real adapter and container checks:
 
 ```sh
 docker compose run --build --rm checks
-lake exe cloud_console_tests --chaos-only --seed 1
+bash deploy/tests-prepare-app.sh
+docker buildx bake -f .github/docker-bake.hcl
+lake exe cloud_console_tests --chaos-only
 ```
 
 [The three main theorems](LeanCloud/Proofs/MainTheorems.lean) prove that sequential,

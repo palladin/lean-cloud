@@ -21,7 +21,7 @@ private def readRecords (path : String) : IO UInt32 := do
     (Lean.Json.parse (← (← IO.getStdin).getLine) >>= Lean.fromJson?)
   let saved ← keys.mapM fun (run, keys) => do
     let records ← keys.mapM fun key => do
-      let some value ← S3.readJson config.blobs run key
+      let some value ← config.objects.readJson run key
         | throw (IO.userError s!"Missing confirmed record: {run}/{key}")
       return (key, value)
     return (run, records)

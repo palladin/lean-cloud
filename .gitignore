@@ -2,6 +2,12 @@
 .lake/
 .lean-cloud/
 
+# OpenTofu provider downloads and local state may contain credentials.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+
 # Lean output produced outside Lake's build directory.
 *.olean
 *.olean.private
@@ -10,3 +16,32 @@
 
 # macOS metadata.
 .DS_Store
+
+# Private helper state, runtime credentials and generated manifests.
+lean-cloud.local.json
+.deployment/
+.*-deployment/
+.*-infra/
+**/.aws/
+**/.azure/
+**/.kube/
+.env
+.env.*
+!.env.example
+!.env.template
+*.tfvars
+*.tfvars.json
+*.token
+kubeconfig
+kubeconfig.*
+!deploy/kubeconfig.sh
+config.json
+!deploy/config.json
+config.next
+storage.json
+s3.json
+!deploy/s3.json
+cloud.json
+deployment.json
+resources.json
+compose.json

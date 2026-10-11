@@ -6,6 +6,9 @@ import LeanCloudTests.Support
 import ApplicationTests
 import ReplyTests
 import SchedulerTests
+import MonitoringTests
+import ObjectStoreTests
+import StorageProviderTests
 
 open Lean LeanCloud LeanCloudRuntime LeanCloudTests
 
@@ -142,11 +145,36 @@ private def http : IO Unit := IO.FS.withTempFile fun _ path => do
   try
     let store ← Inbox.create conn 600
     let config : Config ← IO.ofExcept (Json.parse (include_str "../deploy/config.json") >>= fromJson?)
-    let handler : HttpMailbox.ServerHandler := ⟨store, "test-token", Application.api programs config (fun _ _ _ => pure ())⟩
+    let client : ClientConfig := ⟨"http-test", "sha256:test", "public-client-token"⟩
+    let handler : HttpMailbox.ServerHandler := {
+      store, token := "test-token", api := Application.api programs config (fun _ _ _ => pure ())
+      client := some ⟨client.token, Application.deploymentApi programs config client (fun _ _ _ => pure ())⟩ }
     let server ← (HttpServer.start (.v4 ⟨.ofParts 127 0 0 1, 0⟩) handler).block
     try
       let some (.v4 bound) := server.localAddr | throw (IO.userError "No HTTP address")
       let endpoint : HttpMailbox.Config := ⟨"127.0.0.1", bound.port.toNat, "test-token"⟩
+      let publicUrl := s!"http://127.0.0.1:{bound.port}/deployment"
+      let describe := DeploymentApi.Request.describe.encode
+      let described ← LeanCloudCli.Http.post publicUrl client.token describe.compress
+      let described : Except String Json ← unwrap (Json.parse described >>= fromJson?)
+      let info : DeploymentApi.Info ← unwrap (described >>= fromJson?)
+      assertEq info.deployment client.deployment
+      assertEq info.image client.image
+      for path in ["/mailbox", "/app", "/telemetry"] do
+        rejects (LeanCloudCli.Http.post s!"http://127.0.0.1:{bound.port}{path}" client.token describe.compress)
+          "Client credential reached a private endpoint"
+      rejects (LeanCloudCli.Http.post publicUrl endpoint.token describe.compress)
+        "Internal credential reached the public API"
+      let listPrograms := DeploymentApi.Request.programs.encode.setObjVal! "deployment" (toJson client.deployment)
+      let registered ← LeanCloudCli.Http.post publicUrl client.token listPrograms.compress
+      let registered : Except String Json ← unwrap (Json.parse registered >>= fromJson?)
+      assertEq (← unwrap (registered >>= fromJson? (α := Array ProgramInfo))).size 2
+      for bad in [listPrograms.setObjVal! "deployment" (toJson "another-deployment"),
+          listPrograms.setObjVal! "apiVersion" (toJson (999 : Nat)),
+          Json.mkObj [("args", toJson #["pool-stopped", "config", "worker1", "0"]), ("input", Json.null)]] do
+        let response ← LeanCloudCli.Http.post publicUrl client.token bad.compress
+        let response : Except String Json ← unwrap (Json.parse response >>= fromJson?)
+        assertTrue (!response.isOk) "Invalid public request was accepted"
       -- Bypass the version-aware client to exercise old and future senders.
       let request := toJson (Inbox.Request.mk "compatibility" "" (.send "legacy"))
       for version in [none, some (999 : Nat)] do
@@ -202,7 +230,7 @@ private def http : IO Unit := IO.FS.withTempFile fun _ path => do
       let response ← LeanCloudCli.Http.post s!"http://127.0.0.1:{bound.port}/app" "test-token"
         (Json.mkObj [("args", toJson #["programs"]), ("input", Json.null)]).compress
       let result : Except String Json ← IO.ofExcept (Json.parse response >>= fromJson?)
-      let output : LeanCloudCli.ProcessOutput ← IO.ofExcept (result >>= fromJson?)
+      let output : Application.CommandOutput ← IO.ofExcept (result >>= fromJson?)
       assertEq output.exitCode 0
       let registered : Array ProgramInfo ← IO.ofExcept (Json.parse output.stdout >>= fromJson?)
       assertEq registered.size 2
@@ -223,7 +251,7 @@ private def poolLeases : IO Unit := IO.FS.withTempFile fun _ inboxPath =>
     IO.FS.withTempFile fun _ schedulerPath => IO.FS.withTempFile fun _ configPath => do
   let conn ← LeanLinq.Sqlite.connect inboxPath.toString
   try
-    let handler : HttpMailbox.ServerHandler := ⟨← Inbox.create conn, "lease-test", fun _ => pure Json.null⟩
+    let handler : HttpMailbox.ServerHandler := { store := ← Inbox.create conn, token := "lease-test", api := fun _ => pure Json.null }
     let server ← (HttpServer.start (.v4 ⟨.ofParts 127 0 0 1, 0⟩) handler).block
     try
       let some (.v4 bound) := server.localAddr | throw (IO.userError "No pool HTTP address")
@@ -345,6 +373,9 @@ def main (args : List String) : IO UInt32 := do
   try
     ApplicationTests.run
     IO.println "Application commands and registry passed"
+    MonitoringTests.run
+    ObjectStoreTests.run
+    StorageProviderTests.run
     schemaVersions
     laws
     for seed in [:32] do differential seed

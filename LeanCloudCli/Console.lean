@@ -2,8 +2,6 @@ import LeanCloudCli.Diagnostics
 import LeanCloudCli.Top
 import LeanCloudCli.Help
 import LeanCloudCli.Watch
-import LeanCloudCli.Clean
-import LeanCloudCli.Backup
 import LeanCloudCli.Time
 
 namespace LeanCloudCli
@@ -41,14 +39,14 @@ private def inspectRun (ctx : Context) (id : String) : Cli Unit := do
     printStyled (Styled.text "Outcome: " ++ Styled.text (exitLabel outcome) (Styled.statusColor (exitLabel outcome)))
     if let .failure error := outcome then printLine s!"Error: {safe error.message}"
   if control != .active then
-    if outcome.isNone then printStyled (Styled.text "Status: " ++ Styled.text control.label (Styled.statusColor control.label))
+    if outcome.isNone then printStyled (Styled.text "Status: " ++ Styled.text (controlLabel control) (Styled.statusColor (controlLabel control)))
   let state ← try pure (some (← ctx.observation run)) catch error =>
     if outcome.isSome || control != .active then pure none else throw error
   let some state := state | return
   if let some diagnostics := state.diagnostics then
     printLine s!"Execution: {phaseLabel diagnostics.phase}"
     printLine s!"Assignments: {diagnostics.pending} pending, {diagnostics.running} running, {diagnostics.replies} replies collected"
-    if diagnostics.configuredWorkers == some 0 then printLine "No workers configured. Use 'scale N' to add capacity."
+    if diagnostics.configuredWorkers == some 0 then printLine "No workers configured. Add capacity using your deployment tooling."
     unless diagnostics.stopping.isEmpty do
       printLine s!"Waiting for stop acknowledgement: {String.intercalate ", " diagnostics.stopping.toList}"
   let traces ← Trace.load ctx run
@@ -84,7 +82,7 @@ private def listRuns (ctx : Context) : Cli Unit := do
         let control ← ctx.control run.id
         if let some diagnostics := observed.toOption.bind (·.diagnostics) then
           pure (phaseShortLabel diagnostics.phase)
-        else if control != .active then pure control.label else do
+        else if control != .active then pure (controlLabel control) else do
           let state ← liftExcept observed
           pure (if state.error.isSome then "scheduler error" else
             s!"running ({(state.jobs.filter (·.status == .done)).size}/{state.jobs.size})")
@@ -93,7 +91,7 @@ private def listRuns (ctx : Context) : Cli Unit := do
         pure (phaseShortLabel .stopping)
       else do
         let control ← ctx.control run.id
-        pure (if control != .active then control.label else "unavailable / launch incomplete")
+        pure (if control != .active then (controlLabel control) else "unavailable / launch incomplete")
     let span := timing >>= (·.span)
     let started := span.map (Time.stamp ∘ Timing.Span.startedMs) |>.getD "—"
     let finished := (span >>= (·.finishedMs)).map Time.stamp |>.getD "—"
@@ -101,33 +99,6 @@ private def listRuns (ctx : Context) : Cli Unit := do
     printStyled (Styled.text (pad 31 run.id) .cyan ++ Styled.text (pad 25 run.program.entry) ++
       Styled.text (pad 22 status) (Styled.statusColor status) ++
       Styled.text s!"{pad 21 started}{pad 21 finished}" .muted ++ Styled.text elapsed .cyan)
-
-/-- Reject malformed flags before deployment changes any files or services. -/
-private def deploymentOptions (args : List String) (allowExecutable : Bool)
-  : Except String (Option String × Bool × Option Nat) := do
-  let usage := if allowExecutable then "Usage: deploy [EXECUTABLE] [--workers N] [-v|--verbose]"
-    else "Usage: up [-v|--verbose]"
-  let mut executable := none
-  let mut verbose := false
-  let mut workers := none
-  let mut rest := args
-  while !rest.isEmpty do
-    match rest with
-    | "--workers" :: value :: tail =>
-      unless allowExecutable do throw usage
-      if workers.isSome then throw "Duplicate --workers"
-      let some count := value.toNat? | throw "Worker count must be a nonnegative integer"
-      workers := some count; rest := tail
-    | arg :: tail =>
-      if arg == "-v" || arg == "--verbose" then
-        if verbose then throw "Duplicate verbose flag (-v/--verbose)"
-        verbose := true
-      else if allowExecutable && executable.isNone && !arg.startsWith "-" then
-        executable := some arg
-      else throw usage
-      rest := tail
-    | [] => pure ()
-  return (executable, verbose, workers)
 
 private def runOptions (args : List String) : Except String (Option String × Option String) := do
   let mut file := none
@@ -151,24 +122,10 @@ def command (ctx : Context) (args : List String) : Cli Bool := do
   match args with
   | [] => return true
   | ["quit"] | ["exit"] => return false
-  | "deploy" :: options =>
-    let (executable, verbose, workers) ← liftExcept (deploymentOptions options true)
-    ctx.deploy executable verbose workers
-  | ["scale", value] =>
-    let some count := value.toNat? | throw "Usage: scale N (a nonnegative integer)"
-    ctx.scale count
-  | ["down"] => ctx.down
-  | ["clean"] => ctx.clean
   | ["remove", id] => ctx.removeRun id
-  | ["backup", directory] => Backup.save ctx directory
-  | "up" :: options =>
-    let (_, verbose, _) ← liftExcept (deploymentOptions options false)
-    ctx.up verbose
-  | ["deployments"] => listDeployments ctx
+  | ["connections"] => listConnections ctx
   | ["status"] => ctx.status
   | ["doctor"] => ctx.doctor
-  | ["init", directory] => Project.init ctx directory
-  | ["init", directory, "--sdk", path] => Project.init ctx directory (some path)
   | ["programs"] =>
     printHeading "PROGRAM                  DESCRIPTION"
     for program in (← ctx.deployment).programs do
@@ -191,39 +148,37 @@ def command (ctx : Context) (args : List String) : Cli Bool := do
     match outcome with
     | .success value =>
       if run.program.resultSchema == (inferInstance : Codec BlobRef).schema then
-        printLine (safe (← ctx.remote run "result"))
+        printLine (safe (← ctx.result run))
       else printLine (safe value.pretty)
     | .failure error => printLine s!"failed: {safe error.message}"
     | .cancelled reason => printLine s!"cancelled: {safe reason}"
   | ["logs", id] | ["logs", id, _] =>
-    let role := args[2]?.getD "worker1"
-    unless isActor role do throw "Unknown actor"
     let run ← ctx.loadRun id
-    let output ← docker #["logs", "--tail", "100", ctx.node role]
-    for line in (output.stdout ++ output.stderr).splitOn "\n" do
-      if let some event := event? line then
-        if event.run == run.id then printLine (safe line)
+    let snapshot ← Trace.load ctx run
+    for step in snapshot.steps do
+      if args[2]?.all (· == step.event.worker) then
+        printLine (safe s!"{step.timestamp} {step.event.worker} {step.event.location} {step.event.activity} {step.event.operation}")
+    unless snapshot.warning.isEmpty do printLine (safe snapshot.warning)
   | _ => throw "Unknown command. Use 'help'."
   return true
 
-/-- Project selection belongs to the CLI state, not the process's working directory. -/
+/-- Connection selection changes only the console's local profile. -/
 def dispatch (ctx : Context) (args : List String) : Cli (Context × Bool) := do
   if Help.requested args then return (ctx, ← command ctx args)
   match args with
-  | ["restore", directory] => return (← Backup.restore ctx.root directory, true)
+  | ["connect", name, url] | ["connect", name, url, "--token-env", _] |
+      ["connect", name, url, "--token-file", _] =>
+    let tokenFile ← if args[3]? == some "--token-file" then
+      pure (some ((← request .currentDir) / args[4]!).toString) else pure none
+    let tokenEnv := if args[3]? == some "--token-env" then args[4]! else "LEAN_CLOUD_TOKEN"
+    let selected ← Connections.connect name url tokenEnv tokenFile
+    discard selected.deployment
+    discard selected.allRuns
+    printLine s!"Connected to {safe selected.project}. Use 'programs' or 'ps'."
+    return (selected, true)
   | ["use", name] =>
-    unless (← Deployments.load).entries.any (·.project == name) do Deployments.discover ctx
-    let selected ← Deployments.select name
-    printLine s!"Selected {safe selected.project} at {safe selected.root.toString}"
-    return (selected, true)
-  | ["open", directory] =>
-    let selected ← Project.openDirectory ctx directory
-    Deployments.remember selected
-    return (selected, true)
-  | ["init", directory] | ["init", directory, "--sdk", _] =>
-    discard (command ctx args)
-    let selected ← Project.openDirectory ctx directory
-    Deployments.remember selected
+    let selected ← Profiles.select name
+    printLine s!"Selected {safe selected.project}"
     return (selected, true)
   | _ => return (ctx, ← command ctx args)
 

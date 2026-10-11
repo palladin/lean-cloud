@@ -27,21 +27,31 @@ private def service : Application.Service α → StateM World (Except String α)
   | .configure _ _ | .workerStopped _ _ _ => return .ok ()
   | .remove _ _ | .purge _ _ => return .ok ()
   | .membership _ => return .ok {}
-  | .definition _ _ => return .ok ⟨program.info.entry, Json.null, program.info.resultSchema⟩
+  | .runs _ _ _ => return .ok #[("one", .active)]
+  | .mode _ _ => return .ok .active
+  | .durableControl _ _ _ => return .ok (.ok ())
+  | .nodes _ => return .ok #[]
+  | .observations _ _ _ _ _ => return .ok { items := #[] }
+  | .definition _ _ => return .ok { entry := program.info.entry, input := Json.null, resultSchema := program.info.resultSchema }
   | .outcome _ _ => return .ok (some (.success (toJson (42 : Nat))))
   | .cancel _ _ => return .ok (some (.cancelled "Killed by user"))
   | .status _ _ => return .ok {}
   | .readText _ _ => return .error "A Nat result must not be treated as a blob"
 
+private def failedControl (uncertain : Bool) : Application.Service α → StateM World (Except String α)
+  | .durableControl _ _ _ => return if uncertain then .error "Scheduler timeout" else .ok (.error "Rejected")
+  | op => service op
+
 def run : IO Unit := do
   let key := "runs/example/records/" ++ String.ofList (List.replicate 64 'a')
   let page (contents : String) := s!"<ListBucketResult><KeyCount>1</KeyCount><Contents><Key>{contents}</Key></Contents></ListBucketResult>"
-  assertEq (← unwrap (S3.runRecordKeys "example" (page key))) #[key]
-  assertEq (← unwrap (S3.runRecordKeys "example" (page (key.replace "/" "%2F")))) #[key]
+  let keys xml := S3.listKeys xml >>= ObjectStore.runRecordKeys "example"
+  assertEq (← unwrap (keys (page key))) #[key]
+  assertEq (← unwrap (keys (page (key.replace "/" "%2F")))) #[key]
   for invalid in ["objects/" ++ String.ofList (List.replicate 64 'a'),
       key.replace "example" "other", key ++ "/../objects", "runs/example/records/short"] do
-    assertTrue (S3.runRecordKeys "example" (page invalid)).toOption.isNone "Unsafe cleanup listing accepted"
-  assertTrue (S3.runRecordKeys "example" "<ListBucketResult></ListBucketResult>").toOption.isNone
+    assertTrue (keys (page invalid)).toOption.isNone "Unsafe cleanup listing accepted"
+  assertTrue (keys "<ListBucketResult></ListBucketResult>").toOption.isNone
     "Malformed empty listing was accepted"
   let json ← unwrap (Json.parse (include_str "../deploy/config.json"))
   assertTrue (fromJson? (α := Config) (json.setObjVal! "formatVersion" (toJson (999 : Nat)))).toOption.isNone
@@ -66,7 +76,17 @@ def run : IO Unit := do
     putBlob := fun _ => throw ⟨.unsupported, "unexpected blob"⟩
     readBlob := fun _ => throw ⟨.unsupported, "unexpected blob"⟩
     resolveBlob := fun _ => throw ⟨.unsupported, "unexpected blob"⟩ }
-  let definition : RunDefinition := ⟨entry.info.entry, toJson (5 : Nat), entry.info.resultSchema⟩
+  let definition : RunDefinition := { entry := entry.info.entry, input := toJson (5 : Nat), resultSchema := entry.info.resultSchema }
+  let historical : RunDefinition := { definition with image := some "sha256:old", program := some entry.info }
+  let recovered : RunDefinition ← unwrap (fromJson? (toJson historical))
+  assertEq recovered.image historical.image
+  assertEq (recovered.program.map toJson) (historical.program.map toJson) "Saved source metadata changed"
+  assertTrue (recovered.sameSubmission historical) "Identical submission rejected"
+  assertTrue (!(recovered.sameSubmission { historical with image := some "sha256:new" })) "Run reused across releases"
+  assertTrue (!(recovered.sameSubmission { historical with input := toJson (6 : Nat) })) "Run reused for different input"
+  let legacyDefinition : RunDefinition ← unwrap (fromJson? (Json.mkObj [
+    ("entry", toJson definition.entry), ("input", definition.input), ("resultSchema", toJson definition.resultSchema)]))
+  assertTrue (legacyDefinition.image.isNone && legacyDefinition.program.isNone) "Legacy source/release invented"
   let trace ← Trace.create "config-test"
   let assignment : Assignment := ⟨0, Location.root⟩
   let limited ← registered.execute { interpreterFuel := 1 } definition "test" ⟨store, pure #[]⟩ blobs trace assignment
@@ -79,6 +99,15 @@ def run : IO Unit := do
     | throw (IO.userError "Configured worker did not finish")
   assertEq root.outcome (.success (toJson (7 : Nat)))
   let registry : Registry := ⟨#[program.register]⟩
+  let config : Config ← unwrap (fromJson? json)
+  let client : ClientConfig := ⟨"test", "sha256:app", "public-token"⟩
+  let action := Application.deploymentRun registry config client (.control "request" "one" .pause)
+  let (rejected, _) := (Application.runWith host (failedControl false) action).run {}
+  let (uncertain, _) := (Application.runWith host (failedControl true) action).run {}
+  assertEq (toJson rejected) (toJson (.ok (.error "Rejected") : Except String (Except String Unit)))
+    "Recorded rejection lost its receipt boundary"
+  assertEq (toJson uncertain) (toJson (.error "Scheduler timeout" : Except String (Except String Unit)))
+    "Transport failure looked like a confirmed rejection"
   -- Registration at a different module bundles both imported workflow files.
   let some registered := LeanCloudRuntime.programs.programs[0]? | throw (IO.userError "No registered programs")
   assertTrue (registered.info.sources.any (·.file.endsWith "Demo.lean")) "Imported demo source missing"

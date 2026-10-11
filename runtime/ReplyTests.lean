@@ -189,6 +189,19 @@ private def scheduler : IO Unit := IO.FS.withTempFile fun _ inboxPath =>
         active
         emptyCache
         assertEq (← inboxContents) (0, 1)
+        -- Remote controls retry with a fresh reply inbox. Their durable IDs
+        -- protect ordering even after the first exchange and actor have gone.
+        IO.ofExcept (← LeanCloudRuntime.Pool.control config "client-pause" (.pause "retained"))
+        IO.ofExcept (← LeanCloudRuntime.Pool.control config "client-resume" (.resume "retained"))
+        active
+        stopScheduler
+        IO.sleep 700
+        child.set (some (← start configPath))
+        IO.ofExcept (← LeanCloudRuntime.Pool.control config "client-pause" (.pause "retained"))
+        active
+        rejects (do IO.ofExcept (← LeanCloudRuntime.Pool.control config "client-pause" (.kill "retained")))
+        active
+        assertEq (← snapshot).receipts.size 2 "Control receipts did not survive restart"
         let saved ← snapshot
         assertEq saved.state.runs.size 1 "Cleanup removed workflow state"
         assertEq saved.timings.size 1 "Cleanup removed workflow timing"

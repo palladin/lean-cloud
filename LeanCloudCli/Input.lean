@@ -2,23 +2,44 @@ import LeanCloudCli.Effects
 
 namespace LeanCloudCli.Input
 
+structure Mouse where
+  button : Nat
+  column : Nat
+  row : Nat
+  released : Bool := false
+  deriving BEq, Repr
+
 inductive Key where
   | text (value : String)
+  | mouse (event : Mouse)
+  | selectAll | scrollTop | scrollBottom
   | enter | tab | backTab | backspace | delete | left | right | home | end
   | up | down | pageUp | pageDown | interrupt | eof | escape | clear | killEnd
   | idle
   deriving BEq, Repr
+
+private def mouseKey (sequence : String) : Key := Id.run do
+  let release := sequence.endsWith "m"
+  unless sequence.startsWith "[<" && (release || sequence.endsWith "M") do return .idle
+  let [button, column, row] := (sequence.drop 2 |>.toString.dropEnd 1 |>.toString.splitOn ";")
+    | return .idle
+  let some button := button.toNat? | return .idle
+  let some column := column.toNat? | return .idle
+  let some row := row.toNat? | return .idle
+  unless column > 0 && row > 0 do return .idle
+  return .mouse ⟨button, column, row, release⟩
 
 private def sequenceKey : String → Key
   | "[A" => .up | "[B" => .down | "[C" => .right | "[D" => .left
   | "[H" | "OH" | "[1~" | "[7~" => .home
   | "[F" | "OF" | "[4~" | "[8~" => .end
   | "[3~" => .delete | "[5~" => .pageUp | "[6~" => .pageDown | "[Z" => .backTab
-  | _ => .idle
+  | "[1;5H" => .scrollTop | "[1;5F" => .scrollBottom
+  | sequence => mouseKey sequence
 
 private def escapeSequence : Cli String := do
   let mut sequence := ""
-  for _ in [:12] do
+  for _ in [:64] do
     let byte ← request (.key 20)
     if byte == 0 then break
     sequence := sequence.push (Char.ofNat byte.toNat)
@@ -52,13 +73,21 @@ def read (timeoutMs : UInt32 := 100) : Cli Key := do
   | 9 => return .tab
   | 10 | 13 => return .enter
   | 8 | 127 => return .backspace
-  | 1 => return .home
+  | 1 => return .selectAll
   | 5 => return .end
   | 11 => return .killEnd
   | 21 => return .clear
   | 27 =>
     let sequence ← escapeSequence
     if sequence == "[200~" then paste
+    else if sequence == "[M" then do
+      -- Consume old X10 reports as well, so their payload never becomes input.
+      let button ← request (.key 20)
+      let column ← request (.key 20)
+      let row ← request (.key 20)
+      if button < 32 || column ≤ 32 || row ≤ 32 then return .idle
+      return .mouse ⟨button.toNat - 32, column.toNat - 32, row.toNat - 32,
+        (button.toNat - 32) % 4 == 3⟩
     else return if sequence.isEmpty then .escape else sequenceKey sequence
   | value =>
     if value < 32 then return .idle

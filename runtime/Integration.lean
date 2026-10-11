@@ -3,12 +3,13 @@ import LeanCloudRuntime.Programs
 import LeanCloudTests.Generated
 import PoolTests
 import TestServices
+import ObjectStoreTests
 
 open Lean LeanCloud LeanCloudRuntime LeanCloudTests
 
 /-- Exercise the worker's terminal publication without a deployment coordinator. -/
 private def finalize (config : Config) (run : String) : IO Exit := do
-  let report ← Worker.finalize "test-worker" ⟨S3.records config.blobs run, pure #[]⟩ 0 (.cancelled "Killed by user")
+  let report ← Worker.finalize "test-worker" ⟨config.objects.records run, pure #[]⟩ 0 (.cancelled "Killed by user")
   assertOutcome report.progress (.ok .done)
   let some outcome ← completed config run | throw (IO.userError "Worker did not publish the terminal result")
   return outcome
@@ -24,9 +25,9 @@ private def checkPrograms (config : Config) (runPrefix : String) : IO Unit := do
   let process ← sumSquares.submit config (runPrefix ++ "-typed") input
   assertTrue (← process.poll).isNone "New typed process already completed"
   let trace ← Trace.create "registry-test"
-  let direct ← (DirectInterpreter.interpret (S3.storage config.blobs) Squares.workflow input).run
-  let recorded ← (SequentialReplay.interpret (trace.records (S3.records config.blobs process.id))
-    (trace.blobs (S3.storage config.blobs)) 1000
+  let direct ← (DirectInterpreter.interpret (config.objects.storage) Squares.workflow input).run
+  let recorded ← (SequentialReplay.interpret (trace.records (config.objects.records process.id))
+    (trace.blobs (config.objects.storage)) 1000
     (fun values => trace.instrument 1000 (Squares.workflow values)) input).run
   assertOutcome recorded direct
   assertOutcome (← process.await) (.ok 29)
@@ -50,49 +51,13 @@ private def checkPrograms (config : Config) (runPrefix : String) : IO Unit := do
   assertOutcome (← late.await) (.error ⟨.cancelled, "Killed by user"⟩)
 
 private def checkAdapters (config : Config) (runPrefix : String) : IO Unit := do
-  S3.initializeBucket config.blobs
-  let records := S3.records config.blobs runPrefix
-  let record : ReplayRecord := ⟨ReplayStore.returnRequest, .success (toJson (7 : Nat))⟩
-  assertEq (← records.read "missing") none
-  let tasks ← (Array.range 8).mapM fun i => IO.asTask (records.create "race"
-    { record with outcome := .success (toJson i) }) .dedicated
-  let accepted ← tasks.mapM fun task => IO.ofExcept task.get
-  let some winner ← records.read "race" | throw (IO.userError "Concurrent create lost the record")
-  for result in accepted do assertEq result winner "Writers did not agree on the canonical record"
-  assertEq (← records.create "race" record) winner "Retry overwrote canonical record"
-  let bytes := "global blobs: λ 🌍\n".toUTF8
-  let ref ← S3.putBytes config.blobs bytes
-  S3.name config.blobs (runPrefix ++ "/input") ref
-  let .ok resolved ← (S3.resolve config.blobs (runPrefix ++ "/input")).run
-    | throw (IO.userError "Cannot resolve test blob")
-  assertEq resolved ref
-  let .ok actual ← (S3.readBytes config.blobs ref).run
-    | throw (IO.userError "Cannot read test blob")
-  assertEq actual.data bytes.data
+  ObjectStoreTests.contract config.objects runPrefix
   let removed := runPrefix ++ "-remove"
-  let retained := removed ++ "-keep"
-  discard <| S3.createJson config.blobs retained "keep" (toJson (99 : Nat))
-  -- More than one listing page, plus a neighboring run and shared user blobs.
-  for i in [:129] do discard <| S3.createJson config.blobs removed s!"key-{i}" (toJson i)
-  S3.removeRun config.blobs removed
-  S3.removeRun config.blobs removed
-  assertTrue (← S3.isRemoved config.blobs removed) "Cleanup lost its durable removal marker"
-  for i in [:129] do assertEq (← S3.readJson config.blobs removed s!"key-{i}") none
-  assertEq (← S3.readJson config.blobs retained "keep") (some (toJson (99 : Nat)))
-  let .ok preserved ← (S3.readBytes config.blobs ref).run
-    | throw (IO.userError "Run cleanup removed a user blob")
-  assertEq preserved.data bytes.data
   let recreated ← try
     programs.submit config removed sumSquares.info.entry (toJson (#[1] : Array Nat))
     pure true
     catch _ => pure false
   assertTrue (!recreated) "Removed run accepted a new definition"
-  for invalid in #[{ ref with size := ref.size + 1 }, { ref with checksum := ref.checksum + 1 }] do
-    assertError (← (S3.readBytes config.blobs invalid).run) .integrity
-  assertError (← (S3.resolve config.blobs (runPrefix ++ "/missing")).run) .missingBlob
-  let invalidText ← S3.putBytes config.blobs (ByteArray.mk #[255])
-  assertError (← (DirectInterpreter.interpret (S3.storage config.blobs)
-    (fun _ : Unit => CloudBlob.readText invalidText) ()).run) .invalidUtf8
   IO.FS.withTempFile fun _ path => do
     let conn ← LeanLinq.Sqlite.connect path.toString
     let state := (Scheduler.handle 10 {} (.ready "adapter-worker")).1
@@ -174,7 +139,7 @@ private def checkIsolation (config : Config) (run : String) : IO Unit := do
 /-- Real HTTP/SQLite ports and S3 exercise the same scheduling core and replay step as Sim. -/
 private def compareProgram (config : Config) (run : String) (tree : Tree) (input : Nat) : IO Unit := do
   let program (_ : Unit) : Cloud IO Nat := lower tree input
-  let expected ← (DirectInterpreter.interpret (S3.storage config.blobs) program ()).run
+  let expected ← (DirectInterpreter.interpret (config.objects.storage) program ()).run
   IO.FS.withTempFile fun _ path => do
     let conn ← LeanLinq.Sqlite.connect path.toString
     try
@@ -183,13 +148,13 @@ private def compareProgram (config : Config) (run : String) (tree : Tree) (input
       let nodes := config.mailboxes.workers.extract 0 3
       let handles ← nodes.mapM fun node =>
         HttpMailbox.openMailbox node.endpoint run ("worker." ++ node.worker)
-      let records := S3.records config.blobs run
+      let records := config.objects.records run
       let workers := handles.mapIdx fun index handle => {
         id := nodes[index]!.worker
         inbox := HttpMailbox.inbox handle
         send := fun message => HttpMailbox.send config.mailboxes.scheduler run "scheduler" message
         observe := ⟨records, pure #[]⟩
-        blobs := S3.storage config.blobs : Worker.Ports IO }
+        blobs := config.objects.storage : Worker.Ports IO }
       let scheduler : SchedulerPorts IO := {
         inbox := HttpMailbox.inbox schedulerHandle
         localDb := ← TestServices.schedulerStore conn run
