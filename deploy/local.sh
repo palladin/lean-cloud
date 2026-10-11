@@ -40,6 +40,11 @@ spec="$directory/deployment.json"
 name=$(jq -er .name "$spec"); identifier "$name"
 [[ $(jq -r .directory "$spec") == "$directory" ]] || fail 'Deployment directory has moved; review its bind paths before use.'
 compose() { docker compose -p "$name" -f "$directory/compose.json" "$@"; }
+mounted_config_permissions() {
+  # The host directory stays 0700. Individually mounted files must be readable
+  # by both the worker and SeaweedFS UIDs, which differ from the host user.
+  chmod 644 "$directory/config.json" "$directory/s3.json" "$directory/filer.toml"
+}
 render() {
   jq --slurpfile spec "$spec" --rawfile client "$directory/client.token" --rawfile internal "$directory/internal.token" '
     $spec[0] as $s | .client={deployment:$s.name,image:$s.image,token:($client|rtrimstr("\n"))} |
@@ -48,9 +53,7 @@ render() {
     .mailboxes.workers=[range(1;$s.workers+1) | {worker:"worker\(.)",endpoint:{host:"worker\(.)-mailbox",port:8080,token:($internal|rtrimstr("\n"))}}]
     ' "$directory/config.json" > "$directory/config.next"
   mv "$directory/config.next" "$directory/config.json"
-  # The enclosing directory is 0700. The bind-mounted file must be readable by
-  # the container's UID 10001 on Linux, which differs from the host user's UID.
-  chmod 644 "$directory/config.json"
+  mounted_config_permissions
   jq -f "$assets/local.compose.jq" "$spec" > "$directory/compose.json"
 }
 owned_volume() {
@@ -68,6 +71,8 @@ verify_volumes() {
 }
 start() {
   verify_volumes
+  # Also repair configurations generated before these mount permissions were set.
+  mounted_config_permissions
   # Create every volume before any node starts; persist their names first.
   jq -r --arg name "$name" '.volumes|keys[]|$name+"_"+.' "$directory/compose.json" > "$directory/volumes.next"
   while IFS= read -r volume; do

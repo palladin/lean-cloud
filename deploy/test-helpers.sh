@@ -24,9 +24,20 @@ esac
 MOCK
 chmod +x "$work/bin/docker"
 export PATH="$work/bin:$PATH"
+assert_mode() {
+  local actual
+  actual=$(stat -c '%a' "$2" 2>/dev/null || stat -f '%Lp' "$2")
+  [[ "$actual" == "$1" ]] || { echo "Expected mode $1 for $2, got $actual"; exit 1; }
+}
 for count in 0 1 6; do
   dir="$work/local-$count"
   bash deploy/local.sh init "$dir" app:test "test-$count" "$count" 8080
+  # Native Linux bind mounts preserve host modes; containers use different UIDs.
+  assert_mode 700 "$dir"
+  for file in config.json s3.json filer.toml; do assert_mode 644 "$dir/$file"; done
+  for file in client.token internal.token blob-access.token blob-secret.token; do
+    assert_mode 600 "$dir/$file"
+  done
   jq -e --argjson count "$count" '.services|length==$count+2' "$dir/compose.json" >/dev/null
   jq -e --argjson count "$count" '.mailboxes.workers|length==$count' "$dir/config.json" >/dev/null
   jq -e '.client.token!=.mailboxes.scheduler.token and (.client.token|length)==64' "$dir/config.json" >/dev/null
