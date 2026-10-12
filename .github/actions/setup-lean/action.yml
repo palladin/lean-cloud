@@ -37,6 +37,7 @@ runs:
           .lake
           runtime/.lake
           Applications/CubeAndConquer/.lake
-        key: ${{ runner.os }}-${{ runner.arch }}-lake-v1-${{ inputs.scope }}-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json', 'runtime/lakefile.lean', 'runtime/lake-manifest.json', 'Applications/CubeAndConquer/lakefile.lean', 'Applications/CubeAndConquer/lake-manifest.json', '.github/actions/setup-lean/action.yml') }}-${{ github.sha }}
+          Applications/LeanVerify/.lake
+        key: ${{ runner.os }}-${{ runner.arch }}-lake-v1-${{ inputs.scope }}-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json', 'runtime/lakefile.lean', 'runtime/lake-manifest.json', 'Applications/CubeAndConquer/lakefile.lean', 'Applications/CubeAndConquer/lake-manifest.json', 'Applications/LeanVerify/lakefile.lean', 'Applications/LeanVerify/lake-manifest.json', '.github/actions/setup-lean/action.yml') }}-${{ github.sha }}
         restore-keys: |
-          ${{ runner.os }}-${{ runner.arch }}-lake-v1-${{ inputs.scope }}-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json', 'runtime/lakefile.lean', 'runtime/lake-manifest.json', 'Applications/CubeAndConquer/lakefile.lean', 'Applications/CubeAndConquer/lake-manifest.json', '.github/actions/setup-lean/action.yml') }}-
+          ${{ runner.os }}-${{ runner.arch }}-lake-v1-${{ inputs.scope }}-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json', 'runtime/lakefile.lean', 'runtime/lake-manifest.json', 'Applications/CubeAndConquer/lakefile.lean', 'Applications/CubeAndConquer/lake-manifest.json', 'Applications/LeanVerify/lakefile.lean', 'Applications/LeanVerify/lake-manifest.json', '.github/actions/setup-lean/action.yml') }}-

@@ -26,9 +26,3 @@ lean_exe sat_files where
 @[test_driver]
 lean_exe sat_tests where
   root := `Tests
-
-extern_lib sat_process pkg := do
-  let src ← inputTextFile (pkg.dir / "native" / "process.c")
-  let obj ← buildO (pkg.buildDir / "native" / "process.o") src
-    #["-I", (← getLeanInstall).includeDir.toString] #["-O2", "-Wall", "-Wextra", "-Werror"] "cc"
-  buildStaticLib (pkg.staticLibDir / nameToStaticLib "sat_process") #[obj]

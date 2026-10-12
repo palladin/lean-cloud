@@ -69,6 +69,9 @@ Deployment stays outside the console. The optional [shell helpers](deploy/README
 provide inspectable Docker, Kubernetes and OpenTofu files. Users can use their
 own deployment scripts and existing clusters. See the [console guide](LeanCloud/Console.md).
 
+Applications: [cube-and-conquer SAT solving](Applications/CubeAndConquer/README.md)
+and [LeanVerify](Applications/LeanVerify/README.md), which checks GitHub Lean projects by module.
+
 `||` combines the results of two computations into a pair. Use
 `Cloud.pure (fun _ => analyze input)` to record the result of a delayed pure
 calculation. Ordinary `pure value` and `return value` retain their usual meaning.

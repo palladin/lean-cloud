@@ -1,13 +1,13 @@
 # Applications
 
-The current application focus is distributed cube-and-conquer SAT solving:
+Applications built on the existing cloud effects and interpreters:
 
 | Application | Distributed work | Status |
 | --- | --- | --- |
 | [Cube-and-conquer SAT](CubeAndConquer/README.md) | Recursively split with `march_cu`, solve leaves with Kissat | Implemented; blob inputs, checked models, verified proof bundles |
+| [LeanVerify](LeanVerify/README.md) | Fetch a GitHub project, build and kernel-check its module dependency graph | Module artifacts, diagnostics and theorem/axiom reports |
 
-The application uses existing cloud effects and interpreters. See its
-[design](CubeAndConquer/Design.md) and [run instructions](CubeAndConquer/README.md).
+See each application's README for its input format, deployment and tests.
 
 ## Execution model
 

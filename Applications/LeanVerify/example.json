@@ -1,0 +1,6 @@
+{
+  "repository": "https://github.com/palladin/lean-eff",
+  "revision": "a9808ab3964376eedb54a3f9725d2e1c4c9fc800",
+  "modules": ["LeanEff"],
+  "theorems": []
+}

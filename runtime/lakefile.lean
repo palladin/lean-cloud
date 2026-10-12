@@ -39,6 +39,12 @@ lean_exe cloud_integration_tests where
 lean_exe cloud_storage_tests where
   root := `StorageIntegration
 
+extern_lib cloud_managed_process pkg := do
+  let src ← inputTextFile (pkg.dir / "native" / "managed_process.c")
+  let obj ← buildO (pkg.buildDir / "native" / "managed_process.o") src
+    #["-I", (← getLeanInstall).includeDir.toString] #["-O2", "-Wall", "-Wextra", "-Werror"] "cc"
+  buildStaticLib (pkg.staticLibDir / nameToStaticLib "cloud_managed_process") #[obj]
+
 extern_lib cloud_process_lock pkg := do
   let src ← inputTextFile (pkg.dir / "native" / "process_lock.c")
   let obj ← buildO (pkg.buildDir / "native" / "process_lock.o") src
