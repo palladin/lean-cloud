@@ -1,0 +1,6 @@
+c Every assignment to two variables is excluded.
+p cnf 2 4
+1 2 0
+1 -2 0
+-1 2 0
+-1 -2 0
