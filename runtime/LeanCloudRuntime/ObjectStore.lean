@@ -6,7 +6,9 @@ open Lean LeanCloud
 /-- Provider boundary for durable objects. `create` atomically selects one value
 and returns that value on every retry. `read` observes committed writes. `list`
 returns a bounded first page under a prefix; empty means no matching objects.
-Transport failures are IO exceptions, never workflow failures or missing data. -/
+Transport failures are IO exceptions, never missing data. The user-blob adapter
+converts them to workflow failures; journal/coordination callers leave them outside
+the user-effect boundary. -/
 structure ObjectStore where
   ensureContainer : IO Unit
   read : String → IO (Option ByteArray)
@@ -58,9 +60,9 @@ def resolve (store : ObjectStore) (name : String) : ExceptT CloudError IO BlobRe
   | .error _ => throw ⟨.codec, "Invalid blob name record"⟩
 
 def storage (store : ObjectStore) : BlobStorage IO where
-  putBlob bytes := liftM (store.putBytes bytes)
-  readBlob ref := store.readBytes ref
-  resolveBlob name := store.resolve name
+  putBlob bytes := captureIO (liftM (store.putBytes bytes))
+  readBlob ref := captureIO (store.readBytes ref)
+  resolveBlob name := captureIO (store.resolve name)
 
 def runPrefix (run : String) : Except String String := do
   unless !run.isEmpty && run.length ≤ 100 && run.toList.all (fun c =>

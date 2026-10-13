@@ -112,7 +112,7 @@ def Tools.prepareDirectory (tools : Tools) (store : ObjectStore) (request : Requ
   match prepared with
   | .error reason => return { error := reason, diagnostics := ← logs store directory }
   | .ok (toolchain, modules, snapshot) =>
-    -- Publication errors escape to the worker, so replay can retry preparation.
+    -- Cloud.exec records publication exceptions as execution failures.
     let source ← snapshot.publish store
     return { plan := some { commit, toolchain, modules, source := ← Files.putJson store source } }
 
@@ -146,7 +146,7 @@ def prerequisites (plan : Plan) (target : Module) : Array String := Id.run do
 def Tools.check (tools : Tools) (store : ObjectStore) (request : Request)
     (plan : Plan) (module : Module) (completed : Array ModuleResult) : IO ModuleResult :=
   withWorkspace fun directory => do
-    -- Blob transport errors propagate so the runtime can retry them.
+    -- Storage exceptions propagate to Cloud.exec; they are not proof rejections.
     let source : Bundle.Manifest ← Files.readJson store plan.source
     Bundle.restore store directory source request.limits.bytes
     let needed := prerequisites plan module

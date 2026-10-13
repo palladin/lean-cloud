@@ -136,16 +136,16 @@ private def liveFailure (config : Config) (runPrefix : String) : IO Unit := do
         assertTrue ((output.stderr.splitOn fuelError.message).length > 1) "Application omitted the failure reason"
       else
         assertEq (← IO.ofExcept (Json.parse output.stdout >>= fromJson? (α := Option Exit))) (some (.failure fuelError))
-    -- An IO transport exception produces no terminal report. The same assignment
-    -- can retry, and the shared worker can still complete another workflow.
+    -- Journal transport is outside user effects. It produces no terminal report;
+    -- a replacement node can recover the still-pending assignment.
     let healthy ← sumSquares.submit config (runPrefix ++ "-healthy") #[2, 3]
     let job ← assignment config first "worker1" healthy.id
     let broken : ReplayStore IO := { (config.objects.records healthy.id) with
       read := fun _ => throw (IO.userError "Temporary connection failure") }
     rejects (Worker.execute "worker1" ⟨broken, pure #[]⟩ (config.objects.storage)
       1000 Squares.workflow #[2, 3] job)
-    assertTrue (← healthy.poll).isNone "IO exception became a workflow result"
-    assertTrue (← LeanCloudRuntime.Pool.status config healthy.id).error.isNone "IO exception terminated the run"
+    assertTrue (← healthy.poll).isNone "Journal exception became a workflow result"
+    assertTrue (← LeanCloudRuntime.Pool.status config healthy.id).error.isNone "Journal exception terminated the run"
     report config healthy.id (← execute config healthy.id "worker1" 1000 #[2, 3] job)
     for _ in [:8] do
       if (← healthy.poll).isSome then break

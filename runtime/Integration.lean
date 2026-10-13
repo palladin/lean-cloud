@@ -211,6 +211,6 @@ def main (args : List String) : IO UInt32 := do
         let tree := (generate 3 seed).1
         try compareProgram config s!"{runPrefix}-{seed}" tree (seed % 7)
         catch error => throw (IO.userError s!"seed={seed}, program={reprStr tree}\n{error}")
-      IO.println "Real adapters: pool terminal failure/recovery and retryable IO, independent inbox services, durable redelivery, immutable writes, blob integrity, SQLite recovery, and 16 differential programs passed."
+      IO.println "Real adapters: pool terminal failure/recovery and journal failure isolation, independent inbox services, durable redelivery, immutable writes, blob integrity, SQLite recovery, and 16 differential programs passed."
     return 0
   catch error => IO.eprintln error.toString; return 1

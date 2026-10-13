@@ -14,7 +14,7 @@ def ready (pending : Array Module) (done : Array ModuleResult) : Array Module :=
   pending.filter fun m => m.imports.all fun dep =>
     done.any fun result => result.name == dep
 
-private def batches [Monad m] (backend : Backend m) (request : Request) (plan : Plan) :
+private def batches [Monad m] [MonadCloudExec m] (backend : Backend m) (request : Request) (plan : Plan) :
     Nat → Array Module → Array ModuleResult → Cloud m (Array ModuleResult)
   | 0, pending, done => pure <| done ++ pending.map fun m =>
       { name := m.name, status := .blocked, message := "Invalid dependency graph" }
@@ -31,7 +31,7 @@ private def batches [Monad m] (backend : Backend m) (request : Request) (plan : 
         (pending.filter fun m => !batch.any (·.name == m.name)) (done ++ results)
     }
 
-def workflow [Monad m] (backend : Backend m) (request : Request) : Cloud m Report := cloud {
+def workflow [Monad m] [MonadCloudExec m] (backend : Backend m) (request : Request) : Cloud m Report := cloud {
   match request.validate with
   | .error reason => Cloud.fail reason
   | .ok () => pure ()

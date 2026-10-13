@@ -44,8 +44,10 @@ def delay (body : Unit → Cloud m α) : Cloud m α := send Control.delay >>= bo
 
 def fail (message : String) : Cloud m α := send (.fail ⟨.application, message⟩)
 
-def exec [Codec α] (body : Unit → m α) (label : String := "") : Cloud m α :=
-  send (.command inferInstance (.exec label body))
+/-- An uncaught computation exception is a recorded failure. To recover or retry,
+handle the exception inside `body`; only node crashes trigger replay recovery. -/
+def exec [MonadCloudExec m] [Codec α] (body : Unit → m α) (label : String := "") : Cloud m α :=
+  send (.command inferInstance (.exec label fun _ => MonadCloudExec.capture (body ())))
 
 def parallel [Codec α] (branches : Array (Cloud m α)) : Cloud m (Array α) :=
   send (.parallel inferInstance branches.size (fun index => branches[index]))
@@ -60,7 +62,7 @@ def both [Codec α] [Codec β] (left : Cloud m α) (right : Cloud m β) : Cloud 
 /-- Compute a pure value and record it for replay. Unlike the ordinary monadic
 `pure value`, this is a delayed computation with a persisted result. -/
 def pure [Pure m] [Codec α] (body : Unit → α) (label : String := "") : Cloud m α :=
-  exec (fun _ => Pure.pure (body ())) label
+  send (.command inferInstance (.exec label fun _ => ExceptT.mk (Pure.pure (.ok (body ())))))
 
 end Cloud
 

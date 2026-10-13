@@ -1,5 +1,6 @@
 import LeanEff.Core
 import LeanCloud.Protocol
+import LeanCloud.Execution
 import LeanCloud.SourceInfo
 
 universe u
@@ -9,7 +10,7 @@ open Lean LeanEff
 
 /-- Primitive operations executed directly or recorded and replayed at a location. -/
 inductive Operation (m : Type → Type u) : Type → Type (max 1 u) where
-  | exec {α : Type} (label : String) (body : Unit → m α) : Operation m α
+  | exec {α : Type} (label : String) (body : Unit → ExceptT CloudError m α) : Operation m α
   | putBlob (bytes : ByteArray) : Operation m BlobRef
   | readBlob (ref : BlobRef) : Operation m ByteArray
   | resolveBlob (name : String) : Operation m BlobRef

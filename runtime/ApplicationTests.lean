@@ -98,6 +98,29 @@ def run : IO Unit := do
   let some root := (← journal.get).lookup (ReplayStore.returnKey Location.root)
     | throw (IO.userError "Configured worker did not finish")
   assertEq root.outcome (.success (toJson (7 : Nat)))
+  -- The registered worker path includes tracing. A user IO exception completes
+  -- the assignment with a durable failure; it does not escape or restart the node.
+  journal.set []
+  let calls ← IO.mkRef (0 : Nat)
+  let throwing : CloudProgram Nat Nat := {
+    name := "throws", version := "v1"
+    run := fun n => Cloud.exec fun _ => do
+      let previous ← calls.modifyGet fun count => (count, count + 1)
+      if previous == 0 then throw (IO.userError "application exception")
+      return n }
+  let throwingDefinition : RunDefinition := {
+    entry := throwing.info.entry, input := toJson (5 : Nat), resultSchema := throwing.info.resultSchema }
+  for _ in [:2] do
+    let done ← (registerProgram throwing #[]).execute {} throwingDefinition "test"
+      ⟨store, pure #[]⟩ blobs trace assignment
+    assertOutcome done.progress (.ok .done)
+  assertEq (← calls.get) 1 "Registered worker retried user IO"
+  assertOutcome (← store.outcome.run) (.ok (some (.failure ⟨.application, "application exception"⟩)))
+  -- The same worker can execute another workflow after that failure.
+  journal.set []
+  let next ← registered.execute {} definition "test" ⟨store, pure #[]⟩ blobs trace assignment
+  assertOutcome next.progress (.ok .done)
+  assertOutcome (← store.outcome.run) (.ok (some (.success (toJson (7 : Nat)))))
   let registry : Registry := ⟨#[program.register]⟩
   let config : Config ← unwrap (fromJson? json)
   let client : ClientConfig := ⟨"test", "sha256:app", "public-token"⟩

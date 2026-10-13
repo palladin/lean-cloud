@@ -66,8 +66,11 @@ HTTP API. The tests cover:
   every client-side cache.
 - Pause/resume/kill with another workflow continuing on the shared pool.
 - Zero capacity, growth and shrink through the helper's stop/start barrier.
+- Uncaught user IO exceptions complete as recorded failures without restarting
+  any node; the same pool continues serving other workflows.
 - Generated pure workflows, including failures, compared with DirectInterpreter
-  after blob outages, worker/scheduler network partitions and six seeded crashes.
+  after journal storage outages, a worker network partition, a scheduler pause,
+  and six seeded crashes.
   Checks cover the stop barrier, stale/duplicate messages, immutable confirmed
   records and completed results surviving another scheduler crash.
 

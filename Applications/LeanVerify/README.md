@@ -181,8 +181,8 @@ Tests compare direct and replay execution on generated dependency graphs, check
 replay reuse and failure propagation, and invoke the real compiler/kernel on a
 diamond project. Tests also recheck published exports, corrupt a proof in valid NDJSON,
 and exercise all paranoid checkers. They also verify modules containing unsafe/partial
-runtime code and retry interrupted source/artifact publication without recording a
-false proof failure. Negative cases cover invalid proofs, private
+runtime code and record source/artifact publication exceptions as execution failures,
+without automatic retry or a false proof rejection. Negative cases cover invalid proofs, private
 `sorry`, disallowed axioms, missing or non-theorem declarations, and toolchain mismatch.
 
 The optional container test fetches a pinned GitHub project and submits it through

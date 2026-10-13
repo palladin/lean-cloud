@@ -49,14 +49,6 @@ private def inspectRun (ctx : Context) (id : String) : Cli Unit := do
     if diagnostics.configuredWorkers == some 0 then printLine "No workers configured. Add capacity using your deployment tooling."
     unless diagnostics.stopping.isEmpty do
       printLine s!"Waiting for stop acknowledgement: {String.intercalate ", " diagnostics.stopping.toList}"
-  let traces ← Trace.load ctx run
-  for job in state.jobs do
-    if let .running worker attempt _ := job.status then
-      let latest := traces.steps.toList.reverse.find? fun step =>
-        step.event.worker == worker && step.event.attempt == some attempt
-      if let some step := latest then
-        if step.event.activity == "retrying" then
-          printLine s!"{safe worker}: {safe step.event.operation} after an IO/transport failure (last observation)"
   printHeading "LOCATION             STATUS       WORKER      ATTEMPT"
   for job in state.jobs do
     let (status, worker, attempt) := match job.status with

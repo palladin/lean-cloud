@@ -53,7 +53,10 @@ private def skipDelay (program : Cloud m α) : Cloud m α :=
 
 private def nextExec (program : Cloud Id α) : Cloud Id α :=
   match program with
-  | .impure _ (.command _ (.exec _ body)) next => next.apply (body ())
+  | .impure _ (.command _ (.exec _ body)) next =>
+    match (body ()).run with
+    | .ok value => next.apply value
+    | .error error => Cloud.send (.fail error)
   | program => program
 
 private def has (text fragment : String) : Bool := (text.splitOn fragment).length > 1

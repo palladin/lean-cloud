@@ -40,7 +40,7 @@ theorem Cursor.exec {journal current encode} (codec : Codec β) (label : String)
     (next : ArrsF (Control M) SourceSiteId β γ)
     (cursor : Cursor blobs source journal current encode (.impure info (.command codec (.exec label (fun _ => pure (body ())))) next))
     (present : journal.lookup (ReplayStore.valueKey current) =
-      some ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → M β)), .success (codec.encode (body ()))⟩)
+      some ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → ExceptT CloudError M β)), .success (codec.encode (body ()))⟩)
     (roundtrip : codec.decode (codec.encode (body ())) = .ok (body ())) :
     Cursor blobs source journal current.next encode (next.apply (body ())) := by
   obtain ⟨route, cost, replay⟩ := cursor

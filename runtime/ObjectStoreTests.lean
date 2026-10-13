@@ -64,11 +64,27 @@ def run : IO Unit := do
   let store ← model
   contract store "model"
   let ref ← store.putBytes "original".toUTF8
-  -- An unavailable provider is not a missing blob and must not be journaled as
-  -- an ordinary CloudError by an interpreter.
-  let unavailable := { store with read := fun _ => throw (IO.userError "Offline") }
+  -- Raw journal IO must escape; user-facing blob IO must become a recorded failure.
+  let unavailable := { store with
+    read := fun _ => throw (IO.userError "Offline")
+    create := fun _ _ => throw (IO.userError "Offline") }
   let failed ← try discard (unavailable.readBytes ref).run; pure false catch _ => pure true
-  assertTrue failed "Transport error became a workflow outcome"
+  assertTrue failed "Raw storage swallowed a transport exception"
+  for program in #[
+      (do discard <| CloudBlob.putText "value" : Cloud IO Unit),
+      (do discard <| CloudBlob.readBytes ref : Cloud IO Unit),
+      (do discard <| CloudBlob.resolve "input" : Cloud IO Unit)] do
+    let records ← model
+    let journal := records.records "blob-exception"
+    let run (blobs : BlobStorage IO) :=
+      (SequentialReplay.interpret journal blobs 100 (fun _ : Unit => program) ()).run
+    assertOutcome (← (DirectInterpreter.interpret unavailable.storage (fun _ : Unit => program) ()).run)
+      (.error ⟨.application, "Offline"⟩)
+    assertOutcome (← run unavailable.storage) (.error ⟨.application, "Offline"⟩)
+    -- The provider recovers, but replay keeps the original failure.
+    assertOutcome (← run store.storage) (.error ⟨.application, "Offline"⟩)
+  let failed ← try discard <| (unavailable.records "journal-failure").read "key"; pure false catch _ => pure true
+  assertTrue failed "Journal failure was confused with a user blob outcome"
   let corrupt := { store with read := fun _ => pure (some "corrupt!".toUTF8) }
   assertError (← (corrupt.readBytes ref).run) .integrity
   let deleted ← IO.mkRef (#[] : Array String)

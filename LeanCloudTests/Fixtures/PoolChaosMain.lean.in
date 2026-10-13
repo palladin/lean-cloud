@@ -13,6 +13,10 @@ def program : CloudProgram PoolWorkload.Input Nat := {
 def stressProgram : CloudProgram StressWorkload.Input Nat := {
   name := "stress", version := "v1", run := StressWorkload.workflow }
 
+def exceptionProgram : CloudProgram Nat Nat := {
+  name := "throws", version := "v1", sampleInput := some 7
+  run := fun _ => Cloud.exec fun _ => throw (IO.userError "User computation failed") }
+
 /-- Test-only inspection through the production S3 reader. It neither executes
 a workflow nor opens scheduler/inbox storage, and is not exposed by HTTP. -/
 private def readRecords (path : String) : IO UInt32 := do
@@ -31,4 +35,4 @@ private def readRecords (path : String) : IO UInt32 := do
 def main (args : List String) : IO UInt32 :=
   match args with
   | ["read-records", path] => readRecords path
-  | _ => Application.main ⟨#[program.register #[], stressProgram.register #[]]⟩ args
+  | _ => Application.main ⟨#[program.register #[], stressProgram.register #[], exceptionProgram.register #[]]⟩ args

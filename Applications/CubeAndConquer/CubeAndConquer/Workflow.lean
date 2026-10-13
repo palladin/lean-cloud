@@ -12,7 +12,7 @@ structure Backend (m : Type → Type) where
   verify : Request → CubeResult → m CubeResult
   finish : Request → Array CubeResult → m Report
 
-private def conquer [Monad m] (backend : Backend m) (request : Request)
+private def conquer [Monad m] [MonadCloudExec m] (backend : Backend m) (request : Request)
     (cube : Cube) : Cloud m (Array CubeResult) := cloud {
   let solved ← Cloud.exec (fun _ => backend.conquer request cube) "conquer"
   let checked ← Cloud.exec (fun _ => backend.verify request solved) "verify"
@@ -21,7 +21,7 @@ private def conquer [Monad m] (backend : Backend m) (request : Request)
 
 /-- Each successful split adds at least one decision, so at most `depth` rounds
 are needed. The actual path length enforces the total decision budget. -/
-private def solve [Monad m] (backend : Backend m) (request : Request) :
+private def solve [Monad m] [MonadCloudExec m] (backend : Backend m) (request : Request) :
     Nat → Cube → Cloud m (Array CubeResult)
   | 0, cube => conquer backend request cube
   | rounds + 1, cube => cloud {
@@ -44,7 +44,7 @@ private def solve [Monad m] (backend : Backend m) (request : Request) :
                 return results.flatten
     }
 
-def workflow [Monad m] (backend : Backend m) (request : Request) : Cloud m Report := cloud {
+def workflow [Monad m] [MonadCloudExec m] (backend : Backend m) (request : Request) : Cloud m Report := cloud {
   match request.validate with
   | .ok () => pure ()
   | .error reason => Cloud.fail reason

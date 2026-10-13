@@ -78,9 +78,10 @@ and [LeanVerify](Applications/LeanVerify/README.md), which checks GitHub Lean pr
 `||` combines the results of two computations into a pair. Use
 `Cloud.pure (fun _ => analyze input)` to record the result of a delayed pure
 calculation. Ordinary `pure value` and `return value` retain their usual meaning.
-`Cloud.exec` records the results of actions such as `IO` computations. Recorded results are reused
-during replay; an external action may run again if interrupted before its result
-is recorded.
+`Cloud.exec` records both returned values and uncaught `IO` exceptions. An exception
+becomes a `CloudError`; replay reuses that failure without retrying the computation.
+Catch exceptions or implement retries inside the supplied `IO` action when needed.
+Only crash recovery may repeat an action interrupted before its outcome was recorded.
 
 One scheduler organizes assignments and parallel joins through durable mailbox
 messages. Each worker and the scheduler runs its HTTP API and embedded SQLite inbox in the same Lean process

@@ -209,7 +209,7 @@ def replayCases : Array TestCase := invalidReplayCases ++ #[
     assertOutcome (← resume store captured) (.ok .done)
     let .ok (some outcome) ← store.outcome.run | throw (IO.userError "Missing root result")
     assertEq outcome (.success (toJson (42 : Nat)))⟩,
-  ⟨"replay/io-failure-is-not-a-workflow-result", do
+  ⟨"replay/exec-exception-is-a-recorded-failure-not-a-crash", do
     let saved ← IO.mkRef ([] : Records)
     let store := memoryStore saved
     let calls ← IO.mkRef 0
@@ -217,16 +217,52 @@ def replayCases : Array TestCase := invalidReplayCases ++ #[
       let previous ← calls.modifyGet fun n => (n, n + 1)
       if previous == 0 then throw (IO.userError "connection lost")
       return 7
-    let failed ← try
-      let _ ← resume store source
-      pure false
-    catch _ => pure true
-    assertTrue failed "IO exception was swallowed as a workflow result"
-    assertEq (← saved.get) [] "IO exception was persisted as a workflow result"
+    let error : CloudError := ⟨.application, "connection lost"⟩
+    assertOutcome (← (DirectInterpreter.interpret noBlobs (fun _ : Unit => source) ()).run) (.error error)
+    calls.set 0
     assertOutcome (← resume store source) (.ok .done)
-    assertEq (← calls.get) 2
-    let .ok (some outcome) ← store.outcome.run | throw (IO.userError "Missing retried result")
-    assertEq outcome (.success (toJson (7 : Nat)))⟩
+    assertEq ((← saved.get).lookup (ReplayStore.valueKey Location.root))
+      (some ⟨⟨"exec", "nat/v1", toJson ""⟩, .failure error⟩)
+    -- Even without the branch return record, replay must reuse the failed command.
+    saved.modify (·.filter (·.1 != ReplayStore.returnKey Location.root))
+    for _ in [:2] do assertOutcome (← resume store source) (.ok .done)
+    assertEq (← calls.get) 1 "Replay retried a throwing user computation"
+    assertOutcome (← store.outcome.run) (.ok (some (.failure error)))⟩,
+  ⟨"replay/user-code-can-catch-or-retry-its-own-exceptions", do
+    for retry in [false, true] do
+      let calls ← IO.mkRef 0
+      let action : IO Nat := do
+        let previous ← calls.modifyGet fun n => (n, n + 1)
+        if previous == 0 then throw (IO.userError "handled by the application")
+        return 7
+      let source : Cloud IO Nat := Cloud.exec fun _ => do
+        try action
+        catch _ => if retry then action else pure 7
+      let saved ← IO.mkRef ([] : Records)
+      let store := memoryStore saved
+      for _ in [:2] do assertOutcome (← resume store source) (.ok .done)
+      assertEq (← calls.get) (if retry then 2 else 1)
+      assertOutcome (← store.outcome.run) (.ok (some (.success (toJson (7 : Nat)))))⟩,
+  ⟨"replay/parallel-exceptions-complete-siblings-and-keep-array-error-order", do
+    let calls ← IO.mkRef (#[] : Array Nat)
+    let branches := (Array.range 3).map fun index => Cloud.exec (fun _ => do
+      calls.modify (·.push index)
+      if index < 2 then throw (IO.userError s!"error-{index}")
+      return index) s!"branch-{index}"
+    let source : Cloud IO (Array Nat) := Cloud.parallel branches
+    let expected : Except CloudError (Array Nat) := .error ⟨.application, "error-0"⟩
+    assertOutcome (← (DirectInterpreter.interpret noBlobs (fun _ : Unit => source) ()).run) expected
+    assertEq (← calls.get) #[0, 1, 2] "A throwing branch skipped later siblings"
+    calls.set #[]
+    let saved ← IO.mkRef ([] : Records)
+    let store := memoryStore saved
+    assertOutcome (← resume store source) (.ok (.fork Location.root 3))
+    for index in [2, 1, 0] do
+      assertOutcome (← resume store source ⟨index + 1, Location.root.child index⟩) (.ok .done)
+    for _ in [:2] do assertOutcome (← resume store source) (.ok .done)
+    assertEq (← calls.get) #[2, 1, 0]
+    let .ok (some outcome) ← store.outcome.run | throw (IO.userError "Missing parallel outcome")
+    assertOutcome (ReplayInterpreter.result (m := Id) outcome).run expected⟩
 ]
 
 end LeanCloudTests

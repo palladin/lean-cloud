@@ -52,7 +52,8 @@ structure Snapshot where
   paths : Array String
 
 /-- Validate the workspace before publishing. Invalid source/build output is a
-verification failure; a blob transport exception during publication must retry. -/
+verification failure; a blob transport exception during publication propagates
+as an execution failure, not a proof rejection. -/
 def prepare (root : System.FilePath) (limit : Nat)
     (build : Bool) (previous : Manifest := #[]) : IO Snapshot := do
   let mut total := 0

@@ -82,7 +82,7 @@ private def generatedTests : IO Unit := do
     check (!Bundle.safePath path) "Unsafe artifact path accepted"
   IO.println "PASS 80 generated module DAGs: ordering, failures, direct/replay agreement and replay reuse"
 
-private def restartTest : IO Unit := do
+private def executionFailureTest : IO Unit := do
   let saved ← IO.mkRef []
   let calls ← IO.mkRef (#[] : Array String)
   let stop ← IO.mkRef true
@@ -95,16 +95,16 @@ private def restartTest : IO Unit := do
       calls.modify (·.push m.name)
       if m.name == "Final" then
         if ← stop.modifyGet fun old => (old, false) then
-          throw (IO.userError "Injected worker stop")
+          throw (IO.userError "Verifier failed")
       return { name := m.name, status := .checked } }
   let req := { request with modules := #["Final"], theorems := #[] }
   let run := (SequentialReplay.interpret (journal saved) noBlobs 1000 (workflow backend) req).run
-  let interrupted ← try discard run; pure false catch _ => pure true
-  check interrupted "Worker stop did not interrupt verification"
-  let .ok report ← run | throw (IO.userError "Restart failed")
-  check (report.success && (← calls.get) == #["Base", "Final", "Final"])
-    "Restart repeated a recorded prerequisite or lost the interrupted job"
-  IO.println "PASS interrupted module retries while checked prerequisites are replayed"
+  for _ in [:2] do
+    let .error error ← run | throw (IO.userError "Throwing verifier did not fail the workflow")
+    check (error == ⟨.application, "Verifier failed"⟩) "Wrong execution failure"
+  check ((← calls.get) == #["Base", "Final"])
+    "Replay retried a failed verifier or repeated a recorded prerequisite"
+  IO.println "PASS verifier exceptions are recorded once; replay never retries them"
 
 private def copyFixture (source destination : System.FilePath) : IO Unit := do
   let out ← IO.Process.output { cmd := "cp", args := #["-R", source.toString ++ "/.", destination.toString] }
@@ -153,15 +153,13 @@ private def publicationTests (tools : Tools) (store : ObjectStore)
           tools.check flaky request plan module completed }
       let saved ← IO.mkRef []
       let run := (SequentialReplay.interpret (journal saved) noBlobs 1000 (workflow backend) req).run
-      let interrupted ← try discard run; pure false catch error =>
-        pure (((toString error).splitOn "Injected publication failure").length > 1)
+      for _ in [:2] do
+        let .error error ← run | throw (IO.userError "Publication failure did not fail the workflow")
+        check (error == ⟨.application, "Injected publication failure"⟩) "Wrong publication failure"
       check (!(← pending.get)) "Publication fault did not reach the intended blob"
-      check interrupted s!"Blob publication failure was recorded as a proof failure (artifact={artifact})"
-      let .ok report ← run | throw (IO.userError "Publication retry failed")
-      check report.success s!"Retry did not complete verification: {repr report}"
-      check ((← prepares.get) == (if artifact then 1 else 2) &&
-        (← checks.get) == (if artifact then 2 else 1)) "Retry repeated the wrong workflow effects"
-    IO.println "PASS source/artifact publication failures retry without recording false proof failures"
+      check ((← prepares.get) == 1 && (← checks.get) == (if artifact then 1 else 0))
+        "Replay retried failed publication after storage became healthy"
+    IO.println "PASS publication exceptions are execution failures, not crashes or proof rejections"
 
 private def nativeTests : IO Unit := do
   let tools ← Tools.fromEnvironment
@@ -315,5 +313,5 @@ private def nativeTests : IO Unit := do
 
 def main (args : List String) : IO Unit := do
   generatedTests
-  restartTest
+  executionFailureTest
   if args.contains "--native" then nativeTests

@@ -17,7 +17,7 @@ inductive Cursor : Journal → {β : Type} → Location → (β → Json) → Cl
       (next : ArrsF (Control WorkerM) SourceSiteId β γ)
       (cursor : Cursor journal current encode (.impure info (.command codec (.exec label (fun _ => pure (body ())))) next) cost)
       (present : journal.lookup (ReplayStore.valueKey current) =
-        some ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → WorkerM β)), .success (codec.encode (body ()))⟩)
+        some ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → ExceptT CloudError WorkerM β)), .success (codec.encode (body ()))⟩)
       (decoded : codec.decode (codec.encode (body ())) = .ok (body ())) :
       Cursor journal current.next encode (next.apply (body ())) (cost + 1)
   | joined {info} (codec : Codec β) (count : Nat) (branches : Fin count → Cloud WorkerM β)

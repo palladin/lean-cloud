@@ -87,14 +87,18 @@ private def crash (f : Fixture) (role : String) : IO Unit := do
 private def progress (f : Fixture) (runs : Array Run) : IO Unit := do
   let deadline := (← IO.monoMsNow) + 90000
   let mut baseline : Option Nat := none
+  let mut observation := "No snapshot received"
   repeat
-    let current ← try pure (some (← snapshots f runs)) catch _ => pure none
-    if let some current := current then
-      assertTrue (current.all (·.error.isNone)) "Transport failure became a workflow error"
+    let current : Except String (Array Scheduler.Snapshot) ←
+      try pure (.ok (← snapshots f runs)) catch error => pure (.error error.toString)
+    if let .error error := current then observation := error
+    if let .ok current := current then
+      assertTrue (current.all (·.error.isNone)) "Journal transport failure became a workflow error"
       let completed := current.foldl (fun n state => n + (state.jobs.filter (·.status == .done)).size) 0
-      if baseline.any (· < completed) then return
+      observation := s!"Completed jobs: {completed}; baseline: {baseline}"
+      if current.all (·.finished) || baseline.any (· < completed) then return
       if baseline.isNone then baseline := some completed
-    assertTrue ((← IO.monoMsNow) < deadline) "No progress after recovery"
+    assertTrue ((← IO.monoMsNow) < deadline) s!"No progress after recovery: {observation}"
     IO.sleep 500
 
 private def readRecords (f : Fixture) (keys : Array (String × Array String)) : IO (Array (String × Array (String × Json))) := do
@@ -122,7 +126,7 @@ private def blobOutage (f : Fixture) (runs : Array Run) : IO (Array (String × A
   try
     let deadline := (← IO.monoMsNow) + 90000
     repeat
-      assertTrue ((← snapshots f runs).all (·.error.isNone)) "Blob outage installed terminal error"
+      assertTrue ((← snapshots f runs).all (·.error.isNone)) "Journal outage installed terminal error"
       let failures ← storageFailures f
       if (failures.zip before).all (fun (after, prior) => after > prior) then break
       assertTrue ((← IO.monoMsNow) < deadline) "Blob outage did not exercise every worker"
@@ -203,13 +207,32 @@ private def partitions (f : Fixture) (runs : Array Run) : IO Interrupted := do
   healthy f old.worker
   progress f runs
   discard <| busy f runs
-  network f "scheduler" false
-  try IO.sleep 35000 finally network f "scheduler" true
+  -- Make the scheduler unresponsive without detaching its published port.
+  -- Docker Desktop can route that port to a stale/reused IP after reconnecting
+  -- a running container, even while internal workflow recovery succeeds.
+  discard <| external "docker" #["pause", scheduler]
+  event f "paused" [("node", toJson "scheduler")]
+  try IO.sleep 35000 finally discard <| external "docker" #["unpause", scheduler]
+  event f "unpaused" [("node", toJson "scheduler")]
   healthy f "scheduler"
   progress f runs
   return old
 
+private def userException (f : Fixture) : IO Unit := do
+  let nodes ← #["scheduler", "worker1", "worker2", "worker3"].mapM (node f)
+  let generations := nodes.mapM fun id => external "docker"
+    #["inspect", "--format", "{{.RestartCount}} {{.State.StartedAt}}", id]
+  let before ← generations
+  f.command ["run", "throws", "--id", "user-exception"]
+  let run ← cli (f.context.loadRun "user-exception")
+  let expected := Exit.failure ⟨.application, "User computation failed"⟩
+  assertEq (← cli (awaitOutcome f.context run ((← IO.monoMsNow) + 30000))) expected
+    "User exception escaped instead of completing the workflow"
+  assertEq (← generations) before "An ordinary user exception restarted a node"
+  event f "user-exception-recorded-without-node-restart"
+
 def chaos (f : Fixture) : IO Unit := do
+  userException f
   let seed := 7
   let inputs := PoolWorkload.inputs seed
   let mut runs := #[]
@@ -239,6 +262,7 @@ def chaos (f : Fixture) : IO Unit := do
   assertEq (toJson (← readRecords f (saved.map fun (id, records) => (id, records.map Prod.fst)))) (toJson saved)
     "Confirmed replay records changed"
   assertEq (← f.compose #["ps", "-a", "-q"]) identities "Recovery replaced deployed nodes"
-  event f "passed" [("seed", toJson seed), ("crashes", toJson (7 : Nat)), ("partitions", toJson (3 : Nat))]
+  event f "passed" [("seed", toJson seed), ("crashes", toJson (7 : Nat)),
+    ("partitions", toJson (2 : Nat)), ("schedulerPauses", toJson (1 : Nat))]
 
 end LeanCloudTests.ConsoleRuntime

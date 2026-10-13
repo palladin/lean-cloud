@@ -1,6 +1,7 @@
 import LeanCloudTests.ConsoleRemote
 import LeanCloudTests.PoolWorkload
 import LeanCloudTests.Support
+import Std.Async.TCP
 
 /-! Deployment is test setup, outside the HTTP-only console. Fault injection
 uses Docker explicitly; every workflow operation uses the real client API. -/
@@ -40,11 +41,21 @@ def Fixture.command (f : Fixture) (args : List String) : IO Unit :=
 def Fixture.wait (f : Fixture) (id : String) : IO Exit :=
   cli do awaitOutcome f.context (← f.context.loadRun id) ((← request .now) + 120000)
 
+private def availablePort : IO UInt16 := do
+  let socket ← Std.Async.TCP.Socket.Server.mk
+  socket.bind (.v4 ⟨.ofParts 127 0 0 1, 0⟩)
+  socket.listen 1
+  let .v4 address ← socket.getSockName | throw (IO.userError "Expected a loopback IPv4 socket")
+  return address.port
+
 def withFixture (suite image : String) (action : Fixture → IO Unit) : IO Unit := do
   let root ← IO.Process.getCurrentDir
   let name := s!"lean-cloud-{suite}-{← IO.Process.getPID}"
   let directory := root / ".lean-cloud" / name
-  discard <| external "bash" #["deploy/local.sh", "init", directory.toString, image, name, "3", "0"]
+  -- Assign a fixed port for this fixture. Docker may change an ephemeral port
+  -- on an automatic node restart, stranding the client during crash recovery.
+  let port ← availablePort
+  discard <| external "bash" #["deploy/local.sh", "init", directory.toString, image, name, "3", toString port]
   let ctx : Context := ⟨directory / "client", name⟩
   let f : Fixture := ⟨directory, ctx, ""⟩
   try

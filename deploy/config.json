@@ -1,8 +1,6 @@
 {
   "worker": {
-    "interpreterFuel": 100000,
-    "retryDelayMs": 500,
-    "retryMaxDelayMs": 5000
+    "interpreterFuel": 100000
   },
   "scheduler": {
     "database": "/data/scheduler.sqlite",

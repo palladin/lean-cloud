@@ -99,7 +99,8 @@ wrong formulas, invalid models and invalid proofs cannot establish UNSAT.
 
 Timeouts or failed certificate checks are **inconclusive**, never UNSAT. The
 bundle retains each task's outcome so unresolved cubes can be identified.
-Storage/transport failures use normal worker retry behavior. Certificates are
+Uncaught storage/transport exceptions inside a job are recorded execution failures;
+any desired retry must be implemented inside that job's IO action. Certificates are
 checked by the pinned external checker, **not a theorem proved in Lean**.
 
 Files are immutable, SHA-256-addressed **4 MiB blob chunks plus a manifest**.

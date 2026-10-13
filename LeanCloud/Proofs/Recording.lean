@@ -145,7 +145,7 @@ theorem exec_present (journal : Journal) (blobs : BlobStorage M) (branch : Locat
     (current : Location) (fuel : Nat) (codec : Codec α) (label : String) (body : Unit → α)
     (next : ArrsF (Control M) SourceSiteId α β)
     (present : journal.lookup (ReplayStore.valueKey current) =
-      some ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → M α)),
+      some ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → ExceptT CloudError M α)),
         .success (codec.encode (body ()))⟩)
     (roundtrip : codec.decode (codec.encode (body ())) = .ok (body ())) :
     (replay store blobs branch (fuel + 1) encode
@@ -164,7 +164,7 @@ theorem exec_within (journal expected : Journal) (blobs : BlobStorage M) (branch
     (roundtrip : codec.decode (codec.encode (body ())) = .ok (body ()))
     (consistent : Extends journal expected)
     (known : expected.lookup (ReplayStore.valueKey current) =
-      some ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → M α)),
+      some ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → ExceptT CloudError M α)),
         .success (codec.encode (body ()))⟩) :
     let operation : Operation M α := .exec label (fun _ => pure (body ()))
     let record : ReplayRecord := ⟨Internal.request codec operation, .success (codec.encode (body ()))⟩
@@ -177,7 +177,7 @@ theorem exec_within (journal expected : Journal) (blobs : BlobStorage M) (branch
   have accepted := create_within journal expected _ _ consistent known
   refine ⟨_, create_extends journal _ _, accepted.2, Writes.create _ _ _ _ rfl, ?_, ?_⟩
   · have visible := create_visible journal (ReplayStore.valueKey current)
-      ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → M α)),
+      ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → ExceptT CloudError M α)),
         .success (codec.encode (body ()))⟩
     exact visible.trans (congrArg some accepted.1)
   · intro fuel

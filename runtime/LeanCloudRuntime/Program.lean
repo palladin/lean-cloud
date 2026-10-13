@@ -53,54 +53,46 @@ def Registry.submit (registry : Registry) (config : Config) (run entry : String)
     entry, input, resultSchema := program.info.resultSchema
     image := config.client.map (·.image), program := some program.info }
 
-/-- Retry one inbox assignment locally. Transport failures never become Cloud
-errors. Every attempt checks ownership before touching records; cancellation
+/-- Execute one inbox assignment. User exceptions are already Cloud outcomes.
+A runtime failure escapes and stops the node without acknowledging this delivery;
+its supervisor can restart it and recover from the durable journal. Cancellation
 returns only after the active attempt and its heartbeat task have stopped. -/
 private def executeAssignment (registry : Registry) (config : Config) (id run : String)
     (assignment : Assignment) (finalize : Option Exit := none) (record : Trace.Recorder := fun _ => pure ()) : IO Unit := do
   let trace ← Trace.create id run record
   trace.assign assignment
-  let mut retries := 0
-  repeat
-    let revoked ← IO.mkRef false
-    try
-      Pool.withHeartbeat config run id assignment.attempt fun healthy => do
-        let check : IO Unit := do
-          healthy
-          let allowed : Bool ← IO.ofExcept (fromJson? (← Pool.request config (.check run id assignment.attempt)))
-          unless allowed do
-            revoked.set true
-            throw (IO.userError "Assignment revoked")
-        check
-        if finalize.isSome then config.objects.ensureContainer
-        let records := trace.records (config.objects.records run)
-        let guarded : ReplayStore IO := {
-          read := fun key => do check; records.read key
-          create := fun key value => do check; records.create key value }
-        let observed ← observe guarded
-        let report ← match finalize with
-          | some outcome => Worker.finalize id observed assignment.attempt outcome
-          | none => do
-            let definition ← loadRun config run
-            unless definition.image.all (fun image => config.client.any (·.image == image)) do
-              throw (IO.userError "Worker image does not match the submitted run")
-            let program ← IO.ofExcept (registry.find definition.entry)
-            program.execute config.worker definition id observed (trace.blobs (config.objects.storage)) trace assignment
-        match report.progress with
-        | .ok (.fork ..) => trace.emit "suspended" ""
-        | .ok .done => trace.emit (if finalize.isSome then "sealed" else "returned") ""
-        | .error error => trace.emit "failed" error.message
-        Pool.send config (.report run report)
-      break
-    catch error =>
-      if ← revoked.get then
-        trace.emit "revoked" ""
-        break
-      let wait := config.worker.retryWaitMs retries
-      retries := retries + 1
-      trace.emit "retrying" s!"retry {retries}; waiting {wait} ms"
-      IO.eprintln s!"worker {id}: {error}; local retry {retries} in {wait} ms"
-      IO.sleep wait
+  let revoked ← IO.mkRef false
+  try
+    Pool.withHeartbeat config run id assignment.attempt fun healthy => do
+      let check : IO Unit := do
+        healthy
+        let allowed : Bool ← IO.ofExcept (fromJson? (← Pool.request config (.check run id assignment.attempt)))
+        unless allowed do
+          revoked.set true
+          throw (IO.userError "Assignment revoked")
+      check
+      if finalize.isSome then config.objects.ensureContainer
+      let records := trace.records (config.objects.records run)
+      let guarded : ReplayStore IO := {
+        read := fun key => do check; records.read key
+        create := fun key value => do check; records.create key value }
+      let observed ← observe guarded
+      let report ← match finalize with
+        | some outcome => Worker.finalize id observed assignment.attempt outcome
+        | none => do
+          let definition ← loadRun config run
+          unless definition.image.all (fun image => config.client.any (·.image == image)) do
+            throw (IO.userError "Worker image does not match the submitted run")
+          let program ← IO.ofExcept (registry.find definition.entry)
+          program.execute config.worker definition id observed (trace.blobs (config.objects.storage)) trace assignment
+      match report.progress with
+      | .ok (.fork ..) => trace.emit "suspended" ""
+      | .ok .done => trace.emit (if finalize.isSome then "sealed" else "returned") ""
+      | .error error => trace.emit "failed" error.message
+      Pool.send config (.report run report)
+  catch error =>
+    if ← revoked.get then trace.emit "revoked" ""
+    else throw error
   trace.emit "idle" ""
 
 /-- One serial inbox loop serves every registered workflow. A cancellation reply
