@@ -159,6 +159,27 @@ structure ServerHandler where
   client : Option ClientHandler := none
   telemetry : Option (Json → IO Json) := none
 
+/-- API callbacks may block on storage or call this node's mailbox. Run them
+outside the async executor, which must remain free to serve those requests.
+Inbox.apply still serializes each SQLite transaction with its own mutex. -/
+private def respond (handler : ServerHandler) (path : String) (json : Json) : IO Json := do
+  let result : Except String Json ← try
+    IO.ofExcept (LeanCloud.Version.check "protocolVersion" "HTTP protocol" json)
+    match path with
+    | "/mailbox" =>
+      let command ← IO.ofExcept (fromJson? json)
+      pure (.ok (← Inbox.apply handler.store (← IO.monoMsNow) command))
+    | "/app" => pure (.ok (← handler.api json))
+    | "/deployment" => match handler.client with
+      | some client => pure (.ok (← client.api json))
+      | none => pure (.error "Deployment API is not configured")
+    | "/telemetry" => match handler.telemetry with
+      | some api => pure (.ok (← api json))
+      | none => pure (.error "Node telemetry is not configured")
+    | _ => pure (.error "Unknown endpoint")
+  catch error => pure (.error error.toString)
+  return LeanCloud.Version.response json (toJson result)
+
 open Std.Http in
 instance : Std.Http.Server.Handler ServerHandler where
   onFailure _ error := IO.eprintln s!"HTTP connection: {error}"
@@ -175,22 +196,7 @@ instance : Std.Http.Server.Handler ServerHandler where
     let response ← try
       let text : String ← request.body.readAll (maximumSize := some (8 * 1024 * 1024))
       let json ← IO.ofExcept (Json.parse text)
-      let result : Except String Json ← try
-        IO.ofExcept (LeanCloud.Version.check "protocolVersion" "HTTP protocol" json)
-        match (toString request.line.uri.path) with
-        | "/mailbox" =>
-          let command ← IO.ofExcept (fromJson? json)
-          pure (.ok (← Inbox.apply handler.store (← IO.monoMsNow) command))
-        | "/app" => pure (.ok (← handler.api json))
-        | "/deployment" => match handler.client with
-          | some client => pure (.ok (← client.api json))
-          | none => pure (.error "Deployment API is not configured")
-        | "/telemetry" => match handler.telemetry with
-          | some api => pure (.ok (← api json))
-          | none => pure (.error "Node telemetry is not configured")
-        | _ => pure (.error "Unknown endpoint")
-      catch error => pure (.error error.toString)
-      pure (LeanCloud.Version.response json (toJson result))
+      Std.Async.Async.ofAsyncTask (← IO.asTask (respond handler path json) .dedicated)
     catch error => pure (toJson (Except.error (α := Json) error.toString))
     Response.ok |>.json response.compress
 

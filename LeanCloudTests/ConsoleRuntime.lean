@@ -20,6 +20,8 @@ private def demo (f : Fixture) : IO Unit := do
   cli <| remoteClient (f.directory / "fresh-client") f.url token 4
   let run ← cli (f.context.loadRun "first")
   let timing ← cli ((·.timing) <$> f.context.observation run)
+  IO.println "Restarting the deployment and checking persisted results and timing…"
+  (← IO.getStdout).flush
   f.helper "down"
   f.helper "up"
   -- Ephemeral localhost ports can change when a stopped node starts again.
@@ -30,6 +32,8 @@ private def demo (f : Fixture) : IO Unit := do
     tokenEnv := "LEAN_CLOUD_TOKEN"
     tokenFile := some (f.directory / "client.token").toString }
   cli <| saveJson (f.context.home / "connection.json") connection
+  IO.println "Deployment restarted; checking the HTTP API…"
+  (← IO.getStdout).flush
   assertEq (← f.wait "first") (.success (toJson (55 : Nat)))
   assertEq ((← cli ((·.timing) <$> f.context.observation run)).map (·.span)) (timing.map (·.span))
   f.command ["remove", "second"]

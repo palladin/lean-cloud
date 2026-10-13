@@ -237,6 +237,39 @@ private def http : IO Unit := IO.FS.withTempFile fun _ path => do
     finally server.shutdownAndWait.block
   finally conn.close
 
+/-- Public requests can synchronously call this node's own mailbox. Even with
+one async executor thread, that mailbox must remain able to answer. -/
+private def reentrantHttp : IO Unit := IO.FS.withTempFile fun _ path => do
+  let conn ← LeanLinq.Sqlite.connect path.toString
+  try
+    let store ← Inbox.create conn
+    let endpoint ← IO.mkRef ({ host := "127.0.0.1", port := 0, token := "reentrant-test" } : HttpMailbox.Config)
+    let call : Json → IO Json := fun _ => do
+      HttpMailbox.call (← endpoint.get) ⟨"nested", "", .send "committed"⟩
+    let handler : HttpMailbox.ServerHandler := {
+      store, token := "reentrant-test", api := call,
+      client := some ⟨"public-test", call⟩, telemetry := some call }
+    let server ← (HttpServer.start (.v4 ⟨.ofParts 127 0 0 1, 0⟩) handler).block
+    try
+      let some (.v4 bound) := server.localAddr | throw (IO.userError "No HTTP address")
+      endpoint.modify fun config => { config with port := bound.port.toNat }
+      for (route, token) in [("app", "reentrant-test"), ("deployment", "public-test"), ("telemetry", "reentrant-test")] do
+        let response ← LeanCloudCli.Http.post s!"http://127.0.0.1:{bound.port}/{route}" token "{}" 10000
+        let result : Except String Json ← IO.ofExcept (Json.parse response >>= fromJson?)
+        discard <| IO.ofExcept result
+      discard <| Inbox.apply store 0 ⟨"nested", "reader", .open⟩
+      for _ in [:3] do
+        let some item ← take store 0 "nested" "reader" | throw (IO.userError "Nested HTTP send was lost")
+        assertEq item.payload "committed"
+        discard <| Inbox.apply store 0 ⟨"nested", "reader", .acknowledge item.receipt⟩
+    catch error =>
+      -- This runs in a child process. A starved server may also stall shutdown;
+      -- report the original timeout immediately instead of hanging the suite.
+      IO.eprintln s!"Nested HTTP failed: {error}"
+      IO.Process.exit 1
+    finally server.shutdownAndWait.block
+  finally conn.close
+
 private def signalWorker : IO Unit := do
   let server ← Std.Http.Server.new
   (HttpServer.stopOnSignal server).block
@@ -366,6 +399,7 @@ private def processCrash : IO Unit := IO.FS.withTempFile fun _ path => do
     try discard child.wait catch _ => pure ()
 
 def main (args : List String) : IO UInt32 := do
+  if args == ["reentrant-http"] then reentrantHttp; return 0
   if args == ["signal-worker"] then signalWorker; return 0
   if let ["crash-writer", path] := args then crashWriter path; return 0
   if let ["pool-scheduler", path] := args then
@@ -383,6 +417,10 @@ def main (args : List String) : IO UInt32 := do
     processCrash
     IO.println "SIGKILL recovery passed"
     processSignals
+    let nested ← IO.Process.output {
+      cmd := (← IO.appPath).toString, args := #["reentrant-http"],
+      env := #[("LEAN_NUM_THREADS", some "1")] }
+    assertEq nested.exitCode 0 s!"Reentrant HTTP request stalled the async executor: {nested.stderr}"
     http
     poolLeases
     SchedulerTests.run
