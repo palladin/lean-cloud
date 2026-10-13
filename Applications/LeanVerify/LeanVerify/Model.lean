@@ -6,6 +6,8 @@ open Lean LeanCloud LeanCloudRuntime
 /-- Sources and generated artifacts are immutable manifests in the global blob store. -/
 abbrev FileRef := LeanCloudRuntime.FileRef
 
+def standardAxioms : Array String := #["propext", "Classical.choice", "Quot.sound"]
+
 structure Limits where
   seconds : Nat := 600
   checkerMemoryMiB : Nat := 4096
@@ -18,7 +20,8 @@ structure Request where
   revision : String
   modules : Array String
   theorems : Array String := #[]
-  allowedAxioms : Array String := #["propext", "Classical.choice", "Quot.sound"]
+  allowedAxioms : Array String := standardAxioms
+  paranoid : Bool := false
   limits : Limits := {}
   deriving Repr, ToJson
 
@@ -40,7 +43,8 @@ instance : FromJson Request where
     revision := ← json.getObjValAs? _ "revision"
     modules := ← json.getObjValAs? _ "modules"
     theorems := ← field json "theorems" #[]
-    allowedAxioms := ← field json "allowedAxioms" #["propext", "Classical.choice", "Quot.sound"]
+    allowedAxioms := ← field json "allowedAxioms" standardAxioms
+    paranoid := ← field json "paranoid" false
     limits := ← field json "limits" {} }
 
 private def identifier (s : String) : Bool :=
@@ -57,9 +61,10 @@ def Request.validate (r : Request) : Except String Unit := do
       !r.revision.startsWith "-" && r.revision.toList.all
         (fun c => c.isAlphanum || "-._/".contains c) do
     throw "revision must be a Git commit, branch, or tag"
-  unless !r.modules.isEmpty && r.modules.all identifier && r.theorems.all identifier &&
-      r.allowedAxioms.all identifier && !r.allowedAxioms.contains "sorryAx" do
-    throw "Provide root module names and optional theorem names; sorryAx is never allowed"
+  unless !r.modules.isEmpty && r.modules.all identifier && r.theorems.all identifier do
+    throw "Provide root module names and optional theorem names"
+  unless r.allowedAxioms.all standardAxioms.contains do
+    throw "lake check permits only propext, Classical.choice and Quot.sound; allowedAxioms may restrict this set"
   unless 0 < r.limits.seconds && r.limits.seconds ≤ 3600 &&
       64 ≤ r.limits.checkerMemoryMiB && r.limits.checkerMemoryMiB ≤ 65536 &&
       0 < r.limits.bytes && r.limits.bytes ≤ 16 * 1024 * 1024 * 1024 &&
@@ -91,6 +96,7 @@ structure ModuleResult where
   name : String
   status : Status
   artifacts : Option FileRef := none
+  exportFile : Option FileRef := none
   diagnostics : Option FileRef := none
   message : String := ""
   theorems : Array Theorem := #[]
@@ -103,6 +109,8 @@ structure Report where
   toolchain : String := ""
   source : Option FileRef := none
   allowedAxioms : Array String := #[]
+  checker : String := "lake check"
+  paranoid : Bool := false
   success : Bool := false
   message : String := ""
   modules : Array ModuleResult := #[]
@@ -114,10 +122,10 @@ structure Preparation where
   error : String := ""
   deriving Repr, ToJson, FromJson
 
-instance : Codec Request := jsonCodec _ "lean-verify/request/v1"
-instance : Codec Preparation := jsonCodec _ "lean-verify/preparation/v1"
-instance : Codec ModuleResult := jsonCodec _ "lean-verify/module-result/v1"
-instance : Codec Report := jsonCodec _ "lean-verify/report/v1"
+instance : Codec Request := jsonCodec _ "lean-verify/request/v2"
+instance : Codec Preparation := jsonCodec _ "lean-verify/preparation/v2"
+instance : Codec ModuleResult := jsonCodec _ "lean-verify/module-result/v2"
+instance : Codec Report := jsonCodec _ "lean-verify/report/v2"
 
 /-- Reject malformed, cyclic, duplicate, or incomplete plans before starting jobs. -/
 def validateModules (modules : Array Module) : Except String Unit := do

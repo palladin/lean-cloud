@@ -1,7 +1,7 @@
 ARG APPLICATION_IMAGE=lean-cloud-verify-app:dev
 FROM ubuntu:24.04 AS checker
 ARG TARGETARCH
-ARG VERIFY_LEAN_VERSION=4.34.1
+ARG VERIFY_LEAN_VERSION=4.35.0
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl zstd \
     && rm -rf /var/lib/apt/lists/*
 RUN set -eu; \
@@ -15,17 +15,22 @@ FROM ${APPLICATION_IMAGE} AS application
 # Keep the large toolchain layer independent of application-code changes.
 FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git build-essential ca-certificates curl openssl tzdata libsqlite3-0 libcurl4t64 \
+    git build-essential bubblewrap ca-certificates curl openssl tzdata libsqlite3-0 libcurl4t64 \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 worker \
     && mkdir /data /mailbox && chown worker:worker /data /mailbox
 COPY --from=checker /opt/verify-lean /opt/verify-lean
 COPY Helper.lean /opt/lean-verify/Helper.lean
-COPY LICENSE-LeanChecker /opt/lean-verify/LICENSE-LeanChecker
+# Fail at image build time if a selected source release changes the helper APIs.
+RUN /opt/verify-lean/bin/lean /opt/lean-verify/Helper.lean
 COPY --from=application /usr/local/bin/cloud-app /usr/local/bin/cloud-app
 COPY --from=application /usr/local/bin/cloud-node /usr/local/bin/cloud-node
 ENV LEAN_VERIFY_TOOLCHAIN=/opt/verify-lean
 ENV LEAN_VERIFY_HELPER=/opt/lean-verify/Helper.lean
+# The default image checks trusted source in an isolated worker deployment.
+# Opt in to bubblewrap's nested namespaces with
+# LEAN_VERIFY_SANDBOX=1 only on a host configured to support nested namespaces.
+ENV LEAN_VERIFY_SANDBOX=0
 LABEL lean-cloud.node="http-inbox-v1"
 HEALTHCHECK --interval=3s --timeout=5s --start-period=10s --retries=40 CMD ["cloud-node", "health"]
 ENTRYPOINT ["cloud-node"]

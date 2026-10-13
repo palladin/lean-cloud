@@ -1,14 +1,10 @@
-/-
-Copyright (c) 2023 Kim Morrison. All rights reserved.
-The kernel replay below is adapted from Lean's LeanChecker.lean by Kim Morrison
-and Sebastian Ullrich, under Apache 2.0; see LICENSE-LeanChecker.
-Modifications: exact module selection, module planning and axiom policy checks.
-
-Runs under the SOURCE project's exact toolchain, not the worker's toolchain.
-   This file is shipped by LeanVerify and is never loaded from the repository. -/
+/- Runs under the SOURCE project's exact toolchain, not the worker's toolchain.
+   This file is shipped by LeanVerify and is never loaded from the repository.
+   It plans and exports modules; the separate `lake check` process verifies them. -/
 import Lake
 import Lake.Load
-import Lean.Replay
+import LeanExport.Basic
+import Lean.Util.CollectAxioms
 import Lean.Elab.ParseImportsFast
 
 open Lean Lake System
@@ -57,48 +53,32 @@ private partial def visit (ws : Workspace) (name : Name) (active : List Name)
   let row := Json.mkObj [("name", toJson name.toString), ("imports", toJson deps)]
   return (done.push name, rows.push row)
 
-private partial def axioms (env : Kernel.Environment) (name : Name)
-    (seen : NameSet := {}) (found : NameSet := {}) : NameSet × NameSet := Id.run do
-  if seen.contains name then return (seen, found)
-  let mut seen := seen.insert name
-  let some info := env.find? name | return (seen, found)
-  let mut found := if info matches .axiomInfo _ then found.insert name else found
-  let deps := info.type.getUsedConstants ++
-    (info.value? true).toArray.flatMap Expr.getUsedConstants
-  for dep in deps do
-    (seen, found) := axioms env dep seen found
-  return (seen, found)
+/-- Explicit roots include safe private/internal declarations that the exporter's
+default selection omits. Unsafe implementations are outside the exporter's scope. -/
+private def exportModule (module : Name) (requested allowed : Array String)
+    (exportPath output : String) : IO Unit := do
+  let env ← importModules #[{ module }] {} (level := .private)
+  let names := env.constants.toList.filterMap fun (name, info) =>
+    if !info.isUnsafe &&
+        (env.getModuleIdxFor? name).any (fun i => env.header.moduleNames[i.toNat]! == module)
+    then some name else none
+  let report : CoreM (Array Json) := do
+    let mut rows := #[]
+    for name in names do
+      let axioms := (← collectAxioms name).map Name.toString
+      unless axioms.all allowed.contains do
+        throwError "{name} uses disallowed axioms: {axioms}"
+      if requested.contains name.toString then
+        unless (env.find? name).any (fun c => c matches .thmInfo _) do
+          throwError "{name} is not a theorem"
+        rows := rows.push (Json.mkObj [("name", toJson name.toString), ("axioms", toJson axioms)])
+    return rows
+  let (rows, _) ← Core.CoreM.toIO report { fileName := "", fileMap := default } { env }
+  IO.FS.writeFile output (toJson rows).pretty
+  IO.FS.withFile exportPath .write fun handle =>
+    IO.withStdout (.ofHandle handle) (LeanExport.dumpEnv env (some names))
 
-/-- Recheck exactly one module, including its private declarations. This follows
-Lean's bundled LeanChecker.replayFromImports, without its prefix selection. -/
-private unsafe def checkModule (module : Name) (requested allowed : Array String) : IO Json := do
-  let path ← findOLean module
-  let mut files := #[path]
-  if ← (path.addExtension "server").pathExists then
-    files := files.push (path.addExtension "server")
-    if ← (path.addExtension "private").pathExists then
-      files := files.push (path.addExtension "private")
-  let parts ← readModuleDataParts files
-  let some (mod, _) := parts[0]? | throw (IO.userError "Empty module artifact")
-  let some (fullMod, _) := parts.back? | throw (IO.userError "Empty module artifact")
-  let (_, state) ← importModulesCore mod.imports |>.run
-  let env ← finalizeImport state mod.imports {} 0 false false (isModule := true)
-  let mut constants := {}
-  for name in fullMod.constNames, info in fullMod.constants do
-    constants := constants.insert name info
-  let checked ← env.toKernelEnv.replay constants
-  let mut rows : Array Json := #[]
-  for name in fullMod.constNames do
-    let names := (axioms checked name).2.toArray.map Name.toString
-    unless names.all allowed.contains do
-      throw (IO.userError s!"{name} uses disallowed axioms: {names}")
-    if requested.contains name.toString then
-      unless (checked.find? name).any (fun c => c matches .thmInfo _) do
-        throw (IO.userError s!"{name} is not a theorem")
-      rows := rows.push (Json.mkObj [("name", toJson name.toString), ("axioms", toJson names)])
-  return toJson rows
-
-unsafe def main (args : List String) : IO UInt32 := do
+def main (args : List String) : IO UInt32 := do
   try
     match args with
     | "plan" :: output :: limit :: roots =>
@@ -108,12 +88,12 @@ unsafe def main (args : List String) : IO UInt32 := do
       for root in roots do
         (done, rows) ← visit ws root.toName [] done rows (limit.toNat?.getD 10000)
       IO.FS.writeFile output (toJson rows).pretty
-    | ["check", module, policy, output] =>
+    | ["export", module, policy, exportPath, output] =>
       initSearchPath (← findSysroot)
       let json ← IO.ofExcept (Json.parse (← IO.FS.readFile policy))
       let requested : Array String ← IO.ofExcept (json.getObjValAs? _ "theorems")
       let allowed : Array String ← IO.ofExcept (json.getObjValAs? _ "allowedAxioms")
-      IO.FS.writeFile output (← checkModule module.toName requested allowed).pretty
-    | _ => throw (IO.userError "Expected plan OUTPUT LIMIT ROOT... or check MODULE POLICY OUTPUT")
+      exportModule module.toName requested allowed exportPath output
+    | _ => throw (IO.userError "Expected plan OUTPUT LIMIT ROOT... or export MODULE POLICY EXPORT OUTPUT")
     return 0
   catch error => IO.eprintln s!"{error}"; return 1

@@ -6,7 +6,7 @@ namespace LeanVerify
 def program (environment : IO (Tools × LeanCloudRuntime.ObjectStore)) :
     LeanCloud.CloudProgram Request Report := {
   name := "lean-verify"
-  version := "v1"
+  version := "v2"
   description := "Check a GitHub Lean project in parallel by module"
   run := fun request => workflow {
     prepare := fun request => do

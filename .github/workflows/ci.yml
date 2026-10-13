@@ -102,18 +102,25 @@ jobs:
           fi
           .lake/build/bin/cloud_app programs | jq -e '.[0].entry == "cube-and-conquer/v3"'
 
-      - name: Check LeanVerify with the real Lean kernel
+      - name: Install LeanVerify checker toolchain
+        run: elan toolchain install "$(cat Applications/LeanVerify/checker-toolchain)"
+
+      - name: Check LeanVerify with lake check
         working-directory: Applications/LeanVerify
-        timeout-minutes: 3
+        timeout-minutes: 5
         run: |
           shellcheck -x build.sh local-files.sh test-deployment.sh
-          export LEAN_VERIFY_TOOLCHAIN="$(lean --print-prefix)"
+          checker=$(cat checker-toolchain)
+          LEAN_VERIFY_TOOLCHAIN=$(elan run "$checker" lean --print-prefix)
+          export LEAN_VERIFY_TOOLCHAIN
           export LEAN_VERIFY_HELPER="$PWD/Helper.lean"
-          lean Helper.lean
+          # These are trusted regression fixtures, also run on macOS and Docker.
+          export LEAN_VERIFY_SANDBOX=0
+          elan run "$checker" lean Helper.lean
           lake build cloud_app verify_local verify_tests
           .lake/build/bin/verify_tests --native
-          .lake/build/bin/cloud_app programs | jq -e '.[0].entry == "lean-verify/v1"'
-          jq -c . example.json | .lake/build/bin/cloud_app validate lean-verify/v1
+          .lake/build/bin/cloud_app programs | jq -e '.[0].entry == "lean-verify/v2"'
+          jq -c . example.json | .lake/build/bin/cloud_app validate lean-verify/v2
 
   runtime:
     name: Runtime

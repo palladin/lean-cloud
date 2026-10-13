@@ -10,6 +10,8 @@ are trusted executable code (Lake configuration and Lean metaprograms). -/
 structure Tools where
   toolchain : System.FilePath
   helper : System.FilePath
+  /-- This applies to the export checker only. Source builds still require trust. -/
+  sandbox : Bool := true
 
 private def withWorkspace (action : System.FilePath → IO α) : IO α :=
   IO.FS.withTempDir fun root => do
@@ -18,7 +20,8 @@ private def withWorkspace (action : System.FilePath → IO α) : IO α :=
     action directory
 
 private def run (tools : Tools) (directory : System.FilePath) (limits : Limits)
-    (label command : String) (args : Array String) : IO (Except String Unit) := do
+    (label command : String) (args : Array String)
+    (files : Array (System.FilePath × Nat) := #[]) : IO (Except String Unit) := do
   let home := directory / ".." / "home"
   IO.FS.createDirAll home
   let out ← Process.runFiles {
@@ -28,23 +31,35 @@ private def run (tools : Tools) (directory : System.FilePath) (limits : Limits)
       s!"HOME={home}", "LANG=C.UTF-8", "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1",
       "LAKE_NO_CACHE=true", "LAKE_ARTIFACT_CACHE=false", command] ++ args
   } (limits.seconds * 1000) (directory / ".." / s!"{label}.stdout")
-    (directory / ".." / s!"{label}.stderr") (16 * 1024 * 1024)
+    (directory / ".." / s!"{label}.stderr") (16 * 1024 * 1024) files
   if out.stopped then return .error s!"{label}: time or output limit exceeded"
-  if out.exitCode != 0 then return .error s!"{label} failed (exit {out.exitCode}): {out.stderr.takeEnd 4000}"
+  if out.exitCode != 0 then
+    return .error s!"{label} failed (exit {out.exitCode}): {out.stdout.takeEnd 2000}\n{out.stderr.takeEnd 4000}"
   return .ok ()
 
 private def lake (tools : Tools) (directory : System.FilePath) (limits : Limits)
-    (label : String) (args : Array String) : IO (Except String Unit) :=
+    (label : String) (args : Array String)
+    (files : Array (System.FilePath × Nat) := #[]) : IO (Except String Unit) :=
   run tools directory limits label (tools.toolchain / "bin/lake").toString
-    (#["--no-cache", "--keep-toolchain"] ++ args)
+    (#["--no-cache", "--keep-toolchain"] ++ args) files
 
 private def runHelper (tools : Tools) (directory : System.FilePath) (limits : Limits)
-    (label : String) (args : Array String) : IO (Except String Unit) := do
+    (label : String) (args : Array String)
+    (files : Array (System.FilePath × Nat) := #[]) : IO (Except String Unit) := do
   -- Loading Lean Lake configurations requires Lake's native metaprogram support.
   let library := tools.toolchain / "lib/lean" /
     (if System.Platform.isOSX then "libLake_shared.dylib" else "libLake_shared.so")
   lake tools directory limits label (#["env", "lean", s!"-M{limits.checkerMemoryMiB}",
-    "--load-dynlib", library.toString, "--run", tools.helper.toString] ++ args)
+    "--load-dynlib", library.toString, "--run", tools.helper.toString] ++ args) files
+
+/-- Verify an immutable export using the source toolchain's official checker.
+No project artifacts are loaded into the checking process. No sandbox fallback. -/
+def Tools.verifyExport (tools : Tools) (directory : System.FilePath) (limits : Limits)
+    (exportPath : System.FilePath) (paranoid : Bool := false) : IO (Except String Unit) := do
+  let args := #["check", s!"--from-export={exportPath}"] ++
+    (if paranoid then #["--paranoid"] else #[]) ++
+    (if tools.sandbox then #[] else #["--inadvisably-no-sandbox"])
+  lake tools directory limits "check" args
 
 private def logs (store : ObjectStore) (directory : System.FilePath) : IO FileRef := do
   let mut texts : Array String := #[]
@@ -56,11 +71,25 @@ private def logs (store : ObjectStore) (directory : System.FilePath) : IO FileRe
 private def readJson [FromJson α] (path : System.FilePath) : IO α := do
   IO.ofExcept (Json.parse (← IO.FS.readFile path) >>= fromJson?)
 
+/-- Accept stable source releases with `lake check`. The deployed toolchain must
+still match the project exactly; this is a minimum version, not ABI compatibility. -/
+def Tools.sourceRelease (toolchain : String) : Except String String := do
+  let invalid := s!"LeanVerify requires a stable leanprover/lean4 release >= 4.35.0; project requires {toolchain}"
+  let ["leanprover/lean4", release] := toolchain.splitOn ":v" | throw invalid
+  let [major, minor, patch] := release.splitOn "." | throw invalid
+  let some major := major.toNat? | throw invalid
+  let some minor := minor.toNat? | throw invalid
+  let some patch := patch.toNat? | throw invalid
+  unless release == s!"{major}.{minor}.{patch}" &&
+      (major > 4 || (major == 4 && minor >= 35)) do
+    throw invalid
+  return release
+
 private def verifyToolchain (tools : Tools) (directory : System.FilePath) : IO String := do
   let expected := (← IO.FS.readFile (directory / "lean-toolchain")).trimAscii.toString
+  let release ← IO.ofExcept (Tools.sourceRelease expected)
   let version ← IO.Process.output { cmd := (tools.toolchain / "bin/lean").toString, args := #["--version"] }
-  let release := (expected.splitOn ":v").getLast!
-  unless expected == s!"leanprover/lean4:v{release}" && version.exitCode == 0 &&
+  unless version.exitCode == 0 &&
       version.stdout.startsWith s!"Lean (version {release}," do
     throw (IO.userError s!"Project requires {expected}; deploy an image with that exact Lean toolchain")
   return expected
@@ -69,18 +98,23 @@ private def verifyToolchain (tools : Tools) (directory : System.FilePath) : IO S
 revisions travel with them; prebuilt proof artifacts are excluded. -/
 def Tools.prepareDirectory (tools : Tools) (store : ObjectStore) (request : Request)
     (directory : System.FilePath) (commit : String) : IO Preparation := do
-  try
+  let prepared : Except String (String × Array Module × Bundle.Snapshot) ← try
     let toolchain ← verifyToolchain tools directory
     let planned ← runHelper tools directory request.limits "plan"
       (#["plan", "../verify-plan.json", toString request.limits.modules] ++ request.modules)
-    if let .error reason := planned then
-      return { error := reason, diagnostics := ← logs store directory }
+    IO.ofExcept planned
     let modules : Array Module ← readJson (directory / ".." / "verify-plan.json")
     IO.ofExcept (validateModules modules)
     -- Strip generated build products, including downloaded dependency caches.
-    let source ← Bundle.capture store directory request.limits.bytes false
+    let source ← Bundle.prepare directory request.limits.bytes false
+    pure (.ok (toolchain, modules, source))
+  catch error => pure (.error (toString error))
+  match prepared with
+  | .error reason => return { error := reason, diagnostics := ← logs store directory }
+  | .ok (toolchain, modules, snapshot) =>
+    -- Publication errors escape to the worker, so replay can retry preparation.
+    let source ← snapshot.publish store
     return { plan := some { commit, toolchain, modules, source := ← Files.putJson store source } }
-  catch error => return { error := toString error, diagnostics := ← logs store directory }
 
 def Tools.prepare (tools : Tools) (store : ObjectStore) (request : Request) : IO Preparation :=
   withWorkspace fun directory => do
@@ -122,37 +156,43 @@ def Tools.check (tools : Tools) (store : ObjectStore) (request : Request)
       let some ref := result.artifacts | throw (IO.userError "Missing checked prerequisite artifacts")
       imports ← IO.ofExcept (Bundle.merge imports (← Files.readJson store ref))
     Bundle.restore store directory imports request.limits.bytes
-    let result ← try
+    let result : Except String (Array Theorem × Bundle.Snapshot) ← try
       unless (← verifyToolchain tools directory) == plan.toolchain do
         throw (IO.userError "Toolchain changed since preparation")
       -- Lake supplies the project's flags and builds tactic/plugin prerequisites.
       let build ← lake tools directory request.limits "build" #["build", s!"+{module.name}:olean"]
       if let .error reason := build then throw (IO.userError reason)
       IO.FS.writeFile (directory / ".." / "verify-policy.json") (toJson request).pretty
-      let checked ← runHelper tools directory request.limits "check"
-        #["check", module.name, "../verify-policy.json", "../verify-checked.json"]
+      let exportPath := directory / ".." / "verify.ndjson"
+      let exported ← runHelper tools directory request.limits "export"
+        #["export", module.name, "../verify-policy.json", exportPath.toString, "../verify-checked.json"]
+        #[(exportPath, request.limits.bytes)]
+      if let .error reason := exported then throw (IO.userError reason)
+      let checked ← tools.verifyExport directory request.limits exportPath request.paranoid
       if let .error reason := checked then throw (IO.userError reason)
       let theorems : Array Theorem ← readJson (directory / ".." / "verify-checked.json")
-      pure (.ok theorems : Except String (Array Theorem))
+      let artifacts ← Bundle.prepare directory request.limits.bytes true imports
+      pure (.ok (theorems, artifacts))
     catch error => pure (.error (toString error))
     let diagnostics ← logs store directory
     match result with
     | .error message => return { name := module.name, status := .failed, message, diagnostics }
-    | .ok theorems =>
-      let artifacts ← try
-        pure (.ok (← Bundle.capture store directory request.limits.bytes true imports))
-      catch error => pure (.error (toString error) : Except String Bundle.Manifest)
-      match artifacts with
-      | .error message => return { name := module.name, status := .failed, message, diagnostics }
-      | .ok manifest => return {
-          name := module.name, status := .checked, diagnostics, theorems
-          artifacts := ← Files.putJson store manifest }
+    | .ok (theorems, snapshot) =>
+      let artifacts ← snapshot.publish store
+      return {
+        name := module.name, status := .checked, diagnostics, theorems
+        exportFile := ← Files.upload store (directory / ".." / "verify.ndjson") request.limits.bytes
+        artifacts := ← Files.putJson store artifacts }
 
 /-- Both paths are installed by the deployment image. Host tests can provide them. -/
 def Tools.fromEnvironment : IO Tools := do
   let toolchain := (← IO.getEnv "LEAN_VERIFY_TOOLCHAIN").getD "/opt/verify-lean"
   let helper := (← IO.getEnv "LEAN_VERIFY_HELPER").getD "/opt/lean-verify/Helper.lean"
-  return { toolchain := ← IO.FS.realPath toolchain, helper := ← IO.FS.realPath helper }
+  let sandbox ← match (← IO.getEnv "LEAN_VERIFY_SANDBOX").getD "1" with
+    | "1" => pure true
+    | "0" => pure false
+    | _ => throw (IO.userError "LEAN_VERIFY_SANDBOX must be 0 or 1")
+  return { toolchain := ← IO.FS.realPath toolchain, helper := ← IO.FS.realPath helper, sandbox }
 
 def Tools.backend (tools : Tools) (store : ObjectStore) : Backend IO :=
   ⟨tools.prepare store, tools.check store⟩

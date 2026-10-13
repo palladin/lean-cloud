@@ -26,8 +26,8 @@ private def skip (path : String) : Bool :=
   path.endsWith "lakefile.olean.trace" || path.endsWith "lakefile.olean.server" ||
   path.endsWith "lakefile.olean.private"
 
-/-- Do not follow links into the worker's filesystem. Each manifest is size bounded
-and each destination is relative to a new, exclusively owned workspace. -/
+/-- File links inside the checkout are captured as ordinary files. Never follow
+directory links or links outside the workspace. Restored manifests contain no links. -/
 private partial def enumerate (root : System.FilePath) (relative : String := "") : IO (Array String) := do
   let mut files := #[]
   for entry in ← (if relative.isEmpty then root else root / relative).readDir do
@@ -36,28 +36,45 @@ private partial def enumerate (root : System.FilePath) (relative : String := "")
     match metadata.type with
     | .dir => files := files ++ (← enumerate root name)
     | .file => unless skip name do files := files.push name
+    | .symlink =>
+      let target ← IO.FS.realPath entry.path
+      let rootPrefix := (← IO.FS.realPath root).toString ++ "/"
+      unless target.toString.startsWith rootPrefix && (← target.metadata).type == .file do
+        throw (IO.userError s!"Symlink must target a file inside the snapshot: {name}")
+      unless skip name do files := files.push name
     | _ => throw (IO.userError s!"Unsupported symlink or special file: {name}")
   return files
 
-def capture (store : ObjectStore) (root : System.FilePath) (limit : Nat)
-    (build : Bool) (previous : Manifest := #[]) : IO Manifest := do
+/-- Locally validated files, ready to publish while the workspace is alive. -/
+structure Snapshot where
+  root : System.FilePath
+  limit : Nat
+  paths : Array String
+
+/-- Validate the workspace before publishing. Invalid source/build output is a
+verification failure; a blob transport exception during publication must retry. -/
+def prepare (root : System.FilePath) (limit : Nat)
+    (build : Bool) (previous : Manifest := #[]) : IO Snapshot := do
   let mut total := 0
-  let mut entries := #[]
+  let mut paths := #[]
   for path in ← enumerate root do
     if isBuild path != build then continue
     let size := (← (root / path).metadata).byteSize.toNat
     total := total + size
     unless total ≤ limit do throw (IO.userError "Workspace exceeds configured artifact byte limit")
-    let hash ← Files.digest (root / path)
     if let some old := previous.find? (·.path == path) then
+      let hash ← Files.digest (root / path)
       unless hash == old.file.sha256 do
         throw (IO.userError s!"Build changed a prerequisite artifact: {path}")
-    else
-      entries := entries.push {
-        path
-        file := ← Files.upload store (root / path) limit
-        executable := ← executable (root / path).toString }
-  return entries
+    else paths := paths.push path
+  return { root, limit, paths }
+
+def Snapshot.publish (snapshot : Snapshot) (store : ObjectStore) : IO Manifest :=
+  snapshot.paths.mapM fun (path : String) => do
+    return {
+      path
+      file := ← Files.upload store (snapshot.root / path) snapshot.limit
+      executable := ← executable (snapshot.root / path).toString }
 
 def restore (store : ObjectStore) (root : System.FilePath) (manifest : Manifest)
     (limit : Nat) : IO Unit := do

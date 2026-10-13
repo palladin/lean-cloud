@@ -7,6 +7,7 @@ if [[ ! -d "$app" ]]; then "$root/deploy/new-app.sh" "$app" "$root"; fi
 mkdir -p "$app/ChaosFixture"
 printf '\nlean_lib ChaosFixture\n' > "$app/library.fragment"
 # Recreate metadata so preparation is idempotent.
+cp "$root/lean-toolchain" "$app/lean-toolchain"
 sed 's/APP_NAME/chaos-fixture/g' "$root/deploy/app/lakefile.lean.in" > "$app/lakefile.lean"
 cat "$app/library.fragment" >> "$app/lakefile.lean"
 cp "$root/LeanCloudTests/GeneratedProgram.lean" "$app/ChaosFixture/"

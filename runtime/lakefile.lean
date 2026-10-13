@@ -10,7 +10,7 @@ package lean_cloud_runtime where
 
 require lean_cloud from ".."
 require «lean-linq» from git
-  "https://github.com/palladin/lean-linq.git" @ "46ad2efaf9682991eaf1e9b19213d026ad5c20f9"
+  "https://github.com/palladin/lean-linq.git" @ "463e34a331e0912170b3116b76b98b17ca3a67bd"
 
 @[default_target]
 lean_lib LeanCloudRuntime

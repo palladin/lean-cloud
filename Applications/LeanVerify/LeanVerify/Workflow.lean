@@ -38,7 +38,7 @@ def workflow [Monad m] (backend : Backend m) (request : Request) : Cloud m Repor
   let prepared ← Cloud.exec (fun _ => backend.prepare request) "fetch and plan"
   let some plan := prepared.plan | return {
     repository := request.repository, revision := request.revision
-    allowedAxioms := request.allowedAxioms
+    allowedAxioms := request.allowedAxioms, paranoid := request.paranoid
     message := prepared.error
     modules := #[{ name := "prepare", status := .failed, diagnostics := prepared.diagnostics
                    message := prepared.error }] }
@@ -54,6 +54,7 @@ def workflow [Monad m] (backend : Backend m) (request : Request) : Cloud m Repor
     repository := request.repository, revision := request.revision
     commit := plan.commit, toolchain := plan.toolchain, success, modules := results
     source := plan.source, allowedAxioms := request.allowedAxioms
+    paranoid := request.paranoid
     message := if !missing.isEmpty then s!"Missing theorem(s): {String.intercalate ", " missing.toList}"
       else if success then "All requested modules and theorems checked"
       else "Verification failed; see module diagnostics" }

@@ -6,7 +6,7 @@ package lean_cloud where
   license := "MIT"
 
 require lean_eff from git
-  "https://github.com/palladin/lean-eff.git" @ "a9808ab3964376eedb54a3f9725d2e1c4c9fc800"
+  "https://github.com/palladin/lean-eff.git" @ "7adc93de965c30d02b8a8035c2c7efd0dcc75337"
 
 @[default_target]
 lean_lib LeanCloud where

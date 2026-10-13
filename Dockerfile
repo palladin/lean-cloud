@@ -4,7 +4,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsqlite3-dev freetds-dev default-libmysqlclient-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
 ARG TARGETARCH
-ARG LEAN_VERSION=4.34.1
+ARG LEAN_VERSION=4.35.0
 RUN set -eu; \
     case "$TARGETARCH" in arm64) platform=linux_aarch64 ;; amd64) platform=linux ;; *) exit 1 ;; esac; \
     curl -fL --retry 3 --connect-timeout 20 --max-time 180 --retry-max-time 180 \

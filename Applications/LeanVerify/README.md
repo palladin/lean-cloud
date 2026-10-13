@@ -6,10 +6,10 @@ workers; checked module artifacts and diagnostics are saved in global blob stora
 
 ```json
 {
-  "repository": "https://github.com/palladin/lean-eff",
-  "revision": "a9808ab3964376eedb54a3f9725d2e1c4c9fc800",
-  "modules": ["LeanEff"],
-  "theorems": []
+  "repository": "https://github.com/leanprover-community/batteries",
+  "revision": "66e469188fe07963e5cf666c7d4433f45b8131c5",
+  "modules": ["Batteries.Data.Nat.Bisect", "Batteries.Data.Nat.Bitwise.Lemmas"],
+  "theorems": ["Nat.avg_comm"]
 }
 ```
 
@@ -29,8 +29,9 @@ in the preparation step and its actual commit is recorded in the report.
 4. Run a batch of ready modules using `Cloud.parallel`. Each job restores the sources
    and its checked prerequisites into a separate workspace. Lake elaborates the module
    with the project's build options and prepares any required tactic/plugin artifacts.
-5. Recheck that module's declarations with Lean's kernel, using the same replay
-   operation as the bundled `leanchecker`. Include private/server module companions.
+5. Export that module's safe declarations, including private declarations, and their
+   dependencies using Lean's exporter. Run `lake check --from-export=...` on the
+   resulting NDJSON. The checking process reads the export, not project `.olean` files.
 6. Publish the new artifacts and diagnostics. Start the next ready batch.
 7. Return a report. A failed module blocks its dependents; unrelated modules still run.
 
@@ -45,11 +46,23 @@ references and small job descriptions enter the replay journal. Completed effect
 are reused after a worker restart. An interrupted external process may execute again.
 
 The report has `success`, the resolved `commit`, the exact `toolchain`, and one
-entry per module, the source snapshot and the allowed axioms. Each entry identifies its status, diagnostics, output manifest,
-and any requested theorems and their axiom dependencies. Output manifests contain
-content-addressed file references for `.olean`, its companions, and other Lake
+entry per module, the source snapshot and the allowed axioms. Each entry identifies
+its status, diagnostics, output manifest, and any requested theorems and their
+axiom dependencies. Each checked module also
+has an `exportFile` blob reference containing exactly the export accepted by
+`lake check`. The report records the checker and whether `paranoid` mode was used.
+Output manifests contain content-addressed file references for `.olean`, its companions, and other Lake
 artifacts. Checks reject changes to restored prerequisite artifacts and conflicting
 artifacts from different modules.
+
+Add `"paranoid": true` to the request to require all bundled additional checkers:
+`leanchecker-paranoid`, `lean4lean`, `nanoda`, `con-leche`, and `con-ron`.
+Any checker rejection or inability to run fails the module; no checker is skipped.
+
+Plain `lake check` operates on a project's default targets. LeanVerify uses its
+`--from-export` interface to preserve the requested module selection and distributed
+jobs. Each module export includes its declaration dependencies, so shared dependencies
+are rechecked across jobs. This costs more than a single whole-project check.
 
 ## Local deployment
 
@@ -97,55 +110,80 @@ bash deploy/local.sh clean .lean-cloud/verify --yes
 
 The worker application and the checked project have separate toolchains. The image
 ships the project's toolchain; jobs cannot select executable paths or install tools.
-The default image and the checker helper are tested with **Lean 4.34.1**. A different
-source toolchain can be installed with the second build argument:
+Source projects must use a stable **Lean 4.35.0 or later** release. `checker-toolchain`
+selects the default image toolchain, currently **4.35.0**. To build for another release,
+pass its exact version as the second argument to `build.sh`:
 
 ```sh
-bash Applications/LeanVerify/build.sh lean-cloud-verify:custom 4.34.1
+bash Applications/LeanVerify/build.sh lean-cloud-verify:dev 4.35.0
 ```
 
-The source project's version must match exactly. Other releases also need compatibility
-validation of `Helper.lean`, which uses Lean/Lake APIs. Nightly toolchains are not
-currently supported by the image builder.
+The source project's version must match the image's checker exactly; LeanVerify
+does not rewrite its `lean-toolchain`. The image build type-checks the helper with
+the selected release to detect API changes. **4.35.0 is currently tested**; accepting
+a newer version does not guarantee its compatibility. Test its export/check pipeline
+before deployment. The worker SDK uses its separate, pinned `lean-toolchain`.
 
 This checks **trusted project source**. Lake configuration, build scripts, plugins,
 and Lean metaprograms execute code. Run only repositories you trust in a dedicated
 worker deployment: a temporary workspace and cleared subprocess environment are
-not a security sandbox. This is Lean's own kernel rechecking generated artifacts,
-not an independent checker or Comparator's adversarial verification protocol.
+not a security sandbox. The default image explicitly sets `LEAN_VERIFY_SANDBOX=0`
+and invokes `lake check --inadvisably-no-sandbox`, without requiring Docker hosts
+to permit the nested namespaces used by bubblewrap. This retains the application's
+trusted-source boundary; it does not provide Lake's complete sandboxed build pipeline.
 
-The pinned toolchain's standard libraries are trusted. Project source modules in the
-requested closure are built and checked. Extra native support code needed by Lake is
-not certified by this application. By default the only permitted axioms are `propext`,
-`Classical.choice`, and `Quot.sound`; supply `allowedAxioms` explicitly for other
-assumptions. `sorryAx` is always rejected, including in private declarations.
+On Linux hosts configured for bubblewrap, set `LEAN_VERIFY_SANDBOX=1` to sandbox the
+export checkers. Outside the supplied image this is the default. Failure to start
+the sandbox is an error, never a fallback to unsandboxed checking. Source preparation
+and compilation still require a trusted repository in either mode.
+
+The default verification uses Lean's own kernel; `paranoid` adds other kernels and
+the hardened Lean checker. Neither mode compares theorem statements with an external
+specification, as Comparator does. An export alone does not establish source provenance:
+the report ties it to the resolved commit, source snapshot, module and build artifacts.
+
+Project source modules in the requested closure are built and checked. Toolchain
+declarations referenced by their exports are rechecked too. Native support code,
+unsafe implementations and compiler correctness are not certified by this application.
+The only permitted axioms are `propext`, `Classical.choice`, and `Quot.sound`, matching
+`lake check`. `allowedAxioms` may restrict that set, including `[]` for no axioms;
+it cannot extend it. `sorryAx` is always rejected in checked declarations, including
+private ones. Unsafe runtime declarations are excluded, as in Lean's exporter.
 
 The request's optional `limits` controls per-command `seconds` (default 600),
 `checkerMemoryMiB` (4096), total source/output `bytes` (2 GiB per snapshot or job),
-and the module count (10,000). Each command's diagnostic output is capped at 16 MiB
+and the module count (10,000). Each NDJSON export is also bounded by `bytes`.
+Each command's diagnostic output is capped at 16 MiB
 per stream. Use container memory and disk quotas for hard limits on Lake, native
 build tools, and temporary files; the checker memory option covers the helper only.
 
 Public GitHub HTTPS repositories, ordinary Lake layouts, and dependencies contained
-inside the snapshot are supported. Symlinks, Git submodules, and source dependencies
-outside the checkout are rejected. Large Mathlib/FLT-scale performance has **not**
-been validated. Batches have barriers, and workers currently restore temporary
+inside the snapshot are supported. File symlinks within the checkout are materialized
+as ordinary files in the snapshot. Directory links, external symlinks, Git submodules,
+and source dependencies outside the checkout are rejected. Large Mathlib/FLT-scale
+performance has **not** been validated. Batches have barriers, and workers currently restore temporary
 workspaces rather than keeping imported environments resident.
 
 ## Tests
 
 ```sh
 cd Applications/LeanVerify
-export LEAN_VERIFY_TOOLCHAIN="$(lean --print-prefix)"
+elan toolchain install "$(cat checker-toolchain)"
+export LEAN_VERIFY_TOOLCHAIN="$(elan run "$(cat checker-toolchain)" lean --print-prefix)"
 export LEAN_VERIFY_HELPER="$PWD/Helper.lean"
+# Trusted test fixtures; also works on macOS without Linux namespaces.
+export LEAN_VERIFY_SANDBOX=0
 lake build cloud_app verify_local verify_tests
 .lake/build/bin/verify_tests --native
 ```
 
 Tests compare direct and replay execution on generated dependency graphs, check
 replay reuse and failure propagation, and invoke the real compiler/kernel on a
-diamond project. Negative cases cover invalid proofs, `sorry`, missing or non-theorem
-declarations, and toolchain mismatch.
+diamond project. Tests also recheck published exports, corrupt a proof in valid NDJSON,
+and exercise all paranoid checkers. They also verify modules containing unsafe/partial
+runtime code and retry interrupted source/artifact publication without recording a
+false proof failure. Negative cases cover invalid proofs, private
+`sorry`, disallowed axioms, missing or non-theorem declarations, and toolchain mismatch.
 
 The optional container test fetches a pinned GitHub project and submits it through
 the normal HTTP client to three workers. It cleans up its own deployment on exit:

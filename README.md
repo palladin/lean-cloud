@@ -1,10 +1,13 @@
 # lean-cloud
 
 [![CI](https://github.com/palladin/lean-cloud/actions/workflows/ci.yml/badge.svg)](https://github.com/palladin/lean-cloud/actions/workflows/ci.yml)
-[![Lean 4](https://img.shields.io/badge/Lean-v4.34.1-blue)](https://leanprover.github.io/)
+[![Lean 4](https://img.shields.io/badge/Lean-%E2%89%A5%204.35.0-blue)](https://leanprover.github.io/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
 Parallel and distributed programming for Lean.
+
+Requires Lean **4.35.0 or later**. This repository pins **4.35.0** in
+`lean-toolchain` for reproducible builds; newer releases need compatibility testing.
 
 Use simple monadic code to split work into smaller computations, run them in
 parallel, and combine their results.

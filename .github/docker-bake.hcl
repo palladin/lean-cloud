@@ -1,5 +1,5 @@
 variable "LEAN_VERSION" {
-  default = "4.34.1"
+  default = "4.35.0"
 }
 
 // Also usable locally; CI adds its legacy GitHub cache imports via --set.

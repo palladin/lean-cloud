@@ -40,15 +40,17 @@ for ((attempt=0; attempt<300; attempt++)); do
 done
 compose logs --no-color > "$test_dir/containers.log" 2>&1
 [[ $ready == true ]] || { echo 'Timed out waiting for verification' >&2; exit 1; }
-if ! jq -e '.success == true and (.modules | length > 2)' "$test_dir/report.json" >/dev/null; then
+if ! jq -e '.success == true and .checker == "lake check" and
+    .toolchain == "leanprover/lean4:v4.35.0" and (.modules | length > 2) and
+    all(.modules[]; .exportFile != null)' "$test_dir/report.json" >/dev/null; then
   cat "$test_dir/report.json" >&2
   exit 1
 fi
 jq '.modules[-1].artifacts' "$test_dir/report.json" > "$test_dir/ref.json"
 bash "$app/local-files.sh" "$deployment" "$test_dir/ref.json" > "$test_dir/artifacts.json"
-jq -e 'any(.[]; .path | endswith("LeanEff.olean"))' "$test_dir/artifacts.json" >/dev/null
+jq -e 'any(.[]; .path | endswith("Batteries/Data/Nat/Bisect.olean"))' "$test_dir/artifacts.json" >/dev/null
 cli inspect modules > "$test_dir/inspect.log"
 cli watch modules --once > "$test_dir/watch.log"
 cli logs modules > "$test_dir/logs.log"
 [[ $(compose ps -q | sort) == "$before" ]] || { echo 'Submission changed containers' >&2; exit 1; }
-echo 'PASS GitHub source checkout, module jobs, kernel verification, artifact publication and HTTP monitoring'
+echo 'PASS GitHub source checkout, module jobs, lake check, export publication and HTTP monitoring'
