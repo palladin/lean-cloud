@@ -278,6 +278,47 @@ private def signalWorker : IO Unit := do
   (← IO.getStdout).flush
   repeat IO.sleep 1000
 
+/-- A node failure must not wait for an unrelated HTTP callback to return. -/
+private def nodeExitWorker (path : String) (throws : Bool) : IO UInt32 := do
+  let conn ← LeanLinq.Sqlite.connect path
+  let entered ← IO.mkRef false
+  let handler : HttpMailbox.ServerHandler := {
+    store := ← Inbox.create conn, token := "exit-test", api := fun _ => do
+      entered.set true
+      IO.sleep 30000
+      return Json.null }
+  let server ← (HttpServer.start (.v4 ⟨.ofParts 127 0 0 1, 0⟩) handler).block
+  try
+    let some (.v4 bound) := server.localAddr | throw (IO.userError "No HTTP address")
+    discard <| IO.asTask (LeanCloudCli.Http.post s!"http://127.0.0.1:{bound.port}/app"
+      "exit-test" "{}" 30000) .dedicated
+    HttpServer.runNode do
+      while !(← entered.get) do IO.sleep 10
+      if throws then throw (IO.userError "Node actor failed")
+      return 7
+  finally server.shutdownAndWait.block
+
+private def nodeExit : IO Unit := do
+  for mode in ["return", "throw"] do
+    IO.FS.withTempFile fun _ path => do
+      let child ← IO.Process.spawn {
+        cmd := (← IO.appPath).toString, args := #["node-exit-worker", path.toString, mode],
+        stdout := .null, stderr := .null }
+      let exited ← IO.mkRef false
+      try
+        let deadline := (← IO.monoMsNow) + 3000
+        repeat
+          if let some code ← child.tryWait then
+            exited.set true
+            assertEq code (if mode == "return" then 7 else 1) "Node exit status changed"
+            break
+          assertTrue ((← IO.monoMsNow) < deadline) "Node exit waited for an outstanding HTTP request"
+          IO.sleep 10
+      finally
+        unless ← exited.get do
+          try child.kill catch _ => pure ()
+          discard child.wait
+
 /-- The real Pool scheduler, SQLite persistence, and HTTP transport. No blob
 service is needed to test work ownership while a computation is busy. -/
 private def poolLeases : IO Unit := IO.FS.withTempFile fun _ inboxPath =>
@@ -400,6 +441,8 @@ private def processCrash : IO Unit := IO.FS.withTempFile fun _ path => do
 
 def main (args : List String) : IO UInt32 := do
   if args == ["reentrant-http"] then reentrantHttp; return 0
+  if args == ["node-exit"] then nodeExit; return 0
+  if let ["node-exit-worker", path, mode] := args then return ← nodeExitWorker path (mode == "throw")
   if args == ["signal-worker"] then signalWorker; return 0
   if let ["crash-writer", path] := args then crashWriter path; return 0
   if let ["pool-scheduler", path] := args then
@@ -417,6 +460,8 @@ def main (args : List String) : IO UInt32 := do
     processCrash
     IO.println "SIGKILL recovery passed"
     processSignals
+    nodeExit
+    IO.println "Node failures exit despite outstanding HTTP callbacks"
     let nested ← IO.Process.output {
       cmd := (← IO.appPath).toString, args := #["reentrant-http"],
       env := #[("LEAN_NUM_THREADS", some "1")] }

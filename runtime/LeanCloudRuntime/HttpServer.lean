@@ -4,6 +4,16 @@ import Std.Async.Signal
 namespace LeanCloudRuntime.HttpServer
 open Std Std.Http Std.Async
 
+/-- A node's actor owns its lifetime. Once it stops, terminate the process so
+the supervisor can restart it. Waiting for HTTP callbacks can deadlock: they
+may themselves be waiting for replies from the actor that just stopped.
+Committed SQLite transactions survive; unanswered requests may be retried. -/
+def runNode (actor : IO UInt32) : IO UInt32 := do
+  let code ← try actor catch error => IO.eprintln error; pure 1
+  (← IO.getStdout).flush
+  (← IO.getStderr).flush
+  IO.Process.exit code.toUInt8
+
 -- Poll the signal task itself. Std 4.34's Signal.Waiter.selector polls an outer
 -- task that merely installs the waiter, which can spuriously report a signal.
 private def signalSelector (signal : Signal.Waiter) : Selector Unit where

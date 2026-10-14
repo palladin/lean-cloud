@@ -339,7 +339,8 @@ def main (registry : Registry) (args : List String)
         let client := if command == "serve-scheduler" then config.client.map fun client =>
           { token := client.token, api := fun json => deploymentApi registry config client prepare json (some store) : HttpMailbox.ClientHandler }
           else none
-        HttpMailbox.withServer endpoint database api (execute (some store)) (handleSignals := true) (client := client)
+        HttpMailbox.withServer endpoint database api (HttpServer.runNode (execute (some store)))
+          (handleSignals := true) (client := client)
           (telemetry := some (Monitoring.api store))
     else execute none
   | _ => execute none
