@@ -34,5 +34,5 @@ counts and saves a report. Its type, `Cloud IO BlobRef`, tells us that the resul
 is a reference to that report in blob storage.
 
 - [Run locally with Docker](deploy/README.md#local-docker)
-- [Set up Azure](deploy/README.md#optional-azure--aws-infrastructure)
+- [Deploy and run the example on Azure](deploy/Azure.md)
 - [Run your first log-processing workflow](deploy/README.md#run-the-log-processing-example)

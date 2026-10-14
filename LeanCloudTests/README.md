@@ -77,7 +77,7 @@ HTTP API. The tests cover:
 Deployment setup and fault injection use Docker explicitly in the test driver;
 they are not CLI commands. Failure logs remain under `.lean-cloud/lean-cloud-*/`.
 CI builds both images together with a shared Buildx cache, then runs independent
-suites concurrently. These local tests do not provision Azure or AWS resources.
+suites concurrently. These local tests do not provision cloud resources.
 Run the same HTTP client checks against a separately deployed cluster:
 
 ```sh

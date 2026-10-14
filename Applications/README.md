@@ -126,5 +126,5 @@ logic, compare direct and replay execution with deterministic tool adapters,
 then run real-tool and crash/recovery integration tests.
 
 Develop the application first against local containers. The same registry and
-HTTP client path can then use existing Kubernetes, Azure or AWS deployment
+HTTP client path can then use existing Kubernetes or Azure deployment
 helpers; no application-specific cloud backend is needed.

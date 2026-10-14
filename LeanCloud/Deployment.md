@@ -6,11 +6,12 @@ blob storage. Each node owns its durable SQLite volume. Application registration
 is in `LeanCloudRuntime.Application`; users supply a registry to `Application.main`.
 
 The cloud console communicates only with the scheduler's authenticated
-`/deployment` API. Local Docker, existing Kubernetes, Azure and AWS deployments
+`/deployment` API. Local Docker, existing Kubernetes and Azure deployments
 use this same client path. Infrastructure management is external and replaceable.
 
 See [deployment helpers and examples](../deploy/README.md) for inspectable shell
 scripts, Compose generation, Kubernetes resources and OpenTofu modules.
+The [Azure walkthrough](../deploy/Azure.md) covers provisioning through cleanup.
 See [console commands](Console.md) for workflow operations.
 
 Deployment tooling must preserve stable node IDs, isolated durable inbox volumes,
