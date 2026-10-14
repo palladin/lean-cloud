@@ -17,16 +17,8 @@ From the repository directory:
 lake exe lean_cloud
 ```
 
-Inside the console:
-
-```text
-connect development http://127.0.0.1:8080 --token-file .deployment/client.token
-programs
-run sum-squares --id my-example
-ps
-watch my-example
-result my-example
-```
+Continue with [the log-processing example](#run-the-log-processing-example)
+to submit and watch your first workflow.
 
 The helper creates one scheduler, the specified workers, and local blob storage.
 Each node hosts its HTTP inbox and embedded SQLite database. Submitting a run
@@ -55,6 +47,37 @@ including when you choose a custom directory name. Generated applications also
 exclude credentials, provider state, and generated configs from Docker contexts.
 Keep these exclusions when supplying your own build files. `clean` retains
 the inspectable configuration; choose a fresh directory to deploy again.
+
+## Run the log-processing example
+
+Start the [local deployment](#local-docker) above, then enter these commands in
+the cloud console:
+
+```text
+connect development http://127.0.0.1:8080 --token-file .deployment/client.token
+programs
+run log-summary --id my-logs
+ps
+watch my-logs
+```
+
+The bundled application creates 16 sample log files in blob storage and processes
+them in parallel batches. `watch` shows the branch tree, source code, and workers.
+Press `q` to return to the prompt, then read the completed report:
+
+```text
+result my-logs
+```
+
+Expected output:
+
+```text
+files=16, errors=24
+```
+
+See the [workflow](../runtime/LeanCloudRuntime/Demo.lean) and
+[console guide](../LeanCloud/Console.md). For a remote deployment, connect to its
+scheduler endpoint instead; the workflow commands are the same.
 
 ## Your application
 
