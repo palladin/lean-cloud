@@ -135,8 +135,8 @@ def Tools.conquer (tools : Tools) (store : ObjectStore) (request : Request)
       | code, _ => pure (.error s!"Unexpected Kissat exit/status: {code}/{status}"))
     return { cube, answer, log }
 
-/-- A separate durable action reuses the published certificate after a checker
-crash. No solver workspace or unrecorded local pathname crosses this boundary. -/
+/-- A separate durable action reuses the published certificate after a node
+crashes during checking. No solver workspace or local pathname crosses this boundary. -/
 def Tools.verify (tools : Tools) (store : ObjectStore) (request : Request)
     (result : CubeResult) : IO CubeResult := do
   let .unverified formula proof := result.answer | return result

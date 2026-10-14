@@ -162,6 +162,29 @@ private def replayTests : IO Unit := do
     check (same recovered expected) s!"Recovery mismatch after write {stop}"
   IO.println "PASS 40 differential programs, cached replay and every-write recovery"
 
+private def exceptionTests : IO Unit := do
+  let calls ← IO.mkRef 0
+  let checks ← IO.mkRef 0
+  let reliable := modelBackend ⟨1, #[#[1], #[-1]]⟩ calls
+  let failing := { reliable with
+    verify := fun request result => do
+      let attempt ← checks.modifyGet fun n => (n, n + 1)
+      if attempt == 0 then throw (IO.userError "Checker IO failed")
+      reliable.verify request result }
+  let journal ← IO.mkRef []
+  let writes ← IO.mkRef 0
+  let request : CubeAndConquer.Request := { cnf := fakeRef "input", depth := 0 }
+  let replay := SequentialReplay.interpret (memoryStore journal none writes) noBlobs 10000
+    (workflow failing) request
+  -- This checker would succeed on a second invocation. Its first exception
+  -- is a durable execution failure, so replay must never make that invocation.
+  for _ in [:2] do
+    let .error error ← replay.run | throw (IO.userError "Checker exception did not fail the workflow")
+    check (error == ⟨.application, "Checker IO failed"⟩) "Wrong checker execution failure"
+  check ((← checks.get) == 1 && (← calls.get) == 1)
+    "Replay retried the checker or repeated the solver"
+  IO.println "PASS checker IO exceptions are recorded failures, never worker crashes"
+
 private def depthTests : IO Unit := do
   let request : CubeAndConquer.Request := { cnf := fakeRef "input", depth := 3, splitDepth := 2 }
   for invalid in [{ request with splitDepth := 0 }, { request with splitDepth := 9 },
@@ -331,30 +354,47 @@ private def realTools : IO Unit := do
     | throw (IO.userError "Depth-zero solving failed")
   check (direct.outcome == .unsat && direct.totalCubes == 1) "Depth-zero result was not one verified leaf"
   check ((← tools.verifyBundle store direct.bundle) == .unsat) "Depth-zero bundle recheck failed"
-  -- A crash during verification must reuse the already-recorded solve action.
-  let request : CubeAndConquer.Request := { cnf := ← Files.putText store "p cnf 1 2\n1 0\n-1 0\n" }
-  let solves ← IO.mkRef 0
-  let stop ← IO.mkRef true
-  let reliable := backend tools store
-  let crashing := { reliable with
-    conquer := fun request cube => do
-      solves.modify (· + 1)
-      reliable.conquer request cube
-    verify := fun request result => do
-      let result ← reliable.verify request result
-      if ← stop.modifyGet (fun was => (was, false)) then throw (IO.userError "Checker worker stopped")
-      return result }
-  let journal ← IO.mkRef []
-  let writes ← IO.mkRef 0
-  let replay := SequentialReplay.interpret (memoryStore journal none writes) noBlobs 10000
-    (workflow crashing) request
-  rejects replay.run "Checker fault did not fire"
-  let before ← solves.get
-  let .ok recovered ← replay.run | throw (IO.userError "Checker recovery failed")
-  check (recovered.outcome == .unsat && (← solves.get) == before && before == 1)
-    "Recovery reran Kissat instead of reusing the certificate"
-  for (_, record) in ← journal.get do
-    check (((toJson record).compress.splitOn "p cnf").length == 1) "CNF contents entered replay journal"
+  -- Crash outside user IO, immediately before/after the checker result's
+  -- journal commit. A committed result replays; an uncommitted one runs again.
+  let request : CubeAndConquer.Request := {
+    cnf := ← Files.putText store "p cnf 1 2\n1 0\n-1 0\n", depth := 0 }
+  for afterCommit in [false, true] do
+    let solves ← IO.mkRef 0
+    let checks ← IO.mkRef 0
+    let reliable := backend tools store
+    let counted := { reliable with
+      conquer := fun request cube => do
+        solves.modify (· + 1)
+        reliable.conquer request cube
+      verify := fun request result => do
+        checks.modify (· + 1)
+        reliable.verify request result }
+    let journal ← IO.mkRef []
+    let writes ← IO.mkRef 0
+    let pending ← IO.mkRef true
+    let base := memoryStore journal none writes
+    let interrupted : ReplayStore IO := { base with
+      create := fun key record => do
+        if record.request.kind == "exec" && record.request.payload.getStr?.toOption == some "verify" then
+          if ← pending.modifyGet (fun was => (was, false)) then
+            if afterCommit then discard (base.create key record)
+            throw (IO.userError "Worker stopped at checker journal commit")
+        base.create key record }
+    let replay := SequentialReplay.interpret interrupted noBlobs 10000 (workflow counted) request
+    try
+      discard replay.run
+      throw (IO.userError "Worker crash did not fire")
+    catch error =>
+      check (error.toString == "Worker stopped at checker journal commit") "Unexpected recovery exception"
+    check (!(← pending.get) && (← solves.get) == 1 && (← checks.get) == 1) "Missed the checker commit"
+    for _ in [:2] do
+      let .ok recovered ← replay.run | throw (IO.userError "Checker recovery failed")
+      check (recovered.outcome == .unsat && (← solves.get) == 1 &&
+        (← checks.get) == (if afterCommit then 1 else 2))
+        "Recovery repeated a committed action or lost an uncommitted check"
+    for (_, record) in ← journal.get do
+      check (((toJson record).compress.splitOn "p cnf").length == 1) "CNF contents entered replay journal"
+  IO.println "PASS worker crashes before/after checker commit reuse the solver certificate"
   IO.println s!"PASS real solver/checker, {count}-cube UNSAT bundle, independent recheck and forged evidence rejection"
 
 def main (args : List String) : IO UInt32 := do
@@ -362,6 +402,7 @@ def main (args : List String) : IO UInt32 := do
     modelTests
     depthTests
     replayTests
+    exceptionTests
     processTests
     fileTests
     if args == ["--tools"] then realTools

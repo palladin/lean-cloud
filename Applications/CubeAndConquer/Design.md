@@ -81,8 +81,10 @@ These checks use external tools and application validation, not Lean kernel proo
 Cubing, solving, verification and final publication are separate `Cloud.exec`
 actions. Each restores its immutable input into a private temporary workspace.
 Only cube descriptions and artifact references enter the replay journal. A
-recorded solver result can be reused if verification crashes, without rerunning
-Kissat. Workers never depend on another worker's temporary files.
+recorded solver result can be reused if the node crashes during verification,
+without rerunning Kissat. An uncaught IO exception is recorded as an execution
+failure; replay does not retry it. Workers never depend on another worker's
+temporary files.
 
 The application image contains pinned source builds of
 [march_cu](https://github.com/marijnheule/CnC),
@@ -96,7 +98,8 @@ Use larger `splitDepth` values to amortize repeated CNF loading and preprocessin
 Local caches and adaptive recubing of solver timeouts can be added after
 measurement; neither is required by this workflow.
 
-Tests cover generated formula oracles, direct/replay equivalence, every-write
-recovery, uneven splits, depth bounds, real recursive cubing, certificate
-corruption and a three-worker HTTP deployment. See the run instructions for
+Tests cover generated formula oracles, direct/replay equivalence, recorded IO
+failures, every-write recovery, crashes before/after checker-result commits,
+uneven splits, depth bounds, real recursive cubing, certificate corruption and
+a three-worker HTTP deployment. See the run instructions for
 native and deployment test commands.
