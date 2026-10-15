@@ -80,6 +80,7 @@ jobs:
       - name: Check application commands and HTTP inbox durability
         working-directory: runtime
         run: |
+          bash test-telemetry.sh
           lake build cloud_storage_tests
           lake exe cloud_inbox_tests
 

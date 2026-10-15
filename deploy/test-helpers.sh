@@ -17,6 +17,7 @@ cat > "$work/bin/docker" <<'MOCK'
 printf '%s\n' "$*" >> "$HELPER_TEST_LOG"
 case "$*" in
   'image inspect '* ) printf 'sha256:%064d\n' 1 ;;
+  'info --format {{.Name}}') printf 'test-machine\n' ;;
   *'volume inspect'*) exit 1 ;;
   *'compose '*down*) ;;
   'buildx build '* | 'build '*) ;;
@@ -40,6 +41,7 @@ for count in 0 1 6; do
     assert_mode 600 "$dir/$file"
   done
   jq -e --argjson count "$count" '.services|length==$count+2' "$dir/compose.json" >/dev/null
+  jq -e '[.services|to_entries[]|select(.key!="blobs")|.value.environment.CLOUD_NODE_NAME]|all(.=="test-machine")' "$dir/compose.json" >/dev/null
   jq -e --argjson count "$count" '.mailboxes.workers|length==$count' "$dir/config.json" >/dev/null
   jq -e '.client.token!=.mailboxes.scheduler.token and (.client.token|length)==64' "$dir/config.json" >/dev/null
   jq -e --slurpfile s3 "$dir/s3.json" '
@@ -71,6 +73,7 @@ bash deploy/kubernetes.sh render "$work/kube"
 jq -e '[.items[]|select(.kind=="StatefulSet")]|length==4 and all(.spec.replicas==0 and .spec.updateStrategy.type=="OnDelete" and .spec.persistentVolumeClaimRetentionPolicy.whenDeleted=="Retain")' "$work/kube/resources.json" >/dev/null
 jq -e '[.items[]|select(.kind=="Service")]|all(.spec.type=="ClusterIP")' "$work/kube/resources.json" >/dev/null
 jq -e '[.items[]|select(.kind=="PersistentVolumeClaim")]|length==4' "$work/kube/resources.json" >/dev/null
+jq -e '[.items[]|select(.kind=="StatefulSet")|.spec.template.spec.containers[0].env[]|select(.name=="CLOUD_NODE_NAME")]|length==4 and all(.valueFrom.fieldRef.fieldPath=="spec.nodeName")' "$work/kube/resources.json" >/dev/null
 if grep -q 'token\|secretKey' "$work/kube/resources.json"; then echo 'Credentials in preview'; exit 1; fi
 jq '.image="mutable:tag"' "$work/kube/deployment.json" > "$work/kube/next.json"
 mv "$work/kube/next.json" "$work/kube/deployment.json"

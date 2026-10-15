@@ -43,6 +43,7 @@ def styledCases : Array TestCase := #[
     let points : Array ResourceSample := #[
       { incarnation := "boot", timeNs := 1000000000, cpuNs := some 0 },
       { incarnation := "boot", timeNs := 2000000000, cpuNs := some 2500000000,
+        cpuCapacityMillis := some 1000,
         memory := some 1048576, memoryLimit := some 2097152,
         diskUsed := some 1048576, diskCapacity := some 2097152 }]
     let lines := (SnapshotMetrics.lines points 56).map Styled.plain
@@ -62,6 +63,28 @@ def styledCases : Array TestCase := #[
         let colored := Watch.frame ctx run #[] #[{ name := node.name, resources }] {} width height "" true
         assertEq (colored.map uncolor) plain
         assertTrue (plain.size < height && plain.all (·.length ≤ width)) "Resource frame escaped terminal dimensions"⟩,
+  ⟨"console.style.host-and-container-capacity", do
+    let before : ResourceSample := { incarnation := "boot", timeNs := 1000000000, cpuNs := some 0 }
+    let after : ResourceSample := {
+      incarnation := "boot", timeNs := 2000000000, cpuNs := some 1000000000,
+      nodeName := some "aks-node-1", hostname := some "worker1-0", cpuCores := some 8,
+      memoryCapacity := some 17179869184, cpuCapacityMillis := some 1500,
+      memory := some 1048576, memoryLimit := some 536870912 }
+    let lines := (SnapshotMetrics.lines #[before, after] 80).map Styled.plain
+    assertEq lines.size 9
+    assertEq lines[0]! "Node aks-node-1"
+    assertEq lines[1]! "Host 8 logical CPUs · 16.0 GiB RAM"
+    assertTrue (has lines[2]! "100.00% / 1.500 CPUs" && !has lines[2]! "+")
+      "CPU meter did not use fractional container capacity"
+    assertTrue (has lines[3]! "1.0 MiB / 512.0 MiB") "Host RAM replaced container limit"
+    let unknown := (SnapshotMetrics.lines #[before, { after with cpuCapacityMillis := none }] 80).map Styled.plain
+    assertTrue (has unknown[2]! "100.00%" && !has unknown[2]! "[") "Missing CPU capacity fabricated a meter"
+    let fallback := (SnapshotMetrics.lines #[{ after with nodeName := none }] 80).map Styled.plain
+    assertEq fallback[0]! "Container worker1-0"
+    let missing := (SnapshotMetrics.lines #[before] 80).map Styled.plain
+    assertEq missing[0]! "Container unavailable"
+    assertTrue (has missing[1]! "unavailable" && !has missing[1]! "0 logical CPUs")
+      "Missing host capacity became zero"⟩,
   ⟨"console.style.shared-theme-and-no-color", do
     let ctx : Context := ⟨"/work", "test"⟩
     let program : Cli (Context × Bool) := do

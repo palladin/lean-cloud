@@ -47,6 +47,20 @@ show the last view with frozen metrics. There is no history timeline. Source,
 telemetry and outcomes come from the API; caches allow a clearly labeled last
 view during an outage. `logs` is not a complete container-log archive.
 
+Both `watch` and `top` show each worker or scheduler's machine name, host logical
+CPU count and total RAM. The CPU and memory meters show container usage and
+capacity separately: 100% CPU means one logical CPU, and CPU capacity includes
+visible affinity and quota limits. A Kubernetes node can host several workers;
+on Docker Desktop, the host is its Linux VM. Missing metadata stays unavailable,
+with the container hostname used when no machine name is supplied.
+Capacity reflects limits visible inside the container. Parent limits can be
+shared with other containers; they do not reserve those resources for a worker.
+
+This requires an updated runtime image. The deployment helpers supply
+`CLOUD_NODE_NAME` from Docker's engine name or Kubernetes `spec.nodeName`. Custom
+deployment scripts can set the same environment variable; no infrastructure
+access is needed by the console.
+
 A submission prints its ID before sending. Retry with that same ID after an
 uncertain response. Control requests persist an idempotency key before sending;
 repeat the same command to resolve an uncertain result. Pause/kill acceptance

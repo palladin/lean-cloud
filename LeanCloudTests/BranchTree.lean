@@ -51,7 +51,10 @@ public def cases : Array TestCase := #[
       (workerStep 5 sibling sibling "ancestor").event with worker := "worker3" } }
     let active := (steps.extract 0 5) ++ #[jobStep 5 ⟨sibling, sibling, false, .running "worker3" 1 100⟩, other]
     let ctx : Context := ⟨"/work", "test"⟩
-    let histories : Array History := (Array.range 3).map fun i => ⟨ctx.node s!"worker{i+1}", #[], true⟩
+    let histories : Array History := (Array.range 3).map fun i => ⟨ctx.node s!"worker{i+1}", #[{
+      incarnation := "boot", timeNs := 1, nodeName := some s!"machine-{i+1}",
+      cpuCores := some 8, memoryCapacity := some 17179869184,
+      cpuCapacityMillis := some 2000, memory := some 1048576, memoryLimit := some 536870912 }], true⟩
     let view (selection : String) (trace := active) := String.intercalate "\n"
       (Watch.frame ctx run trace histories { tree := { selected := some selection } } 220 50 "result pending").toList
     let group := view "parallel/0:2"
@@ -60,12 +63,17 @@ public def cases : Array TestCase := #[
     assertTrue (has group "worker1 · idle" && has group "worker2 · branch 0:2/0:0" &&
       has group "worker3 · branch 0:2/1:0") "Worker cards lost current assignments"
     assertTrue (has group "Example.lean:3" && has group "Example.lean:2") "Workers did not show their own source locations"
+    for machine in ["machine-1", "machine-2", "machine-3"] do
+      assertTrue (has group ("Node " ++ machine)) "Parallel group lost worker placement"
+    for metric in ["8 logical CPUs", "16.0 GiB RAM", "I/O W"] do
+      assertTrue (has group metric) "Worker card clipped machine information or graphs"
     for page in [:3] do
       let narrow := String.intercalate "\n" (Watch.frame ctx run active histories
         { tree := { selected := some "parallel/0:2" }, workers := page } 120 35 "result pending").toList
       assertTrue (has narrow s!"worker{page + 1} ·") "Paging did not make every worker reachable"
     let selected := view "branch/0:2/0:0"
     assertTrue (has selected "worker2 · executing" && !has selected "worker3 · executing") "Branch showed another worker"
+    assertTrue (has selected "Node machine-2" && !has selected "Node machine-3") "Branch showed another machine"
     let done := view "branch/0:2/0:0" (active.push (jobStep 6 ⟨child, child, false, .done⟩))
     assertTrue (has done "No worker executing this branch" && !has done "worker2 · executing") "Completed branch kept its old live worker"
     let retry := active.push (jobStep 6 ⟨child, child, false, .running "worker2" 2 200⟩)

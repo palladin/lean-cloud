@@ -16,7 +16,9 @@ def node($role): resource("apps/v1";"StatefulSet";$role;$role) + {spec:{
     securityContext:{runAsNonRoot:true,runAsUser:10001,runAsGroup:10001,fsGroup:10001,seccompProfile:{type:"RuntimeDefault"}},
     containers:[{name:"node",image:$c.image,imagePullPolicy:"IfNotPresent",
       args:[(if $role=="scheduler" then "serve-scheduler" else "serve-worker" end),"/etc/lean-cloud/config.json"],
-      env:([{name:"CLOUD_INBOX_DATABASE",value:"/data/inbox.sqlite"}]+(if $role=="scheduler" then [] else [{name:"CLOUD_WORKER_ID",value:$role}] end)),
+      env:([{name:"CLOUD_INBOX_DATABASE",value:"/data/inbox.sqlite"},
+        {name:"CLOUD_NODE_NAME",valueFrom:{fieldRef:{fieldPath:"spec.nodeName"}}}]+
+        (if $role=="scheduler" then [] else [{name:"CLOUD_WORKER_ID",value:$role}] end)),
       ports:[{name:"http",containerPort:8080}],
       resources:{requests:{cpu:(($c.cpuMillis|tostring)+"m"),memory:(($c.memoryMiB|tostring)+"Mi")},limits:{memory:(($c.memoryMiB|tostring)+"Mi")}},
       securityContext:{allowPrivilegeEscalation:false,readOnlyRootFilesystem:true,capabilities:{drop:["ALL"]}},

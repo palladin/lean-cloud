@@ -79,12 +79,15 @@ def consoleCases : Array TestCase := #[
       timestamp := "1"
       event := ⟨"session", 1, 1, "worker1", some 0, "0:0", "execute", "", run.id, none⟩
       resources := some {
-        incarnation := "boot", timeNs := 1000000000,
+        incarnation := "boot", timeNs := 1000000000, nodeName := some "original-machine",
         memory := some 1048576, memoryLimit := some 4194304 } }
-    let live : History := ⟨ctx.node "worker1", #[{incarnation := "now", timeNs := 10, memory := some 9663676416}], true⟩
+    let live : History := ⟨ctx.node "worker1", #[{
+      incarnation := "now", timeNs := 10,
+      nodeName := some "replacement-machine", memory := some 9663676416 }], true⟩
     let text := String.intercalate "\n" (Watch.frame ctx run #[step] #[live] {} 180 40 "completed").toList
     assertTrue ((text.splitOn "1.0 MiB").length > 1 && (text.splitOn "LAST VIEW").length > 1) "Final snapshot lost its sample"
-    for label in ["9.0 GiB", "999.00%", "HISTORY", "Step ", "report worker"] do
+    assertTrue ((text.splitOn "Node original-machine").length > 1) "Final snapshot lost its original machine"
+    for label in ["replacement-machine", "9.0 GiB", "999.00%", "HISTORY", "Step ", "report worker"] do
       assertTrue ((text.splitOn label).length == 1) s!"Final view contains live stats or timeline: {label}"
     let restarted := { step with
       event := { step.event with seq := 2 },
@@ -104,10 +107,18 @@ def consoleCases : Array TestCase := #[
     let legacy := Json.mkObj [("timestamp", toJson "stamp"), ("event", toJson event)]
     let old ← unwrap (fromJson? (α := LeanCloudCli.Trace.Step) legacy)
     assertTrue old.resources.isNone "Legacy trace fabricated a sample"
-    let sample : ResourceSample := { incarnation := "boot", timeNs := 1000, memory := some 1234 }
+    let oldSample ← unwrap (fromJson? (α := ResourceSample)
+      (Json.mkObj [("incarnation", toJson "old"), ("timeNs", toJson (1 : Nat))]))
+    assertTrue (oldSample.nodeName.isNone && oldSample.hostname.isNone && oldSample.cpuCores.isNone &&
+      oldSample.memoryCapacity.isNone && oldSample.cpuCapacityMillis.isNone) "Legacy API fabricated host information"
+    let sample : ResourceSample := {
+      incarnation := "boot", timeNs := 1000, memory := some 1234,
+      nodeName := some "node", hostname := some "pod", cpuCores := some 4,
+      memoryCapacity := some 17179869184, cpuCapacityMillis := some 500 }
     let step : Trace.Step := { timestamp := "stamp", event, resources := some sample }
     assertEq (step.resources >>= (·.memory)) (some 1234)
     let cached ← unwrap (fromJson? (α := LeanCloudCli.Trace.Step) (toJson step))
-    assertEq (cached.resources >>= (·.memory)) (some 1234)⟩
+    assertEq (cached.resources >>= (·.memory)) (some 1234)
+    assertEq (cached.resources.map toJson) (some (toJson sample))⟩
 ]
 end LeanCloudTests

@@ -6,6 +6,7 @@ def node($role): {
   networks: {default: {aliases: [($role + "-mailbox")]}},
   command: [(if $role == "scheduler" then "serve-scheduler" else "serve-worker" end), "/etc/lean-cloud/config.json"],
   environment: ({CLOUD_INBOX_DATABASE:"/data/inbox.sqlite"} +
+    (if ($c.nodeName // "") == "" then {} else {CLOUD_NODE_NAME:$c.nodeName} end) +
     (if $role == "scheduler" then {} else {CLOUD_WORKER_ID:$role} end)),
   volumes: [($role + "-data:/data"), {type:"bind",source:($c.directory + "/config.json"),target:"/etc/lean-cloud/config.json",read_only:true}],
   logging: {driver:"json-file",options:{"max-size":"10m","max-file":"2"}}

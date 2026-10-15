@@ -126,8 +126,10 @@ def workerRoster (ctx : Context) (steps : Array Trace.Step) (histories : Array H
 
 private def workerColumns (count width : Nat) := min count (max 1 (min 3 (width / 44)))
 
+private def workerCardHeight (height : Nat) := min 14 (height - 1)
+
 private def workerCapacity (count width height : Nat) :=
-  max 1 (workerColumns count width * max 1 ((height - 1) / max 1 (min 12 (height - 1))))
+  max 1 (workerColumns count width * max 1 ((height - 1) / max 1 (workerCardHeight height)))
 
 private def workerGrid (ctx : Context) (run : Run) (steps : Array Trace.Step)
     (entries : Array BranchTree.Entry) (histories : Array History)
@@ -137,7 +139,7 @@ private def workerGrid (ctx : Context) (run : Run) (steps : Array Trace.Step)
   if count == 0 then return #[Styled.text "No workers" .muted]
   let columns := workerColumns count width
   let cellWidth := (width - (columns - 1) * 3) / columns
-  let cellHeight := min 12 (height - 1)
+  let cellHeight := workerCardHeight height
   let perPage := workerCapacity count width height
   let pages := max 1 ((count + perPage - 1) / perPage)
   let page := min page (pages - 1)
@@ -161,7 +163,7 @@ private def branchPanel (ctx : Context) (run : Run) (steps : Array Trace.Step)
   let code := if live && assigned.isSome && row.fork.isNone then
     executing steps entries (assigned.get!.1) else branchCode steps row
   let title := row.fork.map (fun fork => s!" Parallel {fork.key}") |>.getD s!" Branch {row.branch.key}"
-  let codeRows := if row.fork.isSome then min 5 (max 2 (height / 5)) else min 12 (max 2 (height - 14))
+  let codeRows := if row.fork.isSome then min 5 (max 2 (height / 5)) else min 12 (max 2 (height - 16))
   let mut lines := #[Styled.text (pad width title) .header,
     Styled.text row.status .cyan, Styled.text s!"Source: {sourceLabel run code}" .muted]
   lines := lines ++ sourceRows run code codeRows nav.offset

@@ -29,6 +29,13 @@ def rates (points : Array ResourceSample) (counter : ResourceSample → Option N
 private def value (format : Nat → String) (n : Option Nat) : String :=
   n.map format |>.getD "unavailable"
 
+private def cpus (millis : Nat) : String :=
+  if millis % 1000 == 0 then s!"{millis / 1000} CPUs"
+  else
+    let fraction := toString (millis % 1000)
+    let zeros := String.ofList (List.replicate (3 - fraction.length) '0')
+    s!"{millis / 1000}.{zeros}{fraction} CPUs"
+
 private def usage (label : String) (amount capacity : Option Nat) (detail : String) (width : Nat)
     (history : Array (Option Nat)) : Styled.Line :=
   let room := width - detail.length - label.length - 4
@@ -46,13 +53,21 @@ def lines (points : Array ResourceSample) (width : Nat) : Array Styled.Line := I
   let some current := points.back? | return #[Styled.text "Stats: unavailable in last view" .muted]
   let cpu := rates points (·.cpuNs) 100000
   let cpuValue := cpu.back? >>= id
+  let cpuDetail := value percent cpuValue ++
+    (current.cpuCapacityMillis.map (fun n => " / " ++ cpus n)).getD ""
+  let identity := match current.nodeName with
+    | some name => Styled.text "Node " .cyan ++ Styled.text name
+    | none => Styled.text "Container " .cyan ++ Styled.text (current.hostname.getD "unavailable")
   let counter (label : String) (get : ResourceSample → Option Nat) :=
     let values := rates points get
     let detail := value (fun n => humanBytes n ++ "/s") (values.back? >>= id)
     Styled.text (pad 7 label) .cyan ++ Styled.text (spark values (min 16 (width - 9 - detail.length))) .green ++
       Styled.text (" " ++ detail)
   return #[
-    usage "CPU" cpuValue (some 100000) (value percent cpuValue) width cpu,
+    identity,
+    Styled.text "Host " .cyan ++ Styled.text
+      (value (fun n => s!"{n} logical CPUs") current.cpuCores ++ " · " ++ value humanBytes current.memoryCapacity ++ " RAM"),
+    usage "CPU" cpuValue (current.cpuCapacityMillis.map (· * 100)) cpuDetail width cpu,
     usage "Mem" current.memory current.memoryLimit
       (value humanBytes current.memory ++ " / " ++ value humanBytes current.memoryLimit) width (points.map (·.memory)),
     usage "Disk" current.diskUsed current.diskCapacity

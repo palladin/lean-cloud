@@ -30,6 +30,10 @@ private def http : IO Unit := do
     let store ← ObservationStore.create observationConn "scheduler"
     let observed := { step 0 1 with
       event := { (step 0 1).event with worker := "scheduler" }
+      resources := some {
+        incarnation := "boot", timeNs := 1000,
+        nodeName := some "machine-1", hostname := some "scheduler-0", cpuCores := some 8,
+        memoryCapacity := some 17179869184, cpuCapacityMillis := some 1500 }
       job := some { branch := Location.root, location := Location.root, joining := false, status := .done } }
     store.record observed
     let config : Config ← unwrap (Json.parse (include_str "../deploy/config.json") >>= fromJson?)
@@ -54,6 +58,8 @@ private def http : IO Unit := do
           let connection ← LeanCloudCli.Client.connect url "TEST_TOKEN"
           LeanCloudCli.Client.call connection (.observations "one" "scheduler" none 17))
       assertTrue (received.items.any (·.job.isSome)) "Public API lost scheduler observations"
+      assertTrue (received.items.any (fun item => item.resources.map toJson == observed.resources.map toJson))
+        "SQLite/HTTP lost machine identity or capacity"
       let response ← LeanCloudCli.Http.post (url ++ "/telemetry") "internal-token" DeploymentApi.Request.nodes.encode.compress
       let node : DeploymentApi.Node ← unwrap ((← unwrap (Json.parse response >>= fromJson? (α := Except String Json))) >>= fromJson?)
       assertEq node.id "scheduler"
@@ -64,7 +70,20 @@ private def http : IO Unit := do
     finally server.shutdownAndWait.block
   finally inboxConn.close; observationConn.close
 
+private def nativeResources : IO Unit := do
+  -- Run on cgroup v2 Linux (including CI); unsupported hosts keep no sample.
+  if !(← System.FilePath.pathExists "/sys/fs/cgroup/cgroup.controllers") then return
+  let some sample ← Trace.resources | throw (IO.userError "Native resource sample could not be decoded")
+  assertTrue (sample.hostname.any (!·.isEmpty)) "Missing container hostname"
+  assertTrue (sample.cpuCores.getD 0 > 0 && sample.memoryCapacity.getD 0 > 0)
+    "Missing host CPU/RAM capacity"
+  assertTrue (sample.cpuCapacityMillis.getD 0 > 0) "Missing visible CPU capacity"
+  if let some name ← IO.getEnv "CLOUD_NODE_NAME" then
+    if !name.isEmpty && name.utf8ByteSize ≤ 255 then
+      assertEq sample.nodeName (some name) "Native JSON changed the deployment-provided name"
+
 def run : IO Unit := IO.FS.withTempFile fun _ path => do
+  nativeResources
   let conn ← LeanLinq.Sqlite.connect path.toString
   try
     let store ← ObservationStore.create conn "worker1"

@@ -10,7 +10,11 @@ private def keys (text : String) : List UInt32 := text.toUTF8.data.toList.map (�
 
 private def actors : Array Node := (Array.range 8).map fun i =>
   let role := if i == 0 then "scheduler" else s!"worker{i}"
-  { name := s!"demo-{role}", role, state := "running", resources := some #[{incarnation := "boot", timeNs := 1, memory := some 1048576}] }
+  { name := s!"demo-{role}", role, state := "running", resources := some #[{
+      incarnation := "boot", timeNs := 1, memory := some 1048576,
+      nodeName := some s!"machine-{i / 2}", hostname := some s!"{role}-0",
+      cpuCores := some 8, memoryCapacity := some 17179869184,
+      cpuCapacityMillis := some 1500, memoryLimit := some 536870912 }] }
 
 
 private def http (nodes : Array Node) (_url _token : String) (body : Json) : Except String Json := do
@@ -48,6 +52,10 @@ def topCases : Array TestCase := #[
     assertTrue (!has world.stdout "demo-blobs") "Infrastructure mixed with actors"
     for metric in ["CPU", "Mem", "Disk", "Net RX", "Net TX", "I/O R", "I/O W"] do
       assertTrue (has world.stdout metric) s!"Missing graph {metric}"
+    for machine in ["machine-0", "machine-1", "machine-2", "machine-3"] do
+      assertTrue (has world.stdout ("Node " ++ machine)) "Host placement missing from HTTP dashboard"
+    for capacity in ["8 logical CPUs", "16.0 GiB RAM", "1.500 CPUs", "512.0 MiB"] do
+      assertTrue (has world.stdout capacity) s!"Missing capacity {capacity}"
     assertTrue (!world.trace.contains "enterTerminal" &&
       !world.trace.contains "key" && !world.stdout.contains '\x1b') "Snapshot needed workflow metadata or a TTY"
     assertEq world.httpRequests.size 1⟩,
@@ -61,7 +69,7 @@ def topCases : Array TestCase := #[
   ⟨"console.top.resize-and-no-color", do
     let (_, world) ← checked (command ctx ["top"]) { initial with
       sizes := [(120, 35), (80, 24)], keys := [0, 113], envs := initial.envs.push ("NO_COLOR", "1") }
-    assertTrue (has world.stdout "1/2" && has world.stdout "1/4") "Resize did not adjust the grid"
+    assertTrue (has world.stdout "1/2" && has world.stdout "1/8") "Resize did not adjust the grid"
     assertTrue (!has world.stdout "\x1b[0;32m" && !has world.stdout "\x1b[0;30;46m") "Ignored NO_COLOR"⟩,
   ⟨"console.top.non-tty-and-empty-deployment", do
     let (_, world) ← checked (command ctx ["top"]) { initial with terminalAvailable := false }

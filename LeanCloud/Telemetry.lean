@@ -33,6 +33,14 @@ missing. Monotonic time and incarnation fence rate calculations across restarts.
 structure ResourceSample where
   incarnation : String
   timeNs : Nat
+  /-- Deployment-provided machine identity; the hostname is the container fallback. -/
+  nodeName : Option String := none
+  hostname : Option String := none
+  /-- Host logical CPUs and RAM, distinct from the container's available capacity. -/
+  cpuCores : Option Nat := none
+  memoryCapacity : Option Nat := none
+  /-- Visible CPU affinity/quota, in thousandths of one logical CPU. -/
+  cpuCapacityMillis : Option Nat := none
   cpuNs : Option Nat := none
   memory : Option Nat := none
   memoryLimit : Option Nat := none

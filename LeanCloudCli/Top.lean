@@ -16,7 +16,9 @@ def actors (nodes : Array Node) : Array Node :=
 
 private def columnCount (width : Nat) : Nat := max 1 (min 3 ((width - 1) / 55))
 
-def pageSize (width height : Nat) : Nat := columnCount width * max 1 ((height - 4) / 10)
+private def cardHeight := 12
+
+def pageSize (width height : Nat) : Nat := columnCount width * max 1 ((height - 4) / cardHeight)
 
 def pageCount (nodes : Array Node) (width height : Nat) : Nat :=
   max 1 ((nodes.size + pageSize width height - 1) / pageSize width height)
@@ -40,15 +42,15 @@ def frame (project : String) (nodes : Array Node) (page width height : Nat)
   let page := min page (pageCount nodes width height - 1)
   let mut lines := #[Styled.text (pad room s!" lean-cloud / {project} / top · {(nodes.filter (·.state == "running")).size}/{nodes.size} running") .header,
     Styled.text s!"q: back · PgUp/PgDn or ←/→: page · {page + 1}/{pageCount nodes width height}" .cyan]
-  if width < 40 || height < 14 then
-    lines := lines.push (Styled.text "Enlarge terminal to at least 40 × 14 for graphs." .yellow)
+  if width < 40 || height < 16 then
+    lines := lines.push (Styled.text "Enlarge terminal to at least 40 × 16 for graphs." .yellow)
   else if nodes.isEmpty then
     lines := lines.push (Styled.text "No workers or schedulers reported by the deployment API." .muted)
   else
     let cards := (visible nodes page width height).map fun node =>
       panel node cellWidth
     for row in [:((cards.size + columns - 1) / columns)] do
-      for line in [:10] do
+      for line in [:cardHeight] do
         let mut combined : Styled.Line := #[]
         for column in [:columns] do
           if column > 0 then combined := combined ++ Styled.text " │ " .muted
@@ -60,7 +62,7 @@ def frame (project : String) (nodes : Array Node) (page width height : Nat)
             Styled.text (String.ofList (List.replicate (cellWidth - Styled.length content) ' '))
         lines := lines.push combined
   lines := lines.push (if warning.isEmpty then
-    Styled.text "CPU 100%=1 core (+ overflow); I/O and network show rates; — needs samples." .muted
+    Styled.text "CPU 100%=1 logical CPU; bars use container capacity (+ overflow). I/O and network show rates." .muted
     else Styled.text warning .yellow)
   return (lines.extract 0 (height - 1)).map (fun line => Styled.render line room color)
 

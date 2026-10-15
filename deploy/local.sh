@@ -17,13 +17,14 @@ if [[ "$command" == init ]]; then
   [[ ! -e "$directory" ]] || fail 'Destination already exists; use a fresh directory.'
   # Resolve once. A mutable tag can never change code underneath existing replay records.
   image=$(docker image inspect "$image" --format '{{.Id}}')
+  node_name=$(docker info --format '{{.Name}}')
   need openssl
   mkdir -p "$directory"; directory=$(absolute_dir "$directory"); private_dir "$directory"
   secret > "$directory/client.token"; secret > "$directory/internal.token"
   secret 16 > "$directory/blob-access.token"; secret > "$directory/blob-secret.token"
   jq -n --arg name "$name" --arg image "$image" --arg directory "$directory" \
-    --argjson workers "$workers" --argjson port "$port" \
-    '{name:$name,image:$image,directory:$directory,workers:$workers,retainedWorkers:$workers,port:$port}' > "$directory/deployment.json"
+    --arg nodeName "$node_name" --argjson workers "$workers" --argjson port "$port" \
+    '{name:$name,image:$image,directory:$directory,nodeName:$nodeName,workers:$workers,retainedWorkers:$workers,port:$port}' > "$directory/deployment.json"
   jq --rawfile access "$directory/blob-access.token" --rawfile secret "$directory/blob-secret.token" '
     .blobs.accessKey=($access|rtrimstr("\n")) | .blobs.secretKey=($secret|rtrimstr("\n"))
     ' "$assets/config.json" > "$directory/config.json"
