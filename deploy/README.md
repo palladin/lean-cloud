@@ -154,6 +154,14 @@ Its optional final argument selects the local port, for example
 `./deploy/kubernetes.sh connect .kube-deployment 8081` (default: 8080).
 Keep it running in another terminal. If the scheduler pod restarts or the tunnel
 disconnects, run `connect` again; saved CLI profiles still use the same address.
+
+`cpuMillis` and `memoryMiB` size each node. For applications with large workers,
+`"schedulerResources": {"cpuMillis": 250, "memoryMiB": 512}` can give the scheduler
+smaller requests and a smaller memory limit. Omitted fields use the node defaults.
+
+Applications that install tools at startup can set `startupSeconds` in
+`deployment.json` (default 300, range 5–3600). This controls the startup probe
+and the helper's readiness wait. For LeanBuild's first toolchain download, use 900.
 Your own authenticated HTTPS gateway may
 expose `/deployment` instead; never expose internal `/app`, `/mailbox` or
 `/telemetry` routes publicly. The CLI accepts HTTPS, or HTTP on loopback only.

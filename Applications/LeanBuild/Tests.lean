@@ -151,17 +151,20 @@ private def publicationTests (tools : Tools) (store : ObjectStore) (fixture : Sy
     let directory := root / "project"
     IO.FS.createDir directory
     copyFixture fixture directory
-    let sourceBytes ← IO.FS.readBinFile (directory / "Fixture/Base.lean")
     for artifact in [false, true] do
       let pending ← IO.mkRef true
+      let preparing ← IO.mkRef true
       let flaky := { store with create := fun key bytes => do
         let saved ← store.create key bytes
-        let target := if artifact then bytes.extract 0 5 == "olean".toUTF8 else bytes == sourceBytes
+        let target := artifact != (← preparing.get)
         if target then
           if ← pending.modifyGet fun old => (old, false) then throw (IO.userError "Publication failure")
         return saved }
       let backend := { tools.backend flaky with
-        prepare := fun r => tools.prepareDirectory flaky r directory "fixture" }
+        prepare := fun r => do
+          let result ← tools.prepareDirectory flaky r directory "fixture"
+          preparing.set false
+          return result }
       let saved ← IO.mkRef []
       for _ in [:2] do
         let .error error ← (SequentialReplay.interpret (journal saved) noBlobs 1000 (workflow backend) request).run
@@ -205,6 +208,24 @@ private def bundleTests (store : ObjectStore) : IO Unit :=
     IO.FS.removeDir (restored / "original")
     Bundle.restore store restored manifest 10000
     IO.FS.removeFile (source / "link")
+    -- A restored dependency checkout refreshes its Git index when Lake checks
+    -- its revision. This must not become an artifact conflict between workers.
+    let git := source / ".lake/packages/dependency/.git"
+    IO.FS.createDirAll git
+    IO.FS.writeFile (git / "index") "old cached stat data"
+    IO.FS.writeFile (git / "HEAD") "pinned-commit"
+    let baseline ← (← Bundle.snapshot source 10000).publish store
+    IO.FS.writeFile (git / "index") "refreshed cached stat data"
+    let changed ← Bundle.delta source 10000 baseline baseline
+    check changed.paths.isEmpty "Git index refresh became a parallel artifact"
+    let final ← Bundle.delta source 10000 baseline
+    check (final.paths.contains ".lake/packages/dependency/.git/index") "Final workspace lost its Git index"
+    IO.FS.writeFile (git / "HEAD") "different-commit"
+    let rejected ← try
+      discard <| Bundle.delta source 10000 baseline baseline
+      pure false
+    catch _ => pure true
+    check rejected "A module changed the pinned Git revision"
     for target in ["../restored/original", "."] do
       let linked ← IO.Process.output {
         cmd := "ln", args := #["-s", target, (source / "link").toString] }
@@ -216,15 +237,124 @@ private def bundleTests (store : ObjectStore) : IO Unit :=
       check rejected "Snapshot followed a directory or external symlink"
       IO.FS.removeFile (source / "link")
     let some first := manifest[0]? | throw (IO.userError "Missing snapshot entry")
-    let other := { first with file := ← Files.putText store "conflicting" }
+    let other := { first with file.sha256 := ← Digest.bytes "conflicting".toUTF8 }
     check ((Bundle.merge #[first] #[other]).toOption.isNone) "Parallel artifact conflict accepted"
 
+private def packCacheTests (store : ObjectStore) : IO Unit :=
+  IO.FS.withTempDir fun root => do
+    let source := root / "source"
+    IO.FS.createDir source
+    for i in [:100] do IO.FS.writeFile (source / s!"file-{i}") s!"content-{i}"
+    IO.FS.writeFile (source / "empty") ""
+    let manifest ← (← Bundle.snapshot source 10000).publish store
+    let some entry := manifest[0]? | throw (IO.userError "Empty pack fixture")
+    check (manifest.all (·.file.pack == entry.file.pack)) "Files were not packed together"
+    let reads ← IO.mkRef (0 : Nat)
+    let counting := { store with read := fun key => do
+      reads.modify (· + 1)
+      store.read key }
+    let cache : Bundle.Cache := { directory := root / "cache", bytes := 2000 }
+    let restored := root / "restored"
+    Bundle.restore counting restored manifest 10000 (some cache)
+    check ((← reads.get) == 2) "Small files required separate blob reads"
+    reads.set 0
+    IO.FS.writeFile (restored / "file-1") "modified private copy"
+    Bundle.restore counting restored manifest 10000 (some cache)
+    check ((← reads.get) == 0 && (← IO.FS.readFile (restored / "file-1")) == "content-1")
+      "Cache was not reused or private work changed a cached pack"
+    IO.FS.writeFile (cache.directory / entry.file.pack.sha256) "corrupt cache"
+    Bundle.restore counting restored manifest 10000 (some cache)
+    check ((← reads.get) == 2) "Corrupt cache was trusted"
+    -- A corrupt pack may be shorter than the replacement. Reserve its expected
+    -- size even when a file with this cache key already exists.
+    let repairCache : Bundle.Cache := { directory := root / "repair-cache", bytes := entry.file.pack.size }
+    IO.FS.createDir repairCache.directory
+    IO.FS.writeFile (repairCache.directory / entry.file.pack.sha256) ""
+    IO.FS.writeFile (repairCache.directory / "older-pack") "occupied space"
+    Bundle.restore store (root / "repaired") manifest 10000 (some repairCache)
+    let mut cachedBytes := 0
+    for file in ← repairCache.directory.readDir do
+      cachedBytes := cachedBytes + (← file.path.metadata).byteSize.toNat
+    check (cachedBytes ≤ repairCache.bytes) "Repairing a short corrupt pack exceeded the cache budget"
+    let offline := { store with read := fun _ => throw (IO.userError "No download expected") }
+    let tasks ← (Array.range 2).mapM fun i => IO.asTask
+      (Bundle.restore offline (root / s!"concurrent-{i}") manifest 10000 (some cache)) .dedicated
+    for task in tasks do IO.ofExcept task.get
+    -- Lowering the capacity removes old packs; a pack larger than the cache is
+    -- still restorable via a private temporary file without growing the cache.
+    Bundle.restore store restored manifest 10000 (some { cache with bytes := 1 })
+    check (← cache.directory.readDir).isEmpty "Cache size limit was exceeded"
+    for bad in #[
+        { entry with path := "../escape" },
+        { entry with file.offset := entry.file.pack.size + 1 },
+        { entry with file.sha256 := "invalid" },
+        { entry with file.format := "unknown" }] do
+      let rejected ← try Bundle.restore store restored #[bad] 10000; pure false catch _ => pure true
+      check rejected "Invalid packed file accepted"
+    let rejected ← try Bundle.restore store restored #[entry, entry] 10000; pure false catch _ => pure true
+    check rejected "Duplicate packed path accepted"
+    -- A file can cross the storage chunk boundary inside a larger pack.
+    let large := root / "large"
+    IO.FS.createDir large
+    let bytes := ByteArray.mk ((Array.range (Files.chunkSize + 37)).map fun i => (i % 251).toUInt8)
+    IO.FS.writeBinFile (large / "spanning") bytes
+    IO.FS.writeFile (large / "tail") "last file"
+    let packed ← (← Bundle.snapshot large (2 * Files.chunkSize)).publish store
+    reads.set 0
+    Bundle.restore counting (root / "large-restored") packed (2 * Files.chunkSize)
+    check ((← reads.get) == 3 && (← IO.FS.readBinFile (root / "large-restored/spanning")) == bytes &&
+      (← IO.FS.readFile (root / "large-restored/tail")) == "last file") "Cross-chunk pack restore failed"
+    IO.println "PASS packed transfers, private copies, bounded cache, corruption recovery, and concurrent restores"
+
+private def toolchainTests : IO Unit :=
+  IO.FS.withTempDir fun root => do
+    let source := root / "release/bin"
+    IO.FS.createDirAll source
+    IO.FS.writeFile (source / "lean") "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'Lean (version 4.35.0, fixture)'; else test -f \"$1\"; fi\n"
+    IO.FS.writeFile (source / "lake") "#!/bin/sh\nexit 0\n"
+    let mode ← IO.Process.output { cmd := "chmod", args := #["+x", (source / "lean").toString, (source / "lake").toString] }
+    check (mode.exitCode == 0) "Cannot prepare toolchain fixture"
+    let archive := root / "release.tar.zst"
+    let packed ← IO.Process.output { cmd := "tar", args := #["--zstd", "-cf", archive.toString, "-C", root.toString, "release"] }
+    check (packed.exitCode == 0) "Cannot pack toolchain fixture"
+    let release : Toolchain.Release := { version := "4.35.0", platform := "linux_aarch64", sha256 := ← Digest.file archive.toString }
+    let helper := root / "Helper.lean"
+    IO.FS.writeFile helper "-- fixture"
+    let cache := root / "toolchains"
+    IO.FS.createDirAll (cache / s!"{release.sha256}.pending")
+    IO.FS.writeFile (cache / s!"{release.sha256}.pending" / "interrupted") "partial"
+    let downloads ← IO.mkRef (0 : Nat)
+    let download : String → System.FilePath → IO Unit := fun url path => do
+      check (url == "https://github.com/leanprover/lean4/releases/download/v4.35.0/lean-4.35.0-linux_aarch64.tar.zst") "Wrong release URL"
+      downloads.modify (· + 1)
+      IO.FS.writeBinFile path (← IO.FS.readBinFile archive)
+    let installed ← Toolchain.ensure release cache helper download
+    check ((← (installed / "bin/lean").pathExists) && (← downloads.get) == 1) "Toolchain not installed"
+    let same ← Toolchain.ensure release cache helper fun _ _ => throw (IO.userError "Must reuse toolchain")
+    check (same == installed && !(← (cache / s!"{release.sha256}.pending").pathExists)) "Installation not reused/cleaned"
+    let rejected ← try
+      discard <| Toolchain.ensure release (root / "corrupt") helper fun _ path => IO.FS.writeFile path "bad archive"
+      pure false
+    catch _ => pure true
+    check (rejected && !(← (root / "corrupt" / release.sha256).pathExists)) "Unverified toolchain was published"
+    let rejected ← try
+      discard <| Toolchain.ensure release (root / "bad-helper") (root / "missing.lean") download
+      pure false
+    catch _ => pure true
+    check (rejected && !(← (root / "bad-helper" / release.sha256).pathExists)) "Unchecked helper was published"
+    for bad in #[{ release with version := "../escape" }, { release with platform := "../escape" },
+        { release with sha256 := "invalid" }] do
+      check bad.validate.toOption.isNone "Invalid release accepted"
+    IO.println "PASS pinned toolchain download, checksum rejection, helper check, interrupted installation and reuse"
+
 private def nativeTests : IO Unit := do
+  toolchainTests
   let tools ← Tools.fromEnvironment
   let fixture ← IO.FS.realPath "fixtures/Diamond"
   let full ← IO.FS.realPath "fixtures/FullBuild"
   let store := objects (← IO.mkRef {})
   bundleTests store
+  packCacheTests store
   let built ← nativeTest tools store fixture
   requireSuccess built
   check (built.modules.size == 4 && built.verification.isNone && built.build.status == .built)
@@ -285,7 +415,9 @@ private def nativeTests : IO Unit := do
   let some ref := custom.build.artifacts | throw (IO.userError "Custom artifact missing")
   let entries : Bundle.Manifest ← Files.readJson store ref
   let some entry := entries.find? (·.path == "receipt.txt") | throw (IO.userError "Output outside .lake/build lost")
-  check ((← Files.readText store entry.file) == "built 41\n") "Wrong custom output"
+  IO.FS.withTempDir fun root => do
+    Bundle.restore store root #[entry] req.limits.bytes
+    check ((← IO.FS.readFile (root / entry.path)) == "built 41\n") "Wrong custom output"
   let replacement ← nativeTest tools store full (fun d => do
     IO.FS.writeFile (d / "replaced") "old file"
     IO.FS.writeFile (d / "deleted") "old file"

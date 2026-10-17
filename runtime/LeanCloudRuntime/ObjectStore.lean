@@ -1,4 +1,5 @@
 import LeanCloud.Worker
+import LeanCloudRuntime.Digest
 
 namespace LeanCloudRuntime
 open Lean LeanCloud
@@ -18,14 +19,7 @@ structure ObjectStore where
 
 namespace ObjectStore
 
-private def digest (bytes : ByteArray) : IO String := IO.FS.withTempFile fun handle path => do
-  handle.write bytes
-  handle.flush
-  let result ← IO.Process.output { cmd := "openssl", args := #["dgst", "-sha256", "-r", path.toString] }
-  let hash := (result.stdout.splitOn " ").head!
-  unless result.exitCode == 0 && hash.length == 64 && hash.toList.all (fun c =>
-      c.isDigit || ('a' ≤ c && c ≤ 'f')) do throw (IO.userError "SHA-256 computation failed")
-  return hash
+private abbrev digest := Digest.bytes
 
 private def writeImmutable (store : ObjectStore) (key : String) (bytes : ByteArray) : IO Unit := do
   unless (← store.create key bytes) == bytes do

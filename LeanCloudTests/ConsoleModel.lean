@@ -26,6 +26,9 @@ structure World where
   failAt : Option Nat := none
   http : Option (String → String → Json → Except String Json) := none
   httpRequests : Array Json := #[]
+  httpDelay : Nat := 0
+  nextHttp : Nat := 0
+  pendingHttp : Array (HttpId × Nat × Except String String) := #[]
 
 def World.file (world : World) (path : System.FilePath) : Option String :=
   (world.files.find? (·.1 == path.toString)).map (·.2)
@@ -38,6 +41,7 @@ def World.json [ToJson α] (world : World) (path : System.FilePath) (value : α)
 
 private def label : HostOp α → String
   | .httpPost .. => "httpPost"
+  | .httpStart .. => "httpStart" | .httpPoll .. => "httpPoll" | .httpCancel .. => "httpCancel"
   | .readFile .. => "readFile" | .writeFile .. => "writeFile"
   | .rename .. => "rename" | .exists .. => "exists" | .readDir .. => "readDir"
   | .removeTree .. => "removeTree"
@@ -50,12 +54,29 @@ private def label : HostOp α → String
   | .key .. => "key" | .dimensions => "dimensions" | .lock .. => "lock" | .unlock .. => "unlock"
   | .copyClipboard .. => "copyClipboard"
 
-private def operation : HostOp α → ExceptT String (StateM World) α
-  | .httpPost url token body => do
+private def exchange (url token body : String) : ExceptT String (StateM World) String := do
     let json ← liftExcept (Json.parse body)
     let some http := (← get).http | throw "Unexpected HTTP request"
     modify fun w => { w with httpRequests := w.httpRequests.push json }
     return (← liftExcept (http url token json)).compress
+
+private def operation : HostOp α → ExceptT String (StateM World) α
+  | .httpPost url token body => exchange url token body
+  | .httpStart url token body => do
+    let result ← observing (exchange url token body)
+    let world ← get
+    let id : HttpId := ⟨world.nextHttp⟩
+    set { world with
+      nextHttp := world.nextHttp + 1
+      pendingHttp := world.pendingHttp.push (id, world.time + world.httpDelay, result) }
+    return id
+  | .httpPoll id => do
+    let world ← get
+    let some (_, due, result) := world.pendingHttp.find? (·.1 == id) | throw "Unknown HTTP request"
+    if world.time < due then return none
+    set { world with pendingHttp := world.pendingHttp.filter (·.1 != id) }
+    return some result
+  | .httpCancel id => modify fun w => { w with pendingHttp := w.pendingHttp.filter (·.1 != id) }
   | .readFile path => do
     let some text := (← get).file path | throw s!"Missing file: {path}"
     return text

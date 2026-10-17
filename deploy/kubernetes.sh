@@ -11,8 +11,11 @@ private_dir "$directory"
 name=$(jq -er .name "$spec"); namespace=$(jq -er .namespace "$spec"); context=$(jq -er .context "$spec")
 identifier "$name"; identifier "$namespace"
 workers=$(jq -er .workers "$spec"); number "$workers"
+startup=$(jq -er '.startupSeconds // 300' "$spec"); number "$startup"
+(( startup >= 5 && startup <= 3600 )) || fail 'startupSeconds must be between 5 and 3600'
 jq -e '.image|test("@sha256:[a-f0-9]{64}$")' "$spec" >/dev/null || fail 'Use an immutable registry image digest'
 jq -e '[.diskGiB,.cpuMillis,.memoryMiB]|all(type=="number" and .>0 and floor==.)' "$spec" >/dev/null || fail 'Invalid resource sizes'
+jq -e '(.schedulerResources // {}) | type=="object" and (keys|all(.=="cpuMillis" or .=="memoryMiB")) and (values|all(type=="number" and .>0 and floor==.))' "$spec" >/dev/null || fail 'Invalid scheduler resources'
 kube() { kubectl --context "$context" --namespace "$namespace" --request-timeout=30s "$@"; }
 roles() { printf 'scheduler\n'; for ((i=1;i<=workers;i++)); do printf 'worker%s\n' "$i"; done; }
 if [[ "$command" == render ]]; then
@@ -39,10 +42,12 @@ fi
 kube create configmap cloud-operation --from-literal="operation=$command" >/dev/null || fail 'Deployment operation is locked; verify the previous operator has stopped before removing cloud-operation.'
 trap 'kube delete configmap cloud-operation --wait=true >/dev/null' EXIT
 storage_hash=$(jq -Sc . "$directory/storage.json" | shasum -a 256 | cut -d " " -f 1)
-identity=$(jq -Sc 'del(.workers,.cpuMillis,.memoryMiB)' "$spec")
+identity_filter='del(.workers,.cpuMillis,.memoryMiB,.schedulerResources,.startupSeconds)'
+identity=$(jq -Sc "$identity_filter" "$spec")
 record=$(kube get configmap cloud-deployment --ignore-not-found -o json)
 if [[ -n "$record" ]]; then
-  [[ $(jq -r '.data.identity' <<< "$record") == "$identity" ]] || fail 'Deployment image, storage settings or identity changed. Use a new namespace.'
+  recorded_identity=$(jq -r '.data.identity' <<< "$record" | jq -Sc "$identity_filter")
+  [[ "$recorded_identity" == "$identity" ]] || fail 'Deployment image, storage settings or identity changed. Use a new namespace.'
   [[ $(jq -r '.data.storage' <<< "$record") == "${storage_hash}" ]] || fail 'Blob storage changed; use a new deployment.'
   while IFS= read -r claim; do
     pvc=$(jq -r .name <<< "$claim"); uid=$(jq -r .uid <<< "$claim")
@@ -90,7 +95,7 @@ kube create secret generic cloud-config --from-file="config.json=$directory/conf
 ready() {
   kube scale "statefulset/$1" --replicas=1
   kube wait --for=create "pod/$1-0" --timeout=180s
-  kube wait --for=condition=Ready "pod/$1-0" --timeout=180s
+  kube wait --for=condition=Ready "pod/$1-0" --timeout="${startup}s"
 }
 ready scheduler
 jq -c .mailboxes.workers "$directory/config.json" | kube exec -i scheduler-0 -- cloud-app pool-configure /etc/lean-cloud/config.json >/dev/null

@@ -86,7 +86,7 @@ private def executeAssignment (registry : Registry) (config : Config) (id run : 
           let program ← IO.ofExcept (registry.find definition.entry)
           program.execute config.worker definition id observed (trace.blobs (config.objects.storage)) trace assignment
       match report.progress with
-      | .ok (.fork ..) => trace.emit "suspended" ""
+      | .ok (.fork location _) => trace.suspend location
       | .ok .done => trace.emit (if finalize.isSome then "sealed" else "returned") ""
       | .error error => trace.emit "failed" error.message
       Pool.send config (.report run report)

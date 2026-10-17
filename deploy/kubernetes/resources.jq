@@ -6,6 +6,8 @@ def meta($name;$role): {name:$name,namespace:$c.namespace,labels:labels($role)};
 def resource($api;$kind;$name;$role): {apiVersion:$api,kind:$kind,metadata:meta($name;$role)};
 def claim: {accessModes:["ReadWriteOnce"],storageClassName:$c.storageClass,resources:{requests:{storage:(($c.diskGiB|tostring)+"Gi")}}};
 def probe: {httpGet:{path:"/health",port:"http"},timeoutSeconds:3,periodSeconds:5};
+def resources($role): ($c + (if $role=="scheduler" then ($c.schedulerResources//{}) else {} end)) as $r |
+  {requests:{cpu:(($r.cpuMillis|tostring)+"m"),memory:(($r.memoryMiB|tostring)+"Mi")},limits:{memory:(($r.memoryMiB|tostring)+"Mi")}};
 def service($role): resource("v1";"Service";$role;$role) + {spec:{type:"ClusterIP",publishNotReadyAddresses:true,selector:labels($role),ports:[{name:"http",port:8080,targetPort:"http"}]}};
 def node($role): resource("apps/v1";"StatefulSet";$role;$role) + {spec:{
   serviceName:$role,replicas:0,selector:{matchLabels:labels($role)},updateStrategy:{type:"OnDelete"},
@@ -20,9 +22,9 @@ def node($role): resource("apps/v1";"StatefulSet";$role;$role) + {spec:{
         {name:"CLOUD_NODE_NAME",valueFrom:{fieldRef:{fieldPath:"spec.nodeName"}}}]+
         (if $role=="scheduler" then [] else [{name:"CLOUD_WORKER_ID",value:$role}] end)),
       ports:[{name:"http",containerPort:8080}],
-      resources:{requests:{cpu:(($c.cpuMillis|tostring)+"m"),memory:(($c.memoryMiB|tostring)+"Mi")},limits:{memory:(($c.memoryMiB|tostring)+"Mi")}},
+      resources:resources($role),
       securityContext:{allowPrivilegeEscalation:false,readOnlyRootFilesystem:true,capabilities:{drop:["ALL"]}},
-      startupProbe:(probe+{failureThreshold:60}),readinessProbe:probe,livenessProbe:(probe+{failureThreshold:6}),
+      startupProbe:(probe+{failureThreshold:((($c.startupSeconds//300)/5)|ceil)}),readinessProbe:probe,livenessProbe:(probe+{failureThreshold:6}),
       volumeMounts:[{name:"state",mountPath:"/data"},{name:"configuration",mountPath:"/etc/lean-cloud",readOnly:true},{name:"temporary",mountPath:"/tmp"}]}],
     volumes:[{name:"configuration",secret:{secretName:"cloud-config",defaultMode:288}},{name:"temporary",emptyDir:{}}]}},
   volumeClaimTemplates:[{metadata:{name:"state",labels:labels($role)},spec:claim}]}};

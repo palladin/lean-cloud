@@ -92,7 +92,8 @@ private def monitoringHost (completed : Bool) (url token : String) (json : Json)
           sources := #[⟨"Remote.lean", "cloud {\n  Cloud.pure work\n}", #[⟨"work", 2, 0, 2, 0⟩]⟩] }
         } : LeanCloud.DeploymentApi.RunInfo))
     | .outcome _ => pure (toJson (if completed then some (.success (toJson (55 : Nat))) else none : Option Exit))
-    | .inspect _ => pure (toJson ({} : Timing.Status))
+    | .inspect _ => pure (toJson ({ jobs := #[⟨Location.root, Location.root, false,
+        if completed then .done else .running "worker1" 0 1000⟩] } : Timing.Status))
     | .observations run worker _ _ =>
       let step : Observations.Step := {
         timestamp := "1", event := ⟨"boot", 1, 1, worker, some 0, "0:0", "execute", "work", run, some "work"⟩
@@ -107,6 +108,60 @@ private def monitoringHost (completed : Bool) (url token : String) (json : Json)
   return toJson (.ok value : Except String Json)
 
 def cases : Array TestCase := #[
+  ⟨"deployment-api.watch-bounded-refresh-pages", do
+    let http url token json := do
+      match ← LeanCloud.DeploymentApi.Request.decode json with
+      | .observations run worker after _ =>
+        let second := after == some "page-one"
+        let step : Observations.Step := {
+          timestamp := if second then "2" else "1"
+          event := ⟨"boot", if second then 2 else 1, 0, worker, none, "0:0", "execute", "", run, none⟩ }
+        let page : LeanCloud.DeploymentApi.ObservationPage := {
+          items := #[step], next := if second then none else some "page-one" }
+        return toJson (.ok (toJson page) : Except String Json)
+      | _ => monitoringHost false url token json
+    let initial := withConnection { remoteWorld with http := some http }
+    let action : Cli Unit := do
+      let run ← remoteContext.loadRun "one"
+      let first ← Trace.load remoteContext run (some #[])
+      unless first.cursors.all (·.2 == some "page-one") do throw "First refresh drained all pages"
+      let second ← Trace.load remoteContext run (some first.cursors)
+      unless second.cursors.all (·.2.isNone) do throw "Cursor did not wrap for updated slots"
+      unless second.steps.any (·.event.seq == 2) do throw "Next refresh did not advance"
+    let (result, world) := ConsoleModel.run action initial
+    discard <| unwrap result
+    let pages := world.httpRequests.filter fun json =>
+      match (LeanCloud.DeploymentApi.Request.decode json).toOption with
+      | some (.observations ..) => true | _ => false
+    assertEq pages.size 4 "Refresh made more than one request per online node"⟩,
+  ⟨"deployment-api.watch-keyboard-during-slow-http", do
+    let initial := withConnection { remoteWorld with http := some (monitoringHost false) }
+    let (result, saved) := ConsoleModel.run (command remoteContext ["watch", "one", "--once"]) initial
+    discard <| unwrap result
+    let initial := { saved with
+      stdout := "", trace := #[], httpDelay := 10000
+      keys := [27, 91, 66, 113] } -- Down, then q while the server is still pending.
+    let (result, world) := ConsoleModel.run (command remoteContext ["watch", "one"]) initial
+    discard <| unwrap result
+    assertTrue world.keys.isEmpty "Watch did not read navigation/quit during HTTP"
+    assertTrue (world.time - initial.time < 1000) "Quit waited for a slow refresh"
+    assertTrue (world.trace.contains "httpStart" && world.trace.contains "httpCancel") "Request was not cancelled"
+    assertTrue (world.pendingHttp.isEmpty && !world.terminal && world.locks.isEmpty) "Watch leaked host resources"
+    assertTrue ((world.stdout.splitOn "Remote.lean:2").length > 1) "Watch hid its saved view during refresh"⟩,
+  ⟨"deployment-api.background-fetch-result-and-errors", do
+    for fails in [false, true] do
+      let initial : ConsoleModel.World := {
+        httpDelay := 500
+        http := some fun _ _ _ => if fails then .error "offline" else .ok (toJson (42 : Nat)) }
+      let program : Cli String := try request (.httpPost "https://example.test" "secret" "{}")
+        catch error => pure error
+      let (result, world) := ConsoleModel.run (Fetch.run program (fun n => do
+        discard <| request (.key 100)
+        return some (n + 1)) (0 : Nat)) initial
+      let some (value, ticks) ← unwrap result | throw (IO.userError "Refresh unexpectedly abandoned")
+      assertEq value (if fails then "offline" else "42")
+      assertEq ticks 5
+      assertTrue world.pendingHttp.isEmpty "Completed request retained a task"⟩,
   ⟨"deployment-api.remote-watch-and-top-no-local-processes", do
     for completed in [false, true] do
       let initial := withConnection { remoteWorld with http := some (monitoringHost completed) }

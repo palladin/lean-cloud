@@ -7,6 +7,8 @@ namespace LeanCloudCli
 private structure Resources where
   locks : Array (Option Native.Lock) := #[]
   terminal : Bool := false
+  nextHttp : Nat := 0
+  http : Std.HashMap HttpId (Task (Except IO.Error String)) := {}
 
 private def randomHex (count : Nat) : IO String := IO.FS.withFile "/dev/urandom" .read fun file => do
   let bytes ← file.read count.toUSize
@@ -18,6 +20,21 @@ private def randomHex (count : Nat) : IO String := IO.FS.withFile "/dev/urandom"
 /-- Only this handler touches HTTP, local client files, and the terminal. -/
 private def handle (resources : IO.Ref Resources) : HostOp α → IO α
   | .httpPost url token body => Http.post url token body
+  | .httpStart url token body => do
+    let task ← IO.asTask (Http.post url token body) .dedicated
+    let state ← resources.get
+    let id : HttpId := ⟨state.nextHttp⟩
+    resources.set { state with nextHttp := state.nextHttp + 1, http := state.http.insert id task }
+    return id
+  | .httpPoll id => do
+    let some task := (← resources.get).http[id]?
+      | throw (IO.userError "Unknown HTTP request")
+    unless ← IO.hasFinished task do return none
+    resources.modify fun state => { state with http := state.http.erase id }
+    return some (task.get.mapError toString)
+  | .httpCancel id => do
+    if let some task := (← resources.get).http[id]? then IO.cancel task
+    resources.modify fun state => { state with http := state.http.erase id }
   | .readFile path => IO.FS.readFile path
   | .writeFile path text => IO.FS.writeFile path text
   | .rename source target => IO.FS.rename source target
@@ -82,6 +99,7 @@ def withHostIO (use : ({α : Type} → HostOp α → IO (Except String α)) → 
       catch error => return .error error.toString)
   finally
     let state ← resources.get
+    for (_, task) in state.http.toArray do IO.cancel task
     if state.terminal then Native.leave
     for lock in state.locks do
       if let some lock := lock then Native.unlock lock

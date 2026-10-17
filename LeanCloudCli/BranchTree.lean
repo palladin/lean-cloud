@@ -13,16 +13,31 @@ structure Entry where
   control : String := ""
   deriving Inhabited
 
-private def ensure (entries : Array Entry) (location : Location) : Array Entry := Id.run do
+private def ensure (entries : Array Entry) (known : Std.HashMap String Nat)
+    (location : Location) : Array Entry × Std.HashMap String Nat := Id.run do
   let mut entries := entries
+  let mut known := known
   for depth in [1:location.size + 1] do
     let ancestor := branch (location.extract 0 depth)
-    unless entries.any (·.branch == ancestor) do entries := entries.push { branch := ancestor }
-  return entries
+    unless known.contains ancestor.key do
+      known := known.insert ancestor.key entries.size
+      entries := entries.push { branch := ancestor }
+  return (entries, known)
+
+private def observeJob (entries : Array Entry) (known : Std.HashMap String Nat)
+    (job : BranchObservation) : Array Entry × Std.HashMap String Nat := Id.run do
+  let mut (entries, known) := ensure entries known job.branch
+  if let .waiting children := job.status then
+    for i in [:children] do
+      (entries, known) := ensure entries known (job.location.child i)
+  if let some index := known[job.branch.key]? then
+    entries := entries.set! index { branch := job.branch, job := some job }
+  return (entries, known)
 
 /-- Reconstruct the latest branch tree from observed scheduler states. -/
-def current (observed : Array Trace.Step) : Array Entry := Id.run do
+def current (observed : Array Trace.Step) (jobs : Array BranchObservation := #[]) : Array Entry := Id.run do
   let mut entries := #[]
+  let mut known : Std.HashMap String Nat := {}
   let mut control := ""
   for step in observed do
     if step.event.worker == "scheduler" then
@@ -34,12 +49,11 @@ def current (observed : Array Trace.Step) : Array Entry := Id.run do
       | _ => pure ()
     let some location := step.owner | continue
     if location.isEmpty then continue
-    entries := ensure entries location
+    (entries, known) := ensure entries known location
     if let some job := step.job then
-      if let .waiting children := job.status then
-        for i in [:children] do entries := ensure entries (job.location.child i)
-      if let some index := entries.findIdx? (·.branch == job.branch) then
-        entries := entries.set! index { branch := job.branch, job := some job }
+      (entries, known) := observeJob entries known job
+  for job in jobs do
+    (entries, known) := observeJob entries known job
   return entries.map fun entry => { entry with control }
 
 /-- Replay may visit an ancestor's code while executing a child assignment.
@@ -66,17 +80,30 @@ structure Row where
 private def branchKey (location : Location) := "branch/" ++ location.key
 private def forkKey (location : Location) := "parallel/" ++ location.key
 
-private def forks (entries : Array Entry) (parent : Location) : Array Location :=
-  (entries.foldl (fun all entry =>
-    let fork := entry.branch.extract 0 (entry.branch.size - 1)
-    if !fork.isEmpty && branch fork == parent && !all.contains fork then all.push fork else all) #[]).qsort
-      (fun a b => a.back!.2 < b.back!.2)
+private structure Index where
+  forks : Std.HashMap String (Array Location) := {}
+  children : Std.HashMap String (Array Entry) := {}
 
-private def children (entries : Array Entry) (fork : Location) : Array Entry :=
-  (entries.filter fun e => e.branch.size == fork.size + 1 && e.branch.extract 0 fork.size == fork).qsort
-    (fun a b => a.branch.back!.1 < b.branch.back!.1)
+/-- Build adjacency once, rather than scanning the whole tree at every node. -/
+private def indexTree (entries : Array Entry) : Index := Id.run do
+  let mut index : Index := {}
+  for entry in entries do
+    if entry.branch.size ≤ 1 then continue
+    let fork : Location := entry.branch.extract 0 (entry.branch.size - 1)
+    unless index.children.contains fork.key do
+      let parent := (branch fork).key
+      let forks := (index.forks[parent]?.getD #[]).push fork
+      index := { index with forks := index.forks.insert parent forks }
+    let members := (index.children[fork.key]?.getD #[]).push entry
+    index := { index with children := index.children.insert fork.key members }
+  return {
+    forks := index.forks.map fun _ forks => forks.qsort (fun a b => a.back!.2 < b.back!.2)
+    children := index.children.map fun _ children => children.qsort (fun a b => a.branch.back!.1 < b.branch.back!.1) }
 
-private def label (entries : Array Entry) (entry : Entry) : String :=
+private def children (index : Index) (fork : Location) : Array Entry :=
+  index.children[fork.key]?.getD #[]
+
+private def label (index : Index) (entry : Entry) : String :=
   if !entry.control.isEmpty && !entry.job.any (·.status == .done) then entry.control else
   match entry.job with
   | none => "unknown"
@@ -84,33 +111,33 @@ private def label (entries : Array Entry) (entry : Entry) : String :=
     | .pending => if job.joining then "joining" else "pending"
     | .running worker _ => worker
     | .waiting count =>
-      let done := (children entries job.location).filter (fun e => e.job.any (·.status == .done))
+      let done := (children index job.location).filter (fun e => e.job.any (·.status == .done))
       s!"waiting {done.size}/{count}"
     | .done => "completed"
 
-private def descend (entries : Array Entry) (nav : Navigation) :
+private def descend (index : Index) (nav : Navigation) :
     Nat → Entry → Nat → Option String → Array Row
   | 0, _, _, _ => #[]
   | fuel + 1, entry, depth, parent => Id.run do
-    let groups := forks entries entry.branch
+    let groups := index.forks[entry.branch.key]?.getD #[]
     let key := branchKey entry.branch
     let title := if entry.branch == Location.root then "root" else s!"branch {entry.branch.back!.1}"
-    let mut rows := #[{ key, parent, branch := entry.branch, depth, title, status := label entries entry, expandable := !groups.isEmpty : Row }]
+    let mut rows := #[{ key, parent, branch := entry.branch, depth, title, status := label index entry, expandable := !groups.isEmpty : Row }]
     unless nav.collapsed.contains key do
       for fork in groups do
         let key := forkKey fork
-        let children := children entries fork
+        let children := children index fork
         let done := children.filter (fun e => e.job.any (·.status == .done))
         rows := rows.push { key, parent := some (branchKey entry.branch), branch := entry.branch, fork := some fork, depth := depth + 1, title := s!"parallel @{fork.back!.2}", status := s!"{done.size}/{children.size}", expandable := true }
         unless nav.collapsed.contains key do
           for child in children do
-            rows := rows ++ descend entries nav fuel child (depth + 2) (some key)
+            rows := rows ++ descend index nav fuel child (depth + 2) (some key)
     return rows
 
 def rows (entries : Array Entry) (nav : Navigation) : Array Row :=
   match entries.find? (·.branch == Location.root) with
   | none => #[]
-  | some root => descend entries nav (entries.size + 1) root 0 none
+  | some root => descend (indexTree entries) nav (entries.size + 1) root 0 none
 
 private def index (rows : Array Row) (nav : Navigation) : Nat :=
   (nav.selected >>= fun key => rows.findIdx? (·.key == key)).getD 0

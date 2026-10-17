@@ -142,12 +142,18 @@ To read diagnostics or a manifest, save its file-reference JSON from the report:
 bash Applications/LeanBuild/local-files.sh .lean-cloud/build ref.json
 ```
 
-Each manifest entry gives a relative path, a content-addressed file reference,
-and an executable flag. The application's `files download CONFIG FILE_REF OUTPUT`
-command downloads a file; `files restore CONFIG MANIFEST_REF DIRECTORY` restores
-an entire workspace into a new directory. Run these inside the deployed image,
-where the storage configuration is available. Transfers verify size and SHA-256.
+Each workspace manifest entry gives a relative path, a packed-file reference
+(pack, byte offset, length, and SHA-256), and an executable flag. Files from one
+snapshot share a pack, avoiding a separate remote transfer for each small file.
+The application's `files download CONFIG FILE_REF OUTPUT` command downloads a
+top-level file reference, such as diagnostics or a workspace manifest;
+`files restore CONFIG MANIFEST_REF DIRECTORY` restores the packed workspace into
+a new directory. Run these inside the deployed image, where the storage
+configuration is available. Transfers verify sizes and SHA-256 hashes.
 Native executables require a compatible platform and runtime libraries.
+
+The packed workspace format is used by `lean-build/v2`; old `v1` workspace
+manifests require the old application image to restore.
 
 Remove this test deployment and its stored data:
 
@@ -165,7 +171,18 @@ bash Applications/LeanBuild/build.sh lean-cloud-build:dev 4.35.0
 ```
 
 The project's `lean-toolchain` must match the deployed toolchain exactly; it is
-never rewritten. The image build type-checks the Lake helper with that release.
+never rewritten. The image pins the official release's SHA-256 digest. On first
+startup, each worker downloads that release directly from GitHub into
+`/data/toolchains`, verifies its checksum, and type-checks the Lake helper before
+becoming ready. Restarts reuse the installation. The toolchain is not uploaded
+from your laptop as an image layer. First startup needs outbound GitHub access
+and roughly 3.2 GB of persistent space for Lean 4.35.0, plus installation scratch
+space. For Kubernetes, set `startupSeconds: 900` in `deployment.json` to allow
+time for installation. The scheduler does not download a toolchain.
+
+For an existing local installation, set `LEAN_BUILD_TOOLCHAIN` to its directory;
+this bypasses downloading. `LEAN_BUILD_RELEASE` identifies the pinned release
+JSON and `LEAN_BUILD_TOOLCHAINS` selects the installation cache directory.
 **4.35.0 is tested**; future Lake API changes may require helper updates. The
 lean-cloud worker SDK has its own separate, pinned toolchain.
 
@@ -185,7 +202,15 @@ option is not a container memory limit.
 Dependencies must be inside the repository snapshot. Internal file symlinks are
 materialized; external links, directory links, Git submodules, and dependencies
 outside the snapshot are rejected. Snapshot transfers currently restore private
-workspaces for each job. Large Mathlib/FLT performance has not been validated;
+workspaces for each job. The image caches immutable packs in `/data/build-cache`;
+each hit is verified and copied, so a job cannot change another job's inputs.
+Set `LEAN_BUILD_CACHE` to choose a cache directory and `LEAN_BUILD_CACHE_BYTES`
+to bound it (default 4 GiB). Without `LEAN_BUILD_CACHE`, caching is disabled.
+Packs larger than the budget use temporary files instead. Provision enough disk
+for both the cache and the job's private workspace; the byte limit bounds cached
+pack contents, not filesystem overhead or temporary files.
+
+Large Mathlib/FLT performance has not been validated;
 batch barriers and artifact transfer costs still apply.
 
 ## Tests

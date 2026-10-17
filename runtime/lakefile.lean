@@ -45,6 +45,13 @@ extern_lib cloud_managed_process pkg := do
     #["-I", (← getLeanInstall).includeDir.toString] #["-O2", "-Wall", "-Wextra", "-Werror"] "cc"
   buildStaticLib (pkg.staticLibDir / nameToStaticLib "cloud_managed_process") #[obj]
 
+extern_lib cloud_sha256 pkg := do
+  let src ← inputTextFile (pkg.dir / "native" / "sha256.c")
+  let obj ← buildO (pkg.buildDir / "native" / "sha256.o") src
+    #["-I", (← getLeanInstall).includeDir.toString]
+    #["-O2", "-Wall", "-Wextra", "-Werror", "-Wno-deprecated-declarations"] "cc"
+  buildStaticLib (pkg.staticLibDir / nameToStaticLib "cloud_sha256") #[obj]
+
 extern_lib cloud_process_lock pkg := do
   let src ← inputTextFile (pkg.dir / "native" / "process_lock.c")
   let obj ← buildO (pkg.buildDir / "native" / "process_lock.o") src

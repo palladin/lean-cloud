@@ -25,6 +25,16 @@ case "$*" in
 esac
 MOCK
 chmod +x "$work/bin/docker"
+cat > "$work/bin/curl" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+url=${!#}
+[[ "$url" == https://api.github.com/repos/leanprover/lean4/releases/tags/v* ]] || exit 1
+if [[ ${HELPER_BAD_RELEASE:-0} == 1 ]]; then printf '{"assets":[]}\n'; exit; fi
+version=${url##*/v}
+printf '{"assets":[{"name":"lean-%s-linux.tar.zst","digest":"sha256:%064d"},{"name":"lean-%s-linux_aarch64.tar.zst","digest":"sha256:%064d"}]}\n' "$version" 1 "$version" 2
+MOCK
+chmod +x "$work/bin/curl"
 export PATH="$work/bin:$PATH"
 assert_mode() {
   local actual
@@ -75,6 +85,15 @@ jq -e '[.items[]|select(.kind=="Service")]|all(.spec.type=="ClusterIP")' "$work/
 jq -e '[.items[]|select(.kind=="PersistentVolumeClaim")]|length==4' "$work/kube/resources.json" >/dev/null
 jq -e '[.items[]|select(.kind=="StatefulSet")|.spec.template.spec.containers[0].env[]|select(.name=="CLOUD_NODE_NAME")]|length==4 and all(.valueFrom.fieldRef.fieldPath=="spec.nodeName")' "$work/kube/resources.json" >/dev/null
 if grep -q 'token\|secretKey' "$work/kube/resources.json"; then echo 'Credentials in preview'; exit 1; fi
+jq '.startupSeconds=900' "$work/kube/deployment.json" > "$work/kube/next.json"
+mv "$work/kube/next.json" "$work/kube/deployment.json"
+bash deploy/kubernetes.sh render "$work/kube"
+jq -e '[.items[]|select(.kind=="StatefulSet")|.spec.template.spec.containers[0].startupProbe.failureThreshold]|all(.==180)' "$work/kube/resources.json" >/dev/null
+jq '.schedulerResources={cpuMillis:250,memoryMiB:512}' "$work/kube/deployment.json" > "$work/kube/next.json"
+mv "$work/kube/next.json" "$work/kube/deployment.json"
+bash deploy/kubernetes.sh render "$work/kube"
+jq -e '.items[]|select(.kind=="StatefulSet" and .metadata.name=="scheduler")|.spec.template.spec.containers[0].resources|.requests.cpu=="250m" and .limits.memory=="512Mi"' "$work/kube/resources.json" >/dev/null
+jq -e --arg memory "$(jq -r '.memoryMiB|tostring' "$work/kube/deployment.json")Mi" '[.items[]|select(.kind=="StatefulSet" and .metadata.name!="scheduler")|.spec.template.spec.containers[0].resources.limits.memory]|all(.==$memory)' "$work/kube/resources.json" >/dev/null
 jq '.image="mutable:tag"' "$work/kube/deployment.json" > "$work/kube/next.json"
 mv "$work/kube/next.json" "$work/kube/deployment.json"
 if bash deploy/kubernetes.sh render "$work/kube" 2>/dev/null; then echo 'Accepted mutable registry image'; exit 1; fi
@@ -103,6 +122,11 @@ for version in 4.35.0 4.35.1 4.36.0 4.100.0 5.0.0; do
   [[ $(wc -l < "$HELPER_TEST_LOG") -eq 2 ]]
   grep -Fq -- "--build-arg SOURCE_LEAN_VERSION=$version -t checker:test" "$HELPER_TEST_LOG"
 done
+: > "$HELPER_TEST_LOG"
+if HELPER_BAD_RELEASE=1 bash Applications/LeanBuild/build.sh checker:test 4.35.0; then
+  echo 'Built an image without official release checksums'; exit 1
+fi
+[[ ! -s "$HELPER_TEST_LOG" ]]
 : > "$HELPER_TEST_LOG"
 bash Applications/LeanBuild/build.sh
 grep -Fq -- "--build-arg SOURCE_LEAN_VERSION=$(sed 's|leanprover/lean4:v||' Applications/LeanBuild/source-toolchain)" "$HELPER_TEST_LOG"

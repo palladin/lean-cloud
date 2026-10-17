@@ -34,6 +34,10 @@ This example uses **one ARM64 VM** (`Standard_D4ps_v6`) with one scheduler and
 three worker pods. Workers are processes in containers, not separate VMs. It is
 a development setup, not a highly available cluster. Azure charges for the VM,
 disks, registry, storage and networking until you remove them in step 7.
+`os_disk_size_gb` sets each VM's OS disk (default 32 GiB), which also holds
+container images and temporary workspaces. Increase it for large build jobs.
+The separate `diskGiB` deployment setting controls each node's persistent data
+volume, including SQLite and any application cache.
 
 ## 2. Configure and provision
 

@@ -14,6 +14,8 @@ abbrev latest := Observations.latest
 structure Snapshot where
   steps : Array Step := #[]
   warning : String := ""
+  nodes : Array DeploymentApi.Node := #[]
+  cursors : Array (String × Option String) := #[]
 
 /-- Keep only the latest view under a per-run lock. -/
 def retain (ctx : Context) (run : Run) (incoming : Snapshot) : Cli Snapshot := do
@@ -26,10 +28,14 @@ def retain (ctx : Context) (run : Run) (incoming : Snapshot) : Cli Snapshot := d
     if (steps.map (·.id)) != (saved.map (·.id)) || !(← request (.exists path)) then saveJson path steps
     return { incoming with steps }
 
-def load (ctx : Context) (run : Run) : Cli Snapshot := do
+/-- Interactive refreshes visit one page per node, cycling through stable slots.
+An unbounded read is retained for the final snapshot and `watch --once`. -/
+def load (ctx : Context) (run : Run)
+    (cursors : Option (Array (String × Option String)) := none) : Cli Snapshot := do
   let connection ← ctx.requireConnection
   let mut steps := #[]
   let mut warnings := #[]
+  let mut nextCursors := #[]
   let inventory ← observing (Client.call connection .nodes)
   match inventory with
   | .error _ => warnings := warnings.push "Deployment telemetry unavailable; showing last view."
@@ -39,7 +45,7 @@ def load (ctx : Context) (run : Run) : Cli Snapshot := do
         warnings := warnings.push s!"{node.id} unavailable; its last view may be incomplete."
         continue
       try
-        let mut after := none
+        let mut after := (cursors.getD #[] |>.find? (·.1 == node.id)).bind (·.2)
         repeat
           let page ← Client.call connection (.observations run.id node.id after 100)
           unless page.items.all (fun step => step.event.run == run.id && step.event.worker == node.id) do
@@ -47,11 +53,18 @@ def load (ctx : Context) (run : Run) : Cli Snapshot := do
           steps := steps ++ page.items
           unless page.warning.isEmpty do warnings := warnings.push (node.id ++ ": " ++ page.warning)
           match page.next with
-          | none => break
+          | none =>
+            nextCursors := nextCursors.push (node.id, none)
+            break
           | some key =>
             unless after.all (· < key) do throw "Non-advancing observation cursor"
             after := some key
+            if cursors.isSome then
+              nextCursors := nextCursors.push (node.id, after)
+              break
       catch _ => warnings := warnings.push (node.id ++ " updates unavailable; showing last view.")
-  return ← retain ctx run { steps, warning := String.intercalate "; " warnings.toList }
+  return ← retain ctx run {
+    steps, warning := String.intercalate "; " warnings.toList
+    nodes := inventory.toOption.getD #[], cursors := nextCursors }
 
 end LeanCloudCli.Trace

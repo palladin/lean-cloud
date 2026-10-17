@@ -67,6 +67,11 @@ LEAN_EXPORT lean_obj_res lc_http_client(lean_obj_arg world) {
     return lean_io_result_mk_ok(lean_alloc_external(client_class, client));
 }
 struct buffer { char *data; size_t size, limit; };
+static int progress(void *context, curl_off_t total, curl_off_t now,
+    curl_off_t upload_total, curl_off_t upload_now) {
+    (void)context; (void)total; (void)now; (void)upload_total; (void)upload_now;
+    return lean_io_check_canceled_core() ? 1 : 0;
+}
 static size_t receive(char *data, size_t size, size_t count, void *context) {
     struct buffer *b = context;
     if (count && size > SIZE_MAX / count) return 0;
@@ -112,6 +117,8 @@ static lean_obj_res request_http(b_lean_obj_arg handle, b_lean_obj_arg url,
     p_curl_easy_setopt(c, CURLOPT_WRITEDATA, &b);
     p_curl_easy_setopt(c, CURLOPT_ERRORBUFFER, error);
     p_curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
+    p_curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+    p_curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, progress);
     p_curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT_MS, 2000L);
     p_curl_easy_setopt(c, CURLOPT_TIMEOUT_MS, (long)timeout);
     /* A restarted/reconnected node may have a different IP. easy_reset keeps

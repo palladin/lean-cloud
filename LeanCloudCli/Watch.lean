@@ -1,6 +1,7 @@
 import LeanCloudCli.SnapshotMetrics
 import LeanCloudCli.Input
 import LeanCloudCli.BranchTree
+import LeanCloudCli.Fetch
 
 namespace LeanCloudCli.Watch
 open Lean LeanCloud
@@ -12,9 +13,10 @@ structure Navigation where
   deriving BEq, Inhabited
 
 def navigate (steps : Array Trace.Step) (autoOffset : Nat)
-    (nav : Navigation) (key : Input.Key) (lastPage : Nat := 0) : Navigation :=
+    (nav : Navigation) (key : Input.Key) (lastPage : Nat := 0)
+    (jobs : Array BranchObservation := #[]) : Navigation :=
   if [.left, .right, .up, .down, .enter].contains key then
-    let tree := BranchTree.navigate (BranchTree.current steps) nav.tree key
+    let tree := BranchTree.navigate (BranchTree.current steps jobs) nav.tree key
     { nav with tree, offset := 0, workers := 0 }
   else
     let offset := if nav.offset == 0 then autoOffset else nav.offset
@@ -51,9 +53,10 @@ private def branchCode (steps : Array Trace.Step) (row : BranchTree.Row) : Array
 private def mapped (run : Run) (steps : Array Trace.Step) : Option (ProgramSource × SourceSite) :=
   steps.findSomeRev? (sourcePosition run)
 
-private def sourceStart (run : Run) (steps : Array Trace.Step) (nav : Navigation) : Nat :=
+private def sourceStart (run : Run) (steps : Array Trace.Step) (nav : Navigation)
+    (jobs : Array BranchObservation) : Nat :=
   let line := do
-    let row ← BranchTree.selected (BranchTree.current steps) nav.tree
+    let row ← BranchTree.selected (BranchTree.current steps jobs) nav.tree
     let (_, site) ← mapped run (branchCode steps row)
     pure site.line
   max 1 (line.getD 1 - 1)
@@ -180,9 +183,17 @@ def frame (ctx : Context) (run : Run) (steps : Array Trace.Step)
     (histories : Array History) (nav : Navigation) (width height : Nat)
     (status := "") (color := false) (warning := "")
     (timing : Option Timing.Run := none)
+    (jobs : Array BranchObservation := #[])
     : Array String := Id.run do
   let width := width - 1
-  let entries := BranchTree.current steps
+  let control := if status.startsWith "paused" then some "paused"
+    else if status.startsWith "killed" || status.startsWith "cancelled" then some "killed"
+    else if status.startsWith "failed" then some "stopped"
+    else if status == "result pending" then some "" else none
+  -- Run status is authoritative even when diagnostic control events are missing
+  -- or a paged refresh still contains an older pause event.
+  let entries := (BranchTree.current steps jobs).map fun entry =>
+    { entry with control := control.getD entry.control }
   let live := status == "result pending"
   let mut lines := #[
     Styled.text (pad width s!" {run.id} · {status} · {run.program.entry} / {ctx.project}") .header,
@@ -232,48 +243,90 @@ private def status (ctx : Context) (run : Run) : Cli String := do
 private def terminal (status : String) : Bool :=
   ["completed", "failed", "cancelled", "killed"].any (fun label => status.startsWith label)
 
+private def moved (steps : Array Trace.Step) (run : Run) (nav : Navigation)
+    (key : Input.Key) (lastPage : Nat) (jobs : Array BranchObservation := #[]) : Navigation :=
+  if key == .idle then nav else
+    navigate steps (if key == .text "j" || key == .text "k" then sourceStart run steps nav jobs else 1)
+      nav key lastPage jobs
+
 private partial def wait (draw : Navigation → Nat → Nat → Cli Unit) (lastPage : Nat → Nat → Nat)
     (run : Run) (steps : Array Trace.Step) (refresh : Option Nat) (nav : Navigation)
-    (size : Nat × Nat) : Cli (Option Navigation) := do
+    (size : Nat × Nat) (jobs : Array BranchObservation) : Cli (Option Navigation) := do
   let key ← Input.read
   if [.text "q", .escape, .interrupt, .eof].contains key then return none
   let nextSize ← request .dimensions
-  let next := navigate steps (sourceStart run steps nav) nav key (lastPage nextSize.1 nextSize.2)
+  let next := moved steps run nav key (lastPage nextSize.1 nextSize.2) jobs
   let next := { next with workers := min next.workers (lastPage nextSize.1 nextSize.2) }
   if next != nav || nextSize != size then draw next nextSize.1 nextSize.2
   if refresh.any ((← request .now) ≥ ·) then return some next
-  wait draw lastPage run steps refresh next nextSize
+  wait draw lastPage run steps refresh next nextSize jobs
+
+private structure View where
+  snapshot : Trace.Snapshot := {}
+  history : Array History := #[]
+  status : String := "connecting"
+  timing : Option Timing.Run := none
+  timingAvailable : Bool := false
+  jobs : Array BranchObservation := #[]
+
+private def loadView (ctx : Context) (run : Run) (previous : View) (interactive : Bool) : Cli View := do
+  let status ← status ctx run
+  let observed ← observing (ctx.observation run)
+  let timing ← match observed with
+    | .ok value => pure value.timing
+    | .error _ => ctx.savedTiming run
+  let jobs := observed.toOption.map (fun value => value.jobs.map BranchObservation.ofJob)
+    |>.getD previous.jobs
+  let timingAvailable := observed.isOk
+  let live := status == "result pending"
+  let snapshot ← Trace.load ctx run (if live && interactive then some previous.snapshot.cursors else none)
+  -- Trace already fetched the inventory; do not ask every node a second time.
+  let history := if live then
+    (snapshot.nodes.filter (·.id != "scheduler")).map fun node =>
+      { name := ctx.node node.id, resources := node.samples, fresh := node.online : History }
+    else previous.history
+  return { snapshot, status, timing, timingAvailable, history, jobs }
+
+private def drawView (ctx : Context) (run : Run) (view : View) (interactive color : Bool)
+    (nav : Navigation) (width height : Nat) : Cli Unit := do
+  let lines := frame ctx run view.snapshot.steps view.history nav width height
+    view.status color view.snapshot.warning view.timing view.jobs
+  if interactive then request (.write "\x1b[H\x1b[2J")
+  request (.write (String.intercalate "\n" lines.toList ++ "\n"))
+  request .flush
+
+private def lastPage (ctx : Context) (view : View) (width height : Nat) : Nat :=
+  let width := width - 1
+  let sidebar := width ≥ 100
+  let bodyWidth := if sidebar then width - min 52 (max 38 (width / 4)) - 3 else width
+  let bodyHeight := height - 5 - (if sidebar then 0 else 5)
+  let count := (workerRoster ctx view.snapshot.steps view.history).size
+  let capacity := workerCapacity count bodyWidth (bodyHeight - 3 - min 5 (max 2 (bodyHeight / 5)))
+  (count + capacity - 1) / capacity - 1
 
 private partial def loop (ctx : Context) (run : Run) (interactive color : Bool)
-    (history : Array History := #[]) (nav : Navigation := {}) : Cli Unit := do
-  let snapshot ← Trace.load ctx run
-  let status ← status ctx run
-  let (timing, timingAvailable) ← ctx.timingSnapshot run
-  let live := status == "result pending"
-  let nodes ← if live then try ctx.nodes catch _ => pure #[] else pure #[]
-  let nodes := nodes.filter (fun node => node.role != "scheduler")
-  let history := if live then rememberNodes nodes else history
+    (previous : View) (nav : Navigation := {}) : Cli Unit := do
   let (width, height) ← if interactive then request .dimensions else pure (120, 35)
-  let draw (nav : Navigation) (width height : Nat) : Cli Unit := do
-    let lines := frame ctx run snapshot.steps history nav width height status color snapshot.warning timing
-    if interactive then request (.write "\x1b[H\x1b[2J")
-    request (.write (String.intercalate "\n" lines.toList ++ "\n"))
-    request .flush
+  let fetched ← if !interactive then
+    pure (some (← loadView ctx run previous false, (nav, (width, height))))
+  else
+    Fetch.run (loadView ctx run previous true) (fun (nav, size) => do
+      let key ← Input.read
+      if [.text "q", .escape, .interrupt, .eof].contains key then return none
+      let nextSize ← request .dimensions
+      let next := moved previous.snapshot.steps run nav key (lastPage ctx previous nextSize.1 nextSize.2) previous.jobs
+      if next != nav || nextSize != size then
+        drawView ctx run previous true color next nextSize.1 nextSize.2
+      return some (next, nextSize)) (nav, (width, height))
+  let some (view, (nav, (width, height))) := fetched | return
+  let draw := drawView ctx run view interactive color
   draw nav width height
   if !interactive then return
   let now ← request .now
-  let awaitingTiming := timingAvailable && timing.any (fun timing => timing.span.any (·.finishedMs.isNone))
-  let refresh := if terminal status && !awaitingTiming then none else some (now + 1000)
-  let lastPage (width height : Nat) :=
-    let width := width - 1
-    let sidebar := width ≥ 100
-    let bodyWidth := if sidebar then width - min 52 (max 38 (width / 4)) - 3 else width
-    let bodyHeight := height - 5 - (if sidebar then 0 else 5)
-    let count := (workerRoster ctx snapshot.steps history).size
-    let capacity := workerCapacity count bodyWidth (bodyHeight - 3 - min 5 (max 2 (bodyHeight / 5)))
-    (count + capacity - 1) / capacity - 1
-  let some nav ← wait draw lastPage run snapshot.steps refresh nav (width, height) | return
-  loop ctx run interactive color history nav
+  let awaitingTiming := view.timingAvailable && view.timing.any (fun timing => timing.span.any (·.finishedMs.isNone))
+  let refresh := if terminal view.status && !awaitingTiming then none else some (now + 1000)
+  let some nav ← wait draw (lastPage ctx view) run view.snapshot.steps refresh nav (width, height) view.jobs | return
+  loop ctx run interactive color view nav
 
 /-- Watching is an Eff program and never submits or resumes a workflow. -/
 def run (ctx : Context) (id : String) (once := false) : Cli Unit := do
@@ -288,7 +341,12 @@ def run (ctx : Context) (id : String) (once := false) : Cli Unit := do
   let interactive ← if once then pure false else request .enterTerminal
   try
     if interactive then request (.write "\x1b[?1049h\x1b[?25l")
-    loop ctx run interactive (interactive && (← colorsEnabled))
+    let color := interactive && (← colorsEnabled)
+    let initial : View := { snapshot := ← Trace.retain ctx run {} }
+    if interactive then
+      let (width, height) ← request .dimensions
+      drawView ctx run initial true color {} width height
+    loop ctx run interactive color initial
   finally
     if interactive then
       try request .leaveTerminal

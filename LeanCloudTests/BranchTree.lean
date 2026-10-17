@@ -46,6 +46,16 @@ private def text (nav : Watch.Navigation) (width := 180) (height := 40) (trace :
 private def has (text fragment : String) : Bool := (text.splitOn fragment).length > 1
 
 public def cases : Array TestCase := #[
+  ⟨"console.tree.large-scheduler-snapshot", do
+    let count := 10000
+    let jobs := (Array.range count).map fun i =>
+      BranchObservation.ofJob ⟨fork.child i, fork.child i, false, .done⟩
+    let root := BranchObservation.ofJob ⟨Location.root, fork, true, .running "worker4" 9 100⟩
+    let entries := LeanCloudCli.BranchTree.current steps (jobs.push root)
+    let rows := LeanCloudCli.BranchTree.rows entries {}
+    assertEq (rows.filter fun row => row.parent == some "parallel/0:2").size count
+    assertEq (rows[0]?.map (·.status)) (some "worker4") "Paged observations overrode current scheduler state"
+    assertEq (LeanCloudCli.BranchTree.rows entries { collapsed := #["branch/0:0"] }).size 1⟩,
   ⟨"console.tree.parallel-shows-workers-branch-shows-current-assignment", do
     let other := { workerStep 5 sibling sibling "ancestor" with event := {
       (workerStep 5 sibling sibling "ancestor").event with worker := "worker3" } }
@@ -87,6 +97,9 @@ public def cases : Array TestCase := #[
     assertTrue (early.any (fun e => e.branch == sibling && e.job.isNone)) "Missing event fabricated child state"
     let earlyRows := LeanCloudCli.BranchTree.rows early {}
     assertTrue (!earlyRows.any (·.branch == grandchild)) "Future descendant appeared in history"
+    let current := LeanCloudCli.BranchTree.current #[] #[steps[0]!.job.get!]
+    assertEq current.size 3 "Paged telemetry hid pending children from the current scheduler snapshot"
+    assertEq (LeanCloudCli.BranchTree.rows current {}).size 4
     let compact := Trace.latest #[steps[0]!, steps[10]!]
     assertEq (LeanCloudCli.BranchTree.current compact).size 3 "Completion erased the parallel group when child observations were missing"
     let entries := LeanCloudCli.BranchTree.current steps
@@ -121,6 +134,14 @@ public def cases : Array TestCase := #[
     assertTrue ((Watch.navigate active 1 expanded (.text "[")).tree == expanded.tree) "Removed timeline keys changed selection"⟩,
   ⟨"console.tree.controls-and-legacy-traces", do
     let control (name : String) := { steps[0]! with event := { steps[0]!.event with activity := name }, branch := none, job := none }
+    let frame (status : String) (trace : Array Trace.Step) := String.intercalate "\n"
+      (Watch.frame ⟨"/work", "test"⟩ run trace #[] {} 180 40 status).toList
+    let stopped := frame "paused" (steps.extract 0 3)
+    assertTrue (has stopped "root paused" && !has stopped "root waiting")
+      "Missing telemetry concealed the authoritative paused status"
+    let live := frame "result pending" ((steps.extract 0 3).push (control "paused"))
+    assertTrue (has live "root waiting" && !has live "root paused")
+      "Stale pause telemetry overrode the live run status"
     let paused := LeanCloudCli.BranchTree.current ((steps.extract 0 3).push (control "paused"))
     assertTrue ((LeanCloudCli.BranchTree.rows paused {}).any (·.status == "paused")) "Pause not reflected"
     let resumed := LeanCloudCli.BranchTree.current ((steps.extract 0 3) ++ #[control "paused", control "resumed"])

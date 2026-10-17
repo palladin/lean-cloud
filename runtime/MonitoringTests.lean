@@ -84,6 +84,19 @@ private def nativeResources : IO Unit := do
 
 def run : IO Unit := IO.FS.withTempFile fun _ path => do
   nativeResources
+  let captured ← IO.mkRef (#[] : Array Observations.Step)
+  let trace ← Trace.create "worker1" "parallel-source" (fun step => captured.modify (·.push step))
+  let fork := Location.root.next
+  trace.assign ⟨0, Location.root⟩
+  trace.visit fork (some "parallel-site")
+  let records := trace.records { read := fun _ => pure none, create := fun _ record => pure record }
+  discard <| records.read (ReplayStore.returnKey (fork.child 0))
+  trace.suspend fork
+  trace.emit "idle" ""
+  let retained := Observations.latest (← captured.get)
+  assertTrue (retained.any fun step => step.keys.contains ("fork/" ++ fork.key) &&
+    step.event.source == some "parallel-site" && step.event.location == fork.key)
+    "Suspended parallel source was lost or attributed to a child return"
   let conn ← LeanLinq.Sqlite.connect path.toString
   try
     let store ← ObservationStore.create conn "worker1"

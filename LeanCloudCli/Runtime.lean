@@ -64,11 +64,6 @@ def Context.savedTiming (ctx : Context) (run : Run) : Cli (Option Timing.Run) :=
     if ← request (.exists path) then pure (some (← readJson path)) else pure none
   catch _ => pure none
 
-/-- An unavailable scheduler leaves the saved clock fixed, not ticking locally. -/
-def Context.timingSnapshot (ctx : Context) (run : Run) : Cli (Option Timing.Run × Bool) := do
-  try pure ((← ctx.observation run).timing, true)
-  catch _ => pure (← ctx.savedTiming run, false)
-
 private def chooseProgram (programs : Array ProgramInfo) (name : String) : Except String ProgramInfo :=
   let found := programs.filter fun p => p.entry == name || (p.entry.splitOn "/").head! == name
   match found.toList with

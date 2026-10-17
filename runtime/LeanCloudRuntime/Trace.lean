@@ -82,6 +82,12 @@ def Sink.branches (sink : Sink) (before after : Array Scheduler.Job) : IO Unit :
 def Sink.visit (sink : Sink) (location : Location) (source : Option SourceSiteId) : IO Unit :=
   sink.state.modify fun state => { state with location := location.key, source }
 
+/-- Joining probes child returns. Restore the parallel location before retaining
+its source, rather than attributing the suspension to the last child read. -/
+def Sink.suspend (sink : Sink) (location : Location) : IO Unit := do
+  sink.state.modify fun state => { state with location := location.key }
+  sink.emit "suspended" "parallel"
+
 private def operation (request : Request) : String :=
   if request.kind == "exec" then request.payload.getStr?.toOption.getD "exec" else request.kind
 

@@ -10,9 +10,17 @@ structure LockId where
   value : Nat
   deriving BEq, Repr
 
+/-- An in-flight HTTP request owned by the host handler. -/
+structure HttpId where
+  value : Nat
+  deriving BEq, Repr, Hashable
+
 /-- The CLI's host boundary. Requests contain data, never arbitrary IO actions. -/
 inductive HostOp : Type → Type where
   | httpPost (url token body : String) : HostOp String
+  | httpStart (url token body : String) : HostOp HttpId
+  | httpPoll (id : HttpId) : HostOp (Option (Except String String))
+  | httpCancel (id : HttpId) : HostOp Unit
   | readFile (path : System.FilePath) : HostOp String
   | writeFile (path : System.FilePath) (text : String) : HostOp Unit
   | rename (source target : System.FilePath) : HostOp Unit

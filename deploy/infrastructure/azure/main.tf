@@ -10,6 +10,10 @@ variable "region" { type = string }
 variable "subscription" { type = string }
 variable "machines" { type = number }
 variable "machine_size" { type = string }
+variable "os_disk_size_gb" {
+  type    = number
+  default = 32
+}
 variable "kubernetes_version" { type = string }
 variable "administrator_cidrs" { type = list(string) }
 variable "namespace" { type = string }
@@ -63,7 +67,7 @@ resource "azurerm_kubernetes_cluster" "cloud" {
     name                 = "nodes"
     vm_size              = var.machine_size
     node_count           = var.machines
-    os_disk_size_gb      = 32
+    os_disk_size_gb      = var.os_disk_size_gb
     auto_scaling_enabled = false
   }
   identity { type = "SystemAssigned" }

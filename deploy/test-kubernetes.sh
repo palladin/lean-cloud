@@ -52,6 +52,22 @@ bash deploy/kubernetes.sh down "$work/deployment" > "$work/result" 2>&1
 grep -q 'scale statefulset/worker1 --replicas=0' "$work/calls"
 grep -q 'delete configmap cloud-operation' "$work/calls"
 if grep -q 'delete pvc\|delete namespace' "$work/calls"; then echo 'Down destroyed data'; exit 1; fi
+# Resource/startup changes must not change durable identity, including records
+# saved before these optional settings were excluded from the identity.
+jq '.data.identity |= (fromjson | .startupSeconds=300 | tojson)' "$work/record.json" > "$work/record.next"
+mv "$work/record.next" "$work/record.json"
+jq '.startupSeconds=900 | .schedulerResources={cpuMillis:250,memoryMiB:512}' \
+  "$work/deployment/deployment.json" > "$work/deployment/next.json"
+mv "$work/deployment/next.json" "$work/deployment/deployment.json"
+bash deploy/kubernetes.sh down "$work/deployment" > "$work/result" 2>&1
+cp "$work/deployment/deployment.json" "$work/original.json"
+jq '.image="registry/other@sha256:0000000000000000000000000000000000000000000000000000000000000002"' \
+  "$work/original.json" > "$work/deployment/deployment.json"
+: > "$work/calls"
+if bash deploy/kubernetes.sh down "$work/deployment" > "$work/result" 2>&1; then echo 'Accepted image identity change'; exit 1; fi
+grep -q 'Deployment image, storage settings or identity changed' "$work/result"
+if grep -q 'scale\| apply ' "$work/calls"; then echo 'Changed deployment before validating identity'; exit 1; fi
+cp "$work/original.json" "$work/deployment/deployment.json"
 bash deploy/kubernetes.sh connect "$work/deployment" 18080 > "$work/result"
 grep -q 'http://127.0.0.1:18080' "$work/result"
 grep -q 'port-forward --address 127.0.0.1 service/cloud-api 18080:8080' "$work/calls"

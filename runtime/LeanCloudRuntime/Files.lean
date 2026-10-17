@@ -32,11 +32,7 @@ namespace Files
 def chunkSize : Nat := 4 * 1024 * 1024
 
 def digest (path : System.FilePath) : IO String := do
-  let out ← IO.Process.output { cmd := "openssl", args := #["dgst", "-sha256", "-r", path.toString] }
-  let hash := (out.stdout.splitOn " ").head!
-  unless out.exitCode == 0 && hash.length == 64 && hash.toList.all (fun c =>
-      c.isDigit || ('a' ≤ c && c ≤ 'f')) do throw (IO.userError "File SHA-256 failed")
-  return hash
+  Digest.file path.toString
 
 private def readBlob (store : ObjectStore) (ref : BlobRef) : IO ByteArray := do
   match ← (store.readBytes ref).run with

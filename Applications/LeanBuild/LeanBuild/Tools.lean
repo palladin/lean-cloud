@@ -1,5 +1,6 @@
 import LeanBuild.Workflow
 import LeanBuild.Bundle
+import LeanBuild.Toolchain
 import LeanCloudRuntime.Process
 
 namespace LeanBuild
@@ -11,6 +12,7 @@ structure Tools where
   toolchain : System.FilePath
   helper : System.FilePath
   sandbox : Bool := true
+  cache : Option Bundle.Cache := none
 
 private def withWorkspace (action : System.FilePath → IO α) : IO α :=
   IO.FS.withTempDir fun root => do
@@ -161,7 +163,7 @@ private def restore (tools : Tools) (store : ObjectStore) (directory : System.Fi
   unless (← platform) == plan.platform do throw (IO.userError "Build worker platform changed")
   let source : Bundle.Manifest ← Files.readJson store plan.source
   let workspace := Bundle.overlay source artifacts
-  Bundle.restore store directory workspace request.limits.bytes
+  Bundle.restore store directory workspace request.limits.bytes tools.cache
   unless (← verifyToolchain tools (project directory request)) == plan.toolchain do
     throw (IO.userError "Toolchain changed since preparation")
   return workspace
@@ -171,8 +173,9 @@ private def buildJob (tools : Tools) (store : ObjectStore) (request : Request)
   withWorkspace fun directory => do
     let start ← IO.monoMsNow
     let mut imports : Bundle.Manifest := #[]
+    let needed := module.map (prerequisites plan)
     for result in completed do
-      if module.any (fun m => !(prerequisites plan m).contains result.name) then continue
+      if needed.any (fun names => !names.contains result.name) then continue
       let some ref := result.artifacts | throw (IO.userError "Missing prerequisite artifacts")
       imports ← IO.ofExcept (Bundle.merge imports (← Files.readJson store ref))
     let baseline ← restore tools store directory request plan imports
@@ -220,7 +223,7 @@ def Tools.check (tools : Tools) (store : ObjectStore) (request : Request)
     let start ← IO.monoMsNow
     let some ref := built.artifacts | throw (IO.userError "Missing completed build artifacts")
     -- The final manifest describes the entire completed workspace, including deletions.
-    Bundle.restore store directory (← Files.readJson store ref) request.limits.bytes
+    Bundle.restore store directory (← Files.readJson store ref) request.limits.bytes tools.cache
     let exportPath := directory / ".." / "proofs.ndjson"
     let result : Except String (Array Theorem) ← try
       unless (← platform) == plan.platform &&
@@ -246,13 +249,26 @@ def Tools.check (tools : Tools) (store : ObjectStore) (request : Request)
         exportFile := ← Files.upload store exportPath request.limits.bytes }
 
 def Tools.fromEnvironment : IO Tools := do
-  let toolchain := (← IO.getEnv "LEAN_BUILD_TOOLCHAIN").getD "/opt/build-lean"
   let helper := (← IO.getEnv "LEAN_BUILD_HELPER").getD "/opt/lean-build/Helper.lean"
+  let toolchain : System.FilePath ← match ← IO.getEnv "LEAN_BUILD_TOOLCHAIN" with
+    | some directory => pure (System.FilePath.mk directory)
+    | none => do
+      match ← IO.getEnv "LEAN_BUILD_RELEASE" with
+      | none => pure (System.FilePath.mk "/opt/build-lean")
+      | some spec => do
+        let cache := (← IO.getEnv "LEAN_BUILD_TOOLCHAINS").getD "/data/toolchains"
+        Toolchain.fromFile spec cache helper
   let sandbox ← match (← IO.getEnv "LEAN_BUILD_SANDBOX").getD "1" with
     | "1" => pure true
     | "0" => pure false
     | _ => throw (IO.userError "LEAN_BUILD_SANDBOX must be 0 or 1")
-  return { toolchain := ← IO.FS.realPath toolchain, helper := ← IO.FS.realPath helper, sandbox }
+  let cache : Option Bundle.Cache ← match ← IO.getEnv "LEAN_BUILD_CACHE" with
+    | none => pure none
+    | some directory => do
+      let value := (← IO.getEnv "LEAN_BUILD_CACHE_BYTES").getD "4294967296"
+      let some bytes := value.toNat? | throw (IO.userError "Invalid LEAN_BUILD_CACHE_BYTES")
+      pure (some { directory := directory, bytes : Bundle.Cache })
+  return { toolchain := ← IO.FS.realPath toolchain, helper := ← IO.FS.realPath helper, sandbox, cache }
 
 def Tools.backend (tools : Tools) (store : ObjectStore) : Backend IO :=
   ⟨tools.prepare store, tools.build store, tools.finish store, tools.check store⟩
