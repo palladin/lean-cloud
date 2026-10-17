@@ -1,8 +1,8 @@
-import LeanVerify
+import LeanBuild
 import LeanCloudRuntime.Run
 import LeanCloud.DirectInterpreter
 
-namespace LeanVerify.Command
+namespace LeanBuild.Command
 open Lean LeanCloudRuntime
 
 private def decode [FromJson α] (path : String) : IO α := do
@@ -20,7 +20,7 @@ def main (args : List String) : IO UInt32 := do
       IO.ofExcept request.validate
       let .ok report ← (LeanCloud.DirectInterpreter.interpret cfg.objects.storage
         (workflow (tools.backend cfg.objects)) request).run
-        | throw (IO.userError "Verification workflow failed")
+        | throw (IO.userError "Build workflow failed")
       IO.FS.writeFile output (toJson report).pretty
       return if report.success then 0 else 1
     | ["download", config, refFile, output] =>
@@ -30,9 +30,18 @@ def main (args : List String) : IO UInt32 := do
         IO.print (← Files.readText cfg.objects ref Files.metadataLimit)
       else Files.download cfg.objects ref output (16 * 1024 * 1024 * 1024)
       return 0
+    | ["restore", config, refFile, directory] =>
+      let cfg ← Config.load config
+      let ref : FileRef ← decode refFile
+      let destination := System.FilePath.mk directory
+      if ← destination.pathExists then throw (IO.userError "Restore requires a new directory")
+      let manifest : Bundle.Manifest ← Files.readJson cfg.objects ref
+      IO.FS.createDirAll destination
+      Bundle.restore cfg.objects destination manifest (16 * 1024 * 1024 * 1024)
+      return 0
     | _ =>
-      IO.eprintln "Usage: files run CONFIG INPUT REPORT | files download CONFIG FILE_REF OUTPUT"
+      IO.eprintln "Usage: files run CONFIG INPUT REPORT | files download CONFIG FILE_REF OUTPUT | files restore CONFIG MANIFEST_REF DIRECTORY"
       return 2
   catch error => IO.eprintln s!"{error}"; return 1
 
-end LeanVerify.Command
+end LeanBuild.Command

@@ -1,0 +1,6 @@
+{
+  "repository": "https://github.com/leanprover-community/batteries",
+  "revision": "66e469188fe07963e5cf666c7d4433f45b8131c5",
+  "targets": ["+Batteries.Data.Nat.Bisect", "+Batteries.Data.Nat.Bitwise.Lemmas"],
+  "check": {"mode": "kernel", "theorems": ["Nat.avg_comm"]}
+}

@@ -47,6 +47,6 @@
    "inputRev": "main",
    "inherited": true,
    "configFile": "lakefile.lean"}],
- "name": "lean_verify",
+ "name": "lean_build",
  "lakeDir": ".lake",
  "fixedToolchain": false}

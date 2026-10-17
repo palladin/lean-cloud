@@ -1,3 +1,0 @@
-name = "verify_fixture"
-[[lean_lib]]
-name = "Fixture"

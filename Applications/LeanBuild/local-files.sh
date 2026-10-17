@@ -5,7 +5,7 @@ directory=$(cd "$1" && pwd -P)
 input=$2
 name=$(jq -er .name "$directory/deployment.json")
 compose() { docker compose -p "$name" -f "$directory/compose.json" "$@"; }
-workspace=$(compose exec -T scheduler mktemp -d /tmp/verify-files.XXXXXX)
+workspace=$(compose exec -T scheduler mktemp -d /tmp/build-files.XXXXXX)
 cleanup() { compose exec -T scheduler rm -rf "$workspace" >/dev/null; }
 trap cleanup EXIT
 compose cp "$input" "scheduler:$workspace/ref.json" >/dev/null

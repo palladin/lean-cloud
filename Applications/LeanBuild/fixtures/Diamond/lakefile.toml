@@ -1,0 +1,4 @@
+name = "build_fixture"
+defaultTargets = ["Fixture"]
+[[lean_lib]]
+name = "Fixture"
