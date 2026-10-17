@@ -17,6 +17,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends libcurl4-openss
 WORKDIR /src
 
 FROM toolchain AS build
+ARG APP_BUILD_PACKAGES=""
+# Application helpers can declare inspectable native library dependencies.
+RUN if [ -n "$APP_BUILD_PACKAGES" ]; then apt-get update && \
+    apt-get install -y --no-install-recommends $APP_BUILD_PACKAGES && rm -rf /var/lib/apt/lists/*; fi
 COPY --from=node_assets node.c /tmp/node.c
 RUN cc -O2 -Wall -Wextra -Werror /tmp/node.c -o /usr/local/bin/cloud-node
 COPY --from=sdk lean-toolchain lakefile.lean lake-manifest.json /opt/lean-cloud/
@@ -40,8 +44,9 @@ ARG APP_TARGET
 RUN lake -KleanCloudSdk=/opt/lean-cloud build "$APP_TARGET" && mkdir -p /out && cp ".lake/build/bin/$APP_TARGET" /out/app
 
 FROM ubuntu:24.04
+ARG APP_RUNTIME_PACKAGES=""
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl openssl tzdata libsqlite3-0 libcurl4t64 \
+    ca-certificates curl openssl tzdata libsqlite3-0 libcurl4t64 $APP_RUNTIME_PACKAGES \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 worker \
     && mkdir /data /mailbox && chown worker:worker /data /mailbox

@@ -1,0 +1,14 @@
+<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/">
+  <siteinfo><sitename>Wiki test</sitename></siteinfo>
+  <page><title>Proof &amp; theorem</title><ns>0</ns><id>1</id>
+    <revision><id>11</id><model>wikitext</model><text xml:space="preserve">Proof proof! A theorem &amp; an algorithm. [[Proof]]</text></revision></page>
+  <page><title>Computers</title><ns>0</ns><id>2</id>
+    <revision><id>12</id><model>wikitext</model><text>Computer ALGORITHM algorithms.
+<![CDATA[π proof <tag>]]></text></revision></page>
+  <page><title>Empty</title><ns>0</ns><id>3</id>
+    <revision><id>13</id><model>wikitext</model><text /></revision></page>
+  <page><title>Redirect</title><ns>0</ns><id>4</id><redirect title="Computers"/>
+    <revision><id>14</id><text>#REDIRECT [[Computer]]</text></revision></page>
+  <page><title>Talk:Proof</title><ns>1</ns><id>5</id>
+    <revision><id>15</id><text>proof proof proof</text></revision></page>
+</mediawiki>
