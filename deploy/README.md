@@ -7,6 +7,24 @@ Kubernetes cluster needs no cloud provisioning helper.
 Start with [local Docker](#local-docker), or follow the separate
 [Azure walkthrough](Azure.md) to run the same example on AKS.
 
+Both follow **check tools → build → configure → up → connect → run**.
+Azure adds explicit login, infrastructure provisioning, and image publishing.
+Once configured, the deployment commands have the same shape:
+
+| Action | Local Docker | Azure / Kubernetes |
+| --- | --- | --- |
+| Inspect configuration | `./deploy/local.sh show DIR` | `./deploy/kubernetes.sh show DIR` |
+| Start / restart | `./deploy/local.sh up DIR` | `./deploy/kubernetes.sh up DIR` |
+| Inspect nodes | `./deploy/local.sh status DIR` | `./deploy/kubernetes.sh status DIR` |
+| Get the console connection | `./deploy/local.sh connect DIR` | `./deploy/kubernetes.sh connect DIR 8081` |
+| Set worker count | `./deploy/local.sh scale DIR 5` | `./deploy/kubernetes.sh scale DIR 5` |
+| Stop; keep data | `./deploy/local.sh down DIR` | `./deploy/kubernetes.sh down DIR` |
+| Delete deployment data | `./deploy/local.sh clean DIR --yes` | `./deploy/kubernetes.sh clean DIR --yes` |
+
+Local `connect` prints the connection command and exits. Kubernetes `connect`
+keeps a private tunnel open. Local `clean` also deletes the local blob service;
+Kubernetes `clean` leaves shared blobs and infrastructure for separate cleanup.
+
 ## Local Docker
 
 You need:
@@ -22,15 +40,19 @@ version in `lean-toolchain`. The application itself builds inside Docker.
 Use a fresh `.deployment` directory and an unused local port (8080 below).
 
 ```sh
-lake build lean_cloud
+./deploy/local.sh doctor
 ./deploy/build.sh . lean-cloud-demo:dev
-./deploy/local.sh init .deployment lean-cloud-demo:dev development 3 8080
+./deploy/local.sh configure .deployment lean-cloud-demo:dev development 3 8080
+./deploy/local.sh show .deployment
 # Review .deployment/compose.json and .deployment/config.json.
 ./deploy/local.sh up .deployment
+./deploy/local.sh status .deployment
+./deploy/local.sh connect .deployment
 ```
 
 This starts one scheduler, three workers and local blob storage. Wait for the
-helper to report that the nodes are healthy, then open the console:
+helper to report that the nodes are healthy, then open the console. Lake builds
+it automatically on the first run:
 
 ```sh
 lake exe lean_cloud
@@ -38,6 +60,10 @@ lake exe lean_cloud
 
 Continue with [the log-processing example](#run-the-log-processing-example)
 to submit and watch your first workflow.
+
+`configure` only prepares files and pins the local image ID; `up` starts the
+containers. The old `init` spelling remains an alias for `configure`.
+`show` displays deployment settings without printing authentication tokens.
 
 Each node hosts its HTTP inbox and embedded SQLite database. Submitting a run
 uses these existing nodes. Only the scheduler port is published, on loopback.
@@ -111,25 +137,24 @@ the inspectable configuration; choose a fresh directory to deploy again.
 ./deploy/new-app.sh ../my-app "$PWD"
 # Edit ../my-app/Main.lean: register your CloudProgram values.
 ./deploy/build.sh ../my-app my-app:dev cloud_app "$PWD"
-./deploy/local.sh init .my-app-deployment my-app:dev my-app 3 8081
+./deploy/local.sh configure .my-app-deployment my-app:dev my-app 3 8081
 ./deploy/local.sh up .my-app-deployment
 ```
 
 `Main.lean` delegates to `Application.main registry args`. The same executable
 serves either a scheduler or a worker. `deploy/app/Dockerfile` is an ordinary
 Buildx Dockerfile with explicit SDK and node source contexts. Building and
-publishing for a remote architecture is a normal Docker operation:
+publishing for a remote architecture uses the same build helper:
 
 ```sh
-docker buildx build --platform linux/arm64 --push \
-  --build-context sdk="$PWD" --build-context node_assets="$PWD/deploy" \
-  --build-arg LEAN_VERSION="$(sed 's|leanprover/lean4:v||' ../my-app/lean-toolchain)" \
-  --build-arg APP_TARGET=cloud_app -f deploy/app/Dockerfile \
-  -t YOUR_REGISTRY/cloud-app:VERSION ../my-app
+./deploy/build.sh --platform linux/arm64 ../my-app my-app:dev
+./deploy/azure.sh publish .azure-infra my-app:dev VERSION
 ```
 
-Sign in to the registry yourself using its documented Docker/provider CLI flow.
-Use the resulting registry digest (`IMAGE@sha256:...`) in Kubernetes.
+For Azure, first follow the [cluster setup](Azure.md); `publish` uses your existing
+login. `azure.sh configure` resolves the published image to an immutable digest.
+With another registry, use its normal image publishing tools and supply the
+resulting digest (`IMAGE@sha256:...`) in Kubernetes.
 
 ## Existing Kubernetes cluster
 
@@ -146,8 +171,14 @@ cp deploy/kubernetes/deployment.example.json .kube-deployment/deployment.json
 ./deploy/kubernetes.sh render .kube-deployment
 # Review .kube-deployment/resources.json; render does not contact Kubernetes.
 ./deploy/kubernetes.sh up .kube-deployment
+./deploy/kubernetes.sh status .kube-deployment
 ./deploy/kubernetes.sh connect .kube-deployment
 ```
+
+`status` lists the cluster machines and the deployment's pods. An optional
+`kubeconfig` path in deployment.json pins the credentials file, so commands do
+not depend on your shell's current Kubernetes configuration. Azure's `configure`
+helper fills this in automatically.
 
 `connect` runs a foreground loopback port-forward and prints the console command.
 Its optional final argument selects the local port, for example
@@ -180,16 +211,30 @@ private storage.json file. The bucket/container must already exist when marked
 provisioned. With Azure workload identity, nodes obtain credentials themselves;
 no storage key is needed in the configuration.
 
-To change worker count, edit deployment.json and run `up` again. The helper
-stops all old pods and waits for deletion before any replacement starts. It
+To change worker count, use the same command as locally:
+
+```sh
+./deploy/kubernetes.sh scale .kube-deployment 5
+```
+
+The helper updates deployment.json after stopping all old pods, and waits for
+their deletion before any replacement starts. It
 records PVC UIDs and rejects missing/replaced claims. Operations are serialized
 with the `cloud-operation` ConfigMap; an interrupted operation may leave it
 behind. Remove that lock only after confirming its previous operator has stopped.
 
 `down` stops nodes and retains PVCs. Use your cluster's backup/restore procedures
-for stopped node volumes and shared blobs. To delete the deployment permanently,
-stop it, then explicitly delete its dedicated namespace. Deleting it destroys
-SQLite state; blob cleanup is a separate operation owned by your storage tooling.
+for stopped node volumes and shared blobs. To delete the deployment permanently:
+
+```sh
+./deploy/kubernetes.sh clean .kube-deployment --yes
+```
+
+This stops the nodes, deletes their dedicated namespace, and waits for its disks
+to disappear. It requires volumes with a `Delete` reclaim policy; retained disks
+need your cluster's explicit cleanup procedure. An interrupted cleanup can be
+retried with the same command. Shared blobs are unchanged. Use a fresh deployment
+directory, namespace, and blob storage for a new deployment after cleanup.
 
 For a new Azure cluster, follow [the Azure walkthrough](Azure.md). It includes
 the registry push, workload identity setup, first run and complete teardown.

@@ -18,8 +18,11 @@ printf '%s\n' "$*" >> "$HELPER_TEST_LOG"
 case "$*" in
   'image inspect '* ) printf 'sha256:%064d\n' 1 ;;
   'info --format {{.Name}}') printf 'test-machine\n' ;;
+  info|'compose version'|'buildx version') ;;
   *'volume inspect'*) exit 1 ;;
   *'compose '*down*) ;;
+  *'compose '*port*) printf '127.0.0.1:8080\n' ;;
+  *'compose '*ps) ;;
   'buildx build '* | 'build '*) ;;
   *) echo 'Unexpected Docker action during offline test' >&2; exit 1 ;;
 esac
@@ -36,6 +39,7 @@ printf '{"assets":[{"name":"lean-%s-linux.tar.zst","digest":"sha256:%064d"},{"na
 MOCK
 chmod +x "$work/bin/curl"
 export PATH="$work/bin:$PATH"
+bash deploy/local.sh doctor
 assert_mode() {
   local actual
   actual=$(stat -c '%a' "$2" 2>/dev/null || stat -f '%Lp' "$2")
@@ -43,7 +47,14 @@ assert_mode() {
 }
 for count in 0 1 6; do
   dir="$work/local-$count"
-  bash deploy/local.sh init "$dir" app:test "test-$count" "$count" 8080
+  operation=configure
+  [[ $count != 0 ]] || operation=init  # Keep the original spelling compatible.
+  bash deploy/local.sh "$operation" "$dir" app:test "test-$count" "$count" 8080
+  bash deploy/local.sh show "$dir" > "$work/shown.json"
+  cmp "$dir/deployment.json" "$work/shown.json"
+  bash deploy/local.sh status "$dir"
+  bash deploy/local.sh connect "$dir" > "$work/connection"
+  grep -Fq "connect test-$count http://127.0.0.1:8080" "$work/connection"
   # Native Linux bind mounts preserve host modes; containers use different UIDs.
   assert_mode 700 "$dir"
   for file in config.json s3.json filer.toml; do assert_mode 644 "$dir/$file"; done
@@ -75,6 +86,9 @@ if grep -q 'compose.*up' "$HELPER_TEST_LOG"; then echo 'Started nodes before vol
 # Cleanup can be retried after some volumes have already been deleted.
 bash deploy/local.sh clean "$work/local-0" --yes
 bash deploy/local.sh clean "$work/local-0" --yes
+if bash deploy/local.sh up "$work/local-0" > "$work/result" 2>&1; then echo 'Started cleaned deployment'; exit 1; fi
+grep -Fq 'Cleanup has started' "$work/result"
+if bash deploy/local.sh scale "$work/local-0" 3 > "$work/result" 2>&1; then echo 'Scaled cleaned deployment'; exit 1; fi
 
 mkdir "$work/kube"
 jq '.image="registry/app@sha256:0000000000000000000000000000000000000000000000000000000000000001"' \
@@ -143,3 +157,4 @@ if rg '"(docker|kubectl|tofu|az|aws)"|startProcess|pollProcess|HostOp.*process' 
 fi
 printf 'Deployment helper contracts passed.\n'
 bash deploy/test-kubernetes.sh
+bash deploy/test-azure.sh

@@ -33,7 +33,7 @@ needs Lean, Docker and `jq`. The image contains the native libraries.
 ```sh
 lake build lean_cloud
 ./Applications/Wiki/build.sh
-./deploy/local.sh init .wiki-deployment lean-cloud-wiki:dev wiki-demo 3 8080
+./deploy/local.sh configure .wiki-deployment lean-cloud-wiki:dev wiki-demo 3 8080
 ./deploy/local.sh up .wiki-deployment
 
 ./Applications/Wiki/local-files.sh .wiki-deployment import-xml \

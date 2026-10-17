@@ -1,165 +1,126 @@
 # Run Lean Cloud on Azure
 
-This walkthrough creates a small AKS cluster, deploys the bundled application,
-and runs the log-processing example. The console connects to the scheduler over
-HTTP through a local Kubernetes port-forward. No public application endpoint or
-DNS setup is needed.
+Create a small AKS cluster, deploy the bundled application, and run the
+log-processing example. All deployment commands below are inspectable scripts
+in `deploy/`. They call Azure CLI, Docker, OpenTofu, and Kubernetes for you.
+The cloud console remains an HTTP client for Lean Cloud workflows.
 
-The shell helpers are optional and inspectable. If you already have Kubernetes,
-start with [existing-cluster deployment](README.md#existing-kubernetes-cluster).
-The console itself only manages Lean Cloud workflows.
+The application flow is the same as [local Docker](README.md#local-docker):
+**build → configure → up → connect → run**. Azure adds the cluster setup and
+registry publishing steps below.
 
-## 1. Tools and login
+Already have a cluster? Use the [existing Kubernetes instructions](README.md#existing-kubernetes-cluster).
 
-Use a shell in the repository directory. You need the [local prerequisites](README.md#local-docker),
-plus [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli),
+## 1. Check tools and sign in
+
+Run from the repository directory. Install the [local prerequisites](README.md#local-docker),
+[Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli),
 [OpenTofu](https://opentofu.org/docs/intro/install/) (>= 1.10, < 2), `kubectl`, and
 [Azure kubelogin](https://azure.github.io/kubelogin/install.html).
 
-Sign in yourself and select the subscription that should pay for the test:
-
 ```sh
-az login
-az account set --subscription YOUR_SUBSCRIPTION_NAME_OR_ID
-az account show --query '{name:name,id:id}' --output table
-lake build lean_cloud
+./deploy/azure.sh doctor
+./deploy/azure.sh login YOUR_SUBSCRIPTION_NAME_OR_ID
 ```
 
-Your account needs permission to create AKS, a registry, storage, managed
-identities and role assignments. The helper uses your existing Azure CLI login;
-it does not sign you in or install software. Azure provider registration and VM
-quota must already allow these resources in your chosen region.
+`login` explicitly opens Azure's sign-in flow and selects your subscription.
+Authentication stays with Azure CLI; the helpers do not collect credentials.
+Other commands use that existing login and never initiate sign-in themselves.
+Your account needs permission to create AKS, registry, storage, managed identities,
+and role assignments. Regional VM quota and provider registration must allow them.
 
-This example uses **one ARM64 VM** (`Standard_D4ps_v6`) with one scheduler and
-three worker pods. Workers are processes in containers, not separate VMs. It is
-a development setup, not a highly available cluster. Azure charges for the VM,
-disks, registry, storage and networking until you remove them in step 7.
-`os_disk_size_gb` sets each VM's OS disk (default 32 GiB), which also holds
-container images and temporary workspaces. Increase it for large build jobs.
-The separate `diskGiB` deployment setting controls each node's persistent data
-volume, including SQLite and any application cache.
+## 2. Configure and create the cluster
 
-## 2. Configure and provision
-
-Use fresh `.azure-infra` and `.azure-deployment` directories. Set your public
-administrator IPv4 address below; `/32` restricts Kubernetes API access to that
-address. Use a unique cluster name if `azure-demo` already exists.
+Replace `YOUR_PUBLIC_IPV4` with your administrator machine's public IPv4 address.
+The `/32` restricts Kubernetes API access to that address. This helper does not
+contact an IP lookup service. Use a fresh directory and a unique cluster name.
 
 ```sh
-cloud_subscription=$(az account show --query id --output tsv)
-cloud_region=northeurope
-cloud_admin_cidr='YOUR_PUBLIC_IPV4/32'
-az aks get-versions --location "$cloud_region" --output table
+./deploy/azure.sh init .azure-infra --name azure-demo \
+  --admin-cidr YOUR_PUBLIC_IPV4/32 --region northeurope --machines 1
+./deploy/azure.sh show .azure-infra
+./deploy/azure.sh plan .azure-infra
 ```
 
-Choose a supported non-preview Kubernetes version from that list. The example
-uses `1.35`; change it if your region no longer offers that version. Create the
-configuration from the supplied template:
+`init` writes `.azure-infra/azure.tfvars.json`; you can edit it before planning.
+It uses the selected subscription and pins the latest non-preview Kubernetes
+patch offered in the region. Use `--kubernetes-version` to select one yourself.
+`./deploy/azure.sh help` lists the other configuration options.
+
+Review the plan, then apply it:
 
 ```sh
-jq --arg subscription "$cloud_subscription" \
-   --arg region "$cloud_region" --arg cidr "$cloud_admin_cidr" \
-   '.name="azure-demo" | .subscription=$subscription | .region=$region |
-    .machines=1 | .kubernetes_version="1.35" | .administrator_cidrs=[$cidr]' \
-   deploy/infrastructure/azure/terraform.tfvars.example.json > azure.tfvars.json
-cat azure.tfvars.json
-./deploy/infrastructure.sh plan azure .azure-infra azure.tfvars.json
+./deploy/azure.sh create .azure-infra
 ```
 
-Review the plan before applying it. `plan` creates no cloud resources. `create`
-applies that exact saved plan; if you edit the configuration, run `plan` again.
+`create` applies the saved plan and saves the cluster credentials locally. If you
+edit the configuration, run `plan` again before `create`. If credential retrieval
+fails after provisioning succeeds, retry only `./deploy/azure.sh credentials .azure-infra`.
+
+The default is **one ARM64 VM** (`Standard_D4ps_v6`), with no automatic scaling.
+The application will run one scheduler and three workers on it. This is a small
+development setup; VMs, disks, registry, storage, and networking incur charges
+until removed. Keep this directory: it contains the state needed for cleanup.
+
+## 3. Build and publish the application
 
 ```sh
-./deploy/infrastructure.sh create .azure-infra
-./deploy/kubeconfig.sh .azure-infra
-export KUBECONFIG="$PWD/.azure-infra/kubeconfig"
-kubectl get nodes
+./deploy/build.sh --platform linux/arm64 . lean-cloud-demo:dev
+./deploy/azure.sh publish .azure-infra lean-cloud-demo:dev demo
 ```
 
-Provisioning takes several minutes. The resulting registry and storage details
-are in `.azure-infra/cloud.json`; `azure.tfvars.json` remains your input.
-If Kubernetes initially reports `Forbidden`, allow time for the new Azure role
-assignment to propagate and retry `kubectl get nodes`.
+The image contains the registered `log-summary` and `sum-squares` workflows.
+`publish` authenticates Docker using your existing Azure session, tags the local
+image for this cluster's registry, and pushes it. If uploading is interrupted,
+rerun `publish`; no rebuild is needed. Use `linux/amd64` if you chose an x86 VM.
 
-## 3. Publish the application
-
-The repository's Dockerfile includes the registered `log-summary` and
-`sum-squares` workflows. Sign Docker in to the new registry using your Azure
-session, then build and push its ARM64 image:
-
-```sh
-cloud_registry=$(jq -r .registryName .azure-infra/cloud.json)
-cloud_repository=$(jq -r .repository .azure-infra/cloud.json)
-az acr login --name "$cloud_registry"
-docker buildx build --platform linux/arm64 --target worker --load \
-  --build-arg LEAN_VERSION="$(sed 's|leanprover/lean4:v||' lean-toolchain)" \
-  --tag "$cloud_repository:demo" .
-docker push "$cloud_repository:demo"
-az acr repository show --name "$cloud_registry" --image cloud-app:demo \
-  --query digest --output tsv > .azure-infra/image-digest.txt
-```
-
-Use `linux/amd64` instead if you selected an x86 VM. For your own application,
-use the [application Dockerfile](README.md#your-application) with `--load`
-instead of `--push` and tag it as `"$cloud_repository:demo"`, then run the push
-and digest commands above. The next step
-uses the registry's **digest**, so worker restarts keep exactly the same code.
-
-Building and publishing are separate so an interrupted upload can be retried
-with `docker push` without rebuilding. Only continue after the push and digest
-lookup succeed. For repeated upload timeouts, see
-[Azure registry network troubleshooting](https://learn.microsoft.com/en-us/azure/container-registry/container-registry-troubleshoot-access).
+For your own application, replace the build command with its build script or
+`./deploy/build.sh --platform linux/arm64 ../my-app my-app:dev`, then publish
+that local image. See [application setup](README.md#your-application).
 
 ## 4. Configure and start the nodes
 
-Generate the deployment files from the infrastructure outputs:
-
 ```sh
-mkdir -m 700 .azure-deployment
-cloud_context=$(kubectl config current-context)
-cloud_digest=$(cat .azure-infra/image-digest.txt)
-jq --slurpfile infra .azure-infra/cloud.json \
-   --slurpfile vars .azure-infra/terraform.tfvars.json \
-   --arg context "$cloud_context" --arg digest "$cloud_digest" \
-   '.name=$infra[0].name | .context=$context | .namespace=$vars[0].namespace |
-    .image=($infra[0].repository + "@" + $digest) | .workers=3 |
-    .storageClass=$infra[0].storageClass |
-    .serviceAccountAnnotations={
-      "azure.workload.identity/client-id": $infra[0].storage.clientId,
-      "azure.workload.identity/tenant-id": $infra[0].storage.tenantId} |
-    .podLabels={"azure.workload.identity/use":"true"}' \
-   deploy/kubernetes/deployment.example.json > .azure-deployment/deployment.json
-jq '.storage | {provider:"azure",
-    endpoint:("https://" + .account + ".blob.core.windows.net"),
-    container:.container, authentication:{kind:"workload"}}' \
-   .azure-infra/cloud.json > .azure-deployment/storage.json
-
-./deploy/kubernetes.sh render .azure-deployment
-# Review .azure-deployment/deployment.json, storage.json and resources.json.
+./deploy/azure.sh configure .azure-infra .azure-deployment demo 3
+./deploy/kubernetes.sh show .azure-deployment
+# Review .azure-deployment/deployment.json, storage.json, and resources.json.
 ./deploy/kubernetes.sh up .azure-deployment
-cloud_namespace=$(jq -r .namespace .azure-deployment/deployment.json)
-kubectl --namespace "$cloud_namespace" get pods
+./deploy/kubernetes.sh status .azure-deployment
 ```
 
-The namespace must match the infrastructure configuration: Azure workload
-identity grants blob access to `cloud-node` in that namespace. The generated
-annotations and pod label enable this identity; no storage access key is needed.
-See [Azure's workload identity documentation](https://learn.microsoft.com/en-us/azure/aks/workload-identity-deploy-cluster).
+`configure` writes files without changing the cluster. It resolves `demo` to an
+immutable image digest and fills in the namespace, blob storage, workload
+identity, and kubeconfig path. No manual JSON plumbing or environment exports
+are needed. Use a fresh deployment directory.
 
-Each node has its own SQLite disk. Replay records and user files share the Azure
-blob container. Keep the generated directory private: `up` writes separate client
-and internal tokens there. Do not commit it or the infrastructure state.
+The workers access Azure Blob Storage through workload identity; no storage key
+is needed. Each node has its own SQLite disk. Keep both generated directories
+private: they contain infrastructure state and, after `up`, deployment tokens.
 
-## 5. Connect and run the example
+For larger jobs, edit these settings **before the first `up`**:
 
-In the same shell, start the tunnel and leave it running. Port 8081 avoids the
-local Docker example's port 8080:
+| File | Setting | Meaning |
+| --- | --- | --- |
+| `.azure-infra/azure.tfvars.json` | `machines`, `machine_size` | VM count and size; rerun `plan` and `create` after edits |
+| `.azure-infra/azure.tfvars.json` | `os_disk_size_gb` | VM disk for images and temporary workspaces; default 32 GiB |
+| `.azure-deployment/deployment.json` | `workers` | Number of worker containers |
+| `.azure-deployment/deployment.json` | `cpuMillis`, `memoryMiB` | CPU request and memory request/limit per node |
+| `.azure-deployment/deployment.json` | `diskGiB` | Persistent disk per node for SQLite and application caches |
+| `.azure-deployment/deployment.json` | `schedulerResources` | Optional smaller scheduler CPU/memory settings |
+| `.azure-deployment/deployment.json` | `startupSeconds` | Startup wait; use 900 for LeanBuild toolchain downloads |
+
+Worker count is independent of VM count. Kubernetes places the containers on the
+available VMs. Ensure the requested CPU, memory, and disks fit your cluster.
+
+## 5. Connect and run
+
+Start the private tunnel and leave it running:
 
 ```sh
 ./deploy/kubernetes.sh connect .azure-deployment 8081
 ```
 
-In a **second terminal**, change to the repository directory and open the console:
+In a **second terminal**, open the console from the repository directory:
 
 ```sh
 lake exe lean_cloud
@@ -170,77 +131,54 @@ At the `cloud>` prompt:
 ```text
 connect azure-demo http://127.0.0.1:8081 --token-file .azure-deployment/client.token
 programs
-run log-summary --id azure-logs
+run log-summary --id my-logs
 ps
-watch azure-logs
+watch my-logs
 ```
 
-`watch` shows branches, source lines and workers. Press `q` to return to the
-prompt. Once `ps` reports `completed`, read the output blob:
+Press `q` to leave `watch`. Once the run is completed:
 
 ```text
-result azure-logs
+result my-logs
 ```
 
-Expected report:
+Expected report: `files=16, errors=24`. The example creates its own sample input
+blobs. Use a new `--id` for another run.
 
-```text
-files=16, errors=24
-```
+`127.0.0.1:8081` is the local end of the tunnel to the Azure scheduler. Its HTTP
+port is not exposed to the public internet. If the tunnel closes or the scheduler
+pod restarts, rerun the `connect` script. The console profile stays valid.
 
-These are the same workflow commands used locally. The example creates its own
-sample input blobs. Use a new `--id` for another run. If the tunnel closes or the
-scheduler pod restarts, rerun the shell `connect` helper; the console profile
-continues to use the same local address.
+## 6. Stop, resize, or remove
 
-## 6. Stop or change worker count
-
-Type `quit` in the console, then stop the tunnel with Ctrl-C. In your original
-shell, these commands stop and restart the application while retaining data:
+After exiting the console and stopping the tunnel with Ctrl-C:
 
 ```sh
-./deploy/kubernetes.sh down .azure-deployment
-./deploy/kubernetes.sh up .azure-deployment
+./deploy/kubernetes.sh down .azure-deployment  # stop nodes; keep data
+./deploy/kubernetes.sh up .azure-deployment    # restart
+./deploy/kubernetes.sh scale .azure-deployment 5  # change worker count
 ```
 
-To change worker count, edit `workers` in `.azure-deployment/deployment.json`
-and run `up` again. The helper stops old nodes before replacements start and
-preserves their volumes. This does not change the number of Azure VMs; workers
-must fit the cluster's available capacity. Use a fresh deployment for a new
-application image.
+`scale` updates `workers` in deployment.json. Like local scaling, it stops old
+nodes before starting replacements and preserves their disks. This changes
+worker count, not Azure VM count. Choose a count that fits the cluster; the
+command does not provision more machines. For new application code, use a fresh deployment
+with separate state and blobs.
 
-**`down` does not stop Azure billing.** Use the following cleanup when finished.
-
-## 7. Remove the test deployment and infrastructure
-
-The following permanently deletes this example's workflows, outputs and blobs.
-Stop the tunnel first. In the original shell, remove the application and its
-disks while the cluster's storage controller is still running:
+**Stopping the application does not stop Azure billing.** When finished, remove
+the application and its disks, then review and apply infrastructure deletion:
 
 ```sh
-export KUBECONFIG="$PWD/.azure-infra/kubeconfig"
-cloud_namespace=$(jq -r .namespace .azure-deployment/deployment.json)
-./deploy/kubernetes.sh down .azure-deployment
-kubectl get pv --output json | jq -r --arg ns "$cloud_namespace" \
-  '.items[] | select(.spec.claimRef.namespace == $ns) | .metadata.name' \
-  > .azure-deployment/volumes.txt
-kubectl delete namespace "$cloud_namespace" --wait=true
-while IFS= read -r cloud_volume; do
-  kubectl wait --for=delete "pv/$cloud_volume" --timeout=300s
-done < .azure-deployment/volumes.txt
+./deploy/kubernetes.sh clean .azure-deployment --yes
+./deploy/azure.sh destroy-plan .azure-infra
+./deploy/azure.sh destroy .azure-infra
 ```
 
-Review and apply deletion of the Azure resources:
+These commands permanently delete this example's workflows, outputs, and blobs.
+`clean` waits for the node disks to be deleted while the storage controller is
+still running. `destroy` removes the Azure resources, including shared blobs,
+and checks that the resource group is gone. Keep the local directories until
+cleanup succeeds. Never delete state files as a substitute for destroying resources.
 
-```sh
-./deploy/infrastructure.sh destroy-plan .azure-infra
-./deploy/infrastructure.sh destroy .azure-infra
-az group exists --subscription "$(jq -r .subscription .azure-infra/terraform.tfvars.json)" \
-  --name "$(jq -r .resourceGroup .azure-infra/cloud.json)"
-```
-
-The final command should print `false`. Keep the state directory until deletion
-has finished. If provisioning failed before the application was deployed, skip
-the application cleanup and use `destroy-plan` and `destroy` to remove any
-resources already created. Never delete the state directory as a substitute for
-destroying infrastructure.
+If provisioning failed before any application was started, skip `clean` and use
+`destroy-plan` and `destroy` to remove any resources already created.

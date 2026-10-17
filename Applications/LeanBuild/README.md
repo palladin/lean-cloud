@@ -104,7 +104,7 @@ From the lean-cloud repository:
 
 ```sh
 bash Applications/LeanBuild/build.sh lean-cloud-build:dev
-bash deploy/local.sh init .lean-cloud/build lean-cloud-build:dev build 3 8080
+bash deploy/local.sh configure .lean-cloud/build lean-cloud-build:dev build 3 8080
 bash deploy/local.sh up .lean-cloud/build
 lake exe lean_cloud
 ```

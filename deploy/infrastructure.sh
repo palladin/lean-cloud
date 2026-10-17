@@ -22,7 +22,11 @@ if [[ "$command" == plan ]]; then
   cp "$vars" "$directory/terraform.tfvars.json"
   tofu -chdir="$directory" init
   tofu -chdir="$directory" plan -out=provision.tfplan
-  printf 'Review the plan above. Apply with: deploy/infrastructure.sh create "%s"\n' "$directory"
+  if [[ "$provider" == azure ]]; then
+    printf 'Review the plan above. Apply with: deploy/azure.sh create "%s"\n' "$directory"
+  else
+    printf 'Review the plan above. Apply with: deploy/infrastructure.sh create "%s"\n' "$directory"
+  fi
 else
   [[ $# == 2 ]] || fail 'Usage: deploy/infrastructure.sh create|destroy-plan|destroy|outputs DIR'
   directory=$(absolute_dir "$2")

@@ -1,16 +1,45 @@
 #!/usr/bin/env bash
-# Usage: local.sh init DIR IMAGE [NAME [WORKERS [PORT]]]
-#        local.sh up|down|status|connect DIR
+# Usage: local.sh configure DIR IMAGE [NAME [WORKERS [PORT]]]
+#        local.sh up|down|status|connect|show DIR
 #        local.sh scale DIR WORKERS
 #        local.sh clean DIR --yes
 set -euo pipefail
 assets=$(cd "$(dirname "$0")" && pwd -P)
 source "$assets/common.sh"
+usage() {
+  cat <<'USAGE'
+Usage: deploy/local.sh COMMAND ...
+  doctor
+  configure DIR IMAGE [NAME [WORKERS [PORT]]]  (defaults: lean-cloud, 3, 8080)
+  show|up|down|status|connect DIR
+  scale DIR WORKERS
+  clean DIR --yes
+
+configure writes files only; review them before up. init is an alias for configure.
+down retains data. clean permanently removes workflows and locally hosted blobs.
+USAGE
+}
+command=${1:-help}; directory=${2:-}
+if [[ "$command" == help || "$command" == --help ]]; then usage; exit; fi
 need jq; need docker
-command=${1:-}; directory=${2:-}
-[[ -n "$directory" ]] || fail 'Usage: deploy/local.sh init DIR IMAGE [NAME [WORKERS [PORT]]] | up|down|status|connect DIR | scale DIR N | clean DIR --yes'
-if [[ "$command" == init ]]; then
-  [[ $# -ge 3 && $# -le 6 ]] || fail 'Usage: local.sh init DIR IMAGE [NAME [WORKERS [PORT]]]'
+if [[ "$command" == doctor ]]; then
+  [[ $# == 1 ]] || fail 'Usage: deploy/local.sh doctor'
+  need openssl; need shasum
+  docker compose version >/dev/null
+  docker buildx version >/dev/null
+  docker info >/dev/null
+  printf 'Docker engine, Compose, Buildx, jq, openssl, and shasum are available.\n'
+  exit
+fi
+[[ "$command" != init ]] || command=configure
+case "$command" in
+  configure) [[ $# -ge 3 && $# -le 6 ]] || fail 'Usage: local.sh configure DIR IMAGE [NAME [WORKERS [PORT]]]' ;;
+  up|down|status|connect|show) [[ $# == 2 ]] || fail "Usage: local.sh $command DIR" ;;
+  scale) [[ $# == 3 ]] || fail 'Usage: local.sh scale DIR WORKERS'; number "$3" ;;
+  clean) [[ $# == 3 && $3 == --yes ]] || fail 'clean deletes all workflows and locally hosted blobs. Use clean DIR --yes.' ;;
+  *) usage; exit 1 ;;
+esac
+if [[ "$command" == configure ]]; then
   image=$3; name=${4:-lean-cloud}; workers=${5:-3}; port=${6:-8080}
   identifier "$name"; number "$workers"; number "$port"
   (( port < 65536 )) || fail 'Invalid port'
@@ -38,6 +67,9 @@ else
 fi
 spec="$directory/deployment.json"
 [[ -f "$spec" ]] || fail 'Missing deployment.json'
+if [[ ( "$command" == up || "$command" == scale ) && -f "$directory/cleanup-started" ]]; then
+  fail 'Cleanup has started for this deployment. Finish clean and use a fresh directory to deploy again.'
+fi
 name=$(jq -er .name "$spec"); identifier "$name"
 [[ $(jq -r .directory "$spec") == "$directory" ]] || fail 'Deployment directory has moved; review its bind paths before use.'
 compose() { docker compose -p "$name" -f "$directory/compose.json" "$@"; }
@@ -95,14 +127,14 @@ start() {
   done
   for ((i=1; i<=desired; i++)); do compose up -d --wait --no-build "worker$i"; done
 }
-connection() { resolved=$(compose port scheduler 8080); printf 'cloud> connect %s http://127.0.0.1:%s --token-file "%s/client.token"\n' "$name" "${resolved##*:}" "$directory"; }
+connection() { resolved=$(compose port scheduler 8080); printf 'In cloud CLI: connect %s http://127.0.0.1:%s --token-file "%s/client.token"\n' "$name" "${resolved##*:}" "$directory"; }
 case "$command" in
-  init) render; printf 'Created inspectable files in %s. Run: deploy/local.sh up "%s"\n' "$directory" "$directory" ;;
+  configure) render; printf 'Created inspectable files in %s. Run: deploy/local.sh up "%s"\n' "$directory" "$directory" ;;
+  show) jq . "$spec" ;;
   up) lock_dir "$directory"; start; connection ;;
   down) lock_dir "$directory"; compose stop ;;
   scale)
-    [[ $# == 3 ]] || fail 'Usage: local.sh scale DIR WORKERS'
-    number "$3"; lock_dir "$directory"; verify_volumes
+    lock_dir "$directory"; verify_volumes
     # Stop the entire old generation before replacing config or starting any worker.
     compose stop
     compose down --remove-orphans
@@ -111,7 +143,6 @@ case "$command" in
   status) compose ps ;;
   connect) connection ;;
   clean)
-    [[ ${3:-} == --yes ]] || fail 'clean deletes all workflows and locally hosted blobs. Pass --yes.'
     lock_dir "$directory"
     # A failed cleanup may already have removed some volumes. Check ownership of
     # those remaining, but require complete durable state only when starting.
@@ -120,6 +151,7 @@ case "$command" in
         if docker volume inspect "$volume" >/dev/null 2>&1; then owned_volume "$volume"; fi
       done < <(jq -r '.[]' "$directory/volumes.json")
     fi
+    touch "$directory/cleanup-started"
     compose down --remove-orphans --volumes
     if [[ -f "$directory/volumes.json" ]]; then
       while IFS= read -r volume; do

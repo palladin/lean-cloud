@@ -20,4 +20,4 @@ case "$provider" in
       --name "$name" --kubeconfig "$directory/kubeconfig" --alias "$name" ;;
   *) fail 'Unsupported provider' ;;
 esac
-printf 'export KUBECONFIG="%s/kubeconfig"\n' "$directory"
+printf 'Saved Kubernetes credentials to %s/kubeconfig.\n' "$directory"

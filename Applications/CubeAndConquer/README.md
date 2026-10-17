@@ -15,7 +15,7 @@ From the repository root:
 bash deploy/build.sh Applications/CubeAndConquer lean-cloud-sat-app:dev
 docker buildx build --load --build-arg APPLICATION_IMAGE=lean-cloud-sat-app:dev \
   -t lean-cloud-sat:dev Applications/CubeAndConquer
-bash deploy/local.sh init .sat-deployment lean-cloud-sat:dev sat 3 8080
+bash deploy/local.sh configure .sat-deployment lean-cloud-sat:dev sat 3 8080
 bash deploy/local.sh up .sat-deployment
 
 # Upload the actual CNF to this deployment's blob store.

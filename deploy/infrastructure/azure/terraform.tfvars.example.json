@@ -2,7 +2,7 @@
   "name": "lean-cloud-dev",
   "subscription": "YOUR_SUBSCRIPTION_ID",
   "region": "northeurope",
-  "machines": 2,
+  "machines": 1,
   "machine_size": "Standard_D4ps_v6",
   "os_disk_size_gb": 32,
   "kubernetes_version": "YOUR_SUPPORTED_VERSION",
