@@ -27,7 +27,7 @@ def commands : Array Command := #[
   { name := "programs", summary := "List entry points compiled into the deployed image."
     examples := #["programs"] },
   { name := "remove", arguments := "RUN", summary := "Remove a finished run and its replay records."
-    details := "Only completed, failed, or killed runs can be removed after finalization. User blobs and other runs are preserved. The ID remains reserved so late messages cannot recreate the run. Requires the scheduler and a worker; retry the same command after interrupted cleanup."
+    details := "Only completed, failed, or killed runs can be removed after finalization. User blobs and other runs are preserved. The ID remains reserved so late messages cannot recreate the run. Cleanup visits every active worker; retry the same command if a node is unavailable. Scaled-down workers clear retired views when they return. Requires the scheduler and at least one worker."
     examples := #["remove example-1"] },
   { name := "use", arguments := "NAME", summary := "Select and remember a known deployment."
     details := "Use 'connections' to find names. The selection persists across console sessions."

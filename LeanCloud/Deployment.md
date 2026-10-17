@@ -20,6 +20,19 @@ before replacing the same node; a timeout alone does not prove a worker stopped.
 The provided helpers use a full stop/start barrier and reject missing known
 volumes. No scheduler tree is persisted: recovery reconstructs it through replay.
 
+Workers cache confirmed immutable replay records across assignments. Each node
+defaults to at most 64 MiB of encoded records and keys, and 4,096 entries; map
+overhead is additional. Set `worker.replayCacheBytes` and
+`worker.replayCacheEntries` in the runtime configuration to change these budgets.
+Either value can be zero to disable caching. The cache is disposable memory:
+restarts read the global journal again. Every cache hit still checks assignment
+ownership, and creates always publish to durable storage before caching a value.
+
+Removing a run clears replay records and the last views on every active worker
+and the scheduler. Partial failures are reported; retry `remove` after restoring
+the unavailable node. Scaled-down workers clear retired-run views on their next
+startup. Shared application blobs are retained.
+
 Public client credentials are separate from internal node credentials. Provider
 login stays outside Lean Cloud; deployed cloud nodes use workload identities.
 Only expose `/deployment` through a public authenticated HTTPS endpoint. Internal

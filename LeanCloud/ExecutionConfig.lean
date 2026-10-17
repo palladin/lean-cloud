@@ -6,6 +6,8 @@ open Lean
 /-- Operational limits; they do not change Cloud semantics or replay keys. -/
 structure ExecutionConfig where
   interpreterFuel : Nat := 100000
+  replayCacheBytes : Nat := 64 * 1024 * 1024
+  replayCacheEntries : Nat := 4096
   deriving Repr, BEq, ToJson, Inhabited
 
 def ExecutionConfig.validate (config : ExecutionConfig) : Except String Unit := do
@@ -19,7 +21,9 @@ instance : FromJson ExecutionConfig where
       | none => pure fallback
       | some value => fromJson? value
     let config : ExecutionConfig := {
-      interpreterFuel := ← field "interpreterFuel" 100000 }
+      interpreterFuel := ← field "interpreterFuel" 100000
+      replayCacheBytes := ← field "replayCacheBytes" (64 * 1024 * 1024)
+      replayCacheEntries := ← field "replayCacheEntries" 4096 }
     config.validate
     return config
 

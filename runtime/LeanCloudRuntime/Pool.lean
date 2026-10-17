@@ -126,13 +126,15 @@ private def reply (endpoint : HttpMailbox.Config) (worker : String) (message : L
 /-- Sole owner of the deployment's SQLite database. The catalog is durable before
 replies and input acknowledgements; scheduling continuations are volatile.
 Administrative replies are cached until the caller's address retires. -/
-def scheduler (config : Config) (record : Trace.Recorder := fun _ => pure ()) : IO Unit := do
+def scheduler (config : Config) (record : Trace.Recorder := fun _ => pure ())
+    (retire : String → IO Unit := fun _ => pure ()) : IO Unit := do
   let lock ← ProcessLock.acquire (config.scheduler.database ++ ".lock")
   try
     let conn ← LeanLinq.Sqlite.connect config.scheduler.database
     try
       LocalDb.initializeSchema conn
       let mut saved : Saved ← LocalDb.loadValue conn "pool-v1" {}
+      for run in saved.state.removed do retire run
       let observed ← IO.mkRef saved.state.runs
       let emitted ← IO.mkRef (#[] : Array LeanCloud.Pool.Run)
       let persist (value : Saved) : IO Saved := do
@@ -253,7 +255,7 @@ def scheduler (config : Config) (record : Trace.Recorder := fun _ => pure ()) : 
                   | .error error => (saved.state, .error error)
               saved := { saved with state }
               let cache := match command with
-                | .check .. | .status .. | .health | .workers | .runs .. | .mode .. | .removed .. => false
+                | .check .. | .status .. | .health | .workers | .runs .. | .mode .. | .removed .. | .removedRuns => false
                 | _ => true
               if cache && cached.isNone then
                 saved := { saved with replies := saved.replies.push (replyTo, response) }

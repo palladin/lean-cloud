@@ -96,6 +96,7 @@ inductive Command where
   | status (run : String)
   | remove (run : String)
   | removed (run : String)
+  | removedRuns
   | check (run worker : String) (attempt : Nat)
   deriving Repr, ToJson, FromJson
 
@@ -325,6 +326,7 @@ def command (state : State) : Command → Except String (State × Json)
     let some run := state.runs.find? (·.id == id) | throw s!"Unknown run: {id}"
     return (state, (toJson run.scheduler).setObjVal! "diagnostics" (toJson (diagnostics state run)))
   | .removed id => return (state, toJson (state.removed.contains id))
+  | .removedRuns => return (state, toJson state.removed)
   | .remove id => do
     if state.removed.contains id then return (state, Json.null)
     let some run := state.runs.find? (·.id == id) | throw s!"Unknown run: {id}"

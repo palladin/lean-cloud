@@ -51,6 +51,10 @@ def remoteClient (directory : System.FilePath) (url token : String) (nodeCount :
     require (final.steps.any (·.event.source.isSome)) "Final source depended on a prior client cache"
     discard <| command fresh ["remove", "remote-1"]
     require (!(← fresh.allRuns).any (·.id == "remote-1")) "Removed run remained in remote catalog"
+    let connection ← fresh.requireConnection
+    for node in ← Client.call connection .nodes do
+      let page ← Client.call connection (.observations "remote-1" node.id none 100)
+      require page.items.isEmpty s!"Removed run retained observations on {node.id}"
     -- The same suite checks real user blob effects and workflow controls on any
     -- deployment. Provisioning and node restarts remain outside the client.
     let programs ← fresh.deployment

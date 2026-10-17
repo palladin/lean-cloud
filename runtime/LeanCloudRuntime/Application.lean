@@ -206,8 +206,21 @@ partial def runWith [Monad m]
     runWith handleHost handleService (ExceptT.mk (ArrsF.apply next value))
   | .impure (.there (.there rest)) _ => nomatch rest
 
+/-- Visit every active node even if one fails. Retirement is already durable;
+retrying removal repeats safe cleanup instead of reporting partial work as success. -/
+def cleanupWorkers (routes : Array HttpMailbox.WorkerEndpoint)
+    (purge : HttpMailbox.WorkerEndpoint → IO Unit) : IO Unit := do
+  if routes.isEmpty then
+    throw (IO.userError "Run retired; cleanup incomplete. Add a worker, then retry removal.")
+  let mut failures := #[]
+  for route in routes do
+    try purge route
+    catch error => failures := failures.push s!"{route.worker}: {error}"
+  unless failures.isEmpty do
+    throw (IO.userError ("Run retired; cleanup incomplete. Retry removal. " ++ String.intercalate "; " failures.toList))
+
 private def handle (registry : Registry) (prepare : Config → String → Json → IO Unit)
-    (observations : Option ObservationStore.Store) : Service α → IO α
+    (observations : Option ObservationStore.Store) (replayCache : Option ReplayCache.Cache) : Service α → IO α
   | .submit config id entry input => do
     let removed : Bool ← IO.ofExcept (fromJson? (← Pool.request config (.removed id)))
     if removed then throw (IO.userError "Run was removed; use a new run ID")
@@ -222,10 +235,18 @@ private def handle (registry : Registry) (prepare : Config → String → Json �
   | .mode config id => do IO.ofExcept (fromJson? (← Pool.request config (.mode id)))
   | .durableControl config requestId command => Pool.control config requestId command
   | .workerStopped config worker generation => discard (Pool.request config (.workerStopped worker generation))
-  | .serveScheduler config => Pool.scheduler (config.localInbox none) (observations.map (·.record) |>.getD (fun _ => pure ()))
-  | .serveWorker config => do
-    registry.serveWorker (config.localInbox (some (← workerId)))
+  | .serveScheduler config => Pool.scheduler (config.localInbox none)
       (observations.map (·.record) |>.getD (fun _ => pure ()))
+      (observations.map (·.remove) |>.getD (fun _ => pure ()))
+  | .serveWorker config => do
+    -- A retained node can return after scaling down or being offline during
+    -- removal. Rehydrate retirement before accepting old inbox deliveries.
+    let retired : Array String ← IO.ofExcept (fromJson? (← Pool.request config .removedRuns))
+    for run in retired do
+      if let some store := observations then store.remove run
+      if let some cache := replayCache then cache.remove run
+    registry.serveWorker (config.localInbox (some (← workerId)))
+      (observations.map (·.record) |>.getD (fun _ => pure ())) replayCache
   | .nodes config => do
     let some store := observations | throw (IO.userError "Node telemetry is not configured")
     Monitoring.nodes config store
@@ -244,25 +265,21 @@ private def handle (registry : Registry) (prepare : Config → String → Json �
   | .purge config id => do
     let removed : Bool ← IO.ofExcept (fromJson? (← Pool.request config (.removed id)))
     unless removed do throw (IO.userError "Run has not been retired; refusing to delete records")
-    config.objects.removeRun id
     if let some store := observations then store.remove id
+    if let some cache := replayCache then cache.remove id
+    config.objects.removeRun id
   | .remove config id => do
     discard <| Pool.request config (.remove id)
+    if let some store := observations then store.remove id
     let membership ← Pool.request config .workers
     let routes : Array HttpMailbox.WorkerEndpoint ← IO.ofExcept (membership.getObjValAs? _ "routes")
-    let mut lastError := "No workers available. Add a worker, then retry removal."
-    for route in routes do
-      try
-        let body := Json.mkObj [("args", toJson #["purge-run", "config", id]), ("input", Json.null)]
-        let response ← LeanCloudCli.Http.post s!"http://{route.endpoint.host}:{route.endpoint.port}/app"
-          route.endpoint.token body.compress
-        let result : Except String Json ← IO.ofExcept (Json.parse response >>= fromJson?)
-        let output : CommandOutput ← IO.ofExcept (result >>= fromJson?)
-        unless output.exitCode == 0 do throw (IO.userError (output.stderr ++ output.stdout))
-        if let some store := observations then store.remove id
-        return
-      catch error => lastError := error.toString
-    throw (IO.userError s!"Run retired; record cleanup incomplete. Retry removal. {lastError}")
+    cleanupWorkers routes fun route => do
+      let body := Json.mkObj [("args", toJson #["purge-run", "config", id]), ("input", Json.null)]
+      let response ← LeanCloudCli.Http.post s!"http://{route.endpoint.host}:{route.endpoint.port}/app"
+        route.endpoint.token body.compress
+      let result : Except String Json ← IO.ofExcept (Json.parse response >>= fromJson?)
+      let output : CommandOutput ← IO.ofExcept (result >>= fromJson?)
+      unless output.exitCode == 0 do throw (IO.userError (output.stderr ++ output.stdout))
   | .readText config ref => do
     let bytes ← match ← (config.objects.readBytes ref).run with
       | .ok bytes => pure bytes
@@ -272,8 +289,9 @@ private def handle (registry : Registry) (prepare : Config → String → Json �
 
 private def handleService (registry : Registry) (prepare : Config → String → Json → IO Unit)
     (observations : Option ObservationStore.Store := none)
+    (replayCache : Option ReplayCache.Cache := none)
     (op : Service α) : IO (Except String α) := do
-  try return .ok (← handle registry prepare observations op)
+  try return .ok (← handle registry prepare observations replayCache op)
   catch error => return .error error.toString
 
 def deploymentApi (registry : Registry) (config : Config) (client : ClientConfig)
@@ -286,13 +304,14 @@ def deploymentApi (registry : Registry) (config : Config) (client : ClientConfig
     unless (json.getObjValAs? String "deployment").toOption == some client.deployment do
       throw (IO.userError "Deployment identity mismatch; reconnect before sending commands")
   let result ← runWith (fun _ => pure (.error "Deployment API cannot access the CLI host"))
-    (handleService registry prepare observations) (deploymentRun registry config client request)
+    (handleService registry prepare observations none) (deploymentRun registry config client request)
   return toJson (← IO.ofExcept result)
 
 /-- HTTP exposes the same effect program as the executable, with a restricted
 host interpreter: no filesystem paths or executable commands from the caller. -/
 def api (registry : Registry) (config : Config) (prepare : Config → String → Json → IO Unit)
-    (json : Json) (worker := false) (observations : Option ObservationStore.Store := none) : IO Json := do
+    (json : Json) (worker := false) (observations : Option ObservationStore.Store := none)
+    (replayCache : Option ReplayCache.Cache := none) : IO Json := do
   let args ← IO.ofExcept (json.getObjValAs? (Array String) "args")
   let input ← IO.ofExcept (json.getObjValAs? (Option String) "input")
   let allowed := if worker then args.toList matches ["purge-run", _, _] else match args.toList with
@@ -316,15 +335,16 @@ def api (registry : Registry) (config : Config) (prepare : Config → String →
         else { out with stdout := out.stdout ++ text }
       return .ok ()
     | _ => pure (.error "Unsupported HTTP host operation")
-  let result ← runWith host (handleService registry prepare observations) (run registry args.toList)
+  let result ← runWith host (handleService registry prepare observations replayCache) (run registry args.toList)
   return toJson { (← output.get) with exitCode := result.toOption.getD 1 }
 
 /-- Users only supply their registry. A node runs its HTTP API, embedded SQLite
 inbox, and actor concurrently in this process; Docker restarts the whole node. -/
 def main (registry : Registry) (args : List String)
     (prepare : Config → String → Json → IO Unit := fun _ _ _ => pure ()) : IO UInt32 := do
-  let execute (observations : Option ObservationStore.Store := none) := withHostIO fun handleHost => do
-    let result ← runWith handleHost (handleService registry prepare observations) (run registry args)
+  let execute (observations : Option ObservationStore.Store := none)
+      (replayCache : Option ReplayCache.Cache := none) := withHostIO fun handleHost => do
+    let result ← runWith handleHost (handleService registry prepare observations replayCache) (run registry args)
     return result.toOption.getD 1
   match args with
   | [command, path] =>
@@ -334,12 +354,14 @@ def main (registry : Registry) (args : List String)
         else pure config.mailboxes.scheduler
       let database := (← IO.getEnv "CLOUD_INBOX_DATABASE").getD "/mailbox/inbox.sqlite"
       let worker ← if command == "serve-worker" then workerId else pure "scheduler"
+      let cache ← ReplayCache.create config.worker.replayCacheBytes config.worker.replayCacheEntries
       ObservationStore.withStore (database ++ ".telemetry.sqlite") worker fun store => do
-        let api := fun json => api registry config prepare json (worker := command == "serve-worker") (observations := some store)
+        let api := fun json => api registry config prepare json (worker := command == "serve-worker")
+          (observations := some store) (replayCache := some cache)
         let client := if command == "serve-scheduler" then config.client.map fun client =>
           { token := client.token, api := fun json => deploymentApi registry config client prepare json (some store) : HttpMailbox.ClientHandler }
           else none
-        HttpMailbox.withServer endpoint database api (HttpServer.runNode (execute (some store)))
+        HttpMailbox.withServer endpoint database api (HttpServer.runNode (execute (some store) (some cache)))
           (handleSignals := true) (client := client)
           (telemetry := some (Monitoring.api store))
     else execute none

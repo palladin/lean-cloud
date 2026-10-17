@@ -36,8 +36,24 @@ private def demo (f : Fixture) : IO Unit := do
   (← IO.getStdout).flush
   assertEq (← f.wait "first") (.success (toJson (55 : Nat)))
   assertEq ((← cli ((·.timing) <$> f.context.observation run)).map (·.span)) (timing.map (·.span))
+  -- An unreachable active node must not turn partial cleanup into success.
+  -- The CLI must retain its request and retry even after the catalog entry is gone.
+  discard <| f.compose #["stop", "worker3"]
+  let failed ← try f.command ["remove", "second"]; pure none
+    catch error => pure (some error.toString)
+  assertTrue (failed.any (fun error => error.contains "cleanup incomplete" && error.contains "worker3"))
+    "Removal hid partial cleanup or the unavailable worker"
+  let pending := f.context.directory "second" / "pending-control.json"
+  assertTrue (← pending.pathExists) "CLI discarded the request before cleanup completed"
+  assertTrue (!(← cli f.context.allRuns).any (·.id == "second")) "Failed cleanup did not retire the run"
+  discard <| f.compose #["up", "-d", "--wait", "--no-build", "worker3"]
   f.command ["remove", "second"]
-  assertTrue (!(← cli f.context.allRuns).any (·.id == "second")) "Removal left run in catalog"
+  assertTrue (!(← pending.pathExists)) "Successful cleanup retained the pending request"
+  cli do
+    for node in ← Client.call connection .nodes do
+      let page ← Client.call connection (.observations "second" node.id none 100)
+      require page.items.isEmpty s!"Retried cleanup retained observations on {node.id}"
+  assertEq (← f.wait "first") (.success (toJson (55 : Nat)))
 
 private def controls (f : Fixture) : IO Unit := do
   let programs ← cli f.context.deployment
@@ -71,7 +87,25 @@ private def scaling (f : Fixture) : IO Unit := do
     tokenFile := some (f.directory / "client.token").toString }
   cli <| saveJson (f.context.home / "connection.json") connection
   assertEq (← f.wait "waiting") (.success (toJson (55 : Nat)))
+  -- Helpers start nodes in order; the tiny queued run may finish before
+  -- worker2 boots. Submit a longer workflow after both nodes are ready.
+  f.command ["run", "log-summary", "--id", "retained"]
+  discard <| f.wait "retained"
+  cli do
+    let page ← Client.call connection (.observations "retained" "worker2" none 100)
+    require (!page.items.isEmpty) "Returning-worker cleanup test needs a persisted view on worker2"
   f.helper "scale" #["1"]
+  f.refresh
+  f.command ["remove", "retained"]
+  -- worker2 retains its disk while down. Its startup must discard views of
+  -- runs retired while it was absent, before accepting old inbox messages.
+  f.helper "scale" #["2"]
+  f.refresh
+  cli do
+    let connection ← f.context.requireConnection
+    for node in ← Client.call connection .nodes do
+      let page ← Client.call connection (.observations "retained" node.id none 100)
+      require page.items.isEmpty s!"Returning node retained removed run: {node.id}"
 
 end LeanCloudTests.ConsoleRuntime
 

@@ -28,11 +28,17 @@ def cases : Array TestCase := #[
   ⟨"runtime-config/defaults-and-roundtrip", do
     let config : LeanCloud.ExecutionConfig ← unwrap (fromJson? (Json.mkObj []))
     assertEq config ({} : LeanCloud.ExecutionConfig)
-    let custom : LeanCloud.ExecutionConfig := ⟨123⟩
+    let custom : LeanCloud.ExecutionConfig := { interpreterFuel := 123 }
     assertEq (← unwrap (fromJson? (toJson custom))) custom
+    let bounded := { custom with replayCacheBytes := 1024, replayCacheEntries := 8 }
+    assertEq (← unwrap (fromJson? (toJson bounded))) bounded
+    let disabled := { custom with replayCacheBytes := 0, replayCacheEntries := 0 }
+    assertEq (← unwrap (fromJson? (toJson disabled))) disabled
     for bad in [Json.null, toJson "invalid", Json.mkObj [("interpreterFuel", toJson (0 : Nat))],
         Json.mkObj [("interpreterFuel", toJson "100")],
-        Json.mkObj [("interpreterFuel", Json.null)]] do
+        Json.mkObj [("interpreterFuel", Json.null)],
+        Json.mkObj [("replayCacheBytes", toJson (-1 : Int))],
+        Json.mkObj [("replayCacheEntries", Json.null)]] do
       assertTrue (fromJson? (α := LeanCloud.ExecutionConfig) bad).toOption.isNone
         s!"Accepted invalid limits: {bad.compress}"
     -- Old deployment files remain readable; these fields no longer enable retries.

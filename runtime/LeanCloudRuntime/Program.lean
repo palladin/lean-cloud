@@ -1,5 +1,6 @@
 import LeanCloud.Program
 import LeanCloudRuntime.Pool
+import LeanCloudRuntime.ReplayCache
 
 namespace LeanCloudRuntime
 open Lean LeanCloud
@@ -57,7 +58,7 @@ def Registry.submit (registry : Registry) (config : Config) (run entry : String)
 A runtime failure escapes and stops the node without acknowledging this delivery;
 its supervisor can restart it and recover from the durable journal. Cancellation
 returns only after the active attempt and its heartbeat task have stopped. -/
-private def executeAssignment (registry : Registry) (config : Config) (id run : String)
+private def executeAssignment (registry : Registry) (config : Config) (cache : ReplayCache.Cache) (id run : String)
     (assignment : Assignment) (finalize : Option Exit := none) (record : Trace.Recorder := fun _ => pure ()) : IO Unit := do
   let trace ← Trace.create id run record
   trace.assign assignment
@@ -72,11 +73,8 @@ private def executeAssignment (registry : Registry) (config : Config) (id run : 
           throw (IO.userError "Assignment revoked")
       check
       if finalize.isSome then config.objects.ensureContainer
-      let records := trace.records (config.objects.records run)
-      let guarded : ReplayStore IO := {
-        read := fun key => do check; records.read key
-        create := fun key value => do check; records.create key value }
-      let observed ← observe guarded
+      let records := trace.records (cache.records run (config.objects.records run) check)
+      let observed ← observe records
       let report ← match finalize with
         | some outcome => Worker.finalize id observed assignment.attempt outcome
         | none => do
@@ -98,7 +96,11 @@ private def executeAssignment (registry : Registry) (config : Config) (id run : 
 /-- One serial inbox loop serves every registered workflow. A cancellation reply
 is acknowledged only between attempts. The scheduler awaits that explicit reply
 before dispatching replacements. Late execute messages fail their ownership check. -/
-def Registry.serveWorker (registry : Registry) (config : Config) (record : Trace.Recorder := fun _ => pure ()) : IO Unit := do
+def Registry.serveWorker (registry : Registry) (config : Config) (record : Trace.Recorder := fun _ => pure ())
+    (replayCache : Option ReplayCache.Cache := none) : IO Unit := do
+  let cache ← match replayCache with
+    | some cache => pure cache
+    | none => ReplayCache.create config.worker.replayCacheBytes config.worker.replayCacheEntries
   let id ← workerId
   let endpoint ← IO.ofExcept (config.mailboxes.worker id)
   let handle ← HttpMailbox.openMailbox endpoint Pool.address ("worker." ++ id)
@@ -114,9 +116,9 @@ def Registry.serveWorker (registry : Registry) (config : Config) (record : Trace
         nextReady := (← IO.monoMsNow) + 2000
       let some delivery ← inbox.receive | continue
       match delivery.message with
-      | .execute run assignment => executeAssignment registry config id run assignment (record := record)
+      | .execute run assignment => executeAssignment registry config cache id run assignment (record := record)
       | .finalize run attempt outcome =>
-        executeAssignment registry config id run ⟨attempt, Location.root⟩ (some outcome) record
+        executeAssignment registry config cache id run ⟨attempt, Location.root⟩ (some outcome) record
       | .cancel run barrier => send (.stopped run id barrier)
       | .drain generation => send (.drained id generation)
       | .idle | .acknowledged => pure ()

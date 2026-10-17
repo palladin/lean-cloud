@@ -15,6 +15,7 @@ private def table : Table "observations" Row := ⟨⟩
 
 private structure Pending where
   values : Std.HashMap (String × String) Observations.Step := {}
+  retired : Std.HashSet String := {}
   warning : String := ""
 
 structure Store where
@@ -35,6 +36,7 @@ reported instead of blocking a worker on diagnostic storage. -/
 def Store.record (store : Store) (step : Observations.Step) : IO Unit := do
   if step.event.run.isEmpty then return
   store.pending.atomically do
+    if (← get).retired.contains step.event.run then return
     let mut keys := step.keys
     if let some sample := step.resources then
       -- At most thirty quarter-second samples per run, including after restart.
@@ -93,7 +95,9 @@ def Store.node (store : Store) : IO DeploymentApi.Node := do
 
 def Store.remove (store : Store) (run : String) : IO Unit := store.lock.atomically do
   store.pending.atomically do
-    modify fun state => { state with values := state.values.filter fun address _ => address.1 != run }
+    modify fun state => { state with
+      retired := state.retired.insert run
+      values := state.values.filter fun address _ => address.1 != run }
   let delete : DeleteStmt Context _ _ := table.delete
     |>.where' (fun row => row["run"] ==. SqlExpr.str run)
   discard (store.conn.execDelete delete)

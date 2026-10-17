@@ -128,7 +128,7 @@ def run : IO Unit := IO.FS.withTempFile fun _ path => do
     -- Diagnostics have a separate connection from the actor. Failure here may
     -- lose an observation but cannot throw out of the worker's recorder.
     conn.close
-    store.record (step 0 9999)
+    store.record { step 0 9999 with event := { (step 0 9999).event with run := "other" } }
     store.flush
     assertTrue (!(← store.node).warning.isEmpty) "Telemetry storage failure was hidden"
   finally conn.close

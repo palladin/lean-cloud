@@ -9,6 +9,8 @@ import SchedulerTests
 import MonitoringTests
 import ObjectStoreTests
 import StorageProviderTests
+import ReplayCacheTests
+import CleanupTests
 
 open Lean LeanCloud LeanCloudRuntime LeanCloudTests
 
@@ -449,6 +451,8 @@ def main (args : List String) : IO UInt32 := do
     LeanCloudRuntime.Pool.scheduler (← Config.load path); return 0
   try
     ApplicationTests.run
+    ReplayCacheTests.run
+    CleanupTests.run
     IO.println "Application commands and registry passed"
     MonitoringTests.run
     ObjectStoreTests.run

@@ -25,6 +25,15 @@ temporary inbox reclamation, authentication and registry APIs. Storage tests
 cover immutable writes, request failures, credential refresh, paginated cleanup
 and missing/malformed telemetry.
 
+Replay-cache tests compare the actual interpreter's results, journals and
+ownership checks with caching disabled and enabled, and count backing-store
+reads. They cover byte/entry bounds, canonical writes, missing values, failures,
+revocation on cache hits and removal racing with an in-flight operation.
+Cleanup tests cover every worker, partial failure and retry, late telemetry,
+and run isolation. Docker tests stop an active worker during removal, verify
+that the CLI retains its retry request, and inspect all nodes after retry and
+after a scaled-down node returns.
+
 ## Console and helpers
 
 CLI logic runs in Eff against a pure HTTP/file/terminal host. It has no general
