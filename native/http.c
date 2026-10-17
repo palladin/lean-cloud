@@ -114,6 +114,10 @@ static lean_obj_res request_http(b_lean_obj_arg handle, b_lean_obj_arg url,
     p_curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
     p_curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT_MS, 2000L);
     p_curl_easy_setopt(c, CURLOPT_TIMEOUT_MS, (long)timeout);
+    /* A restarted/reconnected node may have a different IP. easy_reset keeps
+     * libcurl's DNS cache, whose default 60s lifetime outlasts our work leases.
+     * Resolve each new connection instead of sending mail to an old address. */
+    p_curl_easy_setopt(c, CURLOPT_DNS_CACHE_TIMEOUT, 0L);
     p_curl_easy_setopt(c, CURLOPT_NOPROXY, "*");
     CURLcode code = p_curl_easy_perform(c);
     long status = 0;

@@ -22,8 +22,10 @@ trap 'trap - INT TERM; kill "${pids[@]}" 2>/dev/null || true; wait || true; exit
 for suite in "$@"; do
   echo "Starting runtime $suite"
   # Network chaos must outlast real assignment leases before asserting recovery.
+  # Include headroom for stopping nodes and removing the isolated deployment;
+  # workflow assertions can pass before Docker cleanup finishes.
   limit=360
-  if [[ "$suite" == chaos ]]; then limit=480; fi
+  if [[ "$suite" == chaos ]]; then limit=540; fi
   timeout --kill-after=15s "${limit}s" "$driver" "--$suite-only" \
     > ".lean-cloud/ci-runtime-logs/$suite.log" 2>&1 &
   pids+=("$!")

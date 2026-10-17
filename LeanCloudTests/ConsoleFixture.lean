@@ -71,7 +71,12 @@ def withFixture (suite image : String) (action : Fixture → IO Unit) : IO Unit 
     IO.FS.writeFile (directory / "failure.log") logs
     throw error
   finally
+    IO.println s!"Cleaning deployment {name}…"
+    (← IO.getStdout).flush
+    let started ← IO.monoMsNow
     f.helper "clean" #["--yes"]
+    IO.println s!"Deployment cleanup finished in {(← IO.monoMsNow) - started} ms."
+    (← IO.getStdout).flush
 
 
 end LeanCloudTests.ConsoleRuntime
