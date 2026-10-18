@@ -27,6 +27,7 @@ Use a commit hash when you want repeatable inputs.
 | `subdirectory` | Lake project directory within the repository | `"."` |
 | `options` | Lake configuration values, e.g. `{"feature": "enabled"}` passes `-Kfeature=enabled` | `{}` |
 | `cache` | `"rebuild"` clears package build directories during preparation and disables external Lake artifact caches; `"reuse"` allows Lake's cache support | `"rebuild"` |
+| `modulesPerJob` | Maximum modules in one cloud job (1–4096); larger jobs reduce transfers and replay, smaller jobs reduce work repeated after a crash | `64` |
 | `check` | Optional independent proof checking, described below | `{"mode": "none"}` |
 | `limits` | Per-command and artifact limits | See below |
 
@@ -40,8 +41,12 @@ not install toolchains or select a different execution platform.
    declared generated-source prerequisites. Publish the resolved source workspace.
 2. Discover the module dependency graph for ordinary module, library, and
    executable targets using Lake's APIs.
-3. Build ready modules with `Cloud.parallel`. Each job restores the sources and
-   its prerequisites into a private workspace and publishes its new artifacts.
+3. Group ready modules into bounded jobs with `Cloud.parallel`, weighted by the
+   pool's advertised CPU capacities. Each job restores one private workspace,
+   builds multiple modules using one Lake context, and publishes one artifact bundle.
+   Straight dependency chains stay within a job; fan-out and dependencies between
+   jobs return to the next cloud batch. A single-worker pool can keep a whole
+   bounded subgraph local.
 4. Restore those artifacts and pass **the original target list** to Lake's own
    build engine, the same one used by `lake build`.
    Lake completes native compilation, C FFI, linking, custom targets, and dynamic
@@ -60,6 +65,23 @@ facets are delegated to that final build rather than guessing their dependencies
 Build hooks must work in a relocated workspace and declare their dependencies to
 Lake. Module jobs preserve the prepared inputs and their prerequisites. Differing
 artifacts produced at the same path by parallel jobs are rejected.
+
+Parallel planning records `env.workers` so replay preserves the same grouping.
+Each native job uses its executing worker's `env.currentWorker.cpus` for
+`LEAN_NUM_THREADS`, including after a restart on a different worker. Lake handles
+local dependency scheduling and shared prerequisites. This is a concurrency hint,
+not CPU affinity or a hard process limit; container resource limits remain in force.
+The pool describes capacity, not reservations or placement guarantees.
+Configure those budgets in `deployment.json` using `cpuMillis` and `memoryMiB`
+(see [worker resource budgets](../../deploy/README.md#worker-resource-budgets)).
+An unconfigured local worker advertises only one CPU, even on a multicore host.
+
+For example, with four workers and `modulesPerJob: 64`, 1,024 independent modules
+need 16 cloud jobs instead of 1,024. A 128-module dependency chain needs two jobs.
+Real graphs have fan-out, joins, and unequal module costs; these numbers describe
+communication granularity, not a wall-clock speedup. A batch still waits for its
+slowest job. Increase `modulesPerJob` when workspace transfers dominate; reduce it
+when jobs are too long or recovery repeats too much work.
 
 Only job inputs and artifact references enter the replay journal. Completed jobs
 are reused after a worker crash. An interrupted job may execute again. A build
@@ -128,7 +150,10 @@ the console uses the same HTTP connection in each environment.
 The report contains:
 
 - `commit`, `toolchain`, `platform`, and `source`: exact input provenance.
-- `modules`: per-module status, diagnostics, duration, and new artifact manifests.
+- `modules`: per-module status in dependency order. Modules in the same job share
+  diagnostics and job duration; successful modules also share an artifact manifest.
+  Do not sum these durations as per-module CPU time. A failed module blocks its
+  dependents; independent modules in the job can still succeed.
 - `build`: final target status, diagnostics, duration, built modules, and an
   `artifacts` reference to the complete workspace manifest. This includes sources,
   Lake outputs, executables, and custom outputs outside `.lake/build`.
@@ -152,8 +177,10 @@ a new directory. Run these inside the deployed image, where the storage
 configuration is available. Transfers verify sizes and SHA-256 hashes.
 Native executables require a compatible platform and runtime libraries.
 
-The packed workspace format is used by `lean-build/v2`; old `v1` workspace
-manifests require the old application image to restore.
+The batched workflow is `lean-build/v3`. Start new runs with the updated image;
+existing runs must finish with their original image because replay locations changed.
+Packed workspace manifests remain compatible with `v2`; old `v1` manifests
+require the old application image to restore.
 
 Remove this test deployment and its stored data:
 
@@ -195,6 +222,8 @@ This setting does not sandbox source compilation.
 
 `limits` defaults to `seconds: 600` per command, `checkerMemoryMiB: 4096` for the
 helper, `bytes: 2147483648` per workspace/export, and `modules: 10000`.
+The module build command now covers a whole job, not one module. Adjust `seconds`
+or `modulesPerJob` for expensive modules.
 Each command's diagnostics are capped at 16 MiB per stream. Container CPU, memory,
 and disk limits govern native tools and temporary files; the helper's memory
 option is not a container memory limit.
@@ -228,7 +257,8 @@ lake build cloud_app build_local build_tests
 Tests compare direct/replay execution on 80 generated module graphs and compare
 native executable output with ordinary Lake. Fixtures cover library/default/module
 and custom targets, generated sources, C FFI, configuration options, subdirectories,
-replay reuse and durable failures. Checking tests cover combined exports, every
+CPU-weighted batching, overlapping native builds, replay after a capacity change,
+and durable failures. Checking tests cover combined exports, every
 paranoid checker, corrupt proofs, private `sorry`, axiom policies and exact toolchains.
 
 The optional container test fetches the pinned GitHub example through the normal

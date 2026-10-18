@@ -13,6 +13,7 @@ structure Tools where
   helper : System.FilePath
   sandbox : Bool := true
   cache : Option Bundle.Cache := none
+  threads : Nat := 1
 
 private def withWorkspace (action : System.FilePath → IO α) : IO α :=
   IO.FS.withTempDir fun root => do
@@ -34,7 +35,8 @@ private def run (tools : Tools) (directory : System.FilePath) (limits : Limits)
   let out ← Process.runFiles {
     cmd := "/usr/bin/env", cwd := cwd.getD directory
     args := #["-i", s!"PATH={tools.toolchain / "bin"}:/usr/local/bin:/usr/bin:/bin",
-      s!"HOME={home}", "LANG=C.UTF-8", "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1"] ++
+      s!"HOME={home}", s!"LEAN_NUM_THREADS={max 1 tools.threads}",
+      "LANG=C.UTF-8", "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1"] ++
       cacheEnv ++ #[command] ++ args
   } (limits.seconds * 1000) (directory / ".." / s!"{label}.stdout")
     (directory / ".." / s!"{label}.stderr") (16 * 1024 * 1024) files
@@ -150,12 +152,12 @@ def Tools.prepare (tools : Tools) (store : ObjectStore) (request : Request) : IO
     tools.prepareDirectory store request directory commit
 
 /-- Only transitive prerequisites are imported by a parallel module job. -/
-def prerequisites (plan : Plan) (target : Module) : Array String := Id.run do
-  let mut needed := target.imports
+private def prerequisites (plan : Plan) (targets : Array Module) : Std.HashSet String := Id.run do
+  let mut needed := targets.foldl (fun set m => m.imports.foldl (·.insert ·) set) ({} : Std.HashSet String)
   for m in plan.modules.reverse do
     if needed.contains m.name then
       for dep in m.imports do
-        unless needed.contains dep do needed := needed.push dep
+        needed := needed.insert dep
   return needed
 
 private def restore (tools : Tools) (store : ObjectStore) (directory : System.FilePath)
@@ -168,54 +170,85 @@ private def restore (tools : Tools) (store : ObjectStore) (directory : System.Fi
     throw (IO.userError "Toolchain changed since preparation")
   return workspace
 
+private structure ModuleOutcome where
+  name : String
+  built : Bool
+  deriving FromJson
+
 private def buildJob (tools : Tools) (store : ObjectStore) (request : Request)
-    (plan : Plan) (completed : Array BuildResult) (module : Option Module) : IO BuildResult :=
+    (plan : Plan) (completed : Array BuildResult) (modules : Option (Array Module)) : IO (Array BuildResult) :=
   withWorkspace fun directory => do
     let start ← IO.monoMsNow
     let mut imports : Bundle.Manifest := #[]
-    let needed := module.map (prerequisites plan)
+    let needed := modules.map (prerequisites plan)
+    let mut manifests : Std.HashSet String := {}
     for result in completed do
       if needed.any (fun names => !names.contains result.name) then continue
       let some ref := result.artifacts | throw (IO.userError "Missing prerequisite artifacts")
+      if manifests.contains ref.sha256 then continue
+      manifests := manifests.insert ref.sha256
       imports ← IO.ofExcept (Bundle.merge imports (← Files.readJson store ref))
     let baseline ← restore tools store directory request plan imports
-    let result : Except String (Array String × Bundle.Snapshot) ← try
-      let mut names := #[]
-      if let some m := module then
-        IO.ofExcept (← lake tools directory request "build" #["build", s!"+{m.name}"])
+    let result : Except String (Array BuildResult × Bundle.Snapshot) ← try
+      let policy ← policyFile directory request
+      let mut results : Array BuildResult := #[]
+      if let some group := modules then
+        let input := directory / ".." / "module-input.json"
+        let output := directory / ".." / "module-results.json"
+        IO.FS.writeFile input (toJson (group.map (·.name))).compress
+        IO.ofExcept (← runHelper tools directory request "build"
+          #["modules", policy.toString, input.toString, output.toString])
+        let rows : Array ModuleOutcome ← readJson output
+        unless rows.map (·.name) == group.map (·.name) do
+          throw (IO.userError "Lake returned incomplete module results")
+        let mut failed : Std.HashSet String := {}
+        for (m, row) in group.zip rows do
+          let blocked := m.imports.any failed.contains
+          if !row.built then failed := failed.insert m.name
+          results := results.push {
+            name := m.name
+            status := if row.built then .built else if blocked then .blocked else .failed
+            builtModules := if row.built then #[m.name] else #[]
+            message := if row.built then "" else if blocked then "A prerequisite failed" else "Lake module build failed; see job diagnostics" }
       else
-        let policy ← policyFile directory request
         let output := directory / ".." / "built-modules.json"
         IO.ofExcept (← runHelper tools directory request "build" #["build", policy.toString, output.toString])
-        names ← readJson output
+        let names ← readJson output
+        results := #[{ name := "targets", status := .built, builtModules := names }]
       let snapshot ← Bundle.delta directory request.limits.bytes baseline
-        (if module.isSome then baseline else #[])
-      pure (.ok (names, snapshot))
+        (if modules.isSome then baseline else #[])
+      pure (.ok (results, snapshot))
     catch error => pure (.error (toString error))
     let diagnostics ← logs store directory
     let milliseconds := (← IO.monoMsNow) - start
-    let name := module.map (·.name) |>.getD "targets"
     match result with
-    | .error message => return { name, status := .failed, diagnostics, milliseconds, message }
-    | .ok (builtModules, snapshot) =>
+    | .error message => return (modules.map (·.map (·.name)) |>.getD #["targets"]).map fun name =>
+        { name, status := .failed, diagnostics, milliseconds, message }
+    | .ok (results, snapshot) =>
+      -- Failed-only jobs have no artifact consumers. Keep their diagnostics,
+      -- without uploading an unreachable pack of partial build outputs.
+      if !results.any (·.status == .built) then
+        return results.map fun result => { result with diagnostics, milliseconds }
       let changes ← snapshot.publish store
       -- A final workspace manifest includes sources and all outputs, even custom
       -- outputs outside .lake/build. Deletions are respected by taking live paths.
-      let artifacts ← if module.isSome then pure changes else do
+      let artifacts ← if modules.isSome then pure changes else do
         Bundle.existing directory (Bundle.overlay baseline changes)
-      return {
-        name, status := .built, diagnostics, milliseconds, builtModules
-        artifacts := ← Files.putJson store artifacts }
+      let artifacts ← Files.putJson store artifacts
+      return results.map fun result => { result with
+        diagnostics, milliseconds, artifacts := if result.status == .built then some artifacts else none }
 
 def Tools.build (tools : Tools) (store : ObjectStore) (request : Request)
-    (plan : Plan) (module : Module) (completed : Array BuildResult) : IO BuildResult :=
-  buildJob tools store request plan completed (some module)
+    (plan : Plan) (modules : Array Module) (completed : Array BuildResult) : IO (Array BuildResult) :=
+  buildJob tools store request plan completed (some modules)
 
 /-- Lake completes exactly the requested targets: native compilation, linking,
 custom targets and any dynamic dependencies remain Lake's responsibility. -/
 def Tools.finish (tools : Tools) (store : ObjectStore) (request : Request)
-    (plan : Plan) (completed : Array BuildResult) : IO BuildResult :=
-  buildJob tools store request plan completed none
+    (plan : Plan) (completed : Array BuildResult) : IO BuildResult := do
+  let results ← buildJob tools store request plan completed none
+  let some result := results[0]? | throw (IO.userError "Missing target result")
+  return result
 
 def Tools.check (tools : Tools) (store : ObjectStore) (request : Request)
     (plan : Plan) (built : BuildResult) : IO CheckResult :=
@@ -271,6 +304,10 @@ def Tools.fromEnvironment : IO Tools := do
   return { toolchain := ← IO.FS.realPath toolchain, helper := ← IO.FS.realPath helper, sandbox, cache }
 
 def Tools.backend (tools : Tools) (store : ObjectStore) : Backend IO :=
-  ⟨tools.prepare store, tools.build store, tools.finish store, tools.check store⟩
+  let configured := fun env : LeanCloud.Environment => { tools with threads := max 1 env.currentWorker.cpus }
+  { prepare := fun env => (configured env).prepare store
+    build := fun env => (configured env).build store
+    finish := fun env => (configured env).finish store
+    check := fun env => (configured env).check store }
 
 end LeanBuild
