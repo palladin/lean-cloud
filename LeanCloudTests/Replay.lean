@@ -32,8 +32,11 @@ private def rejectReplay [Codec α] (name : String) (source : Cloud IO α)
 
 private def captured : Cloud IO Nat := Cloud.pure (fun _ => 7) "capture"
 private def capturedRequest : Request := ⟨"exec", "nat/v1", toJson "capture"⟩
-private def group : Cloud IO (Array Nat) := Cloud.parallel #[pure 10, pure 20]
+private def group : Cloud IO (Array Nat) := Cloud.parallel fun _ => #[pure 10, pure 20]
 private def groupRequest : Request := ⟨"parallel", "array(nat/v1)/v1", toJson (2 : Nat)⟩
+private def groupLocation : Location := Location.root.next
+private def planningRecords : Records := [(ReplayStore.valueKey Location.root,
+  ⟨⟨"exec", "environment/v1", toJson "parallel"⟩, .success (toJson ({} : LeanCloud.Environment))⟩)]
 
 private def invalidReplayCases : Array TestCase :=
   let valueKey := ReplayStore.valueKey Location.root
@@ -57,21 +60,23 @@ private def invalidReplayCases : Array TestCase :=
     rejectReplay "invalid-return-record" captured root
       [(ReplayStore.returnKey Location.root, ⟨capturedRequest, .success (toJson (7 : Nat))⟩)] .divergence,
     rejectReplay "child-outside-group" group
-      ⟨0, Location.root.child 2⟩ [] .divergence,
-    rejectReplay "missing-joined-prefix" group later [] .divergence,
+      ⟨0, groupLocation.child 2⟩ planningRecords .divergence,
+    rejectReplay "missing-joined-prefix" group
+      ⟨0, groupLocation.next.child 0⟩ planningRecords .divergence,
     rejectReplay "changed-child-count" group root
-      [(valueKey, ⟨{ groupRequest with payload := toJson (1 : Nat) }, .success (toJson (#[10] : Array Nat))⟩)] .divergence,
+      ((ReplayStore.valueKey groupLocation,
+        ⟨{ groupRequest with payload := toJson (1 : Nat) }, .success (toJson (#[10] : Array Nat))⟩) :: planningRecords) .divergence,
     rejectReplay "wrong-result-count" group root
-      [(valueKey, ⟨groupRequest, .success (toJson (#[10] : Array Nat))⟩)] .divergence,
+      ((ReplayStore.valueKey groupLocation, ⟨groupRequest, .success (toJson (#[10] : Array Nat))⟩) :: planningRecords) .divergence,
     rejectReplay "invalid-child-value" group root
-      [(valueKey, ⟨groupRequest, .success (toJson #["ten", "twenty"])⟩)] .codec
+      ((ReplayStore.valueKey groupLocation, ⟨groupRequest, .success (toJson #["ten", "twenty"])⟩) :: planningRecords) .codec
   ]
 
 /-- Exercise real worker steps in a chosen completion order, then compare with
 both the direct interpreter and an explicit expected outcome. -/
 private def reverseCompletion (fails : Bool) : TestCase :=
   ⟨s!"replay/reverse-completion/{if fails then "errors" else "values"}", do
-    let source : Cloud IO (Array Nat) := Cloud.parallel <|
+    let source : Cloud IO (Array Nat) := Cloud.parallel fun _ =>
       if fails then #[Cloud.fail "first", Cloud.fail "second", pure 30]
       else #[pure 10, pure 20, pure 30]
     let expected : Except CloudError (Array Nat) :=
@@ -79,9 +84,9 @@ private def reverseCompletion (fails : Bool) : TestCase :=
     assertOutcome (← (DirectInterpreter.interpret noBlobs (fun _ : Unit => source) ()).run) expected
     let saved ← IO.mkRef ([] : Records)
     let store := memoryStore saved
-    assertOutcome (← resume store source) (.ok (.fork Location.root 3))
+    assertOutcome (← resume store source) (.ok (.fork groupLocation 3))
     for index in [2, 1, 0] do
-      let child := Location.root.child index
+      let child := groupLocation.child index
       assertOutcome (← resume store source ⟨index + 1, child⟩) (.ok .done)
       assertTrue ((← saved.get).lookup (ReplayStore.returnKey child)).isSome "Child has no durable result"
       assertTrue ((← saved.get).lookup (ReplayStore.returnKey Location.root)).isNone "Child completed the parent"
@@ -103,27 +108,27 @@ def replayCases : Array TestCase := invalidReplayCases ++ #[
   ⟨"replay/partial-group-suspends-until-all-children-return", do
     let saved ← IO.mkRef ([] : Records)
     let store := memoryStore saved
-    assertOutcome (← resume store group) (.ok (.fork Location.root 2))
-    assertEq (← saved.get) [] "Suspension created a group result"
-    assertOutcome (← resume store group ⟨1, Location.root.child 1⟩) (.ok .done)
+    assertOutcome (← resume store group) (.ok (.fork groupLocation 2))
+    assertEq (← saved.get) planningRecords "Suspension created more than the planning record"
+    assertOutcome (← resume store group ⟨1, groupLocation.child 1⟩) (.ok .done)
     let partialRecords ← saved.get
-    assertOutcome (← resume store group) (.ok (.fork Location.root 2))
+    assertOutcome (← resume store group) (.ok (.fork groupLocation 2))
     assertEq (← saved.get) partialRecords "Partial join wrote a result"
-    assertOutcome (← resume store group ⟨2, Location.root.child 0⟩) (.ok .done)
+    assertOutcome (← resume store group ⟨2, groupLocation.child 0⟩) (.ok .done)
     -- Exactly the same assignment discovers the complete group and joins it.
     assertOutcome (← resume store group) (.ok .done)
-    assertEq ((← saved.get).lookup (ReplayStore.valueKey Location.root))
+    assertEq ((← saved.get).lookup (ReplayStore.valueKey groupLocation))
       (some ⟨groupRequest, .success (toJson (#[10, 20] : Array Nat))⟩)
     assertOutcome (← store.outcome.run) (.ok (some (.success (toJson (#[10, 20] : Array Nat)))))⟩,
   ⟨"replay/empty-group-continues-without-suspension", do
     let saved ← IO.mkRef ([] : Records)
     let store := memoryStore saved
     let source : Cloud IO Nat := do
-      let values ← Cloud.parallel (#[] : Array (Cloud IO Nat))
+      let values ← Cloud.parallel fun _ => (#[] : Array (Cloud IO Nat))
       return values.size + 42
     assertOutcome (← resume store source) (.ok .done)
     assertOutcome (← store.outcome.run) (.ok (some (.success (toJson (42 : Nat)))))
-    assertEq (← saved.get).length 2 "Empty group created child records"⟩,
+    assertEq (← saved.get).length 3 "Expected planning, empty join, and root return only"⟩,
   ⟨"replay/reconstruction-fuel-and-observations", do
     let calls ← IO.mkRef (#[] : Array String)
     let counted (label : String) (value : Nat) : Cloud IO Nat := Cloud.exec (fun _ => do
@@ -131,28 +136,28 @@ def replayCases : Array TestCase := invalidReplayCases ++ #[
       return value) label
     let source : Cloud IO Nat := do
       let value ← counted "prefix" 7
-      let values ← Cloud.parallel #[counted "child" (value + 1)]
+      let values ← Cloud.parallel fun _ => #[counted "child" (value + 1)]
       return values[0]!
     let saved ← IO.mkRef ([] : Records)
-    let fork := Location.root.next
+    let fork := Location.root.next.next
     assertOutcome (← resume (memoryStore saved) source) (.ok (.fork fork 1))
     let prefixRecords ← saved.get
     let child := fork.child 0
     let assignment : Assignment := ⟨1, child⟩
-    -- Replay prefix command, descend at the fork, execute child command, return.
-    let path := #[Location.root, fork, child, child.next]
-    for fuel in [:6] do
+    -- Replay prefix and planning, descend at the fork, execute child, return.
+    let path := #[Location.root, Location.root.next, fork, child, child.next]
+    for fuel in [:7] do
       saved.set prefixRecords
       calls.set #[]
       let visits ← IO.mkRef (#[] : Array Location)
       let observer : ReplayInterpreter.Observer IO := fun location _ => visits.modify (·.push location)
       let outcome ← (ReplayInterpreter.step (memoryStore saved) noBlobs fuel
         (fun _ : Unit => source) () assignment (some observer)).run
-      if fuel < 4 then assertError outcome .protocol
+      if fuel < 5 then assertError outcome .protocol
       else assertOutcome outcome (.ok .done)
       assertEq (← visits.get) (path.extract 0 fuel) "Phase transition changed source observations"
-      assertEq (← calls.get) (if fuel < 3 then #[] else #["child"]) "Reconstruction executed user code"
-      assertEq ((← saved.get).lookup (ReplayStore.returnKey child)).isSome (fuel ≥ 4)
+      assertEq (← calls.get) (if fuel < 4 then #[] else #["child"]) "Reconstruction executed user code"
+      assertEq ((← saved.get).lookup (ReplayStore.returnKey child)).isSome (fuel ≥ 5)
         "Phase transition consumed extra fuel"
     -- An already completed assignment bypasses both phases, even without fuel.
     let visit : ReplayInterpreter.Observer IO := fun _ _ => throw (IO.userError "Observed a completed assignment")
@@ -179,12 +184,12 @@ def replayCases : Array TestCase := invalidReplayCases ++ #[
       return value) label
     let source : Cloud IO (Array Nat) := do
       let value ← counted "prefix" 10
-      let values ← Cloud.parallel #[counted "child-0" (value + 1), counted "child-1" (value + 2)]
+      let values ← Cloud.parallel fun _ => #[counted "child-0" (value + 1), counted "child-1" (value + 2)]
       let _ ← counted "after" 0
       return values
     let saved ← IO.mkRef ([] : Records)
     let store := memoryStore saved
-    let fork := Location.root.next
+    let fork := Location.root.next.next
     for _ in [:2] do assertOutcome (← resume store source) (.ok (.fork fork 2))
     for index in [1, 0] do
       let child := fork.child index
@@ -249,16 +254,16 @@ def replayCases : Array TestCase := invalidReplayCases ++ #[
       calls.modify (·.push index)
       if index < 2 then throw (IO.userError s!"error-{index}")
       return index) s!"branch-{index}"
-    let source : Cloud IO (Array Nat) := Cloud.parallel branches
+    let source : Cloud IO (Array Nat) := Cloud.parallel fun _ => branches
     let expected : Except CloudError (Array Nat) := .error ⟨.application, "error-0"⟩
     assertOutcome (← (DirectInterpreter.interpret noBlobs (fun _ : Unit => source) ()).run) expected
     assertEq (← calls.get) #[0, 1, 2] "A throwing branch skipped later siblings"
     calls.set #[]
     let saved ← IO.mkRef ([] : Records)
     let store := memoryStore saved
-    assertOutcome (← resume store source) (.ok (.fork Location.root 3))
+    assertOutcome (← resume store source) (.ok (.fork groupLocation 3))
     for index in [2, 1, 0] do
-      assertOutcome (← resume store source ⟨index + 1, Location.root.child index⟩) (.ok .done)
+      assertOutcome (← resume store source ⟨index + 1, groupLocation.child index⟩) (.ok .done)
     for _ in [:2] do assertOutcome (← resume store source) (.ok .done)
     assertEq (← calls.get) #[2, 1, 0]
     let .ok (some outcome) ← store.outcome.run | throw (IO.userError "Missing parallel outcome")

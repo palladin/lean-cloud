@@ -65,9 +65,10 @@ An ordinary `exec` records only its outcome: a completed call is never invoked
 on replay; an interrupted, uncommitted call receives its replacement attempt's
 environment. Exceptions from the user computation remain recorded failures.
 
-`Cloud.parallel #[...]` and `||` keep their existing behavior. For a named
-planning function, use `Cloud.parallelWith plan`. No environment primitive or
-new parallel effect is needed. See [resource settings](../deploy/README.md#worker-resource-budgets)
+For fixed branches, use `Cloud.parallel fun _ => #[...]`. A named planning
+function is passed directly as `Cloud.parallel plan`. The `||` operator still
+combines two fixed branches. No environment primitive or new parallel effect
+is needed. See [resource settings](../deploy/README.md#worker-resource-budgets)
 for deployment configuration.
 
 Removing a run clears replay records and the last views on every active worker

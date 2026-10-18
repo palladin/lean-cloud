@@ -45,15 +45,15 @@ open LeanCloud ReplayFaults
 open RestartingParallelReplay (interpret)
 
 def workflow (n : Nat) : Cloud WorkerM Nat := cloud {
-  let values ← Cloud.parallel #[
+  let values ← Cloud.parallel fun _ => #[
     Cloud.pure (fun _ => n * n),
     Cloud.pure (fun _ => (n + 1) * (n + 1))]
   return values.foldl (· + ·) 0
 }
 
 def faults : Plan := {
-  workers := [(Location.root.child 0,
-    [⟨.create (ReplayStore.valueKey (Location.root.child 0)), .after⟩])] }
+  workers := [(Location.root.next.child 0,
+    [⟨.create (ReplayStore.valueKey (Location.root.next.child 0)), .after⟩])] }
 
 #eval ((interpret 1000 workflow 7).run (Saved.initial faults)).1
 -- Except.ok 113

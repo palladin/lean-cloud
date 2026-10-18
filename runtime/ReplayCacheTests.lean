@@ -124,8 +124,8 @@ private def interruptedRemoval : IO Unit := do
 
 private def workload (_ : Unit) : Cloud IO Nat := cloud {
   let base ← Cloud.pure (fun _ => 10) "prefix"
-  let values ← Cloud.parallel ((Array.range 24).map fun n => cloud {
-    let inner ← Cloud.parallel ((Array.range 3).map fun k => cloud {
+  let values ← Cloud.parallel fun _ => ((Array.range 24).map fun n => cloud {
+    let inner ← Cloud.parallel fun _ => ((Array.range 3).map fun k => cloud {
       Cloud.pure (fun _ => base + n + k) "leaf"
     })
     return inner.foldl (· + ·) 0

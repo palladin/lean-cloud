@@ -12,7 +12,7 @@ private def repeated [Monad m] : Cloud m Nat := cloud {
 }
 
 private def branching [Monad m] : Cloud m (Array Nat) := cloud {
-  Cloud.parallel #[cloud { return 11 }, cloud { return 22 }]
+  Cloud.parallel fun _ => #[cloud { return 11 }, cloud { return 22 }]
 }
 
 private def loopAndReturn [Monad m] (stop : Nat) : Cloud m Nat := cloud {
@@ -85,7 +85,7 @@ private def recursiveCaller : Cloud Id Nat := cloud {
 @[cloud_func] private def opaqueBranches [Monad m] (branches : Array (Cloud m Nat)) :
     Cloud m (Array Nat) := cloud {
   let _ ← Cloud.pure (fun _ => 1) "helper setup"
-  Cloud.parallel branches
+  Cloud.parallel fun _ => branches
 }
 
 private def suppliedBranch : Cloud Id Nat := cloud { return 123 }
@@ -110,7 +110,7 @@ private abbrev Jobs := Array Job
 private def internalBranches : Jobs := #[cloud { Cloud.pure (fun _ => 3) "internal branch" }]
 
 @[cloud_func] private def containerHelper : Cloud Id (Array Nat) := cloud {
-  Cloud.parallel internalBranches
+  Cloud.parallel fun _ => internalBranches
 }
 
 private def containerCaller : Cloud Id (Array Nat) := cloud { containerHelper }
@@ -120,7 +120,7 @@ private def sharedDetail : Cloud Id Nat := cloud { Cloud.pure (fun _ => 5) "shar
 @[cloud_func]
 private def sharedBranches (user : Cloud Id Nat) : Cloud Id (Array Nat) := cloud {
   let _ ← sharedDetail
-  Cloud.parallel #[user]
+  Cloud.parallel fun _ => #[user]
 }
 
 private def sharedCaller : Cloud Id (Array Nat) := cloud { sharedBranches sharedDetail }
@@ -210,7 +210,7 @@ def cases : Array TestCase := #[
     assertTrue (has (textAt command.metadata) "cloud { aliasHelper }") "Type alias bypassed opacity"
     assertEq ((site command.metadata).bind (·.functionInfo) |>.map (·.descr)) (some "Aliased job")⟩,
   ⟨"source.helper-owns-internal-branch-container", do
-    match skipDelay (skipDelay containerCaller) with
+    match nextExec (skipDelay (skipDelay containerCaller)) with
     | .impure _ (.parallel _ count branches) _ =>
       if h : 0 < count then
         let command := skipDelay (branches ⟨0, h⟩)
@@ -220,7 +220,7 @@ def cases : Array TestCase := #[
   ⟨"source.shared-helper-keeps-user-branch-visible", do
     let setup := skipDelay (skipDelay (skipDelay sharedCaller))
     assertTrue (has (textAt setup.metadata) "sharedBranches sharedDetail") "Internal call was not hidden"
-    match nextExec setup with
+    match nextExec (nextExec setup) with
     | .impure _ (.parallel _ count branches) _ =>
       if h : 0 < count then
         let command := skipDelay (branches ⟨0, h⟩)
@@ -288,7 +288,7 @@ def cases : Array TestCase := #[
       assertTrue (view.any (has · s!"Source: {descr} ·")) "Watch did not display the function description"⟩,
   ⟨"source.opaque-helper-preserves-supplied-branches", do
     let setup := skipDelay (skipDelay branchCaller)
-    let fork := nextExec setup
+    let fork := nextExec (nextExec setup)
     assertTrue (has (textAt fork.metadata) "opaqueBranches #[") "Helper fork exposed its definition"
     match fork with
     | .impure _ (.parallel _ count branches) _ =>
@@ -343,7 +343,7 @@ def cases : Array TestCase := #[
     | .impure _ (.command _ (.resolveBlob _)) next =>
       assertEq (next.apply ⟨"log", 0, 0⟩).metadata program.metadata "Helper lost call site between operations"
     | _ => throw (IO.userError "Expected blob helper")
-    match skipDelay (branching (m := Id)) with
+    match nextExec (skipDelay (branching (m := Id))) with
     | .impure info (.parallel _ count branches) _ =>
       assertTrue (has (textAt info) "Cloud.parallel") "Fork source missing"
       if h : 0 < count then

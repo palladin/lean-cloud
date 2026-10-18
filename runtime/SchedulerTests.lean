@@ -109,8 +109,8 @@ def run : IO Unit := IO.FS.withTempFile fun _ inboxPath =>
         report (← execute "worker1" root)
         let left ← assigned (← ready "worker1" first)
         let right ← assigned (← ready "worker2" second)
-        assertEq left.branchStart (Location.root.child 0)
-        assertEq right.branchStart (Location.root.child 1)
+        assertEq left.branchStart (Location.root.next.child 0)
+        assertEq right.branchStart (Location.root.next.child 1)
         report (← execute "worker1" left)
         -- The second worker commits its result but has not delivered its reply.
         let late ← execute "worker2" right

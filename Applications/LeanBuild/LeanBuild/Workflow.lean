@@ -21,7 +21,7 @@ private def batches [Monad m] [MonadCloudExec m] (backend : Backend m) (request 
       if pending.isEmpty then return done
       let batch := ready pending done
       if batch.isEmpty then Cloud.fail "No ready modules in a validated plan"
-      let results ← Cloud.parallel (batch.map fun m => cloud {
+      let results ← Cloud.parallel fun _ => (batch.map fun m => cloud {
         if m.imports.any (fun dep => done.any fun r => r.name == dep && r.status != .built) then
           return { name := m.name, status := .blocked, message := "A prerequisite failed" }
         Cloud.exec (fun _ => backend.build request plan m done) s!"build {m.name}"

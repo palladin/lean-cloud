@@ -28,14 +28,21 @@ private def partitioned (_ : Unit) : Cloud IO (Array (String × (String × Nat))
     }
 }
 
+private def plan (env : LeanCloud.Environment) : Array (Cloud IO Nat) :=
+  #[pure env.currentWorker.cpus]
+
 def cases : Array TestCase := #[
   ⟨"environment.parallel-callback-syntax", do
+    let runParallel : (LeanCloud.Environment → Array (Cloud IO Nat)) → Cloud IO (Array Nat) :=
+      Cloud.parallel
     let programs : Array (Cloud IO (Array Nat)) := #[
       cloud { Cloud.parallel fun (env : LeanCloud.Environment) => #[pure env.currentWorker.cpus] },
       cloud { Cloud.parallel (fun (env : LeanCloud.Environment) => #[pure env.currentWorker.cpus]) },
       cloud { LeanCloud.Cloud.parallel fun env => #[pure env.currentWorker.cpus] },
       cloud { LeanCloud.Cloud.parallel (fun env => #[pure env.currentWorker.cpus]) },
-      cloud { Cloud.parallel fun _ => #[pure 6] }]
+      cloud { Cloud.parallel fun _ => #[pure 6] },
+      cloud { Cloud.parallel plan },
+      runParallel plan]
     for program in programs do
       assertOutcome (← (DirectInterpreter.interpret noBlobs (fun _ : Unit => program) () (context "a" 6 4)).run)
         (.ok #[6])⟩,

@@ -33,7 +33,7 @@ mutual
       lower next (value + input)
     | .branch even odd => if input % 2 == 0 then lower even input else lower odd input
     | .parallel children => do
-      let values ← Cloud.parallel (lowerChildren children input).toArray
+      let values ← Cloud.parallel fun _ => (lowerChildren children input).toArray
       -- An order-sensitive result exposes reordered children; summing hid them.
       Cloud.pure (fun _ => values.foldl (fun acc value => acc * 31 + value + 1) input) "generated/join"
   termination_by structural tree

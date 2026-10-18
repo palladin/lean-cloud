@@ -12,7 +12,7 @@ Prepare the dataset once; reuse its immutable blob reference for many queries.
 
 ```lean
 cloud {
-  let parts ← Cloud.parallel (dataset.shards.map fun shard => cloud {
+  let parts ← Cloud.parallel fun _ => (dataset.shards.map fun shard => cloud {
     Cloud.exec (fun _ => backend.count request shard) "count vocabulary"
   })
   Cloud.exec (fun _ => backend.sumCounts request parts) "combine counts"

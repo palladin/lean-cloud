@@ -29,7 +29,7 @@ private def deep [Pure m] : Nat → Nat → Cloud m Nat
   | 0, input => Cloud.pure (fun _ => input) "leaf"
   | n + 1, input => do
       let captured ← Cloud.pure (fun _ => combine input n) "capture"
-      let values ← Cloud.parallel #[deep n captured, Cloud.pure (fun _ => captured + 1) "sibling"]
+      let values ← Cloud.parallel fun _ => #[deep n captured, Cloud.pure (fun _ => captured + 1) "sibling"]
       return values.foldl combine input
 
 def workflow [Pure m] (input : Input) : Cloud m Nat := do
@@ -38,7 +38,7 @@ def workflow [Pure m] (input : Input) : Cloud m Nat := do
   | .deep => deep input.size input.seed
   | .wide =>
       let captured ← Cloud.pure (fun _ => input.seed + 3) "capture"
-      let values ← Cloud.parallel ((Array.range input.size).map fun i =>
+      let values ← Cloud.parallel fun _ => ((Array.range input.size).map fun i =>
         Cloud.pure (fun _ => combine captured i) "child")
       return values.foldl combine input.seed
 

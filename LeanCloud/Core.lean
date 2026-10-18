@@ -58,19 +58,20 @@ handle the exception inside `body`; only node crashes trigger replay recovery. -
 def exec [MonadCloudExec m] [Codec α] (body : Environment → m α) (label : String := "") : Cloud m α :=
   send (.command inferInstance (.exec label fun environment => MonadCloudExec.capture (body environment)))
 
-def parallel [Codec α] (branches : Array (Cloud m α)) : Cloud m (Array α) :=
+private def fork [Codec α] (branches : Array (Cloud m α)) : Cloud m (Array α) :=
   send (.parallel inferInstance branches.size (fun index => branches[index]))
 
 /-- Record the planning environment before creating branches. Reconstructing any
 child uses the same snapshot, even after pool membership or worker capacity changes. -/
-def parallelWith [Monad m] [MonadCloudExec m] [Codec α]
+def parallel [Pure m] [Codec α]
     (plan : Environment → Array (Cloud m α)) : Cloud m (Array α) := do
-  let environment ← exec (fun environment => pure environment) "parallel"
-  parallel (plan environment)
+  let environment ← send (.command (inferInstance : Codec Environment)
+    (.exec "parallel" fun environment => ExceptT.mk (Pure.pure (.ok environment))))
+  fork (plan environment)
 
 /-- Heterogeneous pairing uses the same collection-parallel primitive. -/
 def both [Codec α] [Codec β] (left : Cloud m α) (right : Cloud m β) : Cloud m (α × β) := do
-  let values ← parallel #[Sum.inl <$> left, Sum.inr <$> right]
+  let values ← fork #[Sum.inl <$> left, Sum.inr <$> right]
   match values.toList with
   | [.inl a, .inr b] => return (a, b)
   | _ => send (.fail ⟨.protocol, "Invalid parallel pair result"⟩)
@@ -102,18 +103,6 @@ def readTextByName (name : String) : Cloud m String := do
   readText (← resolve name)
 
 end CloudBlob
-
-/-- A callback receives an expected Environment type; arrays keep their existing
-expected Cloud type. Named planners can use Cloud.parallelWith directly. -/
-macro_rules
-  | `(Cloud.parallel fun $binders:funBinder* => $body:term) =>
-      `(Cloud.parallelWith fun $binders:funBinder* => $body)
-  | `(Cloud.parallel (fun $binders:funBinder* => $body:term)) =>
-      `(Cloud.parallelWith fun $binders:funBinder* => $body)
-  | `(LeanCloud.Cloud.parallel fun $binders:funBinder* => $body:term) =>
-      `(Cloud.parallelWith fun $binders:funBinder* => $body)
-  | `(LeanCloud.Cloud.parallel (fun $binders:funBinder* => $body:term)) =>
-      `(Cloud.parallelWith fun $binders:funBinder* => $body)
 
 scoped infixl:30 " || " => Cloud.both
 

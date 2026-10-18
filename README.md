@@ -19,7 +19,7 @@ import LeanCloud
 open LeanCloud
 
 def summarizeLogs (files : Array String) : Cloud IO BlobRef := cloud {
-  let counts ← Cloud.parallel (files.map fun name => cloud {
+  let counts ← Cloud.parallel fun _ => (files.map fun name => cloud {
     let text ← CloudBlob.readTextByName name
     return ((text.splitOn "\n").filter (·.startsWith "ERROR")).length
   })
