@@ -15,9 +15,9 @@ structure BlobStorage (m : Type → Type u) where
 /-- Execute a user operation whose adapter returns failures as Cloud errors.
 The interpreter records both success and failure before continuing. -/
 def BlobStorage.execute {m : Type → Type u} {α : Type} [Monad m]
-    (blobs : BlobStorage m) (request : Operation m α) : ExceptT CloudError m α :=
+    (blobs : BlobStorage m) (request : Operation m α) (environment : Environment := {}) : ExceptT CloudError m α :=
   match request with
-  | .exec _ body => body ()
+  | .exec _ body => body environment
   | .putBlob bytes => blobs.putBlob bytes
   | .readBlob ref => blobs.readBlob ref
   | .resolveBlob name => blobs.resolveBlob name

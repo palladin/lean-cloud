@@ -33,7 +33,7 @@ def consoleCases : Array TestCase := #[
     assertTrue (!(clip 8 "0123456789").contains '\x1b') "Unsafe clipping"⟩,
   ⟨"console.watch-final-source", do
     let ctx : Context := ⟨"/work", "test"⟩
-    let source : ProgramSource := ⟨"Example.lean", "cloud {\n  Cloud.exec work\n}", #[⟨"work", 2, 0, 2, 0⟩]⟩
+    let source : ProgramSource := ⟨"Example.lean", "cloud {\n  Cloud.exec work\n}", #[{ id := "work", line := 2, endLine := 2 }]⟩
     let info : ProgramInfo := ⟨"example/v1", "unit/v1", "nat/v1", "", none, #[source]⟩
     let run : Run := ⟨"run-1", "image", info, Json.null⟩
     let event : ExecutionEvent := ⟨"boot", 1, 20, "worker1", some 2, "0:1", "execute", "work", run.id, some "work"⟩

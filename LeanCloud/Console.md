@@ -47,6 +47,30 @@ show the last view with frozen metrics. There is no history timeline. Source,
 telemetry and outcomes come from the API; caches allow a clearly labeled last
 view during an outage. `logs` is not a complete container-log archive.
 
+Use `@[cloud_func]` to describe a Cloud helper in `watch`:
+
+```lean
+@[cloud_func (descr := "Analyze a value") (opaque := true)]
+def analyze (n : Nat) : Cloud IO Nat := cloud {
+  let value ← Cloud.pure (fun _ => n * n) "square"
+  return value + 1
+}
+
+def workflow : Cloud IO Nat := cloud {
+  analyze 7  -- watch stays here while analyze executes
+}
+```
+
+Both options are optional. `descr` defaults to the function name; `opaque`
+defaults to `true`. The description appears beside the source location in the
+branch panel and worker cards. Use `(opaque := false)` to follow the helper's
+internal source lines while still displaying its description.
+
+Opaque helpers hide implementation locations, including nested helper calls. User Cloud
+computations passed into the helper retain their own source locations. After
+the helper returns, `watch` follows the caller's next statement. The annotation
+changes display metadata only; replay locations and recorded results are unchanged.
+
 Both `watch` and `top` show each worker or scheduler's machine name, host logical
 CPU count and total RAM. The CPU and memory meters show container usage and
 capacity separately: 100% CPU means one logical CPU, and CPU capacity includes

@@ -14,7 +14,7 @@ def run : IO Unit := do
   try
     let stores ← connections.mapIdxM fun i conn => ObservationStore.create conn s!"worker{i}"
     let routes : Array HttpMailbox.WorkerEndpoint := (Array.range 3).map fun i =>
-      ⟨s!"worker{i}", ⟨"127.0.0.1", 1, "test"⟩⟩
+      { worker := s!"worker{i}", endpoint := ⟨"127.0.0.1", 1, "test"⟩ }
     for store in stores do
       store.record (step store.worker "retired")
       store.record (step store.worker "kept")

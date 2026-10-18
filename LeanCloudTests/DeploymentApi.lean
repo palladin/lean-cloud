@@ -89,7 +89,7 @@ private def monitoringHost (completed : Bool) (url token : String) (json : Json)
         id, entry := "squares/v1", input := Json.null, resultSchema := "nat", mode := .active
         program := some {
           entry := "squares/v1", inputSchema := "unit", resultSchema := "nat", description := "", sampleInput := none
-          sources := #[⟨"Remote.lean", "cloud {\n  Cloud.pure work\n}", #[⟨"work", 2, 0, 2, 0⟩]⟩] }
+          sources := #[⟨"Remote.lean", "cloud {\n  Cloud.pure work\n}", #[{ id := "work", line := 2, endLine := 2 }]⟩] }
         } : LeanCloud.DeploymentApi.RunInfo))
     | .outcome _ => pure (toJson (if completed then some (.success (toJson (55 : Nat))) else none : Option Exit))
     | .inspect _ => pure (toJson ({ jobs := #[⟨Location.root, Location.root, false,

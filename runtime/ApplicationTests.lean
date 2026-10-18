@@ -59,6 +59,16 @@ def run : IO Unit := do
   let legacy := Json.mkObj ((← unwrap json.getObj?).toList.filter (·.1 != "worker"))
   let old : Config ← unwrap (fromJson? legacy)
   assertEq old.worker ({} : ExecutionConfig) "Legacy config lost defaults"
+  let some route := old.mailboxes.workers[0]? | throw (IO.userError "Missing fixture worker")
+  assertEq route.cpus 1 "Legacy worker lost its conservative CPU budget"
+  assertTrue route.memoryMiB.isNone "Legacy worker fabricated a memory budget"
+  for invalid in [{ route with cpus := 0 }, { route with memoryMiB := some 0 }] do
+    assertTrue ({ old.mailboxes with workers := #[invalid] }.validate).toOption.isNone
+      "Invalid worker budget was accepted"
+  for (field, value) in [("cpus", Json.null), ("cpus", toJson false),
+      ("memoryMiB", toJson false), ("memoryMiB", toJson "8192")] do
+    assertTrue (fromJson? (α := HttpMailbox.WorkerEndpoint)
+      ((toJson route).setObjVal! field value)).toOption.isNone "Malformed worker budget used defaults"
   assertTrue (fromJson? (α := Config) (json.setObjVal! "worker" Json.null)).toOption.isNone
     "Invalid limits silently used defaults"
   let entry : CloudProgram Nat Nat := { name := "fuel", version := "v1", run := fun n => do
@@ -89,11 +99,11 @@ def run : IO Unit := do
   assertTrue (legacyDefinition.image.isNone && legacyDefinition.program.isNone) "Legacy source/release invented"
   let trace ← Trace.create "config-test"
   let assignment : Assignment := ⟨0, Location.root⟩
-  let limited ← registered.execute { interpreterFuel := 1 } definition "test" ⟨store, pure #[]⟩ blobs trace assignment
+  let limited ← registered.execute { interpreterFuel := 1 } definition "test" ⟨store, pure #[]⟩ blobs trace assignment {}
   assertError limited.progress .protocol
   assertTrue ((← journal.get).lookup (ReplayStore.returnKey Location.root)).isNone
     "Fuel exhaustion published completion"
-  let completed ← registered.execute { interpreterFuel := 10 } definition "test" ⟨store, pure #[]⟩ blobs trace assignment
+  let completed ← registered.execute { interpreterFuel := 10 } definition "test" ⟨store, pure #[]⟩ blobs trace assignment {}
   assertOutcome completed.progress (.ok .done)
   let some root := (← journal.get).lookup (ReplayStore.returnKey Location.root)
     | throw (IO.userError "Configured worker did not finish")
@@ -112,15 +122,26 @@ def run : IO Unit := do
     entry := throwing.info.entry, input := toJson (5 : Nat), resultSchema := throwing.info.resultSchema }
   for _ in [:2] do
     let done ← (registerProgram throwing #[]).execute {} throwingDefinition "test"
-      ⟨store, pure #[]⟩ blobs trace assignment
+      ⟨store, pure #[]⟩ blobs trace assignment {}
     assertOutcome done.progress (.ok .done)
   assertEq (← calls.get) 1 "Registered worker retried user IO"
   assertOutcome (← store.outcome.run) (.ok (some (.failure ⟨.application, "application exception"⟩)))
   -- The same worker can execute another workflow after that failure.
   journal.set []
-  let next ← registered.execute {} definition "test" ⟨store, pure #[]⟩ blobs trace assignment
+  let next ← registered.execute {} definition "test" ⟨store, pure #[]⟩ blobs trace assignment {}
   assertOutcome next.progress (.ok .done)
   assertOutcome (← store.outcome.run) (.ok (some (.success (toJson (7 : Nat)))))
+  journal.set []
+  let resources : CloudProgram Unit Nat := {
+    name := "resources", version := "v1"
+    run := fun _ => Cloud.exec fun env => pure env.currentWorker.cpus }
+  let resourceDefinition : RunDefinition := {
+    entry := resources.info.entry, input := toJson (), resultSchema := resources.info.resultSchema }
+  let environment : LeanCloud.Environment := { currentWorker := { id := "test", cpus := 6 } }
+  let used ← (registerProgram resources #[]).execute {} resourceDefinition "test"
+    ⟨store, pure #[]⟩ blobs trace assignment environment
+  assertOutcome used.progress (.ok .done)
+  assertOutcome (← store.outcome.run) (.ok (some (.success (toJson (6 : Nat)))))
   let registry : Registry := ⟨#[program.register]⟩
   let config : Config ← unwrap (fromJson? json)
   let client : ClientConfig := ⟨"test", "sha256:app", "public-token"⟩

@@ -131,6 +131,32 @@ exclude credentials, provider state, and generated configs from Docker contexts.
 Keep these exclusions when supplying your own build files. `clean` retains
 the inspectable configuration; choose a fresh directory to deploy again.
 
+## Worker resource budgets
+
+Set `cpuMillis` and `memoryMiB` in `deployment.json`, for example `6000` and
+`8192` for six CPUs and 8 GiB per worker. Kubernetes uses CPU requests and memory
+limits; local Docker uses CPU and memory limits when these fields are supplied.
+Local defaults leave Docker resources unrestricted and advertise a conservative
+one-job CPU budget. The runtime uses any visible memory limit when no budget is
+configured.
+
+The same settings reach the workflow through `env.currentWorker` and
+`env.workers`; `cpus` is `floor(cpuMillis / 1000)`, with a minimum of one job.
+This is a concurrency budget, not CPU pinning or a count of idle cores. See the
+[environment example](../LeanCloud/Deployment.md#planning-work-and-using-local-resources).
+
+After editing these fields, apply them through `scale` with the desired worker
+count, even if that count is unchanged:
+
+```sh
+./deploy/local.sh scale .deployment 3
+# Or, for Kubernetes (including Azure and AWS):
+./deploy/kubernetes.sh scale .kube-deployment 3
+```
+
+This stops old nodes before updating the runtime configuration and starting
+replacements. Kubernetes also supports separate `schedulerResources`, described below.
+
 ## Your application
 
 ```sh

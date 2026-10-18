@@ -1,6 +1,7 @@
 import LeanCloud.Control
 import LeanCloud.SourceMap
 import Lean.Elab.BuiltinDo
+import Lean.Elab.App
 
 universe u
 
@@ -14,27 +15,34 @@ variable {m : Type → Type u}
 
 namespace Cloud
 
+private def displaySource (site : SourceSiteId) (remap : Array (SourceSiteId × SourceSiteId))
+    (info : Option SourceSiteId) : Option SourceSiteId :=
+  some (info.map (fun id => (remap.find? (·.1 == id)).map (·.2) |>.getD id) |>.getD site)
+
 mutual
-  /-- Supply a call site to unannotated nodes, including higher-order children.
-  Inner cloud blocks retain their own sites. Continuations stay delayed. -/
-  def withSource {m : Type → Type u} {α : Type} (site : SourceSiteId) (program : Cloud m α) : Cloud m α :=
+  /-- Supply a call site to unannotated nodes and remap helper-owned sites.
+  Other inner cloud blocks retain their sites. Continuations stay delayed. -/
+  def withSource {m : Type → Type u} {α : Type} (site : SourceSiteId)
+      (program : Cloud m α) (remap : Array (SourceSiteId × SourceSiteId) := #[]) : Cloud m α :=
     match program with
-    | .pure info value => .pure (info.orElse (fun _ => some site)) value
-    | .impure info request next => .impure (info.orElse (fun _ => some site))
-        (sourceControl site request) (sourceContinuation site next)
+    | .pure info value => .pure (displaySource site remap info) value
+    | .impure info request next => .impure (displaySource site remap info)
+        (sourceControl site request remap) (sourceContinuation site next remap)
   termination_by structural program
 
-  def sourceControl {m : Type → Type u} {α : Type} (site : SourceSiteId) (request : Control m α) : Control m α :=
+  def sourceControl {m : Type → Type u} {α : Type} (site : SourceSiteId)
+      (request : Control m α) (remap : Array (SourceSiteId × SourceSiteId) := #[]) : Control m α :=
     match request with
-    | .parallel codec count branches => .parallel codec count fun i => withSource site (branches i)
+    | .parallel codec count branches => .parallel codec count fun i => withSource site (branches i) remap
     | other => other
   termination_by structural request
 
   def sourceContinuation {m : Type → Type u} {α β : Type} (site : SourceSiteId)
-      (next : ArrsF (Control m) SourceSiteId α β) : ArrsF (Control m) SourceSiteId α β :=
+      (next : ArrsF (Control m) SourceSiteId α β)
+      (remap : Array (SourceSiteId × SourceSiteId) := #[]) : ArrsF (Control m) SourceSiteId α β :=
     match next with
-    | .one k => .one fun value => withSource site (k value)
-    | .append first rest => .append (sourceContinuation site first) (sourceContinuation site rest)
+    | .one k => .one fun value => withSource site (k value) remap
+    | .append first rest => .append (sourceContinuation site first remap) (sourceContinuation site rest remap)
   termination_by structural next
 end
 
@@ -44,13 +52,21 @@ def delay (body : Unit → Cloud m α) : Cloud m α := send Control.delay >>= bo
 
 def fail (message : String) : Cloud m α := send (.fail ⟨.application, message⟩)
 
-/-- An uncaught computation exception is a recorded failure. To recover or retry,
+/-- Run with this attempt's worker environment; record only the outcome.
+An uncaught computation exception is a recorded failure. To recover or retry,
 handle the exception inside `body`; only node crashes trigger replay recovery. -/
-def exec [MonadCloudExec m] [Codec α] (body : Unit → m α) (label : String := "") : Cloud m α :=
-  send (.command inferInstance (.exec label fun _ => MonadCloudExec.capture (body ())))
+def exec [MonadCloudExec m] [Codec α] (body : Environment → m α) (label : String := "") : Cloud m α :=
+  send (.command inferInstance (.exec label fun environment => MonadCloudExec.capture (body environment)))
 
 def parallel [Codec α] (branches : Array (Cloud m α)) : Cloud m (Array α) :=
   send (.parallel inferInstance branches.size (fun index => branches[index]))
+
+/-- Record the planning environment before creating branches. Reconstructing any
+child uses the same snapshot, even after pool membership or worker capacity changes. -/
+def parallelWith [Monad m] [MonadCloudExec m] [Codec α]
+    (plan : Environment → Array (Cloud m α)) : Cloud m (Array α) := do
+  let environment ← exec (fun environment => pure environment) "parallel"
+  parallel (plan environment)
 
 /-- Heterogeneous pairing uses the same collection-parallel primitive. -/
 def both [Codec α] [Codec β] (left : Cloud m α) (right : Cloud m β) : Cloud m (α × β) := do
@@ -87,6 +103,18 @@ def readTextByName (name : String) : Cloud m String := do
 
 end CloudBlob
 
+/-- A callback receives an expected Environment type; arrays keep their existing
+expected Cloud type. Named planners can use Cloud.parallelWith directly. -/
+macro_rules
+  | `(Cloud.parallel fun $binders:funBinder* => $body:term) =>
+      `(Cloud.parallelWith fun $binders:funBinder* => $body)
+  | `(Cloud.parallel (fun $binders:funBinder* => $body:term)) =>
+      `(Cloud.parallelWith fun $binders:funBinder* => $body)
+  | `(LeanCloud.Cloud.parallel fun $binders:funBinder* => $body:term) =>
+      `(Cloud.parallelWith fun $binders:funBinder* => $body)
+  | `(LeanCloud.Cloud.parallel (fun $binders:funBinder* => $body:term)) =>
+      `(Cloud.parallelWith fun $binders:funBinder* => $body)
+
 scoped infixl:30 " || " => Cloud.both
 
 open Lean Elab Term Meta in
@@ -116,7 +144,7 @@ def elabCloudExpression : DoElab := fun stx dec => do
   let value ← elabTermEnsuringType expression (← mkMonadApp dec.resultType)
   let annotated ← match ← SourceMap.capture expression with
     | none => pure value
-    | some site => mkAppM ``Cloud.withSource #[toExpr site, value]
+    | some site => mkAppM ``Cloud.withSource #[toExpr site, value, toExpr (#[] : Array (String × String))]
   dec.mkBindUnlessPure annotated
 
 open Lean Elab Term Meta Do Parser.Term in
@@ -127,6 +155,19 @@ def elabCloudReturn : DoElab := fun stx dec => do
   let value ← elabDoReturn stx dec
   match ← SourceMap.capture stx with
   | none => pure value
-  | some site => mkAppM ``Cloud.withSource #[toExpr site, value]
+  | some site => mkAppM ``Cloud.withSource #[toExpr site, value, toExpr (#[] : Array (String × String))]
 
+open Lean Elab Term Meta in
+/-- Distinguish helper calls before applying their optional display policy.
+Supplied Cloud computations keep their own source information. -/
+@[term_elab Lean.Parser.Term.app, term_elab ident]
+def elabCloudFunction : TermElab := fun stx expected => do
+  unless cloud.captureSource.get (← getOptions) do throwUnsupportedSyntax
+  let value ← if stx.isIdent then Lean.Elab.Term.elabIdent stx expected
+    else Lean.Elab.Term.elabApp stx expected
+  let .const name _ := value.getAppFn | return value
+  unless ← SourceMap.isCloudType (← inferType value) do return value
+  let info := cloudFunc.getParam? (← getEnv) name
+  let some (site, remap) ← SourceMap.functionSites name stx info | return value
+  mkAppM ``Cloud.withSource #[toExpr site, value, toExpr remap]
 end LeanCloud

@@ -71,6 +71,9 @@ if [[ ( "$command" == up || "$command" == scale ) && -f "$directory/cleanup-star
   fail 'Cleanup has started for this deployment. Finish clean and use a fresh directory to deploy again.'
 fi
 name=$(jq -er .name "$spec"); identifier "$name"
+if [[ "$command" == configure || "$command" == up || "$command" == scale ]]; then
+  jq -e '[.cpuMillis,.memoryMiB]|all(.==null or (type=="number" and .>0 and floor==.))' "$spec" >/dev/null || fail 'Invalid worker CPU or memory budget'
+fi
 [[ $(jq -r .directory "$spec") == "$directory" ]] || fail 'Deployment directory has moved; review its bind paths before use.'
 compose() { docker compose -p "$name" -f "$directory/compose.json" "$@"; }
 mounted_config_permissions() {
@@ -83,7 +86,7 @@ render() {
     $spec[0] as $s | .client={deployment:$s.name,image:$s.image,token:($client|rtrimstr("\n"))} |
     .scheduler.database="/data/scheduler.sqlite" |
     .mailboxes.scheduler={host:"scheduler-mailbox",port:8080,token:($internal|rtrimstr("\n"))} |
-    .mailboxes.workers=[range(1;$s.workers+1) | {worker:"worker\(.)",endpoint:{host:"worker\(.)-mailbox",port:8080,token:($internal|rtrimstr("\n"))}}]
+    .mailboxes.workers=[range(1;$s.workers+1) | {worker:"worker\(.)",cpus:([1,(($s.cpuMillis // 1000)/1000|floor)]|max),memoryMiB:($s.memoryMiB // null),endpoint:{host:"worker\(.)-mailbox",port:8080,token:($internal|rtrimstr("\n"))}}]
     ' "$directory/config.json" > "$directory/config.next"
   mv "$directory/config.next" "$directory/config.json"
   mounted_config_permissions

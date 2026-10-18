@@ -105,7 +105,7 @@ private def scheduler : IO Unit := IO.FS.withTempFile fun _ inboxPath =>
       let endpoint : HttpMailbox.Config := ⟨"127.0.0.1", bound.port.toNat, "cleanup"⟩
       let defaults : Config ← IO.ofExcept (Json.parse (include_str "../deploy/config.json") >>= fromJson?)
       let config := { defaults with
-        mailboxes := ⟨endpoint, #[⟨"worker1", endpoint⟩]⟩
+        mailboxes := ⟨endpoint, #[{ worker := "worker1", endpoint }]⟩
         scheduler := { defaults.scheduler with database := database.toString } }
       IO.FS.writeFile configPath (toJson config).compress
       let snapshot : IO LeanCloudRuntime.Pool.Saved := LocalDb.loadValue observer "pool-v1" {}
@@ -143,7 +143,7 @@ private def scheduler : IO Unit := IO.FS.withTempFile fun _ inboxPath =>
         try
           repeatConfiguration
           assertTrue (← response configured).isOk "Initial configuration failed"
-          discard <| LeanCloudRuntime.Pool.configure config #[⟨"worker1", endpoint⟩, ⟨"worker2", endpoint⟩]
+          discard <| LeanCloudRuntime.Pool.configure config #[{ worker := "worker1", endpoint }, { worker := "worker2", endpoint }]
           repeatConfiguration
           assertTrue (← response configured).isOk "Cached configuration reply missing"
           assertEq (← snapshot).state.membership.active #["worker1", "worker2"]

@@ -128,9 +128,9 @@ def Sink.instrument (sink : Sink) (fuel : Nat) (program : Cloud IO α) : Cloud I
   | _, EffF.pure _ _ => program
   | fuel + 1, EffF.impure info control next =>
     let control := match control with
-      | .command codec (.exec label body) => .command codec (.exec label fun _ => do
+      | .command codec (.exec label body) => .command codec (.exec label fun environment => do
           sink.emit "execute" label
-          body ())
+          body environment)
       | .parallel codec count branches => .parallel codec count fun i => sink.instrument fuel (branches i)
       | other => other
     EffF.impure info control (.one fun value => sink.instrument fuel (ArrsF.apply next value))

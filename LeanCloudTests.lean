@@ -18,10 +18,11 @@ import LeanCloudTests.Source
 import LeanCloudTests.Stress
 import LeanCloudTests.ExecutionConfig
 import LeanCloudTests.DeploymentApi
+import LeanCloudTests.Environment
 
 namespace LeanCloudTests
 
 def allCases : Array TestCase := codecCases ++ mailboxCases ++ coordinationCases ++ simulationBoundaryCases ++
-  crashBoundaryCases ++ generatedCases ++ compositionCases ++ blobFailureCases ++ replayDriverCases ++ RestartingReplay.cases ++ replayCases ++ consoleCases ++ BranchTree.cases ++ Timing.cases ++ styledCases ++ shellCases ++ topCases ++ helpCases ++ poolCases ++ PoolModel.cases ++ Source.cases ++ Stress.cases ++ ExecutionConfig.cases ++ DeploymentApi.cases
+  crashBoundaryCases ++ generatedCases ++ compositionCases ++ blobFailureCases ++ replayDriverCases ++ RestartingReplay.cases ++ replayCases ++ consoleCases ++ BranchTree.cases ++ Timing.cases ++ styledCases ++ shellCases ++ topCases ++ helpCases ++ poolCases ++ PoolModel.cases ++ Source.cases ++ Stress.cases ++ ExecutionConfig.cases ++ DeploymentApi.cases ++ Environment.cases
 
 end LeanCloudTests

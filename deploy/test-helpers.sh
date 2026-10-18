@@ -24,6 +24,9 @@ case "$*" in
   *'compose '*port*) printf '127.0.0.1:8080\n' ;;
   *'compose '*ps) ;;
   'buildx build '* | 'build '*) ;;
+  'volume create '*|*'compose '*stop|*'compose '*up*) [[ ${HELPER_TEST_START:-0} == 1 ]] ;;
+  *'compose '*pool-configure*) [[ ${HELPER_TEST_START:-0} == 1 ]] && cat > "$HELPER_TEST_MEMBERSHIP" ;;
+  *'compose '*pool-workers*) [[ ${HELPER_TEST_START:-0} == 1 ]] && printf '{"generation":0}' ;;
   *) echo 'Unexpected Docker action during offline test' >&2; exit 1 ;;
 esac
 MOCK
@@ -64,6 +67,7 @@ for count in 0 1 6; do
   jq -e --argjson count "$count" '.services|length==$count+2' "$dir/compose.json" >/dev/null
   jq -e '[.services|to_entries[]|select(.key!="blobs")|.value.environment.CLOUD_NODE_NAME]|all(.=="test-machine")' "$dir/compose.json" >/dev/null
   jq -e --argjson count "$count" '.mailboxes.workers|length==$count' "$dir/config.json" >/dev/null
+  jq -e '.mailboxes.workers|all(.cpus==1 and .memoryMiB==null)' "$dir/config.json" >/dev/null
   jq -e '.client.token!=.mailboxes.scheduler.token and (.client.token|length)==64' "$dir/config.json" >/dev/null
   jq -e --slurpfile s3 "$dir/s3.json" '
     (.blobs.accessKey|length)==32 and (.blobs.secretKey|length)==64 and
@@ -89,6 +93,32 @@ bash deploy/local.sh clean "$work/local-0" --yes
 if bash deploy/local.sh up "$work/local-0" > "$work/result" 2>&1; then echo 'Started cleaned deployment'; exit 1; fi
 grep -Fq 'Cleanup has started' "$work/result"
 if bash deploy/local.sh scale "$work/local-0" 3 > "$work/result" 2>&1; then echo 'Scaled cleaned deployment'; exit 1; fi
+
+# Invalid resource edits must fail before stopping nodes, but must not prevent
+# inspecting or removing the already-rendered deployment. False is not "unset".
+for resources in '{"cpuMillis":false}' '{"memoryMiB":false}' '{"cpuMillis":0}' '{"memoryMiB":-1}' '{"cpuMillis":1.5}' '{"memoryMiB":"2048"}'; do
+  jq --argjson resources "$resources" 'del(.cpuMillis,.memoryMiB) + $resources' "$work/local-6/deployment.json" > "$work/next.json"
+  mv "$work/next.json" "$work/local-6/deployment.json"
+  : > "$HELPER_TEST_LOG"
+  for command in up 'scale 6'; do
+    read -r operation count <<< "$command"
+    if bash deploy/local.sh "$operation" "$work/local-6" ${count:+"$count"} > "$work/result" 2>&1; then
+      echo 'Invalid resource budget accepted'; exit 1
+    fi
+    grep -Fq 'Invalid worker CPU or memory budget' "$work/result"
+  done
+  [[ ! -s "$HELPER_TEST_LOG" ]] || { echo 'Invalid resources reached Docker'; exit 1; }
+done
+bash deploy/local.sh show "$work/local-6" > "$work/shown.json"
+HELPER_TEST_START=1 bash deploy/local.sh down "$work/local-6"
+bash deploy/local.sh clean "$work/local-6" --yes
+
+# Resource edits take effect through the same stop/render/start barrier as scaling.
+jq '.cpuMillis=2500 | .memoryMiB=2048' "$work/local-1/deployment.json" > "$work/next.json"
+mv "$work/next.json" "$work/local-1/deployment.json"
+HELPER_TEST_START=1 HELPER_TEST_MEMBERSHIP="$work/local-membership.json" bash deploy/local.sh scale "$work/local-1" 1
+jq -e '.services.worker1|.cpus==2.5 and .mem_limit=="2048m"' "$work/local-1/compose.json" >/dev/null
+jq -e 'length==1 and all(.cpus==2 and .memoryMiB==2048)' "$work/local-membership.json" >/dev/null
 
 mkdir "$work/kube"
 jq '.image="registry/app@sha256:0000000000000000000000000000000000000000000000000000000000000001"' \

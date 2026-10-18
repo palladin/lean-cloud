@@ -10,7 +10,9 @@ def node($role): {
     (if $role == "scheduler" then {} else {CLOUD_WORKER_ID:$role} end)),
   volumes: [($role + "-data:/data"), {type:"bind",source:($c.directory + "/config.json"),target:"/etc/lean-cloud/config.json",read_only:true}],
   logging: {driver:"json-file",options:{"max-size":"10m","max-file":"2"}}
-} + (if $role == "scheduler" then {ports:[("127.0.0.1:" + (if $c.port==0 then "" else ($c.port|tostring) end) + ":8080")]} else {} end);
+} + (if $role == "scheduler" then {ports:[("127.0.0.1:" + (if $c.port==0 then "" else ($c.port|tostring) end) + ":8080")]} else
+  (if $c.cpuMillis then {cpus:($c.cpuMillis/1000)} else {} end) +
+  (if $c.memoryMiB then {mem_limit:(($c.memoryMiB|tostring)+"m")} else {} end) end);
 (["scheduler"] + [range(1; $c.workers + 1) | "worker\(.)"]) as $roles |
 { name: $c.name,
   services: ({blobs: {

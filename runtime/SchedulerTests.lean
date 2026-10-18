@@ -1,5 +1,6 @@
 import LeanCloudRuntime.Pool
 import LeanCloudRuntime.Squares
+import LeanCloudRuntime.Program
 import LeanCloud.DirectInterpreter
 import LeanCloudTests.Support
 
@@ -57,7 +58,7 @@ def run : IO Unit := IO.FS.withTempFile fun _ inboxPath =>
       let endpoint : HttpMailbox.Config := ⟨"127.0.0.1", bound.port.toNat, "restart"⟩
       let defaults : Config ← IO.ofExcept (Json.parse (include_str "../deploy/config.json") >>= fromJson?)
       let config := { defaults with
-        mailboxes := ⟨endpoint, #[⟨"worker1", endpoint⟩, ⟨"worker2", endpoint⟩]⟩
+        mailboxes := ⟨endpoint, #[{ worker := "worker1", endpoint }, { worker := "worker2", endpoint }]⟩
         scheduler := ⟨database.toString, 30000⟩ }
       IO.FS.writeFile configPath (toJson config).compress
       let first ← HttpMailbox.openMailbox endpoint LeanCloudRuntime.Pool.address "worker.worker1"
@@ -71,6 +72,18 @@ def run : IO Unit := IO.FS.withTempFile fun _ inboxPath =>
           assertEq killed.exitCode 0
           discard current.wait
       try
+        let original ← executionEnvironment config "worker1"
+        assertEq original.currentWorker.id "worker1"
+        assertEq original.workers.size 2
+        let routes := config.mailboxes.workers.map fun route =>
+          { route with cpus := if route.worker == "worker1" then 2 else 6, memoryMiB := some 8192 }
+        discard <| LeanCloudRuntime.Pool.configure config routes
+        let resized ← executionEnvironment config "worker1"
+        assertTrue (resized.currentWorker.cpus > 0 && resized.currentWorker.cpus ≤ 2)
+          "Execution capacity ignored configuration or container limits"
+        assertEq (resized.workers.find? (·.id == "worker2") |>.map (·.cpus)) (some 6)
+          "Worker used stale local configuration instead of current pool capacity"
+        discard <| LeanCloudRuntime.Pool.configure config config.mailboxes.workers
         let records ← IO.mkRef ([] : List (String × ReplayRecord))
         let reads ← IO.mkRef (0 : Nat)
         let store : ReplayStore IO := {

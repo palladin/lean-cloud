@@ -334,7 +334,7 @@ private def poolLeases : IO Unit := IO.FS.withTempFile fun _ inboxPath =>
       let endpoint : HttpMailbox.Config := ⟨"127.0.0.1", bound.port.toNat, "lease-test"⟩
       let defaults : Config ← IO.ofExcept (Json.parse (include_str "../deploy/config.json") >>= fromJson?)
       let config := { defaults with
-        mailboxes := ⟨endpoint, #[⟨"worker1", endpoint⟩]⟩
+        mailboxes := ⟨endpoint, #[{ worker := "worker1", endpoint }]⟩
         scheduler := ⟨schedulerPath.toString, 1500⟩ }
       IO.FS.writeFile configPath (toJson config).compress
       let child ← IO.Process.spawn {

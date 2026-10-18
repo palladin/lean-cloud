@@ -9,18 +9,18 @@ open Lean LeanCloud
 structure RegisteredProgram where
   info : ProgramInfo
   validate : Json → Except String Unit
-  execute : ExecutionConfig → RunDefinition → String → Worker.ObservedStore IO → BlobStorage IO → Trace.Sink → Assignment → IO Report
+  execute : ExecutionConfig → RunDefinition → String → Worker.ObservedStore IO → BlobStorage IO → Trace.Sink → Assignment → LeanCloud.Environment → IO Report
 
 def registerProgram [Codec ι] [Codec α] (program : LeanCloud.CloudProgram ι α)
     (sources : Array ProgramSource := by exact cloud_sources%) : RegisteredProgram where
   info := { program.info with sources }
   validate input := (Codec.decode (α := ι) input).map (fun _ => ())
-  execute limits definition worker records blobs trace assignment := do
+  execute limits definition worker records blobs trace assignment environment := do
     unless definition.entry == program.info.entry && definition.resultSchema == program.info.resultSchema do
       throw (IO.userError "Deployed program/codec does not match the submitted run")
     let input ← IO.ofExcept (Codec.decode (α := ι) definition.input)
     Worker.execute worker records blobs limits.interpreterFuel
-      (fun input => trace.instrument limits.interpreterFuel (program.run input)) input assignment (some trace.visit)
+      (fun input => trace.instrument limits.interpreterFuel (program.run input)) input assignment (some trace.visit) environment
 
 structure Registry where
   programs : Array RegisteredProgram
@@ -54,6 +54,25 @@ def Registry.submit (registry : Registry) (config : Config) (run entry : String)
     entry, input, resultSchema := program.info.resultSchema
     image := config.client.map (·.image), program := some program.info }
 
+/-- Take the pool snapshot once per assignment, rather than contacting the scheduler
+for every user command. Actual container restrictions can lower the local budget.
+Telemetry never enlarges the configured allocation or substitutes the host total. -/
+def executionEnvironment (config : Config) (worker : String) : IO LeanCloud.Environment := do
+  let membership ← Pool.request config .workers
+  let routes : Array HttpMailbox.WorkerEndpoint ← IO.ofExcept (membership.getObjValAs? _ "routes")
+  let current := (routes.find? (·.worker == worker)).orElse
+    (fun _ => config.mailboxes.workers.find? (·.worker == worker))
+  let some current := current | throw (IO.userError "Executing worker is missing from its configuration")
+  let mut capacity := current.capacity
+  if let some sample ← Trace.resources then
+    if let some millis := sample.cpuCapacityMillis then
+      capacity := { capacity with cpus := min capacity.cpus (max 1 (millis / 1000)) }
+    if let some bytes := sample.memoryLimit then
+      let limit := max 1 (bytes / (1024 * 1024))
+      capacity := { capacity with memoryMiB := some (min (capacity.memoryMiB.getD limit) limit) }
+  return { currentWorker := capacity, workers := routes.map fun route =>
+    if route.worker == worker then capacity else route.capacity }
+
 /-- Execute one inbox assignment. User exceptions are already Cloud outcomes.
 A runtime failure escapes and stops the node without acknowledging this delivery;
 its supervisor can restart it and recover from the durable journal. Cancellation
@@ -82,7 +101,8 @@ private def executeAssignment (registry : Registry) (config : Config) (cache : R
           unless definition.image.all (fun image => config.client.any (·.image == image)) do
             throw (IO.userError "Worker image does not match the submitted run")
           let program ← IO.ofExcept (registry.find definition.entry)
-          program.execute config.worker definition id observed (trace.blobs (config.objects.storage)) trace assignment
+          let environment ← executionEnvironment config id
+          program.execute config.worker definition id observed (trace.blobs (config.objects.storage)) trace assignment environment
       match report.progress with
       | .ok (.fork location _) => trace.suspend location
       | .ok .done => trace.emit (if finalize.isSome then "sealed" else "returned") ""

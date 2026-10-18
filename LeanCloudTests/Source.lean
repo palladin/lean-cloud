@@ -35,6 +35,121 @@ private def files : Cloud Id String := cloud {
   CloudBlob.readTextByName "log.txt"
 }
 
+private def implementationDetail [Monad m] (n : Nat) : Cloud m Nat := cloud {
+  Cloud.pure (fun _ => n + 1) "hidden helper detail"
+}
+
+private def helperImplementation [Monad m] (n : Nat) : Cloud m Nat := cloud {
+  let first ← implementationDetail n
+  implementationDetail first
+}
+
+@[cloud_func (descr := "Increment twice") (opaque := true)]
+private def opaqueHelper [Monad m] (n : Nat) : Cloud m Nat := helperImplementation n
+
+private def helperCaller : Cloud Id Nat := cloud {
+  let answer ← opaqueHelper 10
+  return answer + 1
+}
+
+@[cloud_func] private def constantHelper : Cloud Id Nat := cloud {
+  Cloud.pure (fun _ => 42) "constant detail"
+}
+
+private def constantCaller : Cloud Id Nat := cloud {
+  constantHelper
+}
+
+@[cloud_func (opaque := false) (descr := "Visible steps")]
+private def visibleHelper [Monad m] (n : Nat) : Cloud m Nat := helperImplementation n
+
+private def visibleCaller : Cloud Id Nat := cloud {
+  let answer ← visibleHelper 10
+  return answer + 2
+}
+
+private def plainCaller : Cloud Id Nat := cloud {
+  helperImplementation 10
+}
+
+@[cloud_func] private partial def recursiveHelper (n : Nat) : Cloud Id Nat := cloud {
+  if n == 0 then return 0
+  let value ← Cloud.pure (fun _ => n - 1) "recursive detail"
+  recursiveHelper value
+}
+
+private def recursiveCaller : Cloud Id Nat := cloud {
+  recursiveHelper 2
+}
+
+@[cloud_func] private def opaqueBranches [Monad m] (branches : Array (Cloud m Nat)) :
+    Cloud m (Array Nat) := cloud {
+  let _ ← Cloud.pure (fun _ => 1) "helper setup"
+  Cloud.parallel branches
+}
+
+private def suppliedBranch : Cloud Id Nat := cloud { return 123 }
+
+private def branchCaller : Cloud Id (Array Nat) := cloud {
+  opaqueBranches #[suppliedBranch, cloud { return 456 }]
+}
+
+private def plannedBranches : Cloud Id (Array Nat) := cloud {
+  Cloud.parallel fun environment =>
+    environment.workers.map fun worker => cloud { return worker.cpus }
+}
+
+private abbrev Job := Cloud Id Nat
+
+@[cloud_func (descr := "Aliased job")]
+private def aliasHelper : Job := cloud { Cloud.pure (fun _ => 1) "alias detail" }
+
+private def aliasCaller : Job := cloud { aliasHelper }
+
+private abbrev Jobs := Array Job
+private def internalBranches : Jobs := #[cloud { Cloud.pure (fun _ => 3) "internal branch" }]
+
+@[cloud_func] private def containerHelper : Cloud Id (Array Nat) := cloud {
+  Cloud.parallel internalBranches
+}
+
+private def containerCaller : Cloud Id (Array Nat) := cloud { containerHelper }
+
+private def sharedDetail : Cloud Id Nat := cloud { Cloud.pure (fun _ => 5) "shared detail" }
+
+@[cloud_func]
+private def sharedBranches (user : Cloud Id Nat) : Cloud Id (Array Nat) := cloud {
+  let _ ← sharedDetail
+  Cloud.parallel #[user]
+}
+
+private def sharedCaller : Cloud Id (Array Nat) := cloud { sharedBranches sharedDetail }
+
+@[cloud_func (descr := "Inner steps") (opaque := false)]
+private def innerVisible : Cloud Id Nat := cloud { Cloud.pure (fun _ => 5) "nested detail" }
+
+@[cloud_func (descr := "Outer opaque")]
+private def outerOpaque : Cloud Id Nat := cloud { innerVisible }
+
+@[cloud_func (descr := "Outer visible") (opaque := false)]
+private def outerVisible : Cloud Id Nat := cloud { innerVisible }
+
+private def nestedOpaqueCaller : Cloud Id Nat := cloud { outerOpaque }
+private def nestedVisibleCaller : Cloud Id Nat := cloud { outerVisible }
+
+/-- error: Cloud function opaque must be true or false -/
+#guard_msgs in
+@[cloud_func (opaque := maybe)] private def badOpaque : Cloud Id Nat := pure 1
+
+/-- error: Duplicate cloud_func descr -/
+#guard_msgs in
+@[cloud_func (descr := "first") (descr := "second")]
+private def badDescr : Cloud Id Nat := pure 1
+
+/-- error: Cloud function description cannot be empty -/
+#guard_msgs in
+@[cloud_func (descr := "  ")] private def emptyDescr : Cloud Id Nat := pure 1
+
 private def sources : Array ProgramSource := cloud_sources%
 
 private def site (id : Option SourceSiteId) : Option SourceSite := do
@@ -54,7 +169,7 @@ private def skipDelay (program : Cloud m α) : Cloud m α :=
 private def nextExec (program : Cloud Id α) : Cloud Id α :=
   match program with
   | .impure _ (.command _ (.exec _ body)) next =>
-    match (body ()).run with
+    match (body {}).run with
     | .ok value => next.apply value
     | .error error => Cloud.send (.fail error)
   | program => program
@@ -90,10 +205,116 @@ private def observeReplay : IO Unit := do
   assertEq (← observations.get) first "Replay visits different source sites"
 
 def cases : Array TestCase := #[
+  ⟨"source.helper-return-type-alias", do
+    let command := skipDelay (skipDelay aliasCaller)
+    assertTrue (has (textAt command.metadata) "cloud { aliasHelper }") "Type alias bypassed opacity"
+    assertEq ((site command.metadata).bind (·.functionInfo) |>.map (·.descr)) (some "Aliased job")⟩,
+  ⟨"source.helper-owns-internal-branch-container", do
+    match skipDelay (skipDelay containerCaller) with
+    | .impure _ (.parallel _ count branches) _ =>
+      if h : 0 < count then
+        let command := skipDelay (branches ⟨0, h⟩)
+        assertTrue (has (textAt command.metadata) "cloud { containerHelper }") "Internal container exposed implementation"
+      else throw (IO.userError "Missing internal branch")
+    | _ => throw (IO.userError "Expected internal fork")⟩,
+  ⟨"source.shared-helper-keeps-user-branch-visible", do
+    let setup := skipDelay (skipDelay (skipDelay sharedCaller))
+    assertTrue (has (textAt setup.metadata) "sharedBranches sharedDetail") "Internal call was not hidden"
+    match nextExec setup with
+    | .impure _ (.parallel _ count branches) _ =>
+      if h : 0 < count then
+        let command := skipDelay (branches ⟨0, h⟩)
+        assertTrue (has (textAt command.metadata) "\"shared detail\"") "Shared user branch was hidden"
+        assertTrue ((site command.metadata).bind (·.functionInfo)).isNone "User branch inherited helper metadata"
+      else throw (IO.userError "Missing shared branch")
+    | _ => throw (IO.userError "Expected shared fork")⟩,
+  ⟨"source.nested-function-display-policy", do
+    let opaqueCommand := skipDelay (skipDelay (skipDelay nestedOpaqueCaller))
+    assertTrue (has (textAt opaqueCommand.metadata) "cloud { outerOpaque }") "Nested helper escaped opacity"
+    assertEq ((site opaqueCommand.metadata).bind (·.functionInfo) |>.map (·.descr)) (some "Outer opaque")
+    let visibleCommand := skipDelay (skipDelay (skipDelay nestedVisibleCaller))
+    assertTrue (has (textAt visibleCommand.metadata) "\"nested detail\"") "Transparent nesting hid implementation"
+    assertEq ((site visibleCommand.metadata).bind (·.functionInfo) |>.map (·.descr)) (some "Inner steps")⟩,
+  ⟨"source.opaque-helper-without-arguments", do
+    let command := skipDelay (skipDelay constantCaller)
+    assertTrue (has (textAt command.metadata) "  constantHelper") "Nullary helper exposed its definition"
+    let some info := (site command.metadata).bind (·.functionInfo)
+      | throw (IO.userError "Default function metadata missing")
+    assertTrue (info.name.endsWith "constantHelper" && info.descr == info.name && info.opaque)
+      "Wrong cloud_func defaults"⟩,
+  ⟨"source.opaque-recursive-helper", do
+    let first := skipDelay (skipDelay recursiveCaller)
+    assertTrue (has (textAt first.metadata) "recursiveHelper 2") "Recursive helper exposed its implementation"
+    let second := skipDelay (nextExec first)
+    assertEq second.metadata first.metadata "Recursion lost outer call site"⟩,
+  ⟨"source.opaque-helper-keeps-call-site", do
+    let first := skipDelay (skipDelay helperCaller)
+    let first := skipDelay first
+    assertTrue (has (textAt first.metadata) "opaqueHelper 10") "Helper exposed its implementation"
+    assertEq ((site first.metadata).bind (·.functionInfo) |>.map (·.descr)) (some "Increment twice")
+    let second := skipDelay (nextExec first)
+    assertEq second.metadata first.metadata "Nested helper lost outer call site"
+    let final := nextExec second
+    assertTrue (has (textAt final.metadata) "return answer + 1") "Opacity leaked past helper return"
+    assertTrue ((site final.metadata).bind (·.functionInfo)).isNone "Description leaked past helper return"⟩,
+  ⟨"source.transparent-helper-preserves-implementation", do
+    let first := skipDelay (skipDelay (skipDelay visibleCaller))
+    assertTrue (has (textAt first.metadata) "hidden helper detail") "Transparent helper hid its implementation"
+    let some info := (site first.metadata).bind (·.functionInfo)
+      | throw (IO.userError "Transparent helper lost description")
+    assertEq info.descr "Visible steps"
+    assertTrue (!info.opaque) "Transparent metadata marked opaque"
+    let second := skipDelay (nextExec first)
+    assertEq ((site second.metadata).bind (·.functionInfo)) (some info)
+    let final := nextExec second
+    assertTrue (has (textAt final.metadata) "return answer + 2") "Transparent helper lost caller continuation"
+    assertTrue ((site final.metadata).bind (·.functionInfo)).isNone "Description leaked after helper"
+    let original := skipDelay (skipDelay (skipDelay plainCaller))
+    assertTrue ((site original.metadata).bind (·.functionInfo)).isNone "Description leaked into another call"⟩,
+  ⟨"source.function-metadata-wire-and-watch", do
+    let legacy : SourceSite ← unwrap (Json.parse "{\"id\":\"old\",\"line\":2,\"column\":0,\"endLine\":2,\"endColumn\":5}" >>= fromJson?)
+    assertTrue legacy.functionInfo.isNone "Old source map requires function metadata"
+    let invalid := Json.mkObj [("id", toJson "bad"), ("line", toJson (2 : Nat)),
+      ("column", toJson (0 : Nat)), ("endLine", toJson (2 : Nat)), ("endColumn", toJson (5 : Nat)),
+      ("functionInfo", toJson false)]
+    assertTrue (fromJson? (α := SourceSite) invalid).toOption.isNone "Malformed metadata was silently ignored"
+    let decoded : Array ProgramSource ← unwrap (fromJson? (toJson sources))
+    let run : LeanCloudCli.Run := ⟨"run", "image", ⟨"app/v1", "unit", "nat", "", none, decoded⟩, Json.null⟩
+    for (program, descr) in [(helperCaller, "Increment twice"), (visibleCaller, "Visible steps")] do
+      let command := skipDelay (skipDelay (skipDelay program))
+      let observation : LeanCloudCli.Trace.Step := {
+        timestamp := "1", event := ⟨"boot", 0, 0, "worker1", some 0, "0:0", "execute", "internal", "run", command.metadata⟩ }
+      let view := LeanCloudCli.Watch.frame ⟨"/work", "test"⟩ run #[observation] #[] {} 160 40 "completed"
+      assertTrue (view.any (has · s!"Source: {descr} ·")) "Watch did not display the function description"⟩,
+  ⟨"source.opaque-helper-preserves-supplied-branches", do
+    let setup := skipDelay (skipDelay branchCaller)
+    let fork := nextExec setup
+    assertTrue (has (textAt fork.metadata) "opaqueBranches #[") "Helper fork exposed its definition"
+    match fork with
+    | .impure _ (.parallel _ count branches) _ =>
+      if h : 1 < count then
+        assertTrue (has (textAt (skipDelay (branches ⟨0, by omega⟩)).metadata) "return 123")
+          "Named user branch was hidden"
+        assertTrue (has (textAt (skipDelay (branches ⟨1, h⟩)).metadata) "return 456")
+          "Inline user branch was hidden"
+      else throw (IO.userError "Missing supplied branches")
+    | _ => throw (IO.userError "Expected helper parallel")⟩,
+  ⟨"source.environment-planning-is-opaque", do
+    let setup := skipDelay plannedBranches
+    let fork := nextExec setup
+    assertTrue (has (textAt setup.metadata) "Cloud.parallel fun") "Planning exposed library source"
+    assertEq fork.metadata setup.metadata "Environment record and fork have different call sites"
+    match fork with
+    | .impure _ (.parallel _ count branches) _ =>
+      if h : 0 < count then
+        assertTrue (has (textAt (skipDelay (branches ⟨0, h⟩)).metadata) "return worker.cpus")
+          "User callback source was hidden"
+      else throw (IO.userError "Empty planning environment")
+    | _ => throw (IO.userError "Expected planned parallel")⟩,
   ⟨"source.observer-replay", observeReplay⟩,
   ⟨"source.console-multiple-files-and-unknown-sites", do
-    let a : ProgramSource := ⟨"A.lean", "first\nread a", #[⟨"a", 2, 0, 2, 6⟩]⟩
-    let b : ProgramSource := ⟨"B.lean", "read b\nlast", #[⟨"b", 1, 0, 1, 6⟩]⟩
+    let a : ProgramSource := ⟨"A.lean", "first\nread a", #[{ id := "a", line := 2, endLine := 2, endColumn := 6 }]⟩
+    let b : ProgramSource := ⟨"B.lean", "read b\nlast", #[{ id := "b", line := 1, endLine := 1, endColumn := 6 }]⟩
     let run : LeanCloudCli.Run := ⟨"run", "image", ⟨"app/v1", "unit", "nat", "", none, #[a, b]⟩, Json.null⟩
     let first : LeanCloudCli.Trace.Step := {
       timestamp := "1", event := ⟨"boot", 0, 0, "worker1", some 0, "0:0", "execute", "readBlob", "run", some "a"⟩ }
@@ -153,7 +374,15 @@ def cases : Array TestCase := #[
       let (before, recordsBefore) := (SequentialReplay.interpret store noBlobs fuel plain ()).run []
       let (after, recordsAfter) := (SequentialReplay.interpret store noBlobs fuel annotated ()).run []
       assertOutcome after before
-      assertEq recordsAfter recordsBefore "Metadata changed replay records or the fuel boundary"⟩
+      assertEq recordsAfter recordsBefore "Metadata changed replay records or the fuel boundary"
+      let raw (_ : Unit) : Cloud M Nat := cloud { helperImplementation 10 }
+      let opaqueProgram (_ : Unit) : Cloud M Nat := cloud { opaqueHelper 10 }
+      let visibleProgram (_ : Unit) : Cloud M Nat := cloud { visibleHelper 10 }
+      let expected := (SequentialReplay.interpret store noBlobs fuel raw ()).run []
+      for program in [opaqueProgram, visibleProgram] do
+        let actual := (SequentialReplay.interpret store noBlobs fuel program ()).run []
+        assertOutcome actual.1 expected.1
+        assertEq actual.2 expected.2 "cloud_func changed replay records or fuel"⟩
 ]
 
 end LeanCloudTests.Source

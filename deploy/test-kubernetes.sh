@@ -80,7 +80,7 @@ if grep -q 'delete pvc\|delete namespace' "$work/calls"; then echo 'Down destroy
 # saved before these optional settings were excluded from the identity.
 jq '.data.identity |= (fromjson | .startupSeconds=300 | tojson)' "$work/record.json" > "$work/record.next"
 mv "$work/record.next" "$work/record.json"
-jq '.startupSeconds=900 | .schedulerResources={cpuMillis:250,memoryMiB:512}' \
+jq '.startupSeconds=900 | .cpuMillis=6000 | .memoryMiB=8192 | .schedulerResources={cpuMillis:250,memoryMiB:512}' \
   "$work/deployment/deployment.json" > "$work/deployment/next.json"
 mv "$work/deployment/next.json" "$work/deployment/deployment.json"
 bash deploy/kubernetes.sh down "$work/deployment" > "$work/result" 2>&1
@@ -102,6 +102,8 @@ if bash deploy/kubernetes.sh scale "$work/deployment" invalid > "$work/result" 2
 bash deploy/kubernetes.sh scale "$work/deployment" 2 > "$work/result" 2>&1
 jq -e '.workers==2' "$work/deployment/deployment.json" >/dev/null
 jq -e 'map(.worker)==["worker1","worker2"]' "$work/membership.json" >/dev/null
+jq -e 'all(.cpus==6 and .memoryMiB==8192)' "$work/membership.json" >/dev/null
+jq -e '[.items[]|select(.kind=="StatefulSet" and .metadata.name!="scheduler")|.spec.template.spec.containers[0].resources]|all(.requests.cpu=="6000m" and .limits.memory=="8192Mi")' "$work/deployment/resources.json" >/dev/null
 awk '/wait --for=delete pod/ {stopped=1} /--replicas=1/ {if (!stopped) exit 1}' "$work/calls"
 grep -Fq 'scale statefulset/worker2 --replicas=1' "$work/calls"
 : > "$work/calls"

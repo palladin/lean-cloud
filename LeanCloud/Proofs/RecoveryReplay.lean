@@ -14,13 +14,13 @@ private theorem command (expected base : Journal) (branch current : Location) (c
     (monotone : ∀ before after, property before → Extends before after → property after)
     (owned : Owns branch (ReplayStore.valueKey current))
     (known : expected.lookup (ReplayStore.valueKey current) =
-      some ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → ExceptT CloudError WorkerM β)),
+      some ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Environment → ExceptT CloudError WorkerM β)),
         .success (codec.encode (body ()))⟩) :
     Ensures (Valid expected base branch) (fun j => Valid expected base branch j ∧ property j)
       (Internal.command ReplayFaults.store ReplayFaults.noBlobs current codec (.exec label (fun _ => pure (body ()))))
       (fun value j => property j ∧ value = .success (codec.encode (body ())) ∧
         j.lookup (ReplayStore.valueKey current) =
-          some ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Unit → ExceptT CloudError WorkerM β)),
+          some ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Environment → ExceptT CloudError WorkerM β)),
             .success (codec.encode (body ()))⟩) := by
   unfold Internal.command
   apply Ensures.read_bind _ _ (fun j h => h.1)

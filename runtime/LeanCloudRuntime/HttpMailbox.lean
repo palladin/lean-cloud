@@ -17,7 +17,23 @@ structure Config where
 structure WorkerEndpoint where
   worker : WorkerId
   endpoint : Config
-  deriving FromJson, ToJson, Inhabited
+  /-- Local computation concurrency budget, independent of the host's CPU count. -/
+  cpus : Nat := 1
+  memoryMiB : Option Nat := none
+  deriving ToJson, Inhabited
+
+instance : FromJson WorkerEndpoint where
+  fromJson? json := do
+    return {
+      worker := ← json.getObjValAs? _ "worker"
+      endpoint := ← json.getObjValAs? _ "endpoint"
+      cpus := ← match json.getObjVal? "cpus" with
+        | .error _ => pure 1 | .ok value => fromJson? value
+      memoryMiB := ← match json.getObjVal? "memoryMiB" with
+        | .error _ => pure none | .ok value => fromJson? value }
+
+def WorkerEndpoint.capacity (route : WorkerEndpoint) : WorkerCapacity :=
+  { id := route.worker, cpus := route.cpus, memoryMiB := route.memoryMiB }
 
 structure Mailboxes where
   scheduler : Config
@@ -32,6 +48,8 @@ def Mailboxes.worker (config : Mailboxes) (id : WorkerId) : Except String Config
 def Mailboxes.validate (config : Mailboxes) : Except String Unit := do
   let mut ids : Array String := #[]
   for node in config.workers do
+    unless node.cpus > 0 && node.memoryMiB.all (· > 0) do
+      throw "Worker CPU and configured memory budgets must be positive"
     unless !node.worker.isEmpty && node.worker.length ≤ 64 && node.worker.toList.all (fun c =>
         c.toNat < 128 && (c.isAlphanum || c == '-' || c == '_')) do
       throw "Worker ids must contain 1–64 ASCII letters, digits, '-' or '_'"

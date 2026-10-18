@@ -27,8 +27,9 @@ structure Ports (m : Type → Type u) where
 
 def execute [Monad m] [Codec α] (id : WorkerId) (store : ObservedStore m)
     (blobs : BlobStorage m) (fuel : Nat) (program : ι → Cloud m α) (input : ι)
-    (assignment : Assignment) (observer : Option (ReplayInterpreter.Observer m) := none) : m Report := do
-  let progress ← (ReplayInterpreter.step store.records blobs fuel program input assignment observer).run
+    (assignment : Assignment) (observer : Option (ReplayInterpreter.Observer m) := none)
+    (environment : Environment := {}) : m Report := do
+  let progress ← (ReplayInterpreter.step store.records blobs fuel program input assignment observer environment).run
   return ⟨id, assignment.attempt, progress, ← store.confirmed⟩
 
 /-- Publish a terminal coordination intent. Only a worker touches the root

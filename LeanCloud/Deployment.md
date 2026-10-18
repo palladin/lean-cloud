@@ -29,6 +29,47 @@ Either value can be zero to disable caching. The cache is disposable memory:
 restarts read the global journal again. Every cache hit still checks assignment
 ownership, and creates always publish to durable storage before caching a value.
 
+## Planning work and using local resources
+
+`Cloud.exec` receives an `Environment` with `currentWorker` and `workers`.
+Each worker has an `id`, a `cpus` concurrency budget, and optional `memoryMiB`.
+The runtime refreshes this snapshot once per assignment. It describes configured
+pool capacity, not currently idle workers or free memory. Visible container
+limits can lower the executing worker's budget.
+
+Use `Cloud.parallel fun env => ...` to partition work using a recorded pool
+snapshot, and `Cloud.exec fun env => ...` to use the executing worker's resources:
+
+```lean
+def batches (items : Array Nat) (process : Nat → Array Nat → IO Nat) :
+    Cloud IO (Array Nat) := cloud {
+  Cloud.parallel fun planning =>
+    let count := max 1 (min items.size planning.workers.size)
+    let width := (items.size + count - 1) / count
+    (Array.range count).map fun i => cloud {
+      Cloud.exec fun executing =>
+        process executing.currentWorker.cpus
+          (items.extract (i * width) ((i + 1) * width))
+    }
+}
+```
+
+Here `process` is your local computation; its first argument is the number of
+concurrent jobs it may use. Lean Cloud does not automatically parallelize that
+computation or pin it to a CPU. A planned branch can execute on any worker, so
+use the executing worker's budget inside `exec`.
+
+Parallel planning records its environment through an ordinary `exec` before
+forking. Replay reuses it, preserving the original branches after a pool change.
+An ordinary `exec` records only its outcome: a completed call is never invoked
+on replay; an interrupted, uncommitted call receives its replacement attempt's
+environment. Exceptions from the user computation remain recorded failures.
+
+`Cloud.parallel #[...]` and `||` keep their existing behavior. For a named
+planning function, use `Cloud.parallelWith plan`. No environment primitive or
+new parallel effect is needed. See [resource settings](../deploy/README.md#worker-resource-budgets)
+for deployment configuration.
+
 Removing a run clears replay records and the last views on every active worker
 and the scheduler. Partial failures are reported; retry `remove` after restoring
 the unavailable node. Scaled-down workers clear retired-run views on their next

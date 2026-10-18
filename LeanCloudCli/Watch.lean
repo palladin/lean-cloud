@@ -88,7 +88,10 @@ private def sourceRows (run : Run) (steps : Array Trace.Step)
   return result
 
 private def sourceLabel (run : Run) (steps : Array Trace.Step) : String :=
-  (mapped run steps).map (fun (source, site) => s!"{source.file}:{site.line}") |>.getD "source unavailable"
+  (mapped run steps).map (fun (source, site) =>
+    let position := s!"{source.file}:{site.line}"
+    site.functionInfo.map (fun info => s!"{safe info.descr} · {position}") |>.getD position)
+    |>.getD "source unavailable"
 
 private def beside (left right : Array Styled.Line) (leftWidth : Nat) : Array Styled.Line :=
   (Array.range (max left.size right.size)).map fun row =>

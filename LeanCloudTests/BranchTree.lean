@@ -38,7 +38,8 @@ private def steps : Array Trace.Step := #[
 private def run : Run := {
   id := "run", image := "image", input := Json.null
   program := ⟨"example", "unit", "nat", "", none, #[⟨"Example.lean",
-    "cloud {\n  ancestor_code\n  child_code\n}", #[⟨"ancestor", 2, 0, 2, 0⟩, ⟨"child", 3, 0, 3, 0⟩]⟩]⟩ }
+    "cloud {\n  ancestor_code\n  child_code\n}", #[{ id := "ancestor", line := 2, endLine := 2 },
+      { id := "child", line := 3, endLine := 3 }]⟩]⟩ }
 
 private def text (nav : Watch.Navigation) (width := 180) (height := 40) (trace := steps) : String :=
   String.intercalate "\n" (Watch.frame ⟨"/work", "test"⟩ run trace #[] nav width height "completed").toList
