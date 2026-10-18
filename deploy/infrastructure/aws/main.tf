@@ -5,13 +5,40 @@ terraform {
   }
 }
 
-variable "name" { type = string }
+variable "name" {
+  type = string
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9-]{0,29}$", var.name))
+    error_message = "Use a lowercase cluster name of at most 30 characters."
+  }
+}
 variable "region" { type = string }
 variable "account" { type = string }
 variable "profile" { type = string }
-variable "machines" { type = number }
+variable "machines" {
+  type = number
+  validation {
+    condition     = var.machines >= 1 && floor(var.machines) == var.machines
+    error_message = "Use at least one machine."
+  }
+}
+variable "os_disk_size_gb" {
+  type    = number
+  default = 32
+  validation {
+    condition     = var.os_disk_size_gb >= 32 && floor(var.os_disk_size_gb) == var.os_disk_size_gb
+    error_message = "Use an OS disk of at least 32 GiB."
+  }
+}
+variable "worker_zone" { type = string }
 variable "machine_size" { type = string }
-variable "architecture" { type = string }
+variable "architecture" {
+  type = string
+  validation {
+    condition     = contains(["arm64", "amd64"], var.architecture)
+    error_message = "Architecture must be arm64 or amd64."
+  }
+}
 variable "kubernetes_version" { type = string }
 variable "administrator_cidrs" { type = list(string) }
 variable "namespace" { type = string }
@@ -23,7 +50,19 @@ provider "aws" {
   default_tags { tags = { "managed-by" = "lean-cloud", "lean-cloud-cluster" = var.name } }
 }
 
-data "aws_availability_zones" "available" { state = "available" }
+data "aws_availability_zones" "available" {
+  state = "available"
+  filter {
+    name   = "zone-type"
+    values = ["availability-zone"]
+  }
+}
+locals {
+  # EKS needs two zones; the small development node pool stays in one so that a
+  # replacement VM can always attach the existing SQLite disks. Not multi-AZ HA.
+  zones = concat([var.worker_zone], slice(sort(tolist(setsubtract(
+  toset(data.aws_availability_zones.available.names), toset([var.worker_zone])))), 0, 1))
+}
 
 resource "aws_vpc" "cloud" {
   cidr_block           = "10.80.0.0/16"
@@ -39,9 +78,8 @@ resource "aws_subnet" "cloud" {
   count                   = 2
   vpc_id                  = aws_vpc.cloud.id
   cidr_block              = cidrsubnet(aws_vpc.cloud.cidr_block, 8, count.index)
-  availability_zone       = data.aws_availability_zones.available.names[count.index]
+  availability_zone       = local.zones[count.index]
   map_public_ip_on_launch = true
-  tags                    = { "kubernetes.io/role/elb" = "1" }
 }
 
 resource "aws_route_table" "cloud" {
@@ -84,6 +122,7 @@ resource "aws_eks_cluster" "cloud" {
     endpoint_public_access  = true
     public_access_cidrs     = var.administrator_cidrs
   }
+  upgrade_policy { support_type = "STANDARD" }
   depends_on = [aws_iam_role_policy_attachment.cluster]
 }
 
@@ -100,59 +139,95 @@ resource "aws_iam_role_policy_attachment" "machines" {
   policy_arn = "arn:aws:iam::aws:policy/${each.key}"
 }
 
+resource "aws_launch_template" "machines" {
+  name_prefix = "lean-cloud-${var.name}-"
+  metadata_options {
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+  }
+  block_device_mappings {
+    device_name = "/dev/xvda"
+    ebs {
+      volume_size           = var.os_disk_size_gb
+      volume_type           = "gp3"
+      encrypted             = true
+      delete_on_termination = true
+    }
+  }
+}
+
 resource "aws_eks_node_group" "cloud" {
   cluster_name    = aws_eks_cluster.cloud.name
   node_group_name = "nodes"
   node_role_arn   = aws_iam_role.machines.arn
-  subnet_ids      = aws_subnet.cloud[*].id
+  subnet_ids      = [aws_subnet.cloud[0].id]
   instance_types  = [var.machine_size]
   ami_type        = var.architecture == "arm64" ? "AL2023_ARM_64_STANDARD" : "AL2023_x86_64_STANDARD"
-  disk_size       = 20
-  capacity_type   = "ON_DEMAND"
+  launch_template {
+    id      = aws_launch_template.machines.id
+    version = aws_launch_template.machines.latest_version
+  }
+  capacity_type = "ON_DEMAND"
   scaling_config {
     desired_size = var.machines
     min_size     = var.machines
     max_size     = var.machines
   }
   update_config { max_unavailable = 1 }
-  # Do not start paid machines if workload identity setup is rejected.
   depends_on = [aws_iam_role_policy_attachment.machines, aws_route_table_association.cloud,
-  aws_iam_openid_connect_provider.cluster]
-}
-
-resource "aws_iam_openid_connect_provider" "cluster" {
-  url            = aws_eks_cluster.cloud.identity[0].oidc[0].issuer
-  client_id_list = ["sts.amazonaws.com"]
+  aws_eks_pod_identity_association.node]
 }
 
 locals {
-  issuer     = replace(aws_iam_openid_connect_provider.cluster.url, "https://", "")
-  identities = { node = "${var.namespace}:cloud-node", disk = "kube-system:ebs-csi-controller-sa" }
+  identities = {
+    node = { namespace = var.namespace, service_account = "cloud-node" }
+    disk = { namespace = "kube-system", service_account = "ebs-csi-controller-sa" }
+  }
 }
 
 resource "aws_iam_role" "workload" {
   for_each = local.identities
   name     = "lean-cloud-${var.name}-${each.key}"
   assume_role_policy = jsonencode({ Version = "2012-10-17", Statement = [{
-    Effect = "Allow", Principal = { Federated = aws_iam_openid_connect_provider.cluster.arn },
-    Action = "sts:AssumeRoleWithWebIdentity",
-    Condition = { StringEquals = {
-      "${local.issuer}:sub" = "system:serviceaccount:${each.value}",
-      "${local.issuer}:aud" = "sts.amazonaws.com"
-    } }
+    Effect = "Allow", Principal = { Service = "pods.eks.amazonaws.com" },
+    Action = ["sts:AssumeRole", "sts:TagSession"],
+    Condition = {
+      StringEquals = {
+        "aws:RequestTag/eks-cluster-arn"            = aws_eks_cluster.cloud.arn
+        "aws:RequestTag/kubernetes-namespace"       = each.value.namespace
+        "aws:RequestTag/kubernetes-service-account" = each.value.service_account
+      }
+    }
   }] })
+}
+
+resource "aws_eks_pod_identity_association" "node" {
+  cluster_name    = aws_eks_cluster.cloud.name
+  namespace       = var.namespace
+  service_account = "cloud-node"
+  role_arn        = aws_iam_role.workload["node"].arn
+  depends_on      = [aws_iam_role_policy.storage]
+}
+
+resource "aws_eks_addon" "identity" {
+  cluster_name = aws_eks_cluster.cloud.name
+  addon_name   = "eks-pod-identity-agent"
+  depends_on   = [aws_eks_node_group.cloud]
 }
 
 resource "aws_iam_role_policy_attachment" "disk" {
   role       = aws_iam_role.workload["disk"].name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEBSCSIDriverPolicyV2"
 }
 
 resource "aws_eks_addon" "disk" {
-  cluster_name             = aws_eks_cluster.cloud.name
-  addon_name               = "aws-ebs-csi-driver"
-  service_account_role_arn = aws_iam_role.workload["disk"].arn
-  depends_on               = [aws_eks_node_group.cloud, aws_iam_role_policy_attachment.disk]
+  cluster_name = aws_eks_cluster.cloud.name
+  addon_name   = "aws-ebs-csi-driver"
+  pod_identity_association {
+    role_arn        = aws_iam_role.workload["disk"].arn
+    service_account = "ebs-csi-controller-sa"
+  }
+  depends_on = [aws_eks_addon.identity, aws_iam_role_policy_attachment.disk]
 }
 
 resource "aws_ecr_repository" "cloud" {
@@ -163,7 +238,7 @@ resource "aws_ecr_repository" "cloud" {
 }
 
 resource "aws_s3_bucket" "cloud" {
-  bucket        = "lean-cloud-${var.name}-${var.account}-${var.region}"
+  bucket        = "lean-cloud-${substr(var.name, 0, 20)}-${substr(sha256("${var.account}/${var.region}/${var.name}"), 0, 16)}"
   force_destroy = true
 }
 
@@ -204,14 +279,16 @@ output "cloud" {
     provider     = "aws"
     name         = var.name
     region       = var.region
+    account      = var.account
+    vpcId        = aws_vpc.cloud.id
     registry     = split("/", aws_ecr_repository.cloud.repository_url)[0]
     repository   = aws_ecr_repository.cloud.repository_url
-    storageClass = "lean-cloud-gp3"
+    storageClass = "lean-cloud-${var.name}-gp3"
     storage = {
-      provider = "aws"
-      bucket   = aws_s3_bucket.cloud.id
-      region   = var.region
-      roleArn  = aws_iam_role.workload["node"].arn
+      provider       = "aws"
+      bucket         = aws_s3_bucket.cloud.id
+      region         = var.region
+      authentication = "podIdentity"
     }
   }
 }

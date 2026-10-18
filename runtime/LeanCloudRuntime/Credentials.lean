@@ -48,10 +48,10 @@ structure Aws where
   secretKey : String
   sessionToken : String := ""
 
-def Aws.decode (json : Json) : Except String (Token Aws) := do
+def Aws.decode (json : Json) (tokenField : String := "SessionToken") : Except String (Token Aws) := do
   let access ← json.getObjValAs? String "AccessKeyId"
   let secret ← json.getObjValAs? String "SecretAccessKey"
-  let token ← json.getObjValAs? String "SessionToken"
+  let token ← json.getObjValAs? String tokenField
   let expiration ← json.getObjValAs? String "Expiration"
   unless !access.isEmpty && !secret.isEmpty && !token.isEmpty do throw "Empty AWS credentials"
   return ⟨⟨access, secret, token⟩, ← expires expiration⟩
@@ -62,6 +62,35 @@ def Aws.decodeXml (xml : String) : Except String (Token Aws) := do
 
 private initialize awsCache : Cache Aws ← Cache.create
 private initialize azureCache : Cache String ← Cache.create
+
+/-- Only the documented EKS agent addresses may receive the projected token.
+No redirects or proxies are used, even when the worker has proxy settings. -/
+def podIdentityRequest (endpoint token : String) : Except String StorageHttp.Request := do
+  unless endpoint == "http://169.254.170.23/v1/credentials" ||
+      endpoint == "http://[fd00:ec2::23]/v1/credentials" do
+    throw "Invalid EKS Pod Identity endpoint"
+  unless !token.isEmpty && !token.toList.any (fun c => c == '\r' || c == '\n' || c == '\x00') do
+    throw "Invalid EKS Pod Identity token"
+  return {
+    service := "AWS Pod Identity", url := endpoint
+    headers := #[("Authorization", token)], noProxy := true }
+
+/-- Read the rotated assertion on each exchange. The injected transport also
+lets tests exercise response failures without contacting an AWS metadata agent. -/
+def podIdentityToken (endpoint path : String)
+    (send : StorageHttp.Request → IO (Nat × ByteArray) := StorageHttp.send) : IO (Token Aws) := do
+  let request ← IO.ofExcept (podIdentityRequest endpoint (← readSecret path))
+  let (status, body) ← send request
+  unless status == 200 do throw (IO.userError s!"AWS Pod Identity exchange failed (HTTP {status})")
+  let parsed := do
+    let some text := String.fromUTF8? body | throw "Invalid encoding"
+    Aws.decode (← Json.parse text) "Token"
+  IO.ofExcept (parsed.mapError (fun _ => "Invalid AWS Pod Identity credentials"))
+
+def awsPodIdentity : IO Aws := do
+  let endpoint ← environment "AWS_CONTAINER_CREDENTIALS_FULL_URI"
+  let path ← environment "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"
+  awsCache.acquire ("pod|" ++ endpoint ++ "|" ++ path) now (podIdentityToken endpoint path)
 
 /-- EKS IRSA: the pod admission controller injects the role and projected JWT
 file. Exchange it at the regional STS endpoint; no AWS CLI is needed in nodes. -/

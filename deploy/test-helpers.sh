@@ -158,3 +158,4 @@ fi
 printf 'Deployment helper contracts passed.\n'
 bash deploy/test-kubernetes.sh
 bash deploy/test-azure.sh
+bash deploy/test-aws.sh

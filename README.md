@@ -35,4 +35,5 @@ is a reference to that report in blob storage.
 
 - [Run locally with Docker](deploy/README.md#local-docker)
 - [Deploy and run the example on Azure](deploy/Azure.md)
+- [Deploy and run the example on AWS](deploy/AWS.md)
 - [Run your first log-processing workflow](deploy/README.md#run-the-log-processing-example)

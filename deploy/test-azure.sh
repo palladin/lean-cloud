@@ -34,8 +34,8 @@ printf 'tofu %s\n' "$*" >> "$HELPER_AZURE_WORK/calls"
 directory=${1#-chdir=}; shift
 case "$*" in
   init) ;;
-  'plan -out=provision.tfplan') touch "$directory/provision.tfplan" ;;
-  'plan -destroy -out=destroy.tfplan') touch "$directory/destroy.tfplan" ;;
+  'plan -out=provision.tfplan.pending') touch "$directory/provision.tfplan.pending" ;;
+  'plan -destroy -out=destroy.tfplan.pending') touch "$directory/destroy.tfplan.pending" ;;
   'apply provision.tfplan') [[ -f "$directory/provision.tfplan" ]] ;;
   'apply destroy.tfplan') [[ -f "$directory/destroy.tfplan" ]] ;;
   'output -json cloud') cat "$HELPER_AZURE_WORK/cloud.json" ;;
@@ -108,6 +108,25 @@ bash deploy/azure.sh create "$infra"
 jq -e '.machines==1' "$infra/terraform.tfvars.json" >/dev/null
 [[ -s "$infra/kubeconfig" ]]
 grep -Fq ' -l azurecli' "$work/calls"
+cp "$infra/terraform.tfvars.json" "$work/saved-vars.json"
+cp "$infra/azure.tfvars.json" "$work/editable-vars.json"
+for change in '.name="another-cluster"' '.subscription="00000000-0000-0000-0000-000000000002"' '.region="westeurope"' '.namespace="another-namespace"'; do
+  jq "$change" "$work/editable-vars.json" > "$infra/azure.tfvars.json"
+  : > "$work/calls"
+  if bash deploy/azure.sh plan "$infra" > "$work/result" 2>&1; then echo 'Changed the identity of existing infrastructure'; exit 1; fi
+  grep -Fq 'Use a fresh infrastructure directory' "$work/result"
+  cmp "$work/saved-vars.json" "$infra/terraform.tfvars.json"
+  if grep -q '^tofu ' "$work/calls"; then echo 'Contacted provider after identity change'; exit 1; fi
+done
+cp "$work/editable-vars.json" "$infra/azure.tfvars.json"
+bash deploy/azure.sh plan "$infra"
+jq -e '.machines==2 and .name=="azure-demo"' "$infra/terraform.tfvars.json" >/dev/null
+# Credential recovery refreshes missing outputs from state, without reapplying.
+rm "$infra/cloud.json"
+: > "$work/calls"
+bash deploy/azure.sh credentials "$infra"
+cmp "$work/cloud.json" "$infra/cloud.json"
+if grep -q 'apply' "$work/calls"; then echo 'Reapplied resources to recover credentials'; exit 1; fi
 bash deploy/build.sh --platform linux/arm64 . lean-cloud-demo:dev
 grep -Fq 'docker buildx build --load --platform linux/arm64 --target worker' "$work/calls"
 bash deploy/build.sh --platform linux/amd64 Applications/LeanBuild app:dev

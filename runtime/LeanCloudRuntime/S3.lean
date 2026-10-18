@@ -8,6 +8,7 @@ inductive Authentication where
   | keys (access secret token : String)
   | file (path : String)
   | workload
+  | podIdentity
 
 instance : ToJson Authentication where
   toJson
@@ -15,6 +16,7 @@ instance : ToJson Authentication where
         ("secretKey", toJson secret), ("sessionToken", toJson token)]
     | .file path => Json.mkObj [("kind", toJson "file"), ("path", toJson path)]
     | .workload => Json.mkObj [("kind", toJson "workload")]
+    | .podIdentity => Json.mkObj [("kind", toJson "podIdentity")]
 
 instance : FromJson Authentication where
   fromJson? json := do
@@ -25,6 +27,7 @@ instance : FromJson Authentication where
       return .keys (← json.getObjValAs? _ "accessKey") (← json.getObjValAs? _ "secretKey") token
     | "file" => return .file (← json.getObjValAs? _ "path")
     | "workload" => return .workload
+    | "podIdentity" => return .podIdentity
     | _ => throw "Unknown S3 authentication kind"
 
 structure Config where
@@ -61,13 +64,14 @@ def Config.validate (config : Config) : Except String Unit := do
   match config.authentication with
   | .keys access secret _ => unless !access.isEmpty && !secret.isEmpty do throw "Empty S3 credentials"
   | .file path => unless !path.isEmpty do throw "Empty AWS credential path"
-  | .workload => unless config.endpoint.startsWith "https://" do throw "AWS workload identity requires HTTPS"
+  | .workload | .podIdentity => unless config.endpoint.startsWith "https://" do throw "AWS workload identity requires HTTPS"
 
 private def credentials (config : Config) : IO Credentials.Aws := do
   match config.authentication with
   | .keys access secret token => pure ⟨access, secret, token⟩
   | .file path => Credentials.awsFile path
   | .workload => Credentials.awsWorkload config.region
+  | .podIdentity => Credentials.awsPodIdentity
 
 def requestSpec (config : Config) (keys : Credentials.Aws) (method path : String)
     (body : ByteArray := {}) (immutable := false) : StorageHttp.Request := {

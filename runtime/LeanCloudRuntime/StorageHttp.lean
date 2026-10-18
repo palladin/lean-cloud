@@ -25,6 +25,8 @@ structure Request where
   body : ByteArray := {}
   /-- libcurl's SigV4 service specification and access-key/secret pair. -/
   signing : Option (String × String × String) := none
+  /-- Node-local credential endpoints must not send tokens through a proxy. -/
+  noProxy : Bool := false
 
 /-- Request headers and credentials are sent through stdin. Error messages
 contain only the service and status, never response bodies, tokens, or URLs.
@@ -42,8 +44,9 @@ def send (request : Request) : IO (Nat × ByteArray) :=
       options := options ++ "header = " ++ quote (name ++ ": " ++ value) ++ "\n"
     if let some (service, access, secret) := request.signing then
       options := options ++ "aws-sigv4 = " ++ quote service ++ "\nuser = " ++ quote (access ++ ":" ++ secret) ++ "\n"
-    let args := #["--silent", "--show-error", "--connect-timeout", "10", "--max-time", "60",
+    let args := #["--disable", "--silent", "--show-error", "--connect-timeout", "10", "--max-time", "60",
       "--config", "-", "--request", request.method, "--output", outputPath.toString, "--write-out", "%{http_code}"] ++
+      (if request.noProxy then #["--noproxy", "*"] else #[]) ++
       (if request.method == "PUT" || request.method == "POST" then #["--data-binary", "@" ++ inputPath.toString] else #[])
     let response ← IO.Process.output { cmd := "curl", args } (some options)
     unless response.exitCode == 0 do

@@ -60,6 +60,11 @@ private def configuration : IO Unit := do
   let roundtrip : Storage.Config ← unwrap (fromJson? (toJson aws))
   assertEq (toJson roundtrip) (toJson aws)
   discard <| unwrap roundtrip.validate
+  let pod : Storage.Config := .s3 { s3 with authentication := .podIdentity, endpoint := "https://s3.eu-west-1.amazonaws.com", provisioned := true }
+  assertEq (toJson (← unwrap (fromJson? (α := Storage.Config) (toJson pod)))) (toJson pod)
+  discard <| unwrap pod.validate
+  assertTrue (Storage.Config.validate (.s3 { s3 with authentication := .podIdentity })).toOption.isNone
+    "Pod credentials accepted an insecure storage endpoint"
   assertTrue (Storage.Config.validate (.s3 { s3 with authentication := .workload })).toOption.isNone
     "Workload credentials accepted an insecure endpoint"
   for value in [Json.null, toJson "unknown"] do
@@ -110,10 +115,43 @@ private def parsing : IO Unit := do
     let message ← try discard <| Credentials.awsFile path.toString; pure "" catch error => pure error.toString
     assertTrue (!message.isEmpty && (message.splitOn "sensitive-test-marker").length == 1) "Credential file leaked into diagnostics"
 
+private def podIdentity : IO Unit := do
+  for endpoint in ["http://169.254.170.23/v1/credentials", "http://[fd00:ec2::23]/v1/credentials"] do
+    let request ← unwrap (Credentials.podIdentityRequest endpoint "assertion")
+    assertTrue request.noProxy "Pod assertion could be sent through a proxy"
+    assertEq request.headers #[("Authorization", "assertion")]
+    assertEq request.method "GET"
+  for endpoint in ["https://example.com/v1/credentials", "http://127.0.0.1/v1/credentials",
+      "http://169.254.170.23.evil/v1/credentials", "http://169.254.170.23/v1/credentials?redirect=1"] do
+    assertTrue (Credentials.podIdentityRequest endpoint "secret").toOption.isNone
+      "Pod assertion accepted an untrusted endpoint"
+  for token in ["", "a\nb", "a\rb"] do
+    assertTrue (Credentials.podIdentityRequest "http://169.254.170.23/v1/credentials" token).toOption.isNone
+      "Invalid assertion accepted"
+  IO.FS.withTempFile fun _ path => do
+    let endpoint := "http://169.254.170.23/v1/credentials"
+    let body := (Json.mkObj [("AccessKeyId", toJson "key"), ("SecretAccessKey", toJson "secret"),
+      ("Token", toJson "session"),
+      ("Expiration", toJson "2999-01-01T00:00:00Z")]).compress.toUTF8
+    for assertion in ["first", "rotated"] do
+      IO.FS.writeFile path assertion
+      let token ← Credentials.podIdentityToken endpoint path.toString fun request => do
+        assertEq request.headers #[("Authorization", assertion)] "Rotated assertion was not read"
+        return (200, body)
+      assertEq token.value.sessionToken "session"
+    for response in [(403, "sensitive-response".toUTF8), (200, "sensitive-response".toUTF8)] do
+      let error ← try
+        discard <| Credentials.podIdentityToken endpoint path.toString (fun _ => pure response)
+        pure ""
+        catch error => pure error.toString
+      assertTrue (!error.isEmpty && (error.splitOn "sensitive-response").length == 1)
+        "Credential exchange leaked its response or accepted a failure"
+
 def run : IO Unit := do
   renewal
   configuration
   parsing
+  podIdentity
   IO.println "Cloud providers: credential renewal, concurrent refresh, file rotation, wire contracts, and listing validation passed."
 
 end StorageProviderTests

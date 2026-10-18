@@ -5,13 +5,13 @@ nodes; you can inspect, edit, or replace them with your own tooling. An existing
 Kubernetes cluster needs no cloud provisioning helper.
 
 Start with [local Docker](#local-docker), or follow the separate
-[Azure walkthrough](Azure.md) to run the same example on AKS.
+[Azure walkthrough](Azure.md) or [AWS walkthrough](AWS.md) to run the same example on Kubernetes.
 
-Both follow **check tools → build → configure → up → connect → run**.
-Azure adds explicit login, infrastructure provisioning, and image publishing.
+All follow **check tools → build → configure → up → connect → run**.
+Azure and AWS add explicit login, infrastructure provisioning, and image publishing.
 Once configured, the deployment commands have the same shape:
 
-| Action | Local Docker | Azure / Kubernetes |
+| Action | Local Docker | Azure / AWS / Kubernetes |
 | --- | --- | --- |
 | Inspect configuration | `./deploy/local.sh show DIR` | `./deploy/kubernetes.sh show DIR` |
 | Start / restart | `./deploy/local.sh up DIR` | `./deploy/kubernetes.sh up DIR` |
@@ -177,8 +177,8 @@ cp deploy/kubernetes/deployment.example.json .kube-deployment/deployment.json
 
 `status` lists the cluster machines and the deployment's pods. An optional
 `kubeconfig` path in deployment.json pins the credentials file, so commands do
-not depend on your shell's current Kubernetes configuration. Azure's `configure`
-helper fills this in automatically.
+not depend on your shell's current Kubernetes configuration. The Azure and AWS
+configure helpers fill this in automatically.
 
 `connect` runs a foreground loopback port-forward and prints the console command.
 Its optional final argument selects the local port, for example
@@ -238,3 +238,6 @@ directory, namespace, and blob storage for a new deployment after cleanup.
 
 For a new Azure cluster, follow [the Azure walkthrough](Azure.md). It includes
 the registry push, workload identity setup, first run and complete teardown.
+
+For a new EKS cluster, follow [the AWS walkthrough](AWS.md). It uses the same
+Kubernetes helper and console commands as Azure, with ECR, S3 and EBS.

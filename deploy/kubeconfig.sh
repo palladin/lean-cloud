@@ -7,6 +7,9 @@ need jq
 [[ $# == 1 ]] || fail 'Usage: deploy/kubeconfig.sh INFRASTRUCTURE_DIR'
 directory=$(absolute_dir "$1"); vars="$directory/terraform.tfvars.json"; cloud="$directory/cloud.json"
 private_dir "$directory"
+# Recover metadata even if the previous apply succeeded but its output export
+# failed. This reads OpenTofu state only; it never applies a plan.
+bash "$assets/infrastructure.sh" outputs "$directory" >/dev/null
 provider=$(jq -er .provider "$cloud"); name=$(jq -er .name "$cloud")
 case "$provider" in
   azure)

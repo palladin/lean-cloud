@@ -47,6 +47,10 @@ It uses the selected subscription and pins the latest non-preview Kubernetes
 patch offered in the region. Use `--kubernetes-version` to select one yourself.
 `./deploy/azure.sh help` lists the other configuration options.
 
+The first plan binds this directory to the cluster name, subscription, region and
+namespace. Use a fresh directory to change these. VM count, size and administrator
+access settings remain editable through a new plan.
+
 Review the plan, then apply it:
 
 ```sh
@@ -54,8 +58,10 @@ Review the plan, then apply it:
 ```
 
 `create` applies the saved plan and saves the cluster credentials locally. If you
-edit the configuration, run `plan` again before `create`. If credential retrieval
-fails after provisioning succeeds, retry only `./deploy/azure.sh credentials .azure-infra`.
+edit the configuration, run `plan` again before `create`. If saving cluster metadata
+or retrieving credentials fails after provisioning succeeds, retry only
+`./deploy/azure.sh credentials .azure-infra`. This refreshes metadata from OpenTofu
+state and retrieves credentials without applying the plan again.
 
 The default is **one ARM64 VM** (`Standard_D4ps_v6`), with no automatic scaling.
 The application will run one scheduler and three workers on it. This is a small
