@@ -77,6 +77,13 @@ structure Counts where
   counts : Array Count
   deriving Repr, BEq, ToJson, FromJson
 
+/-- Worker-local aggregate stored in blobs. Per-file totals validate manifests
+even when one file is split across several workers. -/
+structure CountPartial where
+  total : Counts
+  perFile : Array (String × Nat) := #[]
+  deriving ToJson, FromJson
+
 structure GrepRequest where
   dataset : FileRef
   pattern : String

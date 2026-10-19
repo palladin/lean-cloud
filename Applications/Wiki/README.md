@@ -6,24 +6,36 @@ Prepare the dataset once; reuse its immutable blob reference for many queries.
 
 | Program | Result |
 | --- | --- |
-| `wiki-prepare/v1` | Article shards and a reusable dataset reference |
-| `wiki-count/v1` | Occurrences and matching-article counts for each vocabulary word |
-| `wiki-grep/v1` | Matching articles, first-match positions and excerpts in blob files |
+| `wiki-prepare/v2` | Article shards and a reusable dataset reference |
+| `wiki-count/v2` | Occurrences and matching-article counts for each vocabulary word |
+| `wiki-grep/v2` | Matching articles, first-match positions and excerpts in blob files |
 
 ```lean
 cloud {
-  let parts ← Cloud.parallel fun _ => (dataset.shards.map fun shard => cloud {
-    Cloud.exec (fun _ => backend.count request shard) "count vocabulary"
-  })
-  Cloud.exec (fun _ => backend.sumCounts request parts) "combine counts"
+  let dataset ← Cloud.exec (fun _ => backend.dataset request.dataset) "read dataset"
+  let parts ← (backend.articles dataset).foldPartitions (countFold request)
+    (fun _ counts => backend.saveCounts counts) { label := "count vocabulary" }
+  Cloud.exec (fun _ => backend.sumCounts request dataset parts) "combine counts"
 }
 ```
 
-The real workflows are in [Workflow.lean](Wiki/Workflow.lean). Workers read and
-write blobs; the scheduler coordinates branches. Only summaries and immutable
-file references enter the replay journal. Each partial count table is stored in
-blobs; aggregation reads one table at a time, so it does not retain every
-worker's vocabulary table in memory.
+The [workflows](Wiki/Workflow.lean) use the reusable
+[cloud reducer](../../reducers/README.md), backed by
+[lean-reducers](https://github.com/palladin/lean-reducers). Preparation expands
+independent compressed parts with `flatMap`; counting folds article streams;
+grep collects references to independently written result files.
+
+Cloud reducers assign bounded batches across workers and use each executing
+worker's CPU budget for local tasks. Counting and grep split uncompressed blobs
+into byte ranges, including a single large file. Workers fetch only intersecting
+immutable chunks; lean-reducers repairs newline/UTF-8 boundaries and processes
+each article once. Compressed XML is still split at bzip2 stream boundaries.
+
+Only summaries and immutable references enter the journal. Partial count tables
+are stored in blobs and merged one at a time; grep output stays in ordered blob
+parts. Per-file article totals and grep output limits are checked across all
+ranges. The `v2` workflow versions reflect the new execution structure; dataset,
+request, and result formats remain compatible with `v1` artifacts.
 
 ## First example, locally
 
@@ -88,6 +100,11 @@ Remove the temporary deployment and its data when finished:
 
 ## A large dump
 
+For a ready-to-launch full English snapshot, follow
+[Full English Wikipedia](FullWikipedia.md). It includes pinned checksums, an
+independent Kubernetes import job that downloads inside the cluster, and count
+and grep request templates.
+
 Download a **dated** `pages-articles-multistream.xml.bz2` and its matching
 `pages-articles-multistream-index.txt.bz2` from
 [Wikimedia dumps](https://dumps.wikimedia.org/backup-index.html). Verify them
@@ -114,15 +131,16 @@ on an ingest machine with a runtime configuration that can reach the blob store.
 This is a file utility; the cloud console remains an HTTP workflow client.
 
 The same application image can use the existing [Azure deployment helpers](../../deploy/Azure.md)
-and HTTP client. In that guide's publishing step, replace the demo's
-`docker buildx build` command with:
+and HTTP client. Replace the demo's build, publish and configure commands with:
 
 ```sh
-./Applications/Wiki/build.sh "$cloud_repository:demo" linux/arm64
+./Applications/Wiki/build.sh lean-cloud-wiki:dev linux/arm64
+./deploy/azure.sh publish .azure-infra lean-cloud-wiki:dev wiki
+./deploy/azure.sh configure .azure-infra .wiki-deployment wiki 3
 ```
 
 Use `linux/amd64` for an x86 cluster. This helper includes Wiki's XML and bzip2
-libraries. Continue with the guide's push, digest and deployment steps.
+libraries. Continue with the guide's `up`, `connect`, and workflow submission steps.
 Deployment and provisioning remain outside Wiki workflows.
 
 ## Requests and exact semantics
@@ -154,8 +172,8 @@ compressed groups; preparation targets 32 MiB output shards without splitting
 articles. A large article can exceed the target size. Hard limits are 256 MiB
 compressed per group, 1 GiB expanded per group or compressed index, 8 MiB per
 text field, 64 MiB per encoded article, 128 MiB
-per output shard, and 10,000 parts/shards per manifest. XML processing and shard
-scans have five-minute budgets; OS/container limits remain the hard boundary
+per output shard, and 10,000 parts/shards per manifest. XML processing and analysis
+batches have five-minute budgets; OS/container limits remain the hard boundary
 for a native regex call. Inputs exceeding a limit fail explicitly. Grep never
 silently truncates results. Full history dumps, suppressed text and non-wikitext
 selected pages are rejected. DTDs and custom entity declarations are rejected.

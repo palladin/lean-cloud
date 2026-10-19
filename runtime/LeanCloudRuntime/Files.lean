@@ -39,6 +39,64 @@ private def readBlob (store : ObjectStore) (ref : BlobRef) : IO ByteArray := do
   | .ok bytes => return bytes
   | .error error => throw (IO.userError error.message)
 
+/-- An authenticated chunk index. Partial reads verify every fetched chunk;
+the whole-file digest is additionally checked by `download`. The cache holds
+at most one chunk, independently of file size, and is safe for concurrent reads. -/
+structure Reader where
+  private mk ::
+  private store : ObjectStore
+  private chunks : Array BlobRef
+  private ends : Array Nat
+  private cache : Std.Mutex (Option (Nat × ByteArray))
+  size : Nat
+
+def openReader (store : ObjectStore) (ref : FileRef) : IO Reader := do
+  IO.ofExcept ref.validate
+  let bytes ← readBlob store ref.manifest
+  let some text := String.fromUTF8? bytes | throw (IO.userError "Invalid file manifest encoding")
+  let manifest : FileManifest ← IO.ofExcept (Json.parse text >>= fromJson?)
+  unless manifest.format == "lean-cloud/file/v1" && manifest.size == ref.size &&
+      manifest.sha256 == ref.sha256 &&
+      manifest.chunks.all (fun chunk => 0 < chunk.size && chunk.size ≤ chunkSize) &&
+      (manifest.chunks.foldl (fun total chunk => total + chunk.size) 0) == ref.size do
+    throw (IO.userError "Invalid file manifest")
+  let mut ends := #[]
+  let mut total := 0
+  for chunk in manifest.chunks do
+    total := total + chunk.size
+    ends := ends.push total
+  return ⟨store, manifest.chunks, ends, ← Std.Mutex.new none, ref.size⟩
+
+private def Reader.chunk (reader : Reader) (index : Nat) : IO ByteArray := do
+  if let some (cached, bytes) ← reader.cache.atomically get then
+    if cached == index then return bytes
+  let some ref := reader.chunks[index]? | throw (IO.userError "Invalid chunk offset")
+  let bytes ← readBlob reader.store ref
+  reader.cache.atomically (set (some (index, bytes)))
+  return bytes
+
+/-- Seek through the manifest, fetching only intersecting chunks. `count` is
+clipped to EOF; a short/corrupt/missing chunk throws instead of truncating data. -/
+def Reader.read (reader : Reader) (offset count : Nat) : IO ByteArray := do
+  let stop := min reader.size (offset + count)
+  if offset ≥ stop then return {}
+  let mut low := 0
+  let mut high := reader.ends.size
+  while low < high do
+    let mid := (low + high) / 2
+    if reader.ends[mid]! ≤ offset then low := mid + 1 else high := mid
+  let mut index := low
+  let mut position := offset
+  let mut result := ByteArray.empty
+  while position < stop do
+    let start := if index == 0 then 0 else reader.ends[index - 1]!
+    let bytes ← reader.chunk index
+    let finish := min stop reader.ends[index]!
+    result := result ++ bytes.extract (position - start) (finish - start)
+    position := finish
+    index := index + 1
+  return result
+
 /-- Commit the manifest last. A failed upload cannot publish a partial file.
 Retrying uploads reuses immutable chunks. Data buffers are bounded by chunkSize;
 the small chunk index grows with file size. -/
@@ -67,16 +125,9 @@ def download (store : ObjectStore) (ref : FileRef) (path : System.FilePath) (lim
   IO.ofExcept ref.validate
   unless ref.size ≤ limit && ref.manifest.size ≤ 16 * 1024 * 1024 do
     throw (IO.userError "File reference exceeds configured limit")
-  let bytes ← readBlob store ref.manifest
-  let some text := String.fromUTF8? bytes | throw (IO.userError "Invalid file manifest encoding")
-  let manifest : FileManifest ← IO.ofExcept (Json.parse text >>= fromJson?)
-  unless manifest.format == "lean-cloud/file/v1" && manifest.size == ref.size &&
-      manifest.sha256 == ref.sha256 &&
-      manifest.chunks.all (fun chunk => 0 < chunk.size && chunk.size ≤ chunkSize) &&
-      (manifest.chunks.foldl (fun total chunk => total + chunk.size) 0) == ref.size do
-    throw (IO.userError "Invalid file manifest")
+  let reader ← openReader store ref
   let handle ← IO.FS.Handle.mk path .write
-  for chunk in manifest.chunks do handle.write (← readBlob store chunk)
+  for chunk in reader.chunks do handle.write (← readBlob store chunk)
   handle.flush
   unless (← digest path) == ref.sha256 do throw (IO.userError "File digest mismatch")
   -- On failure the caller's private workspace owns any partial file. In

@@ -25,6 +25,7 @@ COPY --from=node_assets node.c /tmp/node.c
 RUN cc -O2 -Wall -Wextra -Werror /tmp/node.c -o /usr/local/bin/cloud-node
 COPY --from=sdk lean-toolchain lakefile.lean lake-manifest.json /opt/lean-cloud/
 COPY --from=sdk runtime/lakefile.lean runtime/lake-manifest.json /opt/lean-cloud/runtime/
+COPY --from=sdk reducers/lakefile.lean reducers/lake-manifest.json /opt/lean-cloud/reducers/
 WORKDIR /src
 COPY lakefile.lean lean-toolchain ./
 RUN lake -KleanCloudSdk=/opt/lean-cloud update lean_cloud_runtime && \
@@ -36,6 +37,8 @@ COPY --from=sdk native /opt/lean-cloud/native
 COPY --from=sdk runtime/LeanCloudRuntime.lean /opt/lean-cloud/runtime/
 COPY --from=sdk runtime/LeanCloudRuntime /opt/lean-cloud/runtime/LeanCloudRuntime
 COPY --from=sdk runtime/native /opt/lean-cloud/runtime/native
+COPY --from=sdk reducers/LeanCloudReducers.lean /opt/lean-cloud/reducers/
+COPY --from=sdk reducers/LeanCloudReducers /opt/lean-cloud/reducers/LeanCloudReducers
 RUN lake -KleanCloudSdk=/opt/lean-cloud build LeanCloudRuntime
 
 WORKDIR /src

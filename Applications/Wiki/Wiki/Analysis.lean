@@ -1,6 +1,8 @@
 import Wiki.Model
+import LeanReducers.FoldSpec
 
 namespace Wiki
+open Lean
 
 abbrev Vocabulary := Std.HashMap String Nat
 
@@ -40,5 +42,41 @@ def addArticle (counts : Counts) (hits : Std.HashMap Nat Nat) : Counts := Id.run
     entries := entries.modify index fun c => {
       c with occurrences := c.occurrences + n, articles := c.articles + 1 }
   return { articles := counts.articles + 1, counts := entries }
+
+def mergeCounts (r : CountRequest) (parts : Array Counts) : Counts := {
+  articles := parts.foldl (fun n p => n + p.articles) 0
+  counts := r.vocabulary.mapIdx fun i name => {
+    word := name
+    occurrences := parts.foldl (fun n p => n + p.counts[i]!.occurrences) 0
+    articles := parts.foldl (fun n p => n + p.counts[i]!.articles) 0 } }
+
+def addFileCount (counts : Array (String × Nat)) (key : String) (value : Nat) : Array (String × Nat) :=
+  match counts.findIdx? (·.1 == key) with
+  | some i => counts.modify i fun (key, n) => (key, n + value)
+  | none => counts.push (key, value)
+
+def countFold (r : CountRequest) : LeanReducers.FoldSpec (String × Article) CountPartial :=
+  let table := vocabulary r
+  { unit := { total := mergeCounts r #[] }
+    combine := fun left right => {
+      total := mergeCounts r #[left.total, right.total]
+      perFile := right.perFile.foldl (fun acc (key, n) => addFileCount acc key n) left.perFile }
+    step := fun (key, article) acc => {
+      total := addArticle acc.total (wordHits table r.ignoreCase article.text)
+      perFile := acc.perFile.foldl (fun counts (key, n) => addFileCount counts key n) #[(key, 1)] } }
+
+def checkArticleCounts (dataset : Dataset) (counts : Array (String × Nat)) : Except String Unit := do
+  let totals := Std.HashMap.ofArray counts
+  unless totals.size == dataset.shards.size && dataset.shards.all (fun shard =>
+      totals[shard.file.sha256]? == some shard.articles) do
+    throw "Article count does not match manifest"
+
+/-- Checked parsing stays fused into the multicore reducer. -/
+def parseArticle (line : String) : Except String Article := do
+  unless line.utf8ByteSize ≤ 64 * MiB do throw "Article size limit exceeded"
+  let article : Article ← Json.parse line >>= fromJson?
+  unless article.text.utf8ByteSize ≤ 8 * MiB && article.title.utf8ByteSize ≤ 8 * MiB &&
+      !article.text.contains '\x00' do throw "Invalid article fields"
+  return article
 
 end Wiki

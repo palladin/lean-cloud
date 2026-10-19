@@ -9,6 +9,12 @@ package wiki
     | some root => System.FilePath.mk root / "runtime"
     | none => "../../runtime")) }
 
+@[package_dep] def lean_cloud_reducers : Dependency := {
+  name := `lean_cloud_reducers, scope := "", version := .none, opts := {}
+  src? := some (.path (match get_config? leanCloudSdk with
+    | some root => System.FilePath.mk root / "reducers"
+    | none => "../../reducers")) }
+
 lean_lib Wiki
 
 -- Lean's bundled linker does not search the host SDK/system library paths.

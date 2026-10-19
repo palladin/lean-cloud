@@ -36,9 +36,10 @@ runs:
         path: |
           .lake
           runtime/.lake
+          reducers/.lake
           Applications/CubeAndConquer/.lake
           Applications/LeanBuild/.lake
           Applications/Wiki/.lake
-        key: ${{ runner.os }}-${{ runner.arch }}-lake-v1-${{ inputs.scope }}-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json', 'runtime/lakefile.lean', 'runtime/lake-manifest.json', 'Applications/CubeAndConquer/lakefile.lean', 'Applications/CubeAndConquer/lake-manifest.json', 'Applications/LeanBuild/lakefile.lean', 'Applications/LeanBuild/lake-manifest.json', 'Applications/Wiki/lakefile.lean', 'Applications/Wiki/lake-manifest.json', '.github/actions/setup-lean/action.yml') }}-${{ github.sha }}
+        key: ${{ runner.os }}-${{ runner.arch }}-lake-v1-${{ inputs.scope }}-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json', 'runtime/lakefile.lean', 'runtime/lake-manifest.json', 'reducers/lakefile.lean', 'reducers/lake-manifest.json', 'Applications/CubeAndConquer/lakefile.lean', 'Applications/CubeAndConquer/lake-manifest.json', 'Applications/LeanBuild/lakefile.lean', 'Applications/LeanBuild/lake-manifest.json', 'Applications/Wiki/lakefile.lean', 'Applications/Wiki/lake-manifest.json', '.github/actions/setup-lean/action.yml') }}-${{ github.sha }}
         restore-keys: |
-          ${{ runner.os }}-${{ runner.arch }}-lake-v1-${{ inputs.scope }}-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json', 'runtime/lakefile.lean', 'runtime/lake-manifest.json', 'Applications/CubeAndConquer/lakefile.lean', 'Applications/CubeAndConquer/lake-manifest.json', 'Applications/LeanBuild/lakefile.lean', 'Applications/LeanBuild/lake-manifest.json', 'Applications/Wiki/lakefile.lean', 'Applications/Wiki/lake-manifest.json', '.github/actions/setup-lean/action.yml') }}-
+          ${{ runner.os }}-${{ runner.arch }}-lake-v1-${{ inputs.scope }}-${{ hashFiles('lean-toolchain', 'lakefile.lean', 'lake-manifest.json', 'runtime/lakefile.lean', 'runtime/lake-manifest.json', 'reducers/lakefile.lean', 'reducers/lake-manifest.json', 'Applications/CubeAndConquer/lakefile.lean', 'Applications/CubeAndConquer/lake-manifest.json', 'Applications/LeanBuild/lakefile.lean', 'Applications/LeanBuild/lake-manifest.json', 'Applications/Wiki/lakefile.lean', 'Applications/Wiki/lake-manifest.json', '.github/actions/setup-lean/action.yml') }}-

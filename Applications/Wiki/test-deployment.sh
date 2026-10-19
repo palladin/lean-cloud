@@ -39,7 +39,23 @@ before=$(compose ps -q | sort)
 awk 'BEGIN { for (i=0; i<100000; i++) pad=pad "padding " }
   { sub(/<text \/>/, "<text> </text>"); sub(/<\/text>/, " " pad "</text>"); print }' \
   "$app/fixtures/tiny.xml" > "$test_dir/three-shards.xml"
-bash "$app/local-files.sh" "$deployment" import-xml "$test_dir/three-shards.xml" "$test_dir/import.json"
+# Exercise the full-dump ingest path using verified cached fixture downloads.
+# Nothing is fetched from Wikimedia, and no large source is required in CI.
+prefix=enwiki-20261001-pages-articles-multistream
+mkdir -p "$test_dir/ingest"
+bzip2 -c "$test_dir/three-shards.xml" > "$test_dir/ingest/$prefix.xml.bz2"
+printf '0:1:Proof\n' | bzip2 -c > "$test_dir/ingest/$prefix-index.txt.bz2"
+jq --argjson dumpBytes "$(wc -c < "$test_dir/ingest/$prefix.xml.bz2")" \
+  --arg dumpSha "$(openssl dgst -sha1 -r "$test_dir/ingest/$prefix.xml.bz2" | cut -d ' ' -f 1)" \
+  --argjson indexBytes "$(wc -c < "$test_dir/ingest/$prefix-index.txt.bz2")" \
+  --arg indexSha "$(openssl dgst -sha1 -r "$test_dir/ingest/$prefix-index.txt.bz2" | cut -d ' ' -f 1)" \
+  '.files[0].bytes=$dumpBytes | .files[0].sha1=$dumpSha |
+   .files[1].bytes=$indexBytes | .files[1].sha1=$indexSha' "$app/full-wikipedia/snapshot.json" > "$test_dir/ingest/snapshot.json"
+cp "$app/full-wikipedia/ingest.sh" "$test_dir/ingest/"
+compose cp "$test_dir/ingest" scheduler:/tmp/wiki-ingest >/dev/null
+compose exec -T scheduler bash /tmp/wiki-ingest/ingest.sh /tmp/wiki-ingest/snapshot.json \
+  /etc/lean-cloud/config.json /tmp/wiki-ingest > "$test_dir/ingest.log"
+compose cp scheduler:/tmp/wiki-ingest/prepare.json "$test_dir/import.json" >/dev/null
 jq '.shardBytes=1048576' "$test_dir/import.json" > "$test_dir/prepare-input.json"
 cli run wiki-prepare --input "$test_dir/prepare-input.json" --id prepare
 result prepare
@@ -60,4 +76,4 @@ jq -e '.id == 2 and .title == "Computers" and .length == 8' "$test_dir/hits.json
 cli inspect counts > "$test_dir/inspect.log"
 cli watch counts --once > "$test_dir/watch.log"
 [[ $(compose ps -q | sort) == "$before" ]] || { echo 'Submission changed containers' >&2; exit 1; }
-echo 'PASS Wiki HTTP submission, preparation, counting, searching, artifact downloads and monitoring'
+echo 'PASS Wiki compressed dump ingest, HTTP submission, preparation, counting, searching, artifact downloads and monitoring'

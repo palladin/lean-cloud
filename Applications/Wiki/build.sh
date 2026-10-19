@@ -9,5 +9,5 @@ version=$(sed 's|leanprover/lean4:v||' "$app/lean-toolchain" | tr -d '\n\r')
 docker buildx build "${options[@]}" --build-context "sdk=$root" --build-context "node_assets=$root/deploy" \
   --build-arg "LEAN_VERSION=$version" --build-arg APP_TARGET=cloud_app \
   --build-arg 'APP_BUILD_PACKAGES=libexpat1-dev libbz2-dev' \
-  --build-arg 'APP_RUNTIME_PACKAGES=libexpat1 libbz2-1.0' \
+  --build-arg 'APP_RUNTIME_PACKAGES=libexpat1 libbz2-1.0 bzip2 jq' \
   -f "$root/deploy/app/Dockerfile" -t "${1:-lean-cloud-wiki:dev}" "$app"

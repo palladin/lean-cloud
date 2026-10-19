@@ -88,10 +88,16 @@ jobs:
         working-directory: Applications/Wiki
         timeout-minutes: 3
         run: |
-          shellcheck -x build.sh local-files.sh test-deployment.sh
+          shellcheck -x build.sh local-files.sh test-deployment.sh test-full-wikipedia.sh full-wikipedia/*.sh
+          bash test-full-wikipedia.sh
           lake build cloud_app wiki_files wiki_tests
           lake test
-          .lake/build/bin/cloud_app programs | jq -e 'map(.entry) == ["wiki-prepare/v1", "wiki-count/v1", "wiki-grep/v1"]'
+          .lake/build/bin/cloud_app programs | jq -e 'map(.entry) == ["wiki-prepare/v2", "wiki-count/v2", "wiki-grep/v2"]'
+
+      - name: Check cloud reducers and blob byte ranges
+        working-directory: reducers
+        timeout-minutes: 3
+        run: lake test
 
       - name: Check cube-and-conquer application with real tools
         working-directory: Applications/CubeAndConquer

@@ -34,13 +34,14 @@ private def dispatch [Codec α] (store : ReplayStore IO) (blobs : BlobStorage IO
     (program : Cloud IO α) : Nat → Assignment → ExceptT CloudError IO Unit
   | 0, _ => throw ⟨.protocol, "Test fuel exhausted"⟩
   | fuel + 1, assignment => do
-    match ← ReplayInterpreter.step store blobs 10000 (fun _ : Unit => program) () assignment with
+    match ← ReplayInterpreter.step store blobs 10000 (fun _ : Unit => program) () assignment
+        (environment := { currentWorker := { cpus := 2 }, workers := #[{ cpus := 2 }, { cpus := 2 }] }) with
     | .done => pure ()
     | .fork location count =>
       let jobs ← (List.range count).mapM fun i =>
         liftM (IO.asTask ((dispatch store blobs program fuel ⟨0, location.child i⟩).run))
       -- Drain all children before propagating an independent worker stop.
-      let outputs ← liftM (jobs.mapM fun job => pure job.get : IO _)
+      let outputs ← liftM (jobs.mapM fun job => IO.wait job : IO _)
       for output in outputs do
         let result ← liftM (IO.ofExcept output)
         liftExcept result
@@ -54,7 +55,8 @@ private def concurrent [Codec α] (store : ReplayStore IO) (blobs : BlobStorage 
   IO.ofExcept ((← (ReplayInterpreter.result outcome : ExceptT CloudError IO α).run).mapError (·.message))
 
 private def direct (store : ObjectStore) (program : Cloud IO α) : IO α := do
-  match ← (DirectInterpreter.Internal.eval store.storage program).run with
+  match ← (DirectInterpreter.Internal.eval store.storage program {
+    currentWorker := { cpus := 4 }, workers := #[{ cpus := 4 }, { cpus := 4 }] }).run with
   | .ok value => return value
   | .error e => throw (IO.userError e.message)
 
@@ -86,12 +88,28 @@ private def nativeTests (store : ObjectStore) : IO Unit := IO.FS.withTempDir fun
   let counted ← direct store (count b r)
   check (counted.articles == 3 && counted.counts.map (·.occurrences) == #[4, 1, 2, 1, 0] &&
     counted.counts.map (·.articles) == #[2, 1, 2, 1, 0]) "Wrong counts (XML entity/CDATA/token handling)"
+  -- Force cuts inside JSON, UTF-8 and individual article lines. The cloud
+  -- reader must repair them exactly once using lean-reducers' byte source.
+  let ranged := backendWith (pure store) 17
+  check ((← direct store (count ranged r)) == counted) "Byte-range count differs from whole-shard count"
   let dataset ← b.dataset prepared.dataset
+  -- Expiry during source setup must stop before the first blob request,
+  -- instead of fetching/folding the entire batch and only then failing.
+  let reads ← Std.Mutex.new (0 : Nat)
+  let observed := { store with read := fun key => do
+    reads.atomically (modify (· + 1))
+    store.read key }
+  let timed := backendWith (do IO.sleep 5; return observed) 17 0
+  rejects (direct store (timed.articles dataset).length) "Expired analysis succeeded"
+  check ((← reads.atomically get) == 0) "Expired analysis continued fetching blobs"
   let invalid ← Files.putJson store { dataset with source := default }
   rejects (direct store (count b { r with dataset := invalid })) "Invalid dataset provenance accepted"
   let duplicate ← Files.putJson store { dataset with shards := dataset.shards ++ dataset.shards }
   rejects (direct store (count b { r with dataset := duplicate })) "Duplicate shards were counted twice"
   let some shard := dataset.shards[0]? | throw (IO.userError "Missing fixture shard")
+  let wrongCounts ← Files.putJson store { dataset with shards := #[{ shard with articles := shard.articles + 1 }] }
+  rejects (direct store (count ranged { r with dataset := wrongCounts })) "Range reduction ignored per-file article counts"
+  rejects (direct store (grep ranged { dataset := wrongCounts, pattern := "proof" })) "Range grep ignored article counts"
   let corrupt : ObjectStore := { store with read := fun key => do
     let bytes ← store.read key
     if key == shard.file.manifest.key then return some "corrupt".toUTF8
@@ -105,6 +123,15 @@ private def nativeTests (store : ObjectStore) : IO Unit := IO.FS.withTempDir fun
   check (hit.id == 2 && hit.length == "π proof".utf8ByteSize && hit.excerpt.startsWith "π proof") "Grep positions/excerpt"
   let regex ← direct store (grep b { dataset := prepared.dataset, pattern := "proof|theorem", regex := true, ignoreCase := true })
   check (regex.matched == 2) "Regex selection"
+  let splitRegex ← direct store (grep ranged { dataset := prepared.dataset, pattern := "proof|theorem", regex := true, ignoreCase := true })
+  check (splitRegex.matched == regex.matched && splitRegex.articles == regex.articles) "Range grep lost or duplicated articles"
+  let expectedParts : MatchManifest ← Files.readJson store regex.results
+  let actualParts : MatchManifest ← Files.readJson store splitRegex.results
+  let expectedText ← expectedParts.parts.foldlM (fun text part => do return text ++ (← Files.readText store part.file)) ""
+  let actualText ← actualParts.parts.foldlM (fun text part => do return text ++ (← Files.readText store part.file)) ""
+  check (actualText == expectedText) "Range grep changed output order"
+  let perFileLimit := expectedParts.parts.foldl (fun n part => n + part.file.size) 0 - 1
+  rejects (direct store (grep ranged { dataset := prepared.dataset, pattern := "proof|theorem", regex := true, ignoreCase := true, maxOutputBytes := perFileLimit })) "Splitting bypassed per-file output limit"
   let empty ← direct store (grep b { dataset := prepared.dataset, pattern := "unlikely absent string" })
   check (empty.matched == 0 && empty.articles == 3) "Empty search"
   rejects (direct store (grep b { dataset := prepared.dataset, pattern := "[", regex := true })) "Invalid regex accepted"
@@ -145,7 +172,7 @@ private def nativeTests (store : ObjectStore) : IO Unit := IO.FS.withTempDir fun
   discard (Import.multistream store dump (root / "index.bz2") 1)
   -- Test concurrent effects and replay caching using the production worker step.
   let calls ← Std.Mutex.new (0 : Nat)
-  let countedBackend := { b with count := fun r shard => do calls.atomically (modify (· + 1)); b.count r shard }
+  let countedBackend := { b with saveCounts := fun value => do calls.atomically (modify (· + 1)); b.saveCounts value }
   let log ← Std.Mutex.new []
   let r := { r with dataset := preparedSplit.dataset }
   let actual ← concurrent (journal log) store.storage (count countedBackend r)
@@ -181,15 +208,18 @@ private def nativeTests (store : ObjectStore) : IO Unit := IO.FS.withTempDir fun
   -- An exception from the user's effect is a recorded failure, never a crash retry.
   let failedCalls ← IO.mkRef (0 : Nat)
   let failedLog ← Std.Mutex.new []
-  let failing := { b with count := fun _ _ => do
+  let failing := { b with saveCounts := fun _ => do
     failedCalls.modify (· + 1)
     throw (IO.userError "analysis failed") }
-  for _ in [:2] do
+  let mut firstCalls := 0
+  for attempt in [:2] do
     let result ← (SequentialReplay.interpret (journal failedLog) store.storage 10000 (count failing) r).run
     match result with
     | .ok _ => throw (IO.userError "Analysis exception was lost")
     | .error e => check (e == ⟨.application, "analysis failed"⟩) "Wrong recorded failure"
-  check ((← failedCalls.get) == preparedSplit.shards) "Ordinary IO error was retried"
+    if attempt == 0 then firstCalls ← failedCalls.get
+    else check ((← failedCalls.get) == firstCalls) "Ordinary IO error was retried"
+  check (firstCalls > 0) "No failing effect executed"
   for bad in [xml.replace "</mediawiki>" "", xml.replace "<text />" "<text>&unknown;</text>",
       "<!DOCTYPE mediawiki [<!ENTITY x 'expanded'>]>" ++ xml,
       xml.replace "<text />" "<text deleted=\"deleted\" />"] do

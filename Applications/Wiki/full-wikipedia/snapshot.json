@@ -1,0 +1,19 @@
+{
+  "wiki": "enwiki",
+  "date": "20261001",
+  "baseUrl": "https://dumps.wikimedia.org/enwiki/20261001",
+  "checksumsUrl": "https://dumps.wikimedia.org/enwiki/20261001/enwiki-20261001-sha1sums.txt",
+  "licenseUrl": "https://dumps.wikimedia.org/legal.html",
+  "files": [
+    {
+      "name": "enwiki-20261001-pages-articles-multistream.xml.bz2",
+      "bytes": 26917225724,
+      "sha1": "992b5ca87b3404894f013e59a43efbb8b1bc012b"
+    },
+    {
+      "name": "enwiki-20261001-pages-articles-multistream-index.txt.bz2",
+      "bytes": 285227194,
+      "sha1": "c4c99005dabde563d018dc778dbd0a0ea60272be"
+    }
+  ]
+}

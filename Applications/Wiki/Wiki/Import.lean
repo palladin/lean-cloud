@@ -51,6 +51,7 @@ def multistream (store : ObjectStore) (dump index : System.FilePath)
   let input ← IO.FS.Handle.mk dump .read
   let mut parts := #[]
   for i in [:offsets.size - 1] do
+    if i % 25 == 0 then IO.eprintln s!"Uploading compressed group {i + 1}/{offsets.size - 1}"
     let size := offsets[i+1]! - offsets[i]!
     unless size ≤ maxPartBytes do throw (IO.userError "A compressed group exceeds 256 MiB; use a smaller part target")
     let file ← IO.FS.withTempFile fun output path => do
