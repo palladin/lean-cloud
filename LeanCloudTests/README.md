@@ -14,6 +14,12 @@ restarts, membership changes and durable completion. Seeded programs cover
 captured inputs, dependent binds, blobs, delay, failure and nested/empty parallel
 arrays. Results and failures preserve source order.
 
+Scheduler tests check that each `forEach` callback advances on its own reply.
+Sibling forks dispatch together, a fast subtree joins while a slow sibling
+is still running, and duplicate replies cannot invoke a callback twice.
+Groups and callbacks are discarded on restart; old workers must stop before
+reconstruction dispatches replacement attempts.
+
 `PoolModel` tests three workflows on three workers across 64 seeds with 400
 operations each. Checks include attempt ownership, pause/resume/kill, expiry and
 renewal, late/duplicate reports, orphan writes and immutable records. Programs

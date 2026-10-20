@@ -109,7 +109,7 @@ def coordinationCases : Array TestCase := #[
     let (state, _) := Scheduler.handle 10 state (.report ⟨"a", root.attempt, .ok (.fork Location.root 0), #[]⟩)
     let (_, resumed) := Scheduler.handle 10 state (.ready "a")
     assertEq (← assigned resumed).branchStart Location.root⟩,
-  ⟨"scheduler/recursive-batch-awaits-siblings-before-descending", do
+  ⟨"scheduler/subtree-progresses-before-sibling-replies", do
     let (state, root) := Scheduler.handle 100 {} (.ready "a")
     let root ← assigned root
     let (state, _) := Scheduler.handle 100 state (.report ⟨"a", root.attempt, .ok (.fork Location.root 2), #[]⟩)
@@ -117,22 +117,75 @@ def coordinationCases : Array TestCase := #[
     let left ← assigned left
     let (state, right) := Scheduler.handle 100 state (.ready "b")
     let right ← assigned right
-    let fork := left.branchStart.next
-    let (state, _) := Scheduler.handle 100 state (.report ⟨"a", left.attempt, .ok (.fork fork 1), #[]⟩)
-    let (_, waiting) := Scheduler.handle 100 state (.ready "c")
-    assertTrue (waiting.all (fun d => match d.message with | .idle => true | _ => false))
-      "Descended into a fork before awaiting the rest of its batch"
-    let (state, _) := Scheduler.handle 100 state (.report ⟨"b", right.attempt, .ok .done, #[]⟩)
+    -- The second branch may descend and join while the first has not replied.
+    let fork := right.branchStart.next
+    let (state, _) := Scheduler.handle 100 state (.report ⟨"b", right.attempt, .ok (.fork fork 1), #[]⟩)
     let (state, child) := Scheduler.handle 100 state (.ready "c")
     let child ← assigned child
     assertEq child.branchStart (fork.child 0)
     let (state, _) := Scheduler.handle 100 state (.report ⟨"c", child.attempt, .ok .done, #[]⟩)
-    let (state, parent) := Scheduler.handle 100 state (.ready "a")
+    let (state, parent) := Scheduler.handle 100 state (.ready "b")
     let parent ← assigned parent
-    assertEq parent.branchStart left.branchStart
-    let (state, _) := Scheduler.handle 100 state (.report ⟨"a", parent.attempt, .ok .done, #[]⟩)
+    assertEq parent.branchStart right.branchStart
+    let (state, _) := Scheduler.handle 100 state (.report ⟨"b", parent.attempt, .ok .done, #[]⟩)
+    let (state, _) := Scheduler.handle 100 state (.report ⟨"b", parent.attempt, .ok .done, #[]⟩)
+    let (_, waiting) := Scheduler.handle 100 state (.ready "c")
+    assertTrue (match response waiting with | .idle => true | _ => false)
+      "Root joined before the first branch finished"
+    let (state, _) := Scheduler.handle 100 state (.report ⟨"a", left.attempt, .ok .done, #[]⟩)
     let (_, root) := Scheduler.handle 100 state (.ready "b")
     assertEq (← assigned root).branchStart Location.root⟩,
+  ⟨"scheduler/sibling-forks-and-joins-progress-independently", do
+    let (state, root) := Scheduler.handle 100 {} (.ready "a")
+    let root ← assigned root
+    let (state, _) := Scheduler.handle 100 state
+      (.report ⟨"a", root.attempt, .ok (.fork Location.root 2), #[]⟩)
+    let (state, left) := Scheduler.handle 100 state (.ready "a")
+    let left ← assigned left
+    let (state, right) := Scheduler.handle 100 state (.ready "b")
+    let right ← assigned right
+    let (state, _) := Scheduler.handle 100 state
+      (.report ⟨"a", left.attempt, .ok (.fork left.branchStart.next 2), #[]⟩)
+    let (state, _) := Scheduler.handle 100 state
+      (.report ⟨"b", right.attempt, .ok (.fork right.branchStart.next 2), #[]⟩)
+    let mut active := state
+    let mut leaves := #[]
+    -- All four leaves are dispatchable before any one finishes.
+    for worker in #["a", "b", "c", "d"] do
+      let (next, delivery) := Scheduler.handle 100 active (.ready worker)
+      leaves := leaves.push (worker, ← assigned delivery)
+      active := next
+    assertEq (leaves.map (·.2.branchStart)) #[
+      left.branchStart.next.child 0, left.branchStart.next.child 1,
+      right.branchStart.next.child 0, right.branchStart.next.child 1]
+    -- Complete the right subtree first, in reverse reply order.
+    for (worker, leaf) in (leaves.extract 2).toList.reverse do
+      active := (Scheduler.handle 100 active (.report ⟨worker, leaf.attempt, .ok .done, #[]⟩)).1
+    let (next, rightJoin) := Scheduler.handle 100 active (.ready "c")
+    let rightJoin ← assigned rightJoin
+    assertEq rightJoin.branchStart right.branchStart
+    active := (Scheduler.handle 100 next (.report ⟨"c", rightJoin.attempt, .ok .done, #[]⟩)).1
+    let (_, waiting) := Scheduler.handle 100 active (.ready "c")
+    assertTrue (match response waiting with | .idle => true | _ => false)
+      "Root resumed before the left subtree finished"
+    for (worker, leaf) in (leaves.extract 0 2).toList.reverse do
+      active := (Scheduler.handle 100 active (.report ⟨worker, leaf.attempt, .ok .done, #[]⟩)).1
+    let (state, leftJoin) := Scheduler.handle 100 active (.ready "c")
+    let leftJoin ← assigned leftJoin
+    assertEq leftJoin.branchStart left.branchStart
+    -- Old completions must not run callbacks again or satisfy the new join.
+    let state := leaves.foldl (fun state (worker, leaf) =>
+      (Scheduler.handle 100 state (.report ⟨worker, leaf.attempt, .ok .done, #[]⟩)).1) state
+    let (_, waiting) := Scheduler.handle 100 state (.ready "d")
+    assertTrue (match response waiting with | .idle => true | _ => false)
+      "Duplicate replies completed the group twice"
+    let (state, _) := Scheduler.handle 100 state (.report ⟨"c", leftJoin.attempt, .ok .done, #[]⟩)
+    let (state, rootJoin) := Scheduler.handle 100 state (.ready "a")
+    let rootJoin ← assigned rootJoin
+    assertEq rootJoin.branchStart Location.root
+    let (state, _) := Scheduler.handle 100 state (.report ⟨"a", rootJoin.attempt, .ok .done, #[]⟩)
+    assertTrue state.finished "Tree did not complete"
+    assertTrue (state.pending.isEmpty && state.groups.isEmpty) "Completed tree retained callbacks"⟩,
   ⟨"scheduler/inspection-tree-does-not-drive-execution", do
     let (state, root) := Scheduler.handle 100 {} (.ready "a")
     let root ← assigned root

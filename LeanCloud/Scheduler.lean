@@ -1,8 +1,8 @@
 import LeanCloud.Scheduler.Program
 
-/-! The inbox handler drives the recursive scheduling program. Tickets and its
-continuation are volatile. Jobs are an inspection view, never the source of
-scheduling decisions. Recovery discards the continuation and starts at the root
+/-! The inbox handler drives the recursive scheduling program. Branch callbacks
+and group joins are volatile. Jobs are an inspection view, never the source of
+scheduling decisions. Recovery discards the callbacks and starts at the root
 only after the pool has cancelled and drained the old attempts. -/
 
 namespace LeanCloud.Scheduler
@@ -36,21 +36,31 @@ structure Snapshot where
   error : Option CloudError := none
   deriving Repr, BEq, ToJson, FromJson
 
+/-- A group counts unfinished callbacks, including callbacks suspended in
+nested groups. Its continuation resumes in the enclosing group. -/
+structure Group where
+  id : Nat
+  parent : Option Nat
+  remaining : Nat
+  next : Unit → Waiting
+  deriving Inhabited
+
 structure Pending where
-  ticket : Ticket
+  group : Nat
   branchStart : Location
   status : Status := .pending
-  reply : Option (Except CloudError Progress) := none
+  next : Progress → Waiting
   deriving Inhabited
 
 structure State extends Snapshot where
-  continuation : Waiting := suspend (run [Location.root]).run
+  started : Bool := false
+  groups : Array Group := #[]
   pending : Array Pending := #[]
-  nextTicket : Nat := 0
+  nextGroup : Nat := 0
   stopping : Array WorkerId := #[]
   barrier : Nat := 0
 
-/-- The durable part contains no traversal, tickets, leases or branch tree. -/
+/-- The durable part contains no callbacks, groups, leases or branch tree. -/
 structure Catalog where
   nextAttempt : Nat := 0
   workers : Array WorkerInfo := #[]
@@ -63,7 +73,7 @@ def State.catalog (state : State) : Catalog :=
 def Catalog.restore (catalog : Catalog) : State :=
   { nextAttempt := catalog.nextAttempt, workers := catalog.workers, error := catalog.error }
 
--- JSON carries observations only, never executable continuations or tickets.
+-- JSON carries observations only, never executable callbacks or groups.
 instance : ToJson State := ⟨fun state => toJson state.toSnapshot⟩
 instance : Repr State := ⟨fun state prec => reprPrec state.toSnapshot prec⟩
 
@@ -72,9 +82,7 @@ def Snapshot.finished (snapshot : Snapshot) : Bool :=
   snapshot.jobs.any fun job => job.branch == Location.root && job.status == .done
 
 def State.finished (state : State) : Bool :=
-  match state.continuation with
-  | .done (.ok _) => true
-  | _ => false
+  state.started && state.groups.isEmpty && state.pending.isEmpty && state.error.isNone
 
 namespace Internal
 
@@ -95,26 +103,32 @@ private def view (state : State) (branch : Location) (update : Job → Job) : St
       | some index => state.jobs.set! index job
       | none => state.jobs.push job }
 
-/-- Run pure scheduling code until it awaits a missing reply. The mailbox loop
-remains free to serve other runs and administrative requests. -/
-partial def advance (state : State) : State :=
-  match state.continuation with
-  | .done result => { state with error := match result with | .ok _ => none | .error error => some error }
-  | .spawn branch next =>
-    let ticket := state.nextTicket
-    let state := view state branch fun job => { job with status := .pending }
-    advance { state with
-      pending := state.pending.push ⟨ticket, branch, .pending, none⟩
-      nextTicket := ticket + 1
-      continuation := next ticket }
-  | .await ticket next =>
-    match state.pending.find? (·.ticket == ticket) with
-    | some task => match task.reply with
-      | some reply => advance { state with
-          continuation := next reply
-          pending := state.pending.filter (·.ticket != ticket) }
-      | none => state
-    | none => { state with error := some ⟨.protocol, "Unknown scheduling ticket"⟩ }
+/-- Handle one callback until it finishes or dispatches a group. Completing
+the last callback removes its group before invoking the group's continuation.
+No other branch's reply is needed to advance this callback. -/
+partial def advance (state : State) (parent : Option Nat) : Waiting → State
+  | .done =>
+    match parent with
+    | none => state
+    | some id =>
+      match state.groups.findIdx? (·.id == id) with
+      | none => { state with error := some ⟨.protocol, "Unknown scheduling group"⟩ }
+      | some index =>
+        let group := state.groups[index]!
+        if group.remaining > 1 then
+          { state with groups := state.groups.set! index { group with remaining := group.remaining - 1 } }
+        else
+          advance { state with groups := state.groups.eraseIdxIfInBounds index } group.parent (group.next ())
+  | .forEach branches body next => Id.run do
+    if branches.isEmpty then return advance state parent (next ())
+    let id := state.nextGroup
+    let mut state := { state with
+      groups := state.groups.push ⟨id, parent, branches.size, next⟩
+      nextGroup := id + 1 }
+    for branch in branches do
+      state := view state branch fun job => { job with status := .pending }
+      state := { state with pending := state.pending.push ⟨id, branch, .pending, body branch⟩ }
+    return state
 
 def owned (state : State) (worker : WorkerId) : Option Assignment :=
   state.pending.findSome? fun task => match task.status with
@@ -125,7 +139,8 @@ def acquire (state : State) (worker : WorkerId) (duration : Nat) : State × Work
   if state.stopping.contains worker then return (state, .cancel state.barrier)
   if !state.stopping.isEmpty then return (state, .idle)
   if let some error := state.error then return (state, .failed error)
-  let state := advance state
+  let state := if state.started then state else
+    advance { state with started := true } none (suspend (run #[Location.root]))
   if let some error := state.error then return (state, .failed error)
   if state.finished then return (state, .finished)
   if let some existing := owned state worker then return (state, .execute existing)
@@ -139,7 +154,7 @@ def acquire (state : State) (worker : WorkerId) (duration : Nat) : State × Work
     .execute ⟨attempt, task.branchStart⟩)
 
 def accept (state : State) (report : Report) : State := Id.run do
-  if !state.stopping.isEmpty then return state
+  if !state.stopping.isEmpty || state.error.isSome then return state
   let some index := state.pending.findIdx? (fun task => match task.status with
       | .running worker attempt _ => worker == report.worker && attempt == report.attempt
       | _ => false) | return state
@@ -150,17 +165,17 @@ def accept (state : State) (report : Report) : State := Id.run do
     | .ok .done => { job with status := .done }
     | .ok (.fork location count) =>
       { job with location, joining := true, status := .waiting ((Array.range count).map location.child) }
-  -- Arrival order does not change the recursive program's result order.
-  let state := { state with
-    pending := state.pending.set! index { task with status := .done, reply := some report.progress } }
+  -- Consume ownership before calling the callback: duplicate reports cannot
+  -- run it twice. Workers still collect workflow results in source order.
+  let state := { state with pending := state.pending.eraseIdxIfInBounds index }
   match report.progress with
   | .error error => return { state with error := some error }
-  | .ok _ => return advance state
+  | .ok progress => return advance state (some task.group) (task.next progress)
 
 end Internal
 
 /-- Recovery uses no saved traversal. Attempt IDs remain monotone so old reports
-cannot satisfy a new ticket. The caller must first stop the old workers. -/
+cannot satisfy a new assignment. The caller must first stop the old workers. -/
 private def restart (state : State) : State :=
   { nextAttempt := state.nextAttempt, now := state.now, error := state.error, workers := state.workers }
 

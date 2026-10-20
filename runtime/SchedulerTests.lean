@@ -120,7 +120,7 @@ def run : IO Unit := IO.FS.withTempFile fun _ inboxPath =>
         let saved : Json ← LocalDb.loadValue observer "pool-v1" Json.null
         let runs ← IO.ofExcept (saved.getObjVal? "state" >>= (·.getObjValAs? (Array Json) "runs"))
         let catalog ← IO.ofExcept (runs[0]!.getObjVal? "scheduler")
-        for field in ["jobs", "pending", "continuation", "stopping"] do
+        for field in ["jobs", "pending", "groups", "started", "nextGroup", "continuation", "stopping"] do
           assertTrue (!(catalog.getObjVal? field).isOk) s!"Persisted traversal field: {field}"
         IO.sleep 500 -- retire the crashed scheduler's inbox session
         child.set (some (← start configPath))

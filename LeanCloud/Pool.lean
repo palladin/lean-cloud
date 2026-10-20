@@ -266,7 +266,7 @@ inductive Phase where
   | completed | failed | killed | paused | stopping | finalizing | noWorkers | queued | running
   deriving Repr, BEq, ToJson, FromJson
 
-/-- Current observations from the executable tickets. These are neither a saved
+/-- Current observations from the executable assignments. These are neither a saved
 schedule nor authority for dispatch. A configured worker need not be reachable. -/
 structure Diagnostics where
   phase : Phase
@@ -274,6 +274,7 @@ structure Diagnostics where
   configuredWorkers : Option Nat
   pending : Nat
   running : Nat
+  /-- Kept for wire compatibility. Worker replies now resume callbacks immediately. -/
   replies : Nat
   deriving Repr, BEq, ToJson, FromJson
 
@@ -295,7 +296,7 @@ def diagnostics (state : State) (run : Run) : Diagnostics := Id.run do
     else if running > 0 then .running else .queued
   return {
     phase, stopping := run.scheduler.stopping, configuredWorkers, pending, running
-    replies := (run.scheduler.pending.filter (·.reply.isSome)).size }
+    replies := 0 }
 
 /-- Administrative requests are serialized with assignment and report handling.
 Pausing revokes attempts; resuming never reuses an attempt number. -/

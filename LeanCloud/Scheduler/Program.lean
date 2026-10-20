@@ -4,40 +4,43 @@ import LeanEff.Core
 namespace LeanCloud.Scheduler
 open LeanEff
 
-/-- Volatile handles correlate replies with dispatched branches. -/
-abbrev Ticket := Nat
-
+/-- Dispatch every branch and start its callback as soon as its reply arrives.
+The effect completes once all callbacks, including their nested work, finish. -/
 inductive Scheduling : Effect where
-  | spawn (branchStart : Location) : Scheduling Ticket
-  | await (ticket : Ticket) : Scheduling (Except CloudError Progress)
+  | forEach (branches : Array Location)
+      (body : Location → Progress → EffF Scheduling Empty Unit) : Scheduling Unit
 
-abbrev Program := ExceptT CloudError (EffF Scheduling Empty)
+abbrev Program := EffF Scheduling Empty
+
+/-- Each callback progresses independently; the continuation after `forEach`
+runs exactly once after the entire group completes. -/
+def forEach (branches : Array Location) (body : Location → Progress → Program Unit) : Program Unit :=
+  EffF.send (Scheduling.forEach branches body)
 
 /-- The recursive coordinator, independent of inboxes, IO, and storage.
-Spawn the entire batch, await its replies in assignment order, finish each
-fork's children, then resume that parent. Only workers access replay records. -/
-partial def run (branches : List Location) : Program Unit := do
-  let tickets ← branches.mapM fun branch => liftM (EffF.send (μ := Empty) (Scheduling.spawn branch))
-  let reports ← tickets.mapM fun ticket => liftM (EffF.send (μ := Empty) (Scheduling.await ticket))
-  for (branch, report) in branches.zip reports do
-    match ← liftExcept report with
+Each subtree advances on its own replies and resumes its parent after its
+children finish. Only workers access replay records. -/
+partial def run (branches : Array Location) : Program Unit :=
+  forEach branches fun branch progress => do
+    match progress with
     | .done => pure ()
     | .fork location count =>
-        run ((List.range count).map location.child)
-        run [branch]
+        run ((Array.range count).map location.child)
+        run #[branch]
 
-/-- The inbox loop keeps only the current request and its in-memory callback.
-The closed request family lets this adapter live in ordinary runtime state. -/
+/-- A scheduling request with separate branch and group continuations.
+This closed request family lets the handler keep callbacks in runtime state. -/
 inductive Waiting where
-  | done (result : Except CloudError Unit)
-  | spawn (branch : Location) (next : Ticket → Waiting)
-  | await (ticket : Ticket) (next : Except CloudError Progress → Waiting)
-  deriving Nonempty
+  | done
+  | forEach (branches : Array Location) (body : Location → Progress → Waiting)
+      (next : Unit → Waiting)
+  deriving Inhabited
 
-partial def suspend (program : EffF Scheduling Empty (Except CloudError Unit)) : Waiting :=
+partial def suspend (program : Program Unit) : Waiting :=
   match program with
-  | .pure _ result => .done result
-  | .impure _ (.spawn branch) next => .spawn branch (fun ticket => suspend (next.apply ticket))
-  | .impure _ (.await ticket) next => .await ticket (fun reply => suspend (next.apply reply))
+  | .pure _ () => .done
+  | .impure _ (.forEach branches body) next =>
+      .forEach branches (fun branch progress => suspend (body branch progress))
+        (fun _ => suspend (next.apply ()))
 
 end LeanCloud.Scheduler
