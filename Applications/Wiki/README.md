@@ -6,16 +6,18 @@ Prepare the dataset once; reuse its immutable blob reference for many queries.
 
 | Program | Result |
 | --- | --- |
-| `wiki-prepare/v2` | Article shards and a reusable dataset reference |
-| `wiki-count/v2` | Occurrences and matching-article counts for each vocabulary word |
-| `wiki-grep/v2` | Matching articles, first-match positions and excerpts in blob files |
+| `wiki-prepare/v3` | Article shards and a reusable dataset reference |
+| `wiki-count/v3` | Occurrences and matching-article counts for each vocabulary word |
+| `wiki-grep/v3` | Matching articles, first-match positions and excerpts in blob files |
 
 ```lean
 cloud {
   let dataset ← Cloud.exec (fun _ => backend.dataset request.dataset) "read dataset"
-  let parts ← (backend.articles dataset).foldPartitions (countFold request)
-    (fun _ counts => backend.saveCounts counts) { label := "count vocabulary" }
-  Cloud.exec (fun _ => backend.sumCounts request dataset parts) "combine counts"
+  let total ← (backend.articles dataset).foldWith (countFold request)
+    (fun _ counts => backend.saveCounts counts)
+    (fun _ left right => backend.combineCounts request left right)
+    { label := "count vocabulary", combineLabel := "combine counts" }
+  Cloud.exec (fun _ => backend.finishCounts request dataset total) "validate counts"
 }
 ```
 
@@ -25,17 +27,19 @@ The [workflows](Wiki/Workflow.lean) use the reusable
 independent compressed parts with `flatMap`; counting folds article streams;
 grep collects references to independently written result files.
 
-Cloud reducers assign bounded batches across workers and use each executing
-worker's CPU budget for local tasks. Counting and grep split uncompressed blobs
+Cloud reducers form a balanced binary tree. Leaves process bounded batches using
+each executing worker's CPU budget; parent workers combine pairs of results.
+Counting and grep split uncompressed blobs
 into byte ranges, including a single large file. Workers fetch only intersecting
 immutable chunks; lean-reducers repairs newline/UTF-8 boundaries and processes
 each article once. Compressed XML is still split at bzip2 stream boundaries.
 
 Only summaries and immutable references enter the journal. Partial count tables
-are stored in blobs and merged one at a time; grep output stays in ordered blob
+are stored in blobs and merged in pairs throughout the tree; grep output stays in ordered blob
 parts. Per-file article totals and grep output limits are checked across all
-ranges. The `v2` workflow versions reflect the new execution structure; dataset,
-request, and result formats remain compatible with `v1` artifacts.
+ranges. The `v3` workflow versions reflect the tree execution structure; dataset,
+request, and result formats remain compatible with earlier artifacts. Finish
+existing `v2` runs with their original image before upgrading.
 
 ## First example, locally
 

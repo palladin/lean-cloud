@@ -12,7 +12,8 @@ structure Backend (m : Type → Type) where
   dataset : FileRef → m Dataset
   articles : Dataset → ReducerCloudM m (String × Article)
   saveCounts : CountPartial → m FileRef
-  sumCounts : CountRequest → Dataset → Array FileRef → m Counts
+  combineCounts : CountRequest → FileRef → FileRef → m FileRef
+  finishCounts : CountRequest → Dataset → FileRef → m Counts
   validateGrep : GrepRequest → m Unit
   search : GrepRequest → Dataset → ReducerCloudM m (String × Matches)
   publishMatches : GrepRequest → Dataset → Array (String × Matches) → m FileRef
@@ -31,9 +32,10 @@ def prepare [Monad m] [MonadCloudExec m] (b : Backend m) (r : PrepareRequest) : 
 def count [Monad m] [MonadCloudExec m] (b : Backend m) (r : CountRequest) : Cloud m Counts := cloud {
   match r.validate with | .error e => Cloud.fail e | .ok () => pure ()
   let dataset ← Cloud.exec (fun _ => b.dataset r.dataset) "read dataset"
-  let parts ← (b.articles dataset).foldPartitions (countFold r)
-    (fun _ counts => b.saveCounts counts) { label := "count vocabulary" }
-  Cloud.exec (fun _ => b.sumCounts r dataset parts) "combine counts"
+  let total ← (b.articles dataset).foldWith (countFold r)
+    (fun _ counts => b.saveCounts counts) (fun _ left right => b.combineCounts r left right)
+    { label := "count vocabulary", combineLabel := "combine counts" }
+  Cloud.exec (fun _ => b.finishCounts r dataset total) "validate counts"
 }
 
 def grep [Monad m] [MonadCloudExec m] (b : Backend m) (r : GrepRequest) : Cloud m GrepReport := cloud {

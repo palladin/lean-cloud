@@ -8,6 +8,12 @@ open Lean LeanCloud LeanCloudRuntime LeanReducers
 private def metadata [FromJson α] (store : ObjectStore) (ref : FileRef) : IO α := do
   IO.ofExcept (Json.parse (← Files.readText store ref (16 * MiB)) >>= fromJson?)
 
+private def countTable (store : ObjectStore) (r : CountRequest) (ref : FileRef) : IO CountPartial := do
+  let table : CountPartial ← metadata store ref
+  unless table.total.counts.map (·.word) == r.vocabulary do
+    throw (IO.userError "Count table does not match the requested vocabulary")
+  return table
+
 private def validParts (source : Source) : Except String Unit := do
   unless source.format == "wiki/source/v1" && !source.label.isEmpty && source.label.utf8ByteSize ≤ 1024 &&
       0 < source.parts.size && source.parts.size ≤ maxParts do throw "Invalid dump manifest"
@@ -129,18 +135,13 @@ def backendWith (getStore : IO ObjectStore) (rangeBytes : Nat := 8 * MiB)
     ReducerCloud.ofPartitions (ReducerCloud.fileRanges (dataset.shards.map (·.file)) rangeBytes)
       (fun _ ranges => articleLines getStore ranges analysisTimeoutMs) (·.size)
   saveCounts counts := do Files.putJson (← getStore) counts
-  sumCounts r dataset parts := do
+  combineCounts r left right := do
     let store ← getStore
-    let mut total := mergeCounts r #[]
-    let mut perFile := #[]
-    for part in parts do
-      let table : CountPartial ← metadata store part
-      unless table.total.counts.map (·.word) == r.vocabulary do
-        throw (IO.userError "Count table does not match the requested vocabulary")
-      total := mergeCounts r #[total, table.total]
-      perFile := table.perFile.foldl (fun acc (key, n) => addFileCount acc key n) perFile
-    IO.ofExcept (checkArticleCounts dataset perFile)
-    return total
+    Files.putJson store (Wiki.combineCounts r (← countTable store r left) (← countTable store r right))
+  finishCounts r dataset result := do
+    let table ← countTable (← getStore) r result
+    IO.ofExcept (checkArticleCounts dataset table.perFile)
+    return table.total
   search r dataset :=
     ReducerCloud.ofArrayIO (ReducerCloud.fileRanges (dataset.shards.map (·.file)) rangeBytes)
       (fun _ range => do return (range.source.sha256, ← grepRange (← getStore) r range analysisTimeoutMs)) (·.size)

@@ -55,12 +55,14 @@ def addFileCount (counts : Array (String × Nat)) (key : String) (value : Nat) :
   | some i => counts.modify i fun (key, n) => (key, n + value)
   | none => counts.push (key, value)
 
+def combineCounts (r : CountRequest) (left right : CountPartial) : CountPartial := {
+  total := mergeCounts r #[left.total, right.total]
+  perFile := right.perFile.foldl (fun acc (key, n) => addFileCount acc key n) left.perFile }
+
 def countFold (r : CountRequest) : LeanReducers.FoldSpec (String × Article) CountPartial :=
   let table := vocabulary r
   { unit := { total := mergeCounts r #[] }
-    combine := fun left right => {
-      total := mergeCounts r #[left.total, right.total]
-      perFile := right.perFile.foldl (fun acc (key, n) => addFileCount acc key n) left.perFile }
+    combine := combineCounts r
     step := fun (key, article) acc => {
       total := addArticle acc.total (wordHits table r.ignoreCase article.text)
       perFile := acc.perFile.foldl (fun counts (key, n) => addFileCount counts key n) #[(key, 1)] } }

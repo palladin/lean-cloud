@@ -91,7 +91,18 @@ private def nativeTests (store : ObjectStore) : IO Unit := IO.FS.withTempDir fun
   -- Force cuts inside JSON, UTF-8 and individual article lines. The cloud
   -- reader must repair them exactly once using lean-reducers' byte source.
   let ranged := backendWith (pure store) 17
-  check ((← direct store (count ranged r)) == counted) "Byte-range count differs from whole-shard count"
+  let merged ← Std.Mutex.new (0 : Nat)
+  let treeBackend := { ranged with combineCounts := fun request left right => do
+    merged.atomically (modify (· + 1))
+    ranged.combineCounts request left right }
+  check ((← direct store (count treeBackend r)) == counted) "Byte-range count differs from whole-shard count"
+  check ((← merged.atomically get) > 1) "Wiki did not combine count blobs through multiple tree nodes"
+  let treeLog ← Std.Mutex.new []
+  check ((← concurrent (journal treeLog) store.storage (count treeBackend r)) == counted)
+    "Concurrent count tree differs from direct"
+  let before ← merged.atomically get
+  discard (concurrent (journal treeLog) store.storage (count treeBackend r))
+  check ((← merged.atomically get) == before) "Replay repeated a recorded count-blob merge"
   let dataset ← b.dataset prepared.dataset
   -- Expiry during source setup must stop before the first blob request,
   -- instead of fetching/folding the entire batch and only then failing.
