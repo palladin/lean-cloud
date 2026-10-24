@@ -3,6 +3,7 @@ import LeanCloud.Proofs.Parallel
 import LeanCloud.Proofs.JournalRegion
 
 namespace LeanCloud.Proofs.Specification
+
 open Lean LeanEff ReplayModel JournalRegion
 
 /-- A real parallel group in the pure specification: its children have known
@@ -37,7 +38,7 @@ inductive Complete {m : Type → Type u} [Monad m] (expected : Journal) :
       Complete expected current (.impure info (.command codec (.exec label (fun _ => pure (body ())))) next)
         outcome (budget + 1)
   | parallelOk {info : Option SourceSiteId} (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
-      (next : ArrsF (Control m) SourceSiteId (Array α) β) (outcomes : Fin count → Except CloudError α)
+      (label : String) (next : ArrsF (Control m) SourceSiteId (Array α) β) (outcomes : Fin count → Except CloudError α)
       (roundtrip : Pure.RoundTrips codec)
       (children : ∀ index, Complete expected (current.child index) (branches index) (outcomes index) childBudget)
       (returned : ∀ index, expected.lookup (ReplayStore.returnKey (current.child index)) =
@@ -46,10 +47,10 @@ inductive Complete {m : Type → Type u} [Monad m] (expected : Journal) :
       (present : expected.lookup (ReplayStore.valueKey current) =
         some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, .success (Json.arr (values.map codec.encode))⟩)
       (rest : Complete expected current.next (next.apply values) outcome budget) :
-      Complete expected current (.impure info (.parallel codec count branches) next) outcome
+      Complete expected current (.impure info (.parallel codec count branches label) next) outcome
         (childBudget + budget + 1)
   | parallelError {info : Option SourceSiteId} (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
-      (next : ArrsF (Control m) SourceSiteId (Array α) β) (outcomes : Fin count → Except CloudError α)
+      (label : String) (next : ArrsF (Control m) SourceSiteId (Array α) β) (outcomes : Fin count → Except CloudError α)
       (roundtrip : Pure.RoundTrips codec)
       (children : ∀ index, Complete expected (current.child index) (branches index) (outcomes index) childBudget)
       (returned : ∀ index, expected.lookup (ReplayStore.returnKey (current.child index)) =
@@ -57,7 +58,7 @@ inductive Complete {m : Type → Type u} [Monad m] (expected : Journal) :
       (collected : (Array.ofFn outcomes).mapM id = .error error)
       (present : expected.lookup (ReplayStore.valueKey current) =
         some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, .failure error⟩) :
-      Complete expected current (.impure info (.parallel codec count branches) next) (.error error) (childBudget + 1)
+      Complete expected current (.impure info (.parallel codec count branches label) next) (.error error) (childBudget + 1)
   | weaken (meaning : Complete expected current program outcome budget) (enough : budget ≤ larger) :
       Complete expected current program outcome larger
 
@@ -85,11 +86,11 @@ theorem Complete.extend {m : Type → Type u} [Monad m] {α : Type}
   | delay next rest ih => exact .delay next ih
   | exec codec label body next roundtrip present rest ih =>
     exact .exec codec label body next roundtrip (extension _ _ present) ih
-  | parallelOk codec count branches next outcomes roundtrip children returned collected present rest ihChildren ih =>
-    exact .parallelOk codec count branches next outcomes roundtrip ihChildren
+  | parallelOk codec count branches label next outcomes roundtrip children returned collected present rest ihChildren ih =>
+    exact .parallelOk codec count branches label next outcomes roundtrip ihChildren
       (fun index => extension _ _ (returned index)) collected (extension _ _ present) ih
-  | parallelError codec count branches next outcomes roundtrip children returned collected present ihChildren =>
-    exact .parallelError codec count branches next outcomes roundtrip ihChildren
+  | parallelError codec count branches label next outcomes roundtrip children returned collected present ihChildren =>
+    exact .parallelError codec count branches label next outcomes roundtrip ihChildren
       (fun index => extension _ _ (returned index)) collected (extension _ _ present)
   | weaken complete enough ih => exact .weaken ih enough
 
@@ -150,7 +151,7 @@ theorem complete_journal_exists {m : Type → Type u} [Monad m] {α : Type}
     obtain ⟨_, extension, present, coverage⟩ := assemble parent branch command [] journal record (by simp [Covers]) coverage
     refine ⟨_, budget + 1, .exec codec label body next roundtrip present ?_, coverage⟩
     simpa only [Location.next_push] using complete.extend extension
-  | parallelOk codec count branches next outcomes roundtrip children collected rest ihChildren ih =>
+  | parallelOk codec count branches label next outcomes roundtrip children collected rest ihChildren ih =>
     rename_i valueType resultType values result sourceInfo
     obtain ⟨descendants, childBudget, childSpecs, returned, childRegion⟩ :=
       children_exist (parent.push (branch, command)) codec count branches outcomes
@@ -160,11 +161,11 @@ theorem complete_journal_exists {m : Type → Type u} [Monad m] {α : Type}
       ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, .success (Json.arr (values.map codec.encode))⟩
     obtain ⟨childExtension, extension, present, coverage⟩ :=
       assemble parent branch command descendants journal record childRegion coverage
-    refine ⟨_, childBudget + budget + 1, .parallelOk codec count branches next outcomes roundtrip
+    refine ⟨_, childBudget + budget + 1, .parallelOk codec count branches label next outcomes roundtrip
       (fun index => (childSpecs index).extend childExtension)
       (fun index => childExtension _ _ (returned index)) collected present ?_, coverage⟩
     simpa only [Location.next_push] using complete.extend extension
-  | parallelError codec count branches next outcomes roundtrip children collected ihChildren =>
+  | parallelError codec count branches label next outcomes roundtrip children collected ihChildren =>
     rename_i valueType resultType error sourceInfo
     obtain ⟨descendants, childBudget, childSpecs, returned, childRegion⟩ :=
       children_exist (parent.push (branch, command)) codec count branches outcomes
@@ -172,7 +173,7 @@ theorem complete_journal_exists {m : Type → Type u} [Monad m] {α : Type}
     let record : ReplayRecord := ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, .failure error⟩
     obtain ⟨extension, _, present, coverage⟩ :=
       assemble parent branch command descendants [] record childRegion (by simp [Covers])
-    exact ⟨_, childBudget + 1, .parallelError codec count branches next outcomes roundtrip
+    exact ⟨_, childBudget + 1, .parallelError codec count branches label next outcomes roundtrip
       (fun index => (childSpecs index).extend extension)
       (fun index => extension _ _ (returned index)) collected present, coverage⟩
 

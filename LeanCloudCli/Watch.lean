@@ -168,7 +168,7 @@ private def branchPanel (ctx : Context) (run : Run) (steps : Array Trace.Step)
   let worker := if live then assigned.map (·.1) else own.back?.map (·.event.worker)
   let code := if live && assigned.isSome && row.fork.isNone then
     executing steps entries (assigned.get!.1) else branchCode steps row
-  let title := row.fork.map (fun fork => s!" Parallel {fork.key}") |>.getD s!" Branch {row.branch.key}"
+  let title := if row.fork.isSome then s!" {row.title}" else s!" Branch {row.branch.key}"
   let codeRows := if row.fork.isSome then min 5 (max 2 (height / 5)) else min 12 (max 2 (height - 16))
   let mut lines := #[Styled.text (pad width title) .header,
     Styled.text row.status .cyan, Styled.text s!"Source: {sourceLabel run code}" .muted]

@@ -30,7 +30,7 @@ mutual
     | .delay => pure ()
     | .fail error => throw error
     | .command _ operation => blobs.execute operation environment
-    | .parallel _ _ branches => do
+    | .parallel _ _ branches _ => do
       -- Run every child, keeping failures as values so they cannot skip later children.
       let outcomes ← liftM (m := m)
         (Array.ofFnM fun index => (eval blobs (branches index) environment).run)

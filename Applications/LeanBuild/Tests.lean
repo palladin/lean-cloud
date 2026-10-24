@@ -160,6 +160,19 @@ private def partitionTests : IO Unit := do
   IO.println "PASS DAG planning: critical paths, local joins, barrier merging, CPU weighting, caps and progress"
 
 private def generatedTests : IO Unit := do
+  check (progressLabel 200 9031 == "200/9,031 · 2%") "Wrong short progress label"
+  check (progressLabel 9031 9031 == "9,031/9,031 · 100%") "Wrong completed progress label"
+  let saved ← IO.mkRef ([] : List (String × ReplayRecord))
+  let labels ← IO.mkRef (#[] : Array String)
+  let observer : ReplayInterpreter.Observer IO := fun _ _ label =>
+    if let some label := label then labels.modify (·.push label) else pure ()
+  let step (location : Location) := (ReplayInterpreter.step (journal saved) noBlobs 1000
+    (workflow stub) { request with modulesPerJob := 1 } ⟨0, location⟩ (some observer)).run
+  for expected in ["0/2 · 0%", "1/2 · 50%"] do
+    let .ok (.fork location 1) ← step Location.root | throw (IO.userError "Expected one-module round")
+    check ((← labels.get).back? == some expected) "Round label is not the completed-module count"
+    let .ok .done ← step (location.child 0) | throw (IO.userError "Child did not complete")
+  let .ok .done ← step Location.root | throw (IO.userError "Labeled workflow did not finish")
   partitionTests
   for version in ["4.35.0", "4.35.1", "4.36.0", "5.0.0"] do
     check ((Tools.sourceRelease s!"leanprover/lean4:v{version}").toOption == some version) "Supported release rejected"

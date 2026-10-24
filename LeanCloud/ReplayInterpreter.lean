@@ -116,8 +116,14 @@ def result [Monad m] [codec : Codec α] (outcome : Exit) : ExceptT CloudError m 
   | .failure error => throw error
   | .cancelled reason => throw ⟨.cancelled, reason⟩
 
-/-- Optional diagnostic context. It is not persisted and never affects routing. -/
-abbrev Observer (m : Type → Type u) := Location → Option SourceSiteId → m Unit
+/-- Optional diagnostic context: location, source site, and parallel display label.
+It is not part of the replay journal and never affects routing. -/
+abbrev Observer (m : Type → Type u) := Location → Option SourceSiteId → Option String → m Unit
+
+private def parallelLabel (program : Cloud m α) : Option String :=
+  match program with
+  | .impure _ (.parallel _ _ _ label) _ => some label
+  | _ => none
 
 /-- Replay the assigned branch until its next suspension or completion.
 Storage alone determines whether a command or parallel group has finished. -/
@@ -141,7 +147,7 @@ def replay [Monad m] (store : ReplayStore m) (blobs : BlobStorage m) (branchStar
           resume store branchStart (decode codec)
             (fun value => replay store blobs branchStart fuel encode
               (ArrsF.apply continuation value) current.next observer environment) outcome
-        | .parallel codec count _, continuation => do
+        | .parallel codec count _ _, continuation => do
           let expected : Request := ⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩
           let continueWith (outcome : Exit) :=
             resume store branchStart (decodeGroup codec count)
@@ -158,7 +164,7 @@ def replay [Monad m] (store : ReplayStore m) (blobs : BlobStorage m) (branchStar
     match observer with
     | none => action
     | some visit => do
-      visit current program.metadata
+      visit current program.metadata (parallelLabel program)
       action
 
 /-- Follow ancestor records from the root to `branchStart`. Descending into a
@@ -185,7 +191,7 @@ def reconstruct [Monad m] (store : ReplayStore m) (blobs : BlobStorage m) (branc
             let wire ← recorded store current (request codec operation) "Missing result in replay prefix"
             let value ← decode codec wire
             reconstruct store blobs branchStart fuel encode (ArrsF.apply continuation value) current.next observer environment
-          | .parallel codec count branches, continuation => do
+          | .parallel codec count branches _, continuation => do
             if current.entersChild branchStart then
               let index := branchStart[current.size]!.1
               if inside : index < count then
@@ -200,7 +206,7 @@ def reconstruct [Monad m] (store : ReplayStore m) (blobs : BlobStorage m) (branc
       match observer with
       | none => action
       | some visit => do
-        visit current program.metadata
+        visit current program.metadata (parallelLabel program)
         action
 
 /-- Run one assigned branch segment. Repeated attempts reuse its durable return

@@ -1,6 +1,8 @@
 import LeanCloud.Proofs.Direct
 
 namespace LeanCloud.Proofs.Pure
+
+variable {label : String}
 open LeanEff DirectInterpreter.Internal
 
 variable {info : Option SourceSiteId}
@@ -37,24 +39,24 @@ inductive Evaluation {m : Type → Type u} [Monad m] :
       (rest : Evaluation (next.apply (body ())) outcome) :
       Evaluation (.impure info (.command codec (.exec label (fun _ => pure (body ())))) next) outcome
   | parallelOk {info : Option SourceSiteId} (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
-      (next : ArrsF (Control m) SourceSiteId (Array α) β) (outcomes : Fin count → Except CloudError α)
+      (label : String) (next : ArrsF (Control m) SourceSiteId (Array α) β) (outcomes : Fin count → Except CloudError α)
       (roundtrip : RoundTrips codec)
       (children : ∀ index, Evaluation (branches index) (outcomes index))
       (collected : (Array.ofFn outcomes).mapM id = .ok values)
       (rest : Evaluation (next.apply values) outcome) :
-      Evaluation (.impure info (.parallel codec count branches) next) outcome
+      Evaluation (.impure info (.parallel codec count branches label) next) outcome
   | parallelError {info : Option SourceSiteId} (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
-      (next : ArrsF (Control m) SourceSiteId (Array α) β) (outcomes : Fin count → Except CloudError α)
+      (label : String) (next : ArrsF (Control m) SourceSiteId (Array α) β) (outcomes : Fin count → Except CloudError α)
       (roundtrip : RoundTrips codec)
       (children : ∀ index, Evaluation (branches index) (outcomes index))
       (collected : (Array.ofFn outcomes).mapM id = .error error) :
-      Evaluation (.impure info (.parallel codec count branches) next) (.error error)
+      Evaluation (.impure info (.parallel codec count branches label) next) (.error error)
 
 private theorem eval_parallel {m : Type → Type u} [Monad m] [LawfulMonad m]
     (blobs : BlobStorage m) (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
     (outcomes : Fin count → Except CloudError α)
     (children : ∀ index, (eval blobs (branches index)).run = pure (outcomes index)) :
-    (evalControl blobs (.parallel codec count branches)).run =
+    (evalControl blobs (.parallel codec count branches label)).run =
       pure ((Array.ofFn outcomes).mapM id) := by
   have same := funext children
   simp only [evalControl]
@@ -77,14 +79,14 @@ theorem evaluation_matches_direct {m : Type → Type u} [Monad m] [LawfulMonad m
   | exec codec label body next roundtrip rest ih =>
     rw [Direct.eval_impure]
     simpa [evalControl, BlobStorage.execute] using ih
-  | parallelOk codec count branches next outcomes roundtrip children collected rest ihChildren ih =>
+  | parallelOk codec count branches label next outcomes roundtrip children collected rest ihChildren ih =>
     rw [Direct.eval_impure]
-    change (evalControl blobs (.parallel codec count branches)).run >>= _ = _
+    change (evalControl blobs (.parallel codec count branches label)).run >>= _ = _
     rw [eval_parallel blobs codec count branches outcomes ihChildren, collected]
     simpa [ExceptT.bindCont, ExceptT.run] using ih
-  | parallelError codec count branches next outcomes roundtrip children collected ihChildren =>
+  | parallelError codec count branches label next outcomes roundtrip children collected ihChildren =>
     rw [Direct.eval_impure]
-    change (evalControl blobs (.parallel codec count branches)).run >>= _ = _
+    change (evalControl blobs (.parallel codec count branches label)).run >>= _ = _
     rw [eval_parallel blobs codec count branches outcomes ihChildren, collected]
     simp [ExceptT.bindCont]
 

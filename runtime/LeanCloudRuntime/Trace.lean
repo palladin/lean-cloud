@@ -79,8 +79,10 @@ def Sink.branches (sink : Sink) (before after : Array Scheduler.Job) : IO Unit :
     sink.emit "branch-state" label (some observation)
 
 /-- Set context before the interpreter touches a record, including replay hits. -/
-def Sink.visit (sink : Sink) (location : Location) (source : Option SourceSiteId) : IO Unit :=
+def Sink.visit (sink : Sink) (location : Location) (source : Option SourceSiteId)
+    (parallelLabel : Option String) : IO Unit := do
   sink.state.modify fun state => { state with location := location.key, source }
+  if let some label := parallelLabel then sink.emit "parallel-label" label
 
 /-- Joining probes child returns. Restore the parallel location before retaining
 its source, rather than attributing the suspension to the last child read. -/
@@ -131,7 +133,8 @@ def Sink.instrument (sink : Sink) (fuel : Nat) (program : Cloud IO α) : Cloud I
       | .command codec (.exec label body) => .command codec (.exec label fun environment => do
           sink.emit "execute" label
           body environment)
-      | .parallel codec count branches => .parallel codec count fun i => sink.instrument fuel (branches i)
+      | .parallel codec count branches label =>
+          .parallel codec count (fun i => sink.instrument fuel (branches i)) label
       | other => other
     EffF.impure info control (.one fun value => sink.instrument fuel (ArrsF.apply next value))
 

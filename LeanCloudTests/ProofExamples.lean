@@ -18,7 +18,7 @@ private theorem child_meaning [Monad m] (captured : Bool) : Pure.Evaluation (chi
 
 private def nested [Monad m] (captured : Bool) : Cloud m Bool :=
   .impure none (.parallel (inferInstance : Codec Bool) 2
-    (fun index => child (if index.val = 0 then captured else !captured)))
+    (fun index => child (if index.val = 0 then captured else !captured)) "nested work")
     (.one fun values => .pure none values[0]!)
 
 private theorem nested_meaning [Monad m] (captured : Bool) : Pure.Evaluation (nested (m := m) captured) (.ok captured) := by
@@ -34,7 +34,7 @@ private def source [Monad m] (_ : Unit) : Cloud m Json :=
   .impure none (.command (inferInstance : Codec Bool) (.exec "captured" fun _ => pure true))
     (.one fun captured =>
       .impure none (.parallel (inferInstance : Codec Bool) 2
-        (fun index => if index.val = 0 then nested captured else child (!captured)))
+        (fun index => if index.val = 0 then nested captured else child (!captured)) "0/2 · 0%")
         (.one fun values => .pure none (toJson values)))
 
 private theorem source_meaning [Monad m] : Pure.Evaluation (source (m := m) ()) (.ok (toJson #[true, false])) := by

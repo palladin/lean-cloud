@@ -3,6 +3,8 @@ import LeanCloud.Proofs.Results
 import LeanCloud.Proofs.JournalMerge
 
 namespace LeanCloud.Proofs.Recording
+
+variable {label : String}
 open Lean LeanEff ReplayModel ReplayInterpreter JournalMerge JournalRegion
 
 variable {info : Option SourceSiteId}
@@ -204,7 +206,7 @@ theorem join_missing_is_cached (journal : Journal) (blobs : BlobStorage M) (bran
       ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩,
         collect ((Array.range count).map outcomes)⟩
     let after := (ReplayStore.valueKey current, record) :: journal
-    let program := EffF.impure info (.parallel codec count branches) next
+    let program := EffF.impure info (.parallel codec count branches label) next
     (replay store blobs branch (fuel + 1) encode program current).run journal =
       (replay store blobs branch (fuel + 1) encode program current).run after := by
   dsimp only
@@ -224,7 +226,7 @@ theorem group_success (journal : Journal) (blobs : BlobStorage M) (branch : Loca
     (present : journal.lookup (ReplayStore.valueKey current) =
       some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩,
         .success (Json.arr (values.map codec.encode))⟩) :
-    (replay store blobs branch (fuel + 1) encode (.impure info (.parallel codec count branches) next) current).run journal =
+    (replay store blobs branch (fuel + 1) encode (.impure info (.parallel codec count branches label) next) current).run journal =
       (replay store blobs branch fuel encode (next.apply values) current.next).run journal := by
   rw [replay]
   erw [read_then]
@@ -237,7 +239,7 @@ theorem group_failure (journal : Journal) (blobs : BlobStorage M) (branch : Loca
     (next : ArrsF (Control M) SourceSiteId (Array α) β) (error : CloudError)
     (present : journal.lookup (ReplayStore.valueKey current) =
       some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, .failure error⟩) :
-    (replay store blobs branch (fuel + 1) encode (.impure info (.parallel codec count branches) next) current).run journal =
+    (replay store blobs branch (fuel + 1) encode (.impure info (.parallel codec count branches label) next) current).run journal =
       (Internal.finish store branch (.failure error)).run journal := by
   rw [replay]
   erw [read_then]

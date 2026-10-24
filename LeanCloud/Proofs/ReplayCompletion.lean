@@ -3,6 +3,8 @@ import LeanCloud.Proofs.ReplayExecution
 import LeanCloud.Proofs.Recording
 
 namespace LeanCloud.Proofs.ReplayCompletion
+
+variable {label : String}
 open Lean LeanEff ReplayModel ReplayInterpreter ProgramCursor ReplayExecution JournalMerge JournalRegion
 
 variable {info : Option SourceSiteId}
@@ -116,8 +118,8 @@ private theorem join_records (expected journal : Journal) (branch current : Loca
       Writes (fun key => key = ReplayStore.valueKey current) journal after ∧
       after.lookup (ReplayStore.valueKey current) =
         some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, outcome⟩ ∧
-      ∀ fuel, (replay store blobs branch (fuel + 1) encode (.impure info (.parallel codec count branches) next) current).run journal =
-        (replay store blobs branch (fuel + 1) encode (.impure info (.parallel codec count branches) next) current).run after := by
+      ∀ fuel, (replay store blobs branch (fuel + 1) encode (.impure info (.parallel codec count branches label) next) current).run journal =
+        (replay store blobs branch (fuel + 1) encode (.impure info (.parallel codec count branches label) next) current).run after := by
   cases found : journal.lookup (ReplayStore.valueKey current) with
   | some record =>
     exact ⟨journal, .refl _, consistent, .refl _ _, found.trans ((consistent _ _ found).symm.trans known), by intros; rfl⟩
@@ -135,7 +137,7 @@ private theorem parallel_runs (expected journal : Journal) (branch current : Loc
     (encode : β → Json) (codec : Codec γ) (count : Nat)
     (branches : Fin count → Cloud M γ) (next : ArrsF (Control M) SourceSiteId (Array γ) β)
     (outcomes : Fin count → Except CloudError γ) (outcome : Exit)
-    (cursor : Cursor blobs source journal current encode (.impure info (.parallel codec count branches) next))
+    (cursor : Cursor blobs source journal current encode (.impure info (.parallel codec count branches label) next))
     (consistent : Extends journal expected)
     (known : expected.lookup (ReplayStore.returnKey branch) = some ⟨ReplayStore.returnRequest, outcome⟩)
     (group : expected.lookup (ReplayStore.valueKey current) =
@@ -151,13 +153,13 @@ private theorem parallel_runs (expected journal : Journal) (branch current : Loc
         some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩,
           Parallel.recorded (fun values => Json.arr (values.map codec.encode)) ((Array.ofFn outcomes).mapM id)⟩ →
       Verified blobs source mode expected branch outcome
-        (fun fuel => replay store blobs branch fuel encode (.impure info (.parallel codec count branches) next) current) after) :
+        (fun fuel => replay store blobs branch fuel encode (.impure info (.parallel codec count branches label) next) current) after) :
     Verified blobs source mode expected branch outcome
-      (fun fuel => replay store blobs branch fuel encode (.impure info (.parallel codec count branches) next) current) journal := by
+      (fun fuel => replay store blobs branch fuel encode (.impure info (.parallel codec count branches label) next) current) journal := by
   have joinRun : ∀ after, Extends journal after → Extends after expected →
       Recording.JoinReady expected after current →
       Verified blobs source mode expected branch outcome
-        (fun fuel => replay store blobs branch fuel encode (.impure info (.parallel codec count branches) next) current) after := by
+        (fun fuel => replay store blobs branch fuel encode (.impure info (.parallel codec count branches label) next) current) after := by
     intro after grows compatible ready
     obtain ⟨recorded, extension, consistentAfter, written, present, executes⟩ := join_records blobs expected after branch current encode codec count branches next _
       compatible group ready
@@ -239,7 +241,7 @@ theorem complete_runs {expected current} {program : Cloud M β} {outcome budget}
     have continues := ih encode after branch compatible (by simpa using same)
       ((cursor.extend blobs source grows).exec blobs source codec label body next recorded roundtrip) known
     exact continues.extend_before blobs source mode (written.mono (fun key eq => eq ▸ Owns.value same)) ⟨1, 0, fun fuel _ => by simpa [Nat.add_comm] using executes fuel⟩
-  | parallelOk codec count branches next outcomes roundtrip children returned collected present rest ihChildren ih =>
+  | parallelOk codec count branches label next outcomes roundtrip children returned collected present rest ihChildren ih =>
     intro encode journal branch consistent same cursor known
     apply parallel_runs blobs source mode expected journal branch _ same encode codec count branches next outcomes _ cursor consistent known
       (by simpa [collected, Parallel.recorded] using present) returned
@@ -258,7 +260,7 @@ theorem complete_runs {expected current} {program : Cloud M β} {outcome budget}
       apply continues.replace blobs source mode
       exact ⟨1, fun fuel => by simpa only [Nat.add_comm 1, Parallel.recorded] using
         Recording.group_success encode after blobs branch _ fuel codec count branches next _ roundtrip size presentAfter⟩
-  | parallelError codec count branches next outcomes roundtrip children returned collected present ihChildren =>
+  | parallelError codec count branches label next outcomes roundtrip children returned collected present ihChildren =>
     intro encode journal branch consistent same cursor known
     apply parallel_runs blobs source mode expected journal branch _ same encode codec count branches next outcomes _ cursor consistent known
       (by simpa [collected, Parallel.recorded] using present) returned

@@ -32,6 +32,31 @@ private def plan (env : LeanCloud.Environment) : Array (Cloud IO Nat) :=
   #[pure env.currentWorker.cpus]
 
 def cases : Array TestCase := #[
+  ⟨"environment.parallel-label-is-display-only", do
+    let labels ← IO.mkRef (#[] : Array (Location × String))
+    let observe : ReplayInterpreter.Observer IO := fun location _ label =>
+      if let some label := label then labels.modify (·.push (location, label)) else pure ()
+    let program (label : String) (_ : Unit) : Cloud IO (Array Nat) := cloud {
+      Cloud.parallel (label := label) fun _ => #[pure 3, pure 5]
+    }
+    let saved ← IO.mkRef ([] : Journal)
+    let store := journalStore saved
+    let step (label : String) (branch : Location) :=
+      (ReplayInterpreter.step store noBlobs 100 (program label) () ⟨0, branch⟩ (some observe)).run
+    let .ok (.fork location 2) ← step "200/9,031 · 2%" Location.root
+      | throw (IO.userError "Expected labeled parallel")
+    for i in [:2] do
+      assertOutcome (← step "renamed" (location.child i)) (.ok .done)
+    assertOutcome (← step "renamed" Location.root) (.ok .done)
+    let before ← saved.get
+    saved.modify (·.filter (·.1 != ReplayStore.returnKey Location.root))
+    assertOutcome (← step "final label" Location.root) (.ok .done)
+    assertTrue ((← saved.get) == before) "Display label changed replay records"
+    assertTrue ((← labels.get).contains (location, "200/9,031 · 2%")) "Source annotation lost parallel label"
+    assertTrue ((← labels.get).contains (location, "final label")) "Cached join lost its label"
+    let .ok (some outcome) ← store.outcome.run | throw (IO.userError "Missing root result")
+    assertOutcome (ReplayInterpreter.result (m := Id) (α := Array Nat) outcome).run (.ok #[3, 5])
+    assertOutcome (← (DirectInterpreter.interpret noBlobs (program "direct label") ()).run) (.ok #[3, 5])⟩,
   ⟨"environment.parallel-callback-syntax", do
     let runParallel : (LeanCloud.Environment → Array (Cloud IO Nat)) → Cloud IO (Array Nat) :=
       Cloud.parallel

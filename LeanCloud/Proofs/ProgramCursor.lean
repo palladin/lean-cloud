@@ -1,6 +1,8 @@
 import LeanCloud.Proofs.ReplayCursor
 
 namespace LeanCloud.Proofs.ProgramCursor
+
+variable {label : String}
 open Lean LeanEff ReplayModel ReplayInterpreter Routing
 
 variable {info : Option SourceSiteId}
@@ -54,7 +56,7 @@ theorem Cursor.exec {journal current encode} (codec : Codec β) (label : String)
 
 theorem Cursor.joined {journal current encode} (codec : Codec β) (count : Nat)
     (branches : Fin count → Cloud M β) (next : ArrsF (Control M) SourceSiteId (Array β) γ) (values : Array β)
-    (cursor : Cursor blobs source journal current encode (.impure info (.parallel codec count branches) next))
+    (cursor : Cursor blobs source journal current encode (.impure info (.parallel codec count branches label) next))
     (present : journal.lookup (ReplayStore.valueKey current) =
       some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, .success (Json.arr (values.map codec.encode))⟩)
     (decoded : (@instCodecArray β codec).decode (Json.arr (values.map codec.encode)) = .ok values)
@@ -72,7 +74,7 @@ theorem Cursor.joined {journal current encode} (codec : Codec β) (count : Nat)
 
 theorem Cursor.child {journal current encode} (codec : Codec β) (count : Nat)
     (branches : Fin count → Cloud M β) (next : ArrsF (Control M) SourceSiteId (Array β) γ)
-    (cursor : Cursor blobs source journal current encode (.impure info (.parallel codec count branches) next)) (index : Fin count) :
+    (cursor : Cursor blobs source journal current encode (.impure info (.parallel codec count branches label) next)) (index : Fin count) :
     Cursor blobs source journal (current.child index) codec.encode (branches index) := by
   obtain ⟨route, cost, replay⟩ := cursor
   have nonempty : 0 < current.size := Nat.lt_of_lt_of_le (by decide) route.depth

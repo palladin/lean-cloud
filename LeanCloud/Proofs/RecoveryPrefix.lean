@@ -3,6 +3,8 @@ import LeanCloud.Proofs.ReplayCursor
 import LeanCloud.Proofs.WorkerRecovery
 
 namespace LeanCloud.Proofs.RecoveryPrefix
+
+variable {label : String}
 open Lean LeanEff ReplayFaults ReplayModel ReplayInterpreter WorkerRecovery
 open ReplayCursor Routing
 
@@ -50,7 +52,7 @@ private theorem joined (point : ReplayTarget)
     (size : values.size = count)
     (rest : Ensures invariant pre (atPoint ReplayFaults.store ReplayFaults.noBlobs point fuel encode (next.apply values) current.next) post) :
     Ensures invariant pre (atPoint ReplayFaults.store ReplayFaults.noBlobs point (fuel + 1) encode
-      (.impure info (.parallel codec count branches) next) current) post := by
+      (.impure info (.parallel codec count branches label) next) current) post := by
   have nextSize : current.next.size = current.size := by simp [LeanCloud.Location.next]
   by_cases same : current.size = point.location.size
   · simp only [atPoint, same, beq_self_eq_true, ite_true, nextSize] at rest ⊢
@@ -109,7 +111,7 @@ theorem transport [rootCodec : Codec α] (source : Cloud WorkerM α)
     rw [Nat.add_comm 1]
     exact joined point branch _ fuel _ codec count branches next values (edge.trans follows) skip valid
       (fun after h => extension after h _ _ present) decoded size rest
-  | @child β γ journal current encode cost info codec count branches next cursor index ih =>
+  | @child β γ journal current encode cost info codec count branches label next cursor index ih =>
     have route := (cursor.route source).1
     have edge := child_follows _ (Nat.lt_of_lt_of_le (by decide) route.depth) index
     have enters := enters_follows (enters_child _ index) follows

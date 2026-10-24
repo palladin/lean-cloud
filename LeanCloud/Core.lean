@@ -33,7 +33,8 @@ mutual
   def sourceControl {m : Type → Type u} {α : Type} (site : SourceSiteId)
       (request : Control m α) (remap : Array (SourceSiteId × SourceSiteId) := #[]) : Control m α :=
     match request with
-    | .parallel codec count branches => .parallel codec count fun i => withSource site (branches i) remap
+    | .parallel codec count branches label =>
+        .parallel codec count (fun i => withSource site (branches i) remap) label
     | other => other
   termination_by structural request
 
@@ -58,16 +59,17 @@ handle the exception inside `body`; only node crashes trigger replay recovery. -
 def exec [MonadCloudExec m] [Codec α] (body : Environment → m α) (label : String := "") : Cloud m α :=
   send (.command inferInstance (.exec label fun environment => MonadCloudExec.capture (body environment)))
 
-private def fork [Codec α] (branches : Array (Cloud m α)) : Cloud m (Array α) :=
-  send (.parallel inferInstance branches.size (fun index => branches[index]))
+private def fork [Codec α] (branches : Array (Cloud m α)) (label : String := "") : Cloud m (Array α) :=
+  send (.parallel inferInstance branches.size (fun index => branches[index]) label)
 
 /-- Record the planning environment before creating branches. Reconstructing any
-child uses the same snapshot, even after pool membership or worker capacity changes. -/
+child uses the same snapshot, even after pool membership or worker capacity changes.
+The optional label is display metadata for `watch`; it does not change replay records. -/
 def parallel [Pure m] [Codec α]
-    (plan : Environment → Array (Cloud m α)) : Cloud m (Array α) := do
+    (plan : Environment → Array (Cloud m α)) (label : String := "") : Cloud m (Array α) := do
   let environment ← send (.command (inferInstance : Codec Environment)
     (.exec "parallel" fun environment => ExceptT.mk (Pure.pure (.ok environment))))
-  fork (plan environment)
+  fork (plan environment) label
 
 /-- Heterogeneous pairing uses the same collection-parallel primitive. -/
 def both [Codec α] [Codec β] (left : Cloud m α) (right : Cloud m β) : Cloud m (α × β) := do

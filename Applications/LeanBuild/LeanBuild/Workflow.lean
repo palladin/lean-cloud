@@ -10,6 +10,12 @@ structure Backend (m : Type → Type) where
   finish : Environment → Request → Plan → Array BuildResult → m BuildResult
   check : Environment → Request → Plan → BuildResult → m CheckResult
 
+/-- Completed modules at the start of this parallel round. -/
+def progressLabel (completed total : Nat) : String :=
+  let number (n : Nat) := String.ofList <| (toString n).toList.reverse.zipIdx.foldl
+    (fun text (digit, index) => digit :: (if index > 0 && index % 3 == 0 then ',' :: text else text)) []
+  s!"{number completed}/{number total} · {completed * 100 / total}%"
+
 private def batches [Monad m] [MonadCloudExec m] (backend : Backend m) (request : Request) (plan : Plan) :
     Nat → Array Module → Array BuildResult → Cloud m (Array BuildResult)
   | 0, pending, done => pure <| done ++ pending.map fun m =>
@@ -17,7 +23,7 @@ private def batches [Monad m] [MonadCloudExec m] (backend : Backend m) (request 
   | rounds + 1, pending, done => cloud {
       let (pending, done) := skipBlocked pending done
       if pending.isEmpty then return done
-      let groups ← Cloud.parallel fun environment =>
+      let groups ← Cloud.parallel (label := progressLabel done.size plan.modules.size) fun environment =>
         ((partition pending done environment request.modulesPerJob).filter (!·.isEmpty)).map fun group => cloud {
           let results ← Cloud.exec (fun executing => backend.build executing request plan group done)
             s!"build {group.size} modules from {(group[0]?.map (·.name)).getD ""}"

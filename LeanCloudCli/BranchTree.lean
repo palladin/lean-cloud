@@ -11,6 +11,7 @@ structure Entry where
   branch : Location
   job : Option BranchObservation := none
   control : String := ""
+  labels : Std.HashMap String String := {}
   deriving Inhabited
 
 private def ensure (entries : Array Entry) (known : Std.HashMap String Nat)
@@ -39,7 +40,12 @@ def current (observed : Array Trace.Step) (jobs : Array BranchObservation := #[]
   let mut entries := #[]
   let mut known : Std.HashMap String Nat := {}
   let mut control := ""
+  let mut labels : Std.HashMap String (Std.HashMap String String) := {}
   for step in observed do
+    if step.event.worker != "scheduler" && step.event.activity == "parallel-label" then
+      if let some fork := Trace.location? step.event.location then
+        let parent := (branch fork).key
+        labels := labels.insert parent ((labels[parent]?.getD {}).insert fork.key step.event.operation)
     if step.event.worker == "scheduler" then
       match step.event.activity with
       | "paused" => control := "paused"
@@ -54,7 +60,7 @@ def current (observed : Array Trace.Step) (jobs : Array BranchObservation := #[]
       (entries, known) := observeJob entries known job
   for job in jobs do
     (entries, known) := observeJob entries known job
-  return entries.map fun entry => { entry with control }
+  return entries.map fun entry => { entry with control, labels := labels[entry.branch.key]?.getD {} }
 
 /-- Replay may visit an ancestor's code while executing a child assignment.
 Use assignment ownership, not the current record's location, to select code. -/
@@ -132,7 +138,8 @@ private def descend (index : Index) (nav : Navigation) :
         let key := forkKey fork
         let children := children index fork
         let done := children.filter (fun e => e.job.any (·.status == .done))
-        rows := rows.push { key, parent := some (branchKey entry.branch), branch := entry.branch, fork := some fork, depth := depth + 1, title := s!"parallel @{fork.back!.2}", status := s!"{done.size}/{children.size}", expandable := true }
+        let title := entry.labels[fork.key]?.filter (!·.isEmpty) |>.getD "parallel"
+        rows := rows.push { key, parent := some (branchKey entry.branch), branch := entry.branch, fork := some fork, depth := depth + 1, title, status := s!"{done.size}/{children.size}", expandable := true }
         if nav.isExpanded key false then
           for child in children do
             rows := rows ++ descend index nav fuel child (depth + 2) (some key)

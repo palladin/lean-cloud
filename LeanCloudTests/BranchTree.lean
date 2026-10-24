@@ -50,6 +50,29 @@ private def text (nav : Watch.Navigation) (width := 180) (height := 40) (trace :
 private def has (text fragment : String) : Bool := (text.splitOn fragment).length > 1
 
 public def cases : Array TestCase := #[
+  ⟨"console.tree.parallel-labels-survive-replay-and-completion", do
+    let labeled (seq : Nat) (owner location : Location) (label : String) :=
+      { workerStep seq owner location with event := {
+        (workerStep seq owner location).event with
+        activity := "parallel-label", operation := label, source := none } }
+    -- Child replay visits the parent's fork; its label belongs to the fork,
+    -- while worker ownership still determines which code pane is current.
+    let observed := steps ++ #[labeled 11 grandchild fork "200/9,031 · 2%",
+      labeled 12 grandchild nestedFork "nested work", workerStep 13 grandchild grandchild]
+    let compact := Trace.latest (Trace.merge #[] observed)
+    let cached ← unwrap (fromJson? (α := Array Trace.Step) (toJson compact))
+    let entries := LeanCloudCli.BranchTree.current cached
+    let rows := LeanCloudCli.BranchTree.rows entries expandedTree
+    assertEq ((rows.find? (·.key == "parallel/0:2")).map (·.title)) (some "200/9,031 · 2%")
+    assertEq ((rows.find? (·.key == "parallel/0:2/0:1")).map (·.title)) (some "nested work")
+    assertEq ((rows.find? (·.key == "parallel/0:2")).map (·.status)) (some "2/2")
+    for width in [100, 180] do
+      let frame := text { tree := { selected := some "parallel/0:2" } } width (trace := cached)
+      assertTrue (has frame "200/9,031 · 2%" && !has frame "parallel @") "Watch lost the short label"
+      assertTrue (!has frame "Parallel 0:2") "Code panel exposed the internal parallel location"
+    let empty := Trace.latest (Trace.merge compact #[labeled 14 child fork ""])
+    let rows := LeanCloudCli.BranchTree.rows (LeanCloudCli.BranchTree.current empty) {}
+    assertEq (rows[1]?.map (·.title)) (some "parallel")⟩,
   ⟨"console.tree.large-scheduler-snapshot", do
     let count := 10000
     let jobs := (Array.range count).map fun i =>
@@ -125,7 +148,7 @@ public def cases : Array TestCase := #[
     let visible := LeanCloudCli.BranchTree.rows early {}
     assertEq (visible.map (·.key)) #["branch/0:0", "parallel/0:2"]
     let initial := text {}
-    assertTrue (has initial "▸ parallel @2" && !has initial "branch 0") "Initial frame did not show a collapsed group"
+    assertTrue (has initial "▸ parallel" && !has initial "parallel @" && !has initial "branch 0") "Initial frame did not show a collapsed group"
     let group := LeanCloudCli.BranchTree.navigate early {} .down
     let opened := LeanCloudCli.BranchTree.navigate early group .right
     assertEq opened.selected group.selected "Expanding moved the selection"

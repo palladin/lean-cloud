@@ -1,6 +1,7 @@
 import LeanCloud.Proofs.RecoveryReads
 
 namespace LeanCloud.Proofs.RecoveryStep
+
 open Lean LeanEff ReplayFaults ReplayModel ReplayInterpreter JournalMerge JournalRegion WorkerRecovery
 open Specification RecoveryCursor
 
@@ -152,12 +153,12 @@ theorem replay_safe [rootCodec : Codec α] (source : Cloud WorkerM α)
     simp only [Internal.resume, Internal.decode, roundtrip, pure_bind]
     exact ih encode base branch (cost + 1) limit n (by simpa using same) (by omega) (by omega) known saved
       ⟨valid, .exec codec label body next cursor recorded roundtrip⟩
-  | parallelOk codec count branches next outcomes roundtrip children returned collected present rest ihChildren ih =>
+  | parallelOk codec count branches label next outcomes roundtrip children returned collected present rest ihChildren ih =>
     intro encode base branch cost limit fuel same bounded enough known
     obtain ⟨n, rfl⟩ := Nat.exists_eq_succ_of_ne_zero (show fuel ≠ 0 by omega)
     rw [replay]
     apply group expected base branch _ codec count outcomes
-      (fun journal => Cursor source journal _ encode (.impure _ (.parallel codec count branches) next) cost)
+      (fun journal => Cursor source journal _ encode (.impure _ (.parallel codec count branches label) next) cost)
       (fun _ _ cursor extension => cursor.extend source extension) (Owns.value same)
       (by simpa [collected, Parallel.recorded] using present) returned
     · simp only [collected, Parallel.recorded, Internal.resume]
@@ -176,12 +177,12 @@ theorem replay_safe [rootCodec : Codec α] (source : Cloud WorkerM α)
       exact ⟨_, codec.encode, branches index, outcomes index, _, cost + 1, _,
         (Proofs.Location.branchStart_child _ _).symm, by omega,
         .child codec count branches next cursor index, children index, returned index⟩
-  | parallelError codec count branches next outcomes roundtrip children returned collected present ihChildren =>
+  | parallelError codec count branches label next outcomes roundtrip children returned collected present ihChildren =>
     intro encode base branch cost limit fuel same bounded enough known
     obtain ⟨n, rfl⟩ := Nat.exists_eq_succ_of_ne_zero (show fuel ≠ 0 by omega)
     rw [replay]
     apply group expected base branch _ codec count outcomes
-      (fun journal => Cursor source journal _ encode (.impure _ (.parallel codec count branches) next) cost)
+      (fun journal => Cursor source journal _ encode (.impure _ (.parallel codec count branches label) next) cost)
       (fun _ _ cursor extension => cursor.extend source extension) (Owns.value same)
       (by simpa [collected, Parallel.recorded] using present) returned
     · simp only [collected, Parallel.recorded, Internal.resume]

@@ -150,7 +150,7 @@ def replayCases : Array TestCase := invalidReplayCases ++ #[
       saved.set prefixRecords
       calls.set #[]
       let visits ← IO.mkRef (#[] : Array Location)
-      let observer : ReplayInterpreter.Observer IO := fun location _ => visits.modify (·.push location)
+      let observer : ReplayInterpreter.Observer IO := fun location _ _ => visits.modify (·.push location)
       let outcome ← (ReplayInterpreter.step (memoryStore saved) noBlobs fuel
         (fun _ : Unit => source) () assignment (some observer)).run
       if fuel < 5 then assertError outcome .protocol
@@ -160,7 +160,7 @@ def replayCases : Array TestCase := invalidReplayCases ++ #[
       assertEq ((← saved.get).lookup (ReplayStore.returnKey child)).isSome (fuel ≥ 5)
         "Phase transition consumed extra fuel"
     -- An already completed assignment bypasses both phases, even without fuel.
-    let visit : ReplayInterpreter.Observer IO := fun _ _ => throw (IO.userError "Observed a completed assignment")
+    let visit : ReplayInterpreter.Observer IO := fun _ _ _ => throw (IO.userError "Observed a completed assignment")
     assertOutcome (← (ReplayInterpreter.step (memoryStore saved) noBlobs 0
       (fun _ : Unit => source) () assignment (some visit)).run) (.ok .done)⟩,
   ⟨"replay/cancelled-result-is-terminal", do

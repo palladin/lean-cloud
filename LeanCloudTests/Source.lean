@@ -190,7 +190,7 @@ private def observeReplay : IO Unit := do
       match records.lookup key with
       | some existing => (existing, records)
       | none => (proposed, (key, proposed) :: records) }
-  let visit : ReplayInterpreter.Observer IO := fun location source =>
+  let visit : ReplayInterpreter.Observer IO := fun location source _ =>
     observations.modify (·.push (location, source))
   let assignment : Assignment := ⟨0, Location.root⟩
   let run := (ReplayInterpreter.step records ioBlobs 20 (fun _ : Unit => repeated) () assignment (some visit)).run
@@ -211,7 +211,7 @@ def cases : Array TestCase := #[
     assertEq ((site command.metadata).bind (·.functionInfo) |>.map (·.descr)) (some "Aliased job")⟩,
   ⟨"source.helper-owns-internal-branch-container", do
     match nextExec (skipDelay (skipDelay containerCaller)) with
-    | .impure _ (.parallel _ count branches) _ =>
+    | .impure _ (.parallel _ count branches _) _ =>
       if h : 0 < count then
         let command := skipDelay (branches ⟨0, h⟩)
         assertTrue (has (textAt command.metadata) "cloud { containerHelper }") "Internal container exposed implementation"
@@ -221,7 +221,7 @@ def cases : Array TestCase := #[
     let setup := skipDelay (skipDelay (skipDelay sharedCaller))
     assertTrue (has (textAt setup.metadata) "sharedBranches sharedDetail") "Internal call was not hidden"
     match nextExec (nextExec setup) with
-    | .impure _ (.parallel _ count branches) _ =>
+    | .impure _ (.parallel _ count branches _) _ =>
       if h : 0 < count then
         let command := skipDelay (branches ⟨0, h⟩)
         assertTrue (has (textAt command.metadata) "\"shared detail\"") "Shared user branch was hidden"
@@ -291,7 +291,7 @@ def cases : Array TestCase := #[
     let fork := nextExec (nextExec setup)
     assertTrue (has (textAt fork.metadata) "opaqueBranches #[") "Helper fork exposed its definition"
     match fork with
-    | .impure _ (.parallel _ count branches) _ =>
+    | .impure _ (.parallel _ count branches _) _ =>
       if h : 1 < count then
         assertTrue (has (textAt (skipDelay (branches ⟨0, by omega⟩)).metadata) "return 123")
           "Named user branch was hidden"
@@ -305,7 +305,7 @@ def cases : Array TestCase := #[
     assertTrue (has (textAt setup.metadata) "Cloud.parallel fun") "Planning exposed library source"
     assertEq fork.metadata setup.metadata "Environment record and fork have different call sites"
     match fork with
-    | .impure _ (.parallel _ count branches) _ =>
+    | .impure _ (.parallel _ count branches _) _ =>
       if h : 0 < count then
         assertTrue (has (textAt (skipDelay (branches ⟨0, h⟩)).metadata) "return worker.cpus")
           "User callback source was hidden"
@@ -344,7 +344,7 @@ def cases : Array TestCase := #[
       assertEq (next.apply ⟨"log", 0, 0⟩).metadata program.metadata "Helper lost call site between operations"
     | _ => throw (IO.userError "Expected blob helper")
     match nextExec (skipDelay (branching (m := Id))) with
-    | .impure info (.parallel _ count branches) _ =>
+    | .impure info (.parallel _ count branches _) _ =>
       assertTrue (has (textAt info) "Cloud.parallel") "Fork source missing"
       if h : 0 < count then
         let child := skipDelay (branches ⟨0, h⟩)

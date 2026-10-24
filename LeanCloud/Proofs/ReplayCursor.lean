@@ -3,6 +3,8 @@ import LeanCloud.Proofs.ReplayModel
 import LeanCloud.Proofs.Routing
 
 namespace LeanCloud.Proofs.ReplayCursor
+
+variable {label : String}
 open Lean LeanEff ReplayInterpreter
 
 /-- A proof cursor may already lie inside the assigned branch, after replaying
@@ -58,7 +60,7 @@ theorem child [Monad m] (store : ReplayStore m) (blobs : BlobStorage m)
     (enters : current.entersChild point.location = true)
     (selected : point.location[current.size]!.1 = index.val)
     (route : Routing.Follows (current.child index) point.location) :
-    atPoint store blobs point (fuel + 1) encode (.impure info (.parallel codec count branches) next) current =
+    atPoint store blobs point (fuel + 1) encode (.impure info (.parallel codec count branches label) next) current =
       atPoint store blobs point fuel codec.encode (branches index) (current.child index) := by
   have depth := ((Routing.entersChild_iff _ _).mp enters).1
   have ancestor : current.entersChild point.branchStart = true := by
@@ -102,7 +104,7 @@ theorem joined (journal : Journal) (blobs : BlobStorage M) (point : ReplayTarget
     (checked : (record.request == ⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩) = true)
     (success : record.outcome = .success wire)
     (decoded : (@instCodecArray α codec).decode wire = .ok values) (size : values.size = count) :
-    (atPoint store blobs point (fuel + 1) encode (.impure info (.parallel codec count branches) next) current).run journal =
+    (atPoint store blobs point (fuel + 1) encode (.impure info (.parallel codec count branches label) next) current).run journal =
       (atPoint store blobs point fuel encode (next.apply values) current.next).run journal := by
   by_cases same : current.size = point.location.size
   · simp only [atPoint, same, beq_self_eq_true, ite_true, LeanCloud.Location.next, Array.size_set!, replay]
