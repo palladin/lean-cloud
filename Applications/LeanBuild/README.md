@@ -27,7 +27,7 @@ Use a commit hash when you want repeatable inputs.
 | `subdirectory` | Lake project directory within the repository | `"."` |
 | `options` | Lake configuration values, e.g. `{"feature": "enabled"}` passes `-Kfeature=enabled` | `{}` |
 | `cache` | `"rebuild"` clears package build directories during preparation and disables external Lake artifact caches; `"reuse"` allows Lake's cache support | `"rebuild"` |
-| `modulesPerJob` | Maximum modules in one cloud job (1–4096); larger jobs reduce transfers and replay, smaller jobs reduce work repeated after a crash | `64` |
+| `modulesPerJob` | `0` groups work automatically using dependencies and available CPU capacity; a positive value caps modules per job (up to 100,000) | `0` |
 | `check` | Optional independent proof checking, described below | `{"mode": "none"}` |
 | `limits` | Per-command and artifact limits | See below |
 
@@ -41,23 +41,27 @@ not install toolchains or select a different execution platform.
    declared generated-source prerequisites. Publish the resolved source workspace.
 2. Discover the module dependency graph for ordinary module, library, and
    executable targets using Lake's APIs.
-3. Group ready modules into bounded jobs with `Cloud.parallel`, weighted by the
-   pool's advertised CPU capacities. Each job restores one private workspace,
-   builds multiple modules using one Lake context, and publishes one artifact bundle.
-   Straight dependency chains stay within a job; fan-out and dependencies between
-   jobs return to the next cloud batch. A single-worker pool can keep a whole
-   bounded subgraph local.
+3. Plan work in CPU slots, prioritizing long remaining dependency paths.
+   Modules using this round's outputs stay with their producing job; modules
+   whose prerequisites are already published can use any worker. Prefer placing
+   inputs of a future join together while filling the available CPU slots.
+   Before keeping a round boundary, try repacking the combined dependency graph
+   of neighboring rounds. Merge them when the estimated compute time is no
+   greater than their separate times. Otherwise publish the first round's
+   results so the following work can use the whole pool.
+   Each `Cloud.parallel` job uses one Lake context for local module scheduling.
+   Workers cache the full prepared source tree and import missing prerequisite
+   artifacts from shared blob storage. They publish only new or changed outputs.
 4. Restore those artifacts and pass **the original target list** to Lake's own
    build engine, the same one used by `lake build`.
    Lake completes native compilation, C FFI, linking, custom targets, and dynamic
    dependencies. Publish the complete workspace as one file manifest.
 5. If requested, export the built modules together and run `lake check` once.
 
-For a diamond dependency graph:
-
-```text
-prepare → Base → parallel [Left, Right] → Final → complete Lake targets → optional check
-```
+For `Base → [Left, Right] → Final`, one job suffices if its worker has two CPUs.
+For `Base → 1,024 independent modules` on four eight-CPU workers, the first job
+publishes `Base`; the next round runs four jobs of 256 modules. Keeping that
+wide fan-out with `Base` would leave the other workers idle.
 
 The module stage is distributed. The final target build and proof check each run
 on one worker; Lake retains its own local parallelism. Custom targets and unusual
@@ -67,21 +71,31 @@ Lake. Module jobs preserve the prepared inputs and their prerequisites. Differin
 artifacts produced at the same path by parallel jobs are rejected.
 
 Parallel planning records `env.workers` so replay preserves the same grouping.
-Each native job uses its executing worker's `env.currentWorker.cpus` for
-`LEAN_NUM_THREADS`, including after a restart on a different worker. Lake handles
-local dependency scheduling and shared prerequisites. This is a concurrency hint,
-not CPU affinity or a hard process limit; container resource limits remain in force.
-The pool describes capacity, not reservations or placement guarantees.
-Configure those budgets in `deployment.json` using `cpuMillis` and `memoryMiB`
+Each native job passes its executing worker's `env.currentWorker.cpus` explicitly
+as `lean -jN` to the Lake helper, including after a restart on another worker.
+Child module compilers default to `-j1`, so each does not create another
+hardware-sized thread pool. Project `weakLeanArgs`/`moreLeanArgs` can override
+that default. `LEAN_NUM_THREADS` is also set for compiled Lean tools.
+These settings are concurrency budgets, not CPU affinity or process limits;
+container resource limits remain in force. The pool describes capacity, not
+reservations or placement guarantees.
+Configure budgets in `deployment.json` using `cpuMillis` and `memoryMiB`
 (see [worker resource budgets](../../deploy/README.md#worker-resource-budgets)).
-An unconfigured local worker advertises only one CPU, even on a multicore host.
+An unconfigured local worker advertises only one CPU.
 
-For example, with four workers and `modulesPerJob: 64`, 1,024 independent modules
-need 16 cloud jobs instead of 1,024. A 128-module dependency chain needs two jobs.
-Real graphs have fan-out, joins, and unequal module costs; these numbers describe
-communication granularity, not a wall-clock speedup. A batch still waits for its
-slowest job. Increase `modulesPerJob` when workspace transfers dominate; reduce it
-when jobs are too long or recovery repeats too much work.
+With four equal workers, 1,024 independent modules need four jobs by default.
+A manual `modulesPerJob: 64` cap instead produces 16 jobs. Long independent
+chains stay local without a cloud round for every module. Cross-worker joins
+require publishing results first.
+
+This deterministic heuristic balances CPU use and fewer rounds. It assumes
+equal module costs and removes barriers without increasing modeled compute time;
+it does not predict compilation times, transfer costs or competing workloads.
+There is no fixed worker count, desired number of rounds or utilization threshold.
+Each round still waits for its slowest job; full CPU utilization and minimum
+build time are not guaranteed. Smaller caps reduce work repeated after a crash.
+The test tool's `--plan PATH` option reports round/job counts and an explicit
+unit-cost compute estimate for a saved module DAG.
 
 Only job inputs and artifact references enter the replay journal. Completed jobs
 are reused after a worker crash. An interrupted job may execute again. A build
@@ -177,7 +191,7 @@ a new directory. Run these inside the deployed image, where the storage
 configuration is available. Transfers verify sizes and SHA-256 hashes.
 Native executables require a compatible platform and runtime libraries.
 
-The batched workflow is `lean-build/v3`. Start new runs with the updated image;
+The CPU-aware workflow is `lean-build/v4`. Start new runs with the updated image;
 existing runs must finish with their original image because replay locations changed.
 Packed workspace manifests remain compatible with `v2`; old `v1` manifests
 require the old application image to restore.
@@ -230,14 +244,26 @@ option is not a container memory limit.
 
 Dependencies must be inside the repository snapshot. Internal file symlinks are
 materialized; external links, directory links, Git submodules, and dependencies
-outside the snapshot are rejected. Snapshot transfers currently restore private
-workspaces for each job. The image caches immutable packs in `/data/build-cache`;
-each hit is verified and copied, so a job cannot change another job's inputs.
-Set `LEAN_BUILD_CACHE` to choose a cache directory and `LEAN_BUILD_CACHE_BYTES`
-to bound it (default 4 GiB). Without `LEAN_BUILD_CACHE`, caching is disabled.
-Packs larger than the budget use temporary files instead. Provision enough disk
-for both the cache and the job's private workspace; the byte limit bounds cached
-pack contents, not filesystem overhead or temporary files.
+outside the snapshot are rejected.
+
+The image caches immutable packs in `/data/build-cache` and keeps one reusable
+workspace in `/data/build-cache.workspace`. Switching builds replaces that
+workspace. Its key includes the prepared source, request, toolchain path and
+helper digest. Cache directories must be private to each worker process.
+Calls within a worker are serialized.
+
+Before a job, files are checked against its committed input manifest; unchanged
+files stay in place. Missing or corrupt files are restored, and outputs outside
+those inputs are removed. This also prevents an interrupted replay from treating
+its own outputs as prerequisites. Only successful, published jobs mark a
+workspace reusable. A crash or failed job leaves it dirty; the next attempt
+reconstructs it from blobs. The cache is an optimization, never durable progress.
+
+Set `LEAN_BUILD_CACHE` to choose the pack directory; the workspace uses that path
+with `.workspace` appended. `LEAN_BUILD_CACHE_BYTES` bounds packs (default 4 GiB).
+Without `LEAN_BUILD_CACHE`, jobs use temporary workspaces. `limits.bytes` bounds
+the reusable workspace; provision additional disk for packs, metadata, logs and
+temporary files. Packs larger than the cache budget use temporary storage.
 
 Large Mathlib/FLT performance has not been validated;
 batch barriers and artifact transfer costs still apply.
@@ -257,9 +283,12 @@ lake build cloud_app build_local build_tests
 Tests compare direct/replay execution on 80 generated module graphs and compare
 native executable output with ordinary Lake. Fixtures cover library/default/module
 and custom targets, generated sources, C FFI, configuration options, subdirectories,
-CPU-weighted batching, overlapping native builds, replay after a capacity change,
+CPU-weighted batching, local joins, barrier merging, overlapping native builds, replay after a capacity change,
 and durable failures. Checking tests cover combined exports, every
 paranoid checker, corrupt proofs, private `sorry`, axiom policies and exact toolchains.
+
+An optional [offline planner benchmark](Benchmarks/README.md) compares the
+heuristic with open-source constraint solvers on saved module graphs.
 
 The optional container test fetches the pinned GitHub example through the normal
 HTTP client and removes its temporary deployment on exit:

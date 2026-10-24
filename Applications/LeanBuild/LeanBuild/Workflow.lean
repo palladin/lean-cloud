@@ -18,7 +18,7 @@ private def batches [Monad m] [MonadCloudExec m] (backend : Backend m) (request 
       let (pending, done) := skipBlocked pending done
       if pending.isEmpty then return done
       let groups ← Cloud.parallel fun environment =>
-        (partition pending done environment request.modulesPerJob).map fun group => cloud {
+        ((partition pending done environment request.modulesPerJob).filter (!·.isEmpty)).map fun group => cloud {
           let results ← Cloud.exec (fun executing => backend.build executing request plan group done)
             s!"build {group.size} modules from {(group[0]?.map (·.name)).getD ""}"
           if results.map (·.name) != group.map (·.name) then

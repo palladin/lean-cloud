@@ -1,5 +1,6 @@
 import LeanBuild.Workflow
 import LeanBuild.Bundle
+import LeanBuild.Workspace
 import LeanBuild.Toolchain
 import LeanCloudRuntime.Process
 
@@ -58,7 +59,7 @@ private def runHelper (tools : Tools) (directory : System.FilePath) (request : R
     (files : Array (System.FilePath × Nat) := #[]) : IO (Except String Unit) := do
   let library := tools.toolchain / "lib/lean" /
     (if System.Platform.isOSX then "libLake_shared.dylib" else "libLake_shared.so")
-  lake tools directory request label (#["env", "lean", s!"-M{request.limits.checkerMemoryMiB}",
+  lake tools directory request label (#["env", "lean", s!"-j{max 1 tools.threads}", s!"-M{request.limits.checkerMemoryMiB}",
     "--load-dynlib", library.toString, "--run", tools.helper.toString] ++ args) files
 
 /-- Check the export independently of the project. Never fall back from a
@@ -161,11 +162,12 @@ private def prerequisites (plan : Plan) (targets : Array Module) : Std.HashSet S
   return needed
 
 private def restore (tools : Tools) (store : ObjectStore) (directory : System.FilePath)
-    (request : Request) (plan : Plan) (artifacts : Bundle.Manifest) : IO Bundle.Manifest := do
+    (request : Request) (plan : Plan) (artifacts : Bundle.Manifest)
+    (session : Workspace.Session) : IO Bundle.Manifest := do
   unless (← platform) == plan.platform do throw (IO.userError "Build worker platform changed")
-  let source : Bundle.Manifest ← Files.readJson store plan.source
+  let source ← session.readManifest plan.source
   let workspace := Bundle.overlay source artifacts
-  Bundle.restore store directory workspace request.limits.bytes tools.cache
+  Bundle.synchronize store directory workspace request.limits.bytes tools.cache
   unless (← verifyToolchain tools (project directory request)) == plan.toolchain do
     throw (IO.userError "Toolchain changed since preparation")
   return workspace
@@ -176,8 +178,12 @@ private structure ModuleOutcome where
   deriving FromJson
 
 private def buildJob (tools : Tools) (store : ObjectStore) (request : Request)
-    (plan : Plan) (completed : Array BuildResult) (modules : Option (Array Module)) : IO (Array BuildResult) :=
-  withWorkspace fun directory => do
+    (plan : Plan) (completed : Array BuildResult) (modules : Option (Array Module)) : IO (Array BuildResult) := do
+  let key := (toJson ("lean-build/workspace/v1", request, plan,
+    tools.toolchain.toString, ← Files.digest tools.helper)).compress
+  let cache := tools.cache.map fun cache => cache.directory.addExtension "workspace"
+  Workspace.use store cache key fun session => do
+    let directory := session.directory
     let start ← IO.monoMsNow
     let mut imports : Bundle.Manifest := #[]
     let needed := modules.map (prerequisites plan)
@@ -187,8 +193,8 @@ private def buildJob (tools : Tools) (store : ObjectStore) (request : Request)
       let some ref := result.artifacts | throw (IO.userError "Missing prerequisite artifacts")
       if manifests.contains ref.sha256 then continue
       manifests := manifests.insert ref.sha256
-      imports ← IO.ofExcept (Bundle.merge imports (← Files.readJson store ref))
-    let baseline ← restore tools store directory request plan imports
+      imports ← IO.ofExcept (Bundle.merge imports (← session.readManifest ref))
+    let baseline ← restore tools store directory request plan imports session
     let result : Except String (Array BuildResult × Bundle.Snapshot) ← try
       let policy ← policyFile directory request
       let mut results : Array BuildResult := #[]
@@ -234,9 +240,11 @@ private def buildJob (tools : Tools) (store : ObjectStore) (request : Request)
       -- outputs outside .lake/build. Deletions are respected by taking live paths.
       let artifacts ← if modules.isSome then pure changes else do
         Bundle.existing directory (Bundle.overlay baseline changes)
-      let artifacts ← Files.putJson store artifacts
+      let reference ← Files.putJson store artifacts
+      if results.all (·.status == .built) then
+        session.commit
       return results.map fun result => { result with
-        diagnostics, milliseconds, artifacts := if result.status == .built then some artifacts else none }
+        diagnostics, milliseconds, artifacts := if result.status == .built then some reference else none }
 
 def Tools.build (tools : Tools) (store : ObjectStore) (request : Request)
     (plan : Plan) (modules : Array Module) (completed : Array BuildResult) : IO (Array BuildResult) :=

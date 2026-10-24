@@ -26,3 +26,7 @@ lean_exe build_tests where
 
 lean_exe build_local where
   root := `Local
+
+-- Optional, offline planner benchmark; never linked into the cloud application.
+lean_exe plan_bench where
+  root := `Benchmarks.Planner

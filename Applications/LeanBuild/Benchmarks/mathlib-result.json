@@ -1,0 +1,178 @@
+{
+  "date": "2026-10-24",
+  "host": "macOS ARM64",
+  "minizinc": "2.10.1",
+  "solver": "OR-Tools CP-SAT 9.15",
+  "input": {
+    "repository": "https://github.com/leanprover-community/mathlib4",
+    "commit": "56a005855ea17e0b0958f73ec801ae140b0a1679",
+    "target": "Mathlib",
+    "sha256": "1663b2136485e9b6a719b273f4d99886db2f301d9a3f9e76ccc844bd87325792",
+    "modules": 9031,
+    "edges": 32949
+  },
+  "model": {
+    "cpus": [
+      7,
+      7,
+      7,
+      7
+    ],
+    "moduleCpuTime": 1,
+    "overheadPerRound": 1,
+    "requestedRoundBound": 58,
+    "effectiveRoundBound": 36,
+    "unequalModuleCosts": false,
+    "networkTransfers": false
+  },
+  "heuristic": {
+    "metrics": {
+      "ticks": 330,
+      "rounds": 29,
+      "jobs": 113,
+      "cost": 359
+    },
+    "planningAndSimulationMs": 789
+  },
+  "fullSearch": {
+    "budgetMs": 180000,
+    "threads": 4,
+    "wallSeconds": 181.45,
+    "report": {
+      "statuses": [
+        "UNKNOWN"
+      ],
+      "statistics": [
+        {
+          "paths": 0,
+          "method": "minimize",
+          "flatTime": 3.55506,
+          "flatIntVars": 90383,
+          "flatIntConstraints": 258343,
+          "flatBoolVars": 102057,
+          "flatBoolConstraints": 32949,
+          "evaluatedReifiedConstraints": 36229,
+          "evaluatedHalfReifiedConstraints": 65898
+        },
+        {
+          "nSolutions": 0
+        }
+      ],
+      "penalty": 1,
+      "modules": 9031,
+      "heuristicPlanningMs": 789,
+      "heuristic": {
+        "ticks": 330,
+        "rounds": 29,
+        "jobs": 113,
+        "cost": 359
+      },
+      "cpus": [
+        7,
+        7,
+        7,
+        7
+      ],
+      "candidates": [],
+      "bestValidated": {
+        "ticks": 330,
+        "rounds": 29,
+        "jobs": 113,
+        "cost": 359
+      }
+    }
+  },
+  "fixedStartSearch": {
+    "budgetMs": 60000,
+    "threads": 4,
+    "wallSeconds": 16.46,
+    "optimalityScope": "Only schedules with the incumbent module start times",
+    "report": {
+      "statuses": [
+        "OPTIMAL_SOLUTION"
+      ],
+      "statistics": [
+        {
+          "paths": 0,
+          "method": "minimize",
+          "flatTime": 2.58469,
+          "flatIntVars": 45480,
+          "flatIntConstraints": 120675,
+          "flatBoolVars": 82583,
+          "flatBoolConstraints": 32949,
+          "evaluatedReifiedConstraints": 36120,
+          "evaluatedHalfReifiedConstraints": 46463
+        },
+        {
+          "solveTime": 12.5625,
+          "propagations": 40765085,
+          "objectiveBound": 25,
+          "objective": 29,
+          "failures": 20794,
+          "boolVariables": 72551
+        },
+        {
+          "nSolutions": 1
+        },
+        {
+          "solveTime": 12.6358,
+          "propagations": 40791819,
+          "objectiveBound": 29,
+          "objective": 29,
+          "failures": 20797,
+          "boolVariables": 72551
+        }
+      ],
+      "penalty": 1,
+      "modules": 9031,
+      "heuristicPlanningMs": 789,
+      "heuristic": {
+        "ticks": 330,
+        "rounds": 29,
+        "jobs": 113,
+        "cost": 359
+      },
+      "cpus": [
+        7,
+        7,
+        7,
+        7
+      ],
+      "candidates": [
+        {
+          "timeMs": 16230,
+          "solverTicks": 330,
+          "solverCost": 359,
+          "resimulated": {
+            "ticks": 330,
+            "rounds": 29,
+            "jobs": 113,
+            "cost": 359
+          }
+        }
+      ],
+      "bestValidated": {
+        "ticks": 330,
+        "rounds": 29,
+        "jobs": 113,
+        "cost": 359
+      }
+    }
+  },
+  "adjacentPairs": {
+    "budgetMsPerPair": 5000,
+    "threads": 1,
+    "wallSecondsTotal": 93.75,
+    "pairs": 28,
+    "optimal": 10,
+    "feasibleWithoutOptimality": 16,
+    "withoutCandidate": 2,
+    "improvements": 0
+  },
+  "decision": "Keep the production heuristic; no validated improvement found. Global optimality is unresolved.",
+  "sourceHashes": {
+    "LeanBuild/Batch.lean": "a40c98b27d0552f8f89e39d552c100be0e589d5390aabcc5d88362dd667def98",
+    "Benchmarks/schedule.mzn": "dca9725cf89a2aecf2adbd8eba12167ed3d85c9fa17316dcdc59c8fcc2c13873",
+    "Benchmarks/barriers.mzn": "2a3ac723fc916eadd806727b546eb3f18669a2f225395cf71cc7895b7abf733b"
+  }
+}

@@ -34,8 +34,8 @@ structure Request where
   targets : Array String := #[]
   options : Std.TreeMap String String := {}
   cache : CachePolicy := .rebuild
-  /-- Maximum modules per durable cloud job; local Lake schedules their dependencies. -/
-  modulesPerJob : Nat := 64
+  /-- Zero balances CPU use and cloud barriers; nonzero also caps job size. -/
+  modulesPerJob : Nat := 0
   check : CheckConfig := {}
   limits : Limits := {}
   deriving Repr, ToJson
@@ -70,7 +70,7 @@ instance : FromJson Request where
       targets := ← field json "targets" #[]
       options := ← field json "options" {}
       cache := ← field json "cache" .rebuild
-      modulesPerJob := ← field json "modulesPerJob" 64
+      modulesPerJob := ← field json "modulesPerJob" 0
       check := ← field json "check" {}
       limits := ← field json "limits" {} }
 
@@ -101,8 +101,8 @@ def Request.validate (r : Request) : Except String Unit := do
     throw "Invalid Lake target"
   unless r.options.toArray.all (fun (key, value) => identifier key && !value.contains '\x00') do
     throw "Invalid Lake configuration option"
-  unless 0 < r.modulesPerJob && r.modulesPerJob ≤ 4096 do
-    throw "modulesPerJob must be between 1 and 4096"
+  unless r.modulesPerJob ≤ 100000 do
+    throw "modulesPerJob must be 0 (automatic) or between 1 and 100000"
   unless r.check.theorems.all identifier do throw "Invalid theorem name"
   unless r.check.allowedAxioms.all standardAxioms.contains do
     throw "Only propext, Classical.choice and Quot.sound may be allowed"

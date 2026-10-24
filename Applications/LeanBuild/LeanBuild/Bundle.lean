@@ -187,25 +187,29 @@ private def makeRoom (cache : Cache) (ref : FileRef) : IO Unit := do
     IO.FS.removeFile path
     total := total - size
 
+private def validate (manifest : Manifest) (limit : Nat) : IO Unit := do
+  let mut total := 0
+  let mut seen : Std.HashSet String := {}
+  for entry in manifest do
+    IO.ofExcept entry.file.pack.validate
+    unless safePath entry.path && !seen.contains entry.path do
+      throw (IO.userError "Unsafe or duplicate artifact path")
+    seen := seen.insert entry.path
+    total := total + entry.file.size
+    unless total ≤ limit && entry.file.offset + entry.file.size ≤ entry.file.pack.size &&
+        entry.file.pack.size ≤ UInt64.size / 2 && entry.file.format == "lean-build/packed-file/v1" do
+      throw (IO.userError "Restored workspace exceeds configured byte limit or pack range")
+
 def restore (store : ObjectStore) (root : System.FilePath) (manifest : Manifest)
     (limit : Nat) (cache : Option Cache := none) : IO Unit :=
   IO.FS.withTempDir fun temporary => do
     if let some cache := cache then
       cacheLock.atomically do makeRoom cache default
-    let mut total := 0
-    let mut seen : Std.HashSet String := {}
-    let mut groups : Std.HashMap String (Array Entry) := {}
-    for entry in manifest do
-      IO.ofExcept entry.file.pack.validate
-      unless safePath entry.path && !seen.contains entry.path do
-        throw (IO.userError "Unsafe or duplicate artifact path")
-      seen := seen.insert entry.path
-      total := total + entry.file.size
-      unless total ≤ limit && entry.file.offset + entry.file.size ≤ entry.file.pack.size &&
-          entry.file.pack.size ≤ UInt64.size / 2 && entry.file.format == "lean-build/packed-file/v1" do
-        throw (IO.userError "Restored workspace exceeds configured byte limit or pack range")
-      groups := groups.insert entry.file.pack.sha256
-        ((groups[entry.file.pack.sha256]?).getD #[] |>.push entry)
+    validate manifest limit
+    let groups := manifest.foldl (fun groups entry =>
+      groups.insert entry.file.pack.sha256
+        ((groups[entry.file.pack.sha256]?).getD #[] |>.push entry))
+      ({} : Std.HashMap String (Array Entry))
     for (_, entries) in groups do
       let some first := entries[0]? | continue
       let ref := first.file.pack
@@ -230,6 +234,27 @@ def restore (store : ObjectStore) (root : System.FilePath) (manifest : Manifest)
       | none =>
         copy temporary
         IO.FS.removeFile (temporary / ref.sha256)
+
+/-- Reconcile a clean cached workspace with exactly this job's committed inputs.
+Keep verified files in place; fetch only missing/changed files. Outputs not in
+these inputs are removed, so a replay cannot accidentally reuse its own results. -/
+def synchronize (store : ObjectStore) (root : System.FilePath) (desired : Manifest)
+    (limit : Nat) (cache : Option Cache := none) : IO Unit := do
+  validate desired limit
+  let paths := desired.foldl (fun set entry => set.insert entry.path) ({} : Std.HashSet String)
+  for path in ← enumerate root do
+    if !paths.contains path then IO.FS.removeFile (root / path)
+  let mut missing := #[]
+  for entry in desired do
+    let path := root / entry.path
+    if ← path.pathExists then
+      unless (← path.symlinkMetadata).type == .file do
+        throw (IO.userError s!"Invalid cached workspace file: {entry.path}")
+      if (← path.metadata).byteSize.toNat == entry.file.size &&
+          (← Files.digest path) == entry.file.sha256 &&
+          (← executable path.toString) == entry.executable then continue
+    missing := missing.push entry
+  restore store root missing limit cache
 
 /-- Separate modules may produce the same auxiliary build artifact. Identical
 content is shared; differing content is an error, never last-writer-wins. -/

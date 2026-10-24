@@ -11,6 +11,24 @@ open Lean Lake System
 private def readJson (path : String) : IO Json := do
   IO.ofExcept (Json.parse (← IO.FS.readFile path))
 
+/-- Lake parallelizes modules. Default each child compiler to one thread so
+each does not independently create a hardware-sized pool. Weak arguments do
+not change artifact traces; explicit project arguments can still override this. -/
+private def compilerBudget (pkg : Package) : Package :=
+  { pkg with config := { pkg.config with weakLeanArgs := #["-j1"] ++ pkg.config.weakLeanArgs } }
+
+private def withCompilerBudget (ws : Workspace) : Workspace :=
+  let packages := ws.packages.map compilerBudget
+  { ws with
+    packages
+    packageMap := packages.foldl (fun map pkg => map.insert pkg.keyName pkg) {}
+    size_packages_pos := by simpa [packages] using ws.size_packages_pos
+    packages_wsIdx := by intro i h; simpa [packages, compilerBudget] using ws.packages_wsIdx (by simpa [packages] using h)
+    depIdxs_packages := by
+      intro pkg hp i hi
+      obtain ⟨original, ho, rfl⟩ := Array.mem_map.mp hp
+      simpa [packages] using ws.depIdxs_packages original ho i hi }
+
 private def workspace (policy : Json) : IO Workspace := do
   let (elan?, lean?, lake?) ← findInstall?
   let some lean := lean? | throw (IO.userError "Lean installation not found")
@@ -23,7 +41,7 @@ private def workspace (policy : Json) : IO Workspace := do
     lakeOpts := options.toArray.foldl (fun map (key, value) => map.insert key.toName value) {} }
   let some ws ← (loadWorkspace cfg).toBaseIO
     | throw (IO.userError "Cannot load Lake workspace")
-  return ws
+  return withCompilerBudget ws
 
 private def inside (root path : FilePath) : IO Unit := do
   let root := (← IO.FS.realPath root).toString

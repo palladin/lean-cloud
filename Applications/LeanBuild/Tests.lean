@@ -61,45 +61,103 @@ private def replayReport (store : ReplayStore IO) (source : Cloud IO LeanBuild.R
   let some outcome ← store.outcome | throw ⟨.protocol, "Missing test outcome"⟩
   ReplayInterpreter.result outcome
 
+/-- Independent unit-cost list scheduler for comparing planned compute time.
+Imports outside this job are already committed. Transfers are not modeled. -/
+private def modelTicks (modules : Array LeanBuild.Module) (cpus : Nat) : Nat := Id.run do
+  let members := modules.foldl (fun set m => set.insert m.name) ({} : Std.HashSet String)
+  let mut done : Std.HashSet String := {}
+  let mut pending := modules
+  let mut ticks := 0
+  for _ in [:modules.size] do
+    if pending.isEmpty then break
+    let ready := (pending.filter fun m => m.imports.all fun dep =>
+      !members.contains dep || done.contains dep).extract 0 (max 1 cpus)
+    for m in ready do done := done.insert m.name
+    pending := pending.filter (!done.contains ·.name)
+    ticks := ticks + 1
+  return ticks
+
+private structure PlanStats where
+  rounds : Nat := 0
+  jobs : Nat := 0
+  ticks : Nat := 0
+  deriving BEq, Repr
+
+private def checkPartition (modules : Array LeanBuild.Module) (environment : LeanCloud.Environment)
+    (limit : Nat := 0) : IO PlanStats := do
+  let mut pending := modules
+  let mut done : Array BuildResult := #[]
+  let mut stats : PlanStats := {}
+  let cpus := workerCpus environment
+  let ordered := criticalOrder modules
+  for _ in [:modules.size] do
+    if pending.isEmpty then break
+    let groups := partition pending done environment limit
+    check (groups.any (!·.isEmpty) && groups.size == cpus.size) "No progress or mismatched CPU slots"
+    for group in groups do
+      check (limit == 0 || group.size ≤ limit) "Job exceeds explicit cap"
+      let mut available := done.foldl (fun set r => set.insert r.name) ({} : Std.HashSet String)
+      for m in group do
+        check (m.imports.all available.contains) "Cross-job dependency inside a round"
+        available := available.insert m.name
+    let names := groups.flatten.map (·.name)
+    let selected := names.foldl (fun set name => set.insert name) ({} : Std.HashSet String)
+    check (selected.size == names.size) "Duplicate module ownership"
+    let times := groups.mapIdx fun i group =>
+      let members := group.foldl (fun set m => set.insert m.name) ({} : Std.HashSet String)
+      modelTicks (ordered.filter fun m => members.contains m.name) cpus[i]!
+    stats := {
+      rounds := stats.rounds + 1
+      jobs := stats.jobs + (groups.filter (!·.isEmpty)).size
+      ticks := stats.ticks + times.foldl max 0 }
+    done := done ++ names.map fun name => { name, status := .built }
+    pending := pending.filter fun m => !selected.contains m.name
+  check (pending.isEmpty && done.size == modules.size) "Incomplete DAG coverage"
+  return stats
+
 private def partitionTests : IO Unit := do
   let wide := (Array.range 1024).map fun i => { name := s!"M{i}", imports := #[] : LeanBuild.Module }
-  let chain := (Array.range 128).map fun i => {
-    name := s!"C{i}", imports := if i == 0 then #[] else #[s!"C{i - 1}"] : LeanBuild.Module }
-  for (modules, expectedJobs) in [(wide, 16), (chain, 2)] do
-    let mut pending := modules
-    let mut done : Array BuildResult := #[]
-    let mut jobs := 0
-    for _ in [:modules.size] do
-      if pending.isEmpty then break
-      let groups := partition pending done (pool #[8, 8, 8, 8]) 64
-      check (!groups.isEmpty && groups.size ≤ 4) "No progress or too many jobs"
-      for group in groups do
-        check (group.size ≤ 64) "Job exceeds its replay granularity"
-        -- Only earlier jobs or this same group may supply a prerequisite.
-        let mut available := done.map (·.name)
-        for m in group do
-          check (m.imports.all available.contains) "Cross-job dependency inside a batch"
-          available := available.push m.name
-      let names := groups.flatten.map (·.name)
-      check (names.toList.eraseDups.length == names.size) "Duplicate module ownership"
-      jobs := jobs + groups.size
-      done := done ++ names.map fun name => { name, status := .built }
-      pending := pending.filter fun m => !names.contains m.name
-    check (pending.isEmpty && done.size == modules.size && jobs == expectedJobs) "Wrong batching/coverage"
-  let weighted := partition (wide.extract 0 10) #[] (pool #[1, 4]) 64
-  check (weighted.map (·.size) == #[2, 8]) "CPU weighting ignored"
-  check ((partition wide #[] (pool #[1, 4]) 64).map (·.size) == #[16, 64])
-    "Large frontiers ignored the capacity-weighted batch limits"
-  check ((partition (wide.extract 0 2) #[] (pool #[1, 16]) 64).map (·.size) == #[1, 1])
-    "A small frontier left a worker without a job"
+  check ((← checkPartition wide (pool #[8, 8, 8, 8])) == ⟨1, 4, 32⟩) "Independent modules lost CPUs or gained barriers"
+  check ((← checkPartition wide (pool #[8, 8, 8, 8]) 64) == ⟨4, 16, 32⟩) "Explicit job cap ignored"
+  let shared := #[⟨"Base", #[]⟩] ++ wide.map fun m => { m with imports := #["Base"] }
+  check ((partition shared #[] (pool #[8, 8, 8, 8]) 0).flatten.map (·.name) == #["Base"])
+    "Shared prerequisite trapped parallel work on its worker"
+  check ((← checkPartition shared (pool #[8, 8, 8, 8])) == ⟨2, 5, 33⟩)
+    "Wide fan-out did not use all CPUs after publishing the shared prerequisite"
+  let chains := (Array.range 4).flatMap fun c => (Array.range 256).map fun i => {
+    name := s!"C{c}_{i}", imports := if i == 0 then #[] else #[s!"C{c}_{i - 1}"] : LeanBuild.Module }
+  check ((← checkPartition chains (pool #[8, 8, 8, 8])) == ⟨1, 4, 256⟩) "Dependency chains fragmented"
+  check ((partition (wide.extract 0 10) #[] (pool #[1, 4]) 0).map (·.size) == #[2, 8]) "CPU weighting ignored"
+  check ((partition (wide.extract 0 2) #[] (pool #[1, 16]) 0).map (·.size) == #[1, 1]) "Small frontier lost parallelism"
   let fork : Array LeanBuild.Module := #[⟨"A", #[]⟩, ⟨"B", #["A"]⟩, ⟨"C", #["A"]⟩]
-  check ((partition fork #[] (pool #[4, 4]) 64).flatten.map (·.name) == #["A"])
-    "One worker captured both sides of a fan-out"
-  check ((partition fork #[] (pool #[4]) 64).flatten.map (·.name) == #["A", "B", "C"])
-    "A single-worker pool took an unnecessary fan-out barrier"
-  let emptyPool : LeanCloud.Environment := { workers := #[], currentWorker := { cpus := 2 } }
-  check ((partition chain #[] emptyPool 5).map (·.size) == #[5]) "Empty pool fallback"
-  IO.println "PASS CPU-weighted bounded batches: 1,024 independent modules → 16 jobs; 128-module chain → 2 jobs"
+  check ((partition fork #[] (pool #[4, 4]) 0).flatten.map (·.name) == #["A", "B", "C"])
+    "Small fan-out introduced an unnecessary cloud barrier"
+  let diamond : Array LeanBuild.Module := #[⟨"A", #[]⟩, ⟨"B", #[]⟩, ⟨"C", #["A", "B"]⟩, ⟨"D", #["C"]⟩]
+  check ((← checkPartition diamond (pool #[4, 4])) == ⟨1, 1, 3⟩) "Shared consumers were split despite free local CPUs"
+  check ((← checkPartition diamond (pool #[1, 1]) 1) == ⟨3, 4, 3⟩) "Capped join crossed job dependencies"
+  let joined : Array LeanBuild.Module := #[⟨"T0", #[]⟩, ⟨"T1", #["T0"]⟩, ⟨"T2", #["T1"]⟩,
+    ⟨"A", #[]⟩, ⟨"B", #[]⟩, ⟨"C", #[]⟩, ⟨"D", #[]⟩, ⟨"Join", #["A", "B", "C", "D"]⟩]
+  check ((← checkPartition joined (pool #[2, 2])) == ⟨1, 2, 3⟩)
+    "A removable join barrier survived despite unchanged compute time"
+  let smallJoin := diamond.extract 0 3
+  check ((partition smallJoin #[] (pool #[1, 4]) 0).map (·.size) == #[0, 3])
+    "Repacked component lost the faster worker's CPU slot"
+  check ((← checkPartition smallJoin (pool #[1, 4])) == ⟨1, 1, 2⟩) "Repacking increased the join's compute span"
+  let priority : Array LeanBuild.Module := #[⟨"short", #[]⟩, ⟨"base", #[]⟩,
+    ⟨"middle", #["base"]⟩, ⟨"tip", #["middle"]⟩]
+  check ((partition priority #[] (pool #[1]) 1).flatten.map (·.name) == #["base"])
+    "Short independent work displaced the critical path"
+  let mixed := shared ++ chains
+  let result ← checkPartition mixed (pool #[8, 8, 8, 8])
+  check (result.ticks < 290) "Independent chains prevented useful work during the wide fan-out"
+  let emptyPool : LeanCloud.Environment := { workers := #[], currentWorker := { cpus := 0 } }
+  check ((partition wide #[] emptyPool 5).map (·.size) == #[5]) "Empty pool/zero CPU fallback"
+  for seed in [:100] do
+    let modules := (Array.range 80).map fun i => {
+      name := s!"G{i}", imports := ((Array.range i).filter fun j =>
+        (i * 31 + j * 17 + seed) % 19 == 0).map (s!"G{·}") : LeanBuild.Module }
+    discard <| checkPartition modules (pool #[1 + seed % 7, 1, 4]) (if seed % 2 == 0 then 0 else 7)
+  IO.println "PASS DAG planning: critical paths, local joins, barrier merging, CPU weighting, caps and progress"
 
 private def generatedTests : IO Unit := do
   partitionTests
@@ -110,7 +168,7 @@ private def generatedTests : IO Unit := do
   let minimal : LeanBuild.Request ← IO.ofExcept (fromJson? (Json.mkObj [
     ("repository", toJson request.repository), ("revision", toJson "main")]))
   check (minimal.targets.isEmpty && minimal.check.mode == .none && minimal.cache == .rebuild &&
-    minimal.options.isEmpty && minimal.subdirectory == "." && minimal.modulesPerJob == 64) "Wrong request defaults"
+    minimal.options.isEmpty && minimal.subdirectory == "." && minimal.modulesPerJob == 0) "Wrong request defaults"
   let encoded ← IO.ofExcept (Json.parse "{\"repository\":\"https://github.com/a/b\",\"revision\":\"main\",\"options\":{\"greeting\":\"42\"},\"check\":{\"mode\":\"kernel\"}}")
   let decoded : LeanBuild.Request ← IO.ofExcept (fromJson? encoded)
   check (decoded.options["greeting"]? == some "42" && decoded.check.mode == .kernel) "JSON options/check mode"
@@ -124,6 +182,7 @@ private def generatedTests : IO Unit := do
     let backend := { stub with
       prepare := fun _ _ => pure { plan := some plan }
       build := fun _ _ _ group done => do
+        check (!group.isEmpty) "Unused CPU slot launched an empty cloud job"
         let mut completed := done
         let mut results := #[]
         for m in group do
@@ -144,7 +203,7 @@ private def generatedTests : IO Unit := do
         calls.modify (·.push "check")
         return { mode := r.check.mode, success := true } }
     let req := { request with
-      modulesPerJob := 1 + seed % 7
+      modulesPerJob := if seed % 3 == 0 then 0 else 1 + seed % 7
       check := { mode := if seed % 3 == 0 then .kernel else .none } }
     let environment := pool ((Array.range (1 + seed % 4)).map fun i => 1 + (seed + i) % 8)
     let direct ← (DirectInterpreter.interpret noBlobs (workflow backend) req environment).run
@@ -189,7 +248,8 @@ private def generatedTests : IO Unit := do
   check (count == 2) "Wrong planned worker count"
   let .ok report ← (replayReport (journal saved) source replacement).run
     | throw (IO.userError "Could not resume batch on replacement worker")
-  check (report.success && (← groups.get) == (partition modules #[] planned 64).map (·.map (·.name)))
+  check (report.success && (← groups.get) ==
+    ((partition modules #[] planned 0).filter (!·.isEmpty)).map (·.map (·.name)))
     "Replay repartitioned an existing batch using the replacement pool"
   for stage in ["prepare", "build", "finish", "check"] do
     let calls ← IO.mkRef (0 : Nat)
@@ -219,8 +279,7 @@ private def generatedTests : IO Unit := do
       { request with revision := "--upload-pack=evil" },
       { request with subdirectory := "../escape" },
       { request with targets := #["--run=evil"] },
-      { request with modulesPerJob := 0 },
-      { request with modulesPerJob := 4097 },
+      { request with modulesPerJob := 100001 },
       { request with check := { mode := .kernel, allowedAxioms := #["sorryAx"] } }] do
     check req.validate.toOption.isNone "Invalid request accepted"
   for path in ["/etc/passwd", "../escape", "a/../../escape", "a//b"] do
@@ -252,7 +311,10 @@ private def nativeTest (tools : Tools) (store : ObjectStore) (fixture : System.F
     let .ok report := result | throw (IO.userError s!"Native workflow failed: {repr result}")
     return report
 
-private def requireSuccess (report : LeanBuild.Report) : IO Unit :=
+private def requireSuccess (store : ObjectStore) (report : LeanBuild.Report) : IO Unit := do
+  if !report.success then
+    let refs := ((report.modules.push report.build).filterMap (·.diagnostics)).toList.eraseDups
+    for ref in refs do IO.eprintln (← Files.readText store ref)
   check report.success s!"Build failed: {repr report}"
 
 private def helperFailureTests (tools : Tools) (fixture : System.FilePath) : IO Unit :=
@@ -463,6 +525,69 @@ private def packCacheTests (store : ObjectStore) : IO Unit :=
       (← IO.FS.readFile (root / "large-restored/tail")) == "last file") "Cross-chunk pack restore failed"
     IO.println "PASS packed transfers, private copies, bounded cache, corruption recovery, and concurrent restores"
 
+private def workspaceTests (store : ObjectStore) : IO Unit := IO.FS.withTempDir fun root => do
+  let source := root / "source"
+  IO.FS.createDir source
+  IO.FS.writeFile (source / "input") "prepared source"
+  let files ← (← Bundle.snapshot source 10000).publish store
+  let ref ← Files.putJson store files
+  let cache := root / "workspace"
+  let use := Workspace.use store (some cache) "build-a"
+  use fun session => do
+    let manifest ← session.readManifest ref
+    Bundle.synchronize store session.directory manifest 10000
+    session.commit
+  let offline := { store with read := fun _ => throw (IO.userError "Unnecessary blob read") }
+  Workspace.use offline (some cache) "build-a" fun session => do
+    let manifest ← session.readManifest ref
+    check (← (session.directory / "input").pathExists) "Clean workspace was discarded"
+    let before ← (session.directory / "input").metadata
+    Bundle.synchronize offline session.directory manifest 10000
+    check ((← (session.directory / "input").metadata).modified == before.modified) "Cached source was rewritten"
+    IO.FS.writeFile (session.directory / "output") "published output"
+    discard <| (← Bundle.snapshot session.directory 10000).publish store
+    session.commit
+  use fun session => do
+    let manifest ← session.readManifest ref
+    Bundle.synchronize offline session.directory manifest 10000
+    check (!(← (session.directory / "output").pathExists)) "Replay reused its own output"
+    session.commit
+  let marker := cache / "ready.json"
+  IO.FS.writeFile marker ((← IO.FS.readFile marker).replace "input" "wrong")
+  use fun session => do
+    let manifest ← session.readManifest ref
+    check ((toJson manifest).compress == (toJson files).compress) "Corrupt cached manifest changed committed inputs"
+    session.commit
+  -- Missing/corrupt files are repaired even when the descriptor says clean.
+  for damage in [IO.FS.writeFile (cache / "project/input") "bad", IO.FS.removeFile (cache / "project/input")] do
+    damage
+    use fun session => do
+      let manifest ← session.readManifest ref
+      Bundle.synchronize store session.directory manifest 10000
+      check ((← IO.FS.readFile (session.directory / "input")) == "prepared source") "Damaged cache not repaired"
+      session.commit
+  -- A stopped attempt may leave arbitrary untracked files. No clean marker
+  -- means none survive into the next attempt, even in a new Session.
+  use fun session => IO.FS.writeFile (session.directory / "partial") "unfinished"
+  use fun session => do
+    check (!(← (session.directory / "input").pathExists) && !(← (session.directory / "partial").pathExists)) "Interrupted workspace reused"
+    Bundle.synchronize store session.directory files 10000
+    session.commit
+  let failed ← try
+    use fun session => do
+      IO.FS.writeFile (session.directory / "partial") "failed"
+      throw (IO.userError "job failure")
+    pure false
+  catch _ => pure true
+  check failed "Exception was swallowed"
+  use fun session => do
+    check (!(← (session.directory / "input").pathExists) && !(← (session.directory / "partial").pathExists)) "Failed workspace reused"
+    Bundle.synchronize store session.directory files 10000
+    session.commit
+  Workspace.use store (some cache) "build-b" fun session => do
+    check (!(← (session.directory / "input").pathExists)) "Different build reused a workspace"
+  IO.println "PASS reusable workspaces: no redundant transfers, replay isolation, corruption repair, interrupted/failed attempts"
+
 private def toolchainTests : IO Unit :=
   IO.FS.withTempDir fun root => do
     let source := root / "release/bin"
@@ -504,9 +629,22 @@ private def toolchainTests : IO Unit :=
       check bad.validate.toOption.isNone "Invalid release accepted"
     IO.println "PASS pinned toolchain download, checksum rejection, helper check, interrupted installation and reuse"
 
-private def nativeTests : IO Unit := do
+/-- Measure executing tasks, not merely the inherited environment variable. -/
+private def threadProbe : String := String.intercalate "\n" [
+  "private def checkThreadPool (expected : Nat) : IO Unit := do",
+  "  let counts ← Std.Mutex.new ((0, 0) : Nat × Nat)",
+  "  let tasks ← (Array.range 16).mapM fun _ => IO.asTask do",
+  "    counts.atomically do modify fun (active, peak) => (active + 1, max peak (active + 1))",
+  "    IO.sleep 30",
+  "    counts.atomically do modify fun (active, peak) => (active - 1, peak)",
+  "  for task in tasks do IO.ofExcept (← IO.wait task)",
+  "  let (_, peak) ← counts.atomically get",
+  "  unless peak == expected do throw (IO.userError s!\"Expected {expected} threads, observed {peak}\")", ""]
+
+private def nativeTests : IO Unit := IO.FS.withTempDir fun cacheRoot => do
   toolchainTests
   let tools ← Tools.fromEnvironment
+  let tools := { tools with cache := some { directory := cacheRoot / "packs" } }
   let fixture ← IO.FS.realPath "fixtures/Diamond"
   let full ← IO.FS.realPath "fixtures/FullBuild"
   helperFailureTests tools fixture
@@ -514,17 +652,23 @@ private def nativeTests : IO Unit := do
   failedJobTests tools store fixture
   bundleTests store
   packCacheTests store
+  workspaceTests store
   let built ← nativeTest tools store fixture (environment := pool #[2, 2])
-  requireSuccess built
+  requireSuccess store built
   check (built.modules.size == 4 && built.verification.isNone && built.build.status == .built)
     "Build-only report is incorrect"
   let split ← nativeTest tools store fixture (req := { request with modulesPerJob := 2 })
-  requireSuccess split
+  requireSuccess store split
   let [base, left, right, final] := split.modules.toList | throw (IO.userError "Missing split results")
-  check (base.artifacts == left.artifacts && right.artifacts == final.artifacts &&
-    base.artifacts != right.artifacts)
+  check (left.artifacts.isSome && left.artifacts == right.artifacts &&
+    base.artifacts != left.artifacts && final.artifacts != left.artifacts)
     "Bounded jobs lost their shared artifact manifests across a dependency boundary"
-  let concurrent ← nativeTest tools store fixture (fun directory => do
+  let helper := cacheRoot / "ThreadHelper.lean"
+  let original ← IO.FS.readFile tools.helper
+  IO.FS.writeFile helper ("import Std.Sync.Mutex\n" ++
+    original.replace "def main (args : List String) : IO UInt32 := do"
+      (threadProbe ++ "\ndef main (args : List String) : IO UInt32 := do\n  checkThreadPool ((← IO.getEnv \"LEAN_NUM_THREADS\").bind String.toNat? |>.getD 0)"))
+  let concurrent ← nativeTest { tools with helper } store fixture (fun directory => do
     for (name, other) in [("Left", "Right"), ("Right", "Left")] do
       let path := directory / "Fixture" / s!"{name}.lean"
       let source ← IO.FS.readFile path
@@ -538,24 +682,24 @@ private def nativeTests : IO Unit := do
         "    if (← IO.monoMsNow) - started > 10000 then",
         "      throw (IO.userError \"Sibling module did not run concurrently\")",
         "    IO.sleep 20", ""]
-      IO.FS.writeFile path ("import Lean\n" ++ source ++ "\n" ++ command))
-  requireSuccess concurrent
+      IO.FS.writeFile path ("import Lean\nimport Std.Sync.Mutex\n" ++ source ++ "\n" ++ threadProbe ++ "\nrun_cmd Lean.Elab.Command.liftIO (checkThreadPool 1)\n" ++ command))
+  requireSuccess store concurrent
   let some left := concurrent.modules.find? (·.name == "Fixture.Left") | throw (IO.userError "Missing Left")
   let some right := concurrent.modules.find? (·.name == "Fixture.Right") | throw (IO.userError "Missing Right")
   check (left.artifacts.isSome && left.artifacts == right.artifacts && left.diagnostics == right.diagnostics)
     "One local job published separate artifacts/diagnostics for each module"
   IO.println "PASS native modules overlap within one Lake job, inherit CPU budget, and share one artifact bundle"
   let defaults ← nativeTest tools store fixture (req := { request with targets := #[] })
-  requireSuccess defaults
+  requireSuccess store defaults
   let reused ← nativeTest tools store fixture (req := { request with cache := .reuse, targets := #["+Fixture.Final:olean"] })
-  requireSuccess reused
+  requireSuccess store reused
   let qualified ← nativeTest tools store fixture (req := { request with targets := #["@build_fixture/Fixture"] })
-  requireSuccess qualified
+  requireSuccess store qualified
   let oversized ← nativeTest tools store fixture (req := { request with limits := { request.limits with bytes := 1 } })
   check (!oversized.success && (oversized.message.splitOn "artifact byte limit").length > 1) "Oversized workspace accepted"
   let req := { request with check := { mode := .kernel, theorems := #["Fixture.result"] } }
   let report ← nativeTest tools store fixture (req := req)
-  requireSuccess report
+  requireSuccess store report
   let cached ← nativeTest tools store fixture (fun d => do
     IO.FS.writeFile (d / "Fixture/Unrelated.lean") "theorem unrelated : False := by sorry\n"
     let result ← IO.Process.output {
@@ -563,7 +707,7 @@ private def nativeTests : IO Unit := do
       cwd := d, args := #["--no-cache", "build", "+Fixture.Unrelated"] }
     check (result.exitCode == 0) "Cannot prepare unrelated cached module")
     { req with cache := .reuse }
-  requireSuccess cached
+  requireSuccess store cached
   check (!cached.build.builtModules.contains "Fixture.Unrelated" && cached.build.builtModules.size == 4)
     "Unrelated cached modules entered the verification closure"
   let some verified := report.verification | throw (IO.userError "No verification report")
@@ -578,7 +722,7 @@ private def nativeTests : IO Unit := do
   for subdir in [".", "packages/app"] do
     let req := { request with targets := #[], subdirectory := subdir, options := ({} : Std.TreeMap String String).insert "greeting" "51" }
     let native ← nativeTest tools store full (req := req)
-    requireSuccess native
+    requireSuccess store native
     IO.FS.withTempDir fun root => do
       let actual := root / "actual"
       let some ref := native.build.artifacts | throw (IO.userError "Missing executable bundle")
@@ -596,7 +740,7 @@ private def nativeTests : IO Unit := do
       check (actualRun.exitCode == 0 && actualRun.stdout == expectedRun.stdout && actualRun.stdout == "52\n")
         "Distributed executable differs from ordinary Lake"
   let custom ← nativeTest tools store full (req := { request with targets := #["receipt"] })
-  requireSuccess custom
+  requireSuccess store custom
   check custom.modules.isEmpty "Opaque custom target was treated as a Lean module"
   let some ref := custom.build.artifacts | throw (IO.userError "Custom artifact missing")
   let entries : Bundle.Manifest ← Files.readJson store ref
@@ -611,7 +755,7 @@ private def nativeTests : IO Unit := do
     IO.FS.writeFile (d / "lakefile.lean") (config ++
       "\ntarget replaceFile pkg : FilePath := do\n  IO.FS.removeFile (pkg.dir / \"replaced\")\n  IO.FS.removeFile (pkg.dir / \"deleted\")\n  IO.FS.createDir (pkg.dir / \"replaced\")\n  let output := pkg.dir / \"replaced\" / \"result\"\n  IO.FS.writeFile output \"new file\"\n  return Job.pure output\n"))
     { request with targets := #["replaceFile"] }
-  requireSuccess replacement
+  requireSuccess store replacement
   IO.FS.withTempDir fun root => do
     let some ref := replacement.build.artifacts | throw (IO.userError "Missing replaced artifact")
     Bundle.restore store root (← Files.readJson store ref) request.limits.bytes
@@ -639,19 +783,19 @@ private def nativeTests : IO Unit := do
   let leanConfig ← nativeTest tools store fixture (fun d => do
     IO.FS.removeFile (d / "lakefile.toml")
     IO.FS.writeFile (d / "lakefile.lean") "import Lake\nopen Lake DSL\npackage build_fixture\nlean_lib Fixture\n")
-  requireSuccess leanConfig
+  requireSuccess store leanConfig
   let customDefaults ← nativeTest tools store fixture (fun d => do
     IO.FS.removeFile (d / "lakefile.toml")
     IO.FS.writeFile (d / "lakefile.lean")
       "import Lake\nopen Lake DSL\npackage build_fixture\nlean_lib Fixture where\n  defaultFacets := #[]\n"
     IO.FS.writeFile (d / "Fixture.lean") "This source is intentionally invalid.\n")
     { request with targets := #["Fixture"] }
-  requireSuccess customDefaults
+  requireSuccess store customDefaults
   check customDefaults.modules.isEmpty "Custom library defaults forced an unrelated Lean compilation"
   let runtime ← nativeTest tools store fixture (fun d =>
     IO.FS.writeFile (d / "Fixture/Base.lean")
       "namespace Fixture\ndef twice (n : Nat) := n + n\nunsafe def castValue (n : Nat) : Int := unsafeCast n\npartial def loop (n : Nat) : Nat := loop (n + 1)\ntheorem twice_zero : twice 0 = 0 := rfl\n")
-  requireSuccess runtime
+  requireSuccess store runtime
   let sorryReport ← nativeTest tools store fixture (fun d =>
     IO.FS.writeFile (d / "Fixture/Left.lean") "import Fixture.Base\nnamespace Fixture\ntheorem left : twice 1 = 2 := by sorry\n") req
   check (!sorryReport.success && sorryReport.build.status == .built &&
@@ -679,7 +823,7 @@ private def nativeTests : IO Unit := do
     { req with check := { mode := .kernel, allowedAxioms := #[] } }
   check (!tighter.success) "Stricter axiom policy ignored"
   let paranoid ← nativeTest tools store fixture (req := { req with targets := #["+Fixture.Base"], check := { mode := .paranoid } })
-  requireSuccess paranoid
+  requireSuccess store paranoid
   let some verifiedParanoid := paranoid.verification | throw (IO.userError "Missing paranoid result")
   let some log := verifiedParanoid.diagnostics | throw (IO.userError "Missing checker log")
   let text ← Files.readText store log
@@ -723,3 +867,11 @@ private def nativeTests : IO Unit := do
 def main (args : List String) : IO Unit := do
   generatedTests
   if args.contains "--native" then nativeTests
+  if let ["--plan", path] := args then
+    let modules : Array LeanBuild.Module ← IO.ofExcept (Json.parse (← IO.FS.readFile path) >>= fromJson?)
+    IO.ofExcept (validateModules modules)
+    let stats ← checkPartition modules (pool #[7, 7, 7, 7])
+    let reference := modelTicks (criticalOrder modules) 28
+    let utilization := modules.size * 1000 / (stats.ticks * 28)
+    IO.println s!"DAG: {modules.size} modules → {stats.rounds} rounds, {stats.jobs} jobs (4 × 7 CPUs)"
+    IO.println s!"Unit-cost compute model: {stats.ticks} slots, {utilization / 10}.{utilization % 10}% CPU use; shared ready queue: {reference} slots. Excludes coordination, transfers and unequal compilation times."
