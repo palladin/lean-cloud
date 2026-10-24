@@ -79,7 +79,8 @@ def cases : Array TestCase := #[
       (some initial) waiting 2000
     let entries := waiting.scheduler.jobs.map fun job => {
       branch := job.branch, job := some (BranchObservation.ofJob job) : BranchTree.Entry }
-    let lines := BranchTree.lines entries {} 20 52 (some { timing with observedMs := 5432 })
+    let lines := BranchTree.lines entries { expanded := .ofList [("parallel/0:2", true)] }
+      20 52 (some { timing with observedMs := 5432 })
     assertTrue (lines.all (Styled.length · ≤ 52)) "Elapsed column exceeded width"
     let text := String.intercalate "\n" (lines.map Styled.plain).toList
     assertTrue ((text.splitOn "ELAPSED").length > 1 && (text.splitOn "4.432s").length > 1 &&

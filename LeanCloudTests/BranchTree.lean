@@ -22,6 +22,9 @@ private def sibling := fork.child 1
 private def nestedFork := child.next
 private def grandchild := nestedFork.child 0
 
+private def expandedTree : LeanCloudCli.BranchTree.Navigation := {
+  expanded := .ofList [("parallel/0:2", true), ("parallel/0:2/0:1", true)] }
+
 private def steps : Array Trace.Step := #[
   jobStep 0 ⟨Location.root, fork, false, .waiting #[child, sibling]⟩,
   jobStep 1 ⟨child, child, false, .running "worker2" 1 100⟩,
@@ -53,10 +56,15 @@ public def cases : Array TestCase := #[
       BranchObservation.ofJob ⟨fork.child i, fork.child i, false, .done⟩
     let root := BranchObservation.ofJob ⟨Location.root, fork, true, .running "worker4" 9 100⟩
     let entries := LeanCloudCli.BranchTree.current steps (jobs.push root)
-    let rows := LeanCloudCli.BranchTree.rows entries {}
+    assertEq (LeanCloudCli.BranchTree.rows entries {}).size 2 "Large parallel group expanded by default"
+    let rows := LeanCloudCli.BranchTree.rows entries expandedTree
     assertEq (rows.filter fun row => row.parent == some "parallel/0:2").size count
     assertEq (rows[0]?.map (·.status)) (some "worker4") "Paged observations overrode current scheduler state"
-    assertEq (LeanCloudCli.BranchTree.rows entries { collapsed := #["branch/0:0"] }).size 1⟩,
+    assertEq (LeanCloudCli.BranchTree.rows entries { expanded := .ofList [("branch/0:0", false)] }).size 1
+    let last := LeanCloudCli.BranchTree.navigate entries expandedTree .up
+    assertEq last.selected (some "branch/0:2/9999:0")
+    let view := LeanCloudCli.BranchTree.lines entries last 12 52
+    assertTrue (view.any (fun line => has (Styled.plain line) "branch 9999")) "Wrapped selection stayed off screen"⟩,
   ⟨"console.tree.parallel-shows-workers-branch-shows-current-assignment", do
     let other := { workerStep 5 sibling sibling "ancestor" with event := {
       (workerStep 5 sibling sibling "ancestor").event with worker := "worker3" } }
@@ -67,7 +75,7 @@ public def cases : Array TestCase := #[
       cpuCores := some 8, memoryCapacity := some 17179869184,
       cpuCapacityMillis := some 2000, memory := some 1048576, memoryLimit := some 536870912 }], true⟩
     let view (selection : String) (trace := active) := String.intercalate "\n"
-      (Watch.frame ctx run trace histories { tree := { selected := some selection } } 220 50 "result pending").toList
+      (Watch.frame ctx run trace histories { tree := { expandedTree with selected := some selection } } 220 50 "result pending").toList
     let group := view "parallel/0:2"
     for worker in ["worker1", "worker2", "worker3"] do
       assertTrue (has group worker) s!"Parallel group omitted {worker}"
@@ -100,18 +108,67 @@ public def cases : Array TestCase := #[
     assertTrue (!earlyRows.any (·.branch == grandchild)) "Future descendant appeared in history"
     let current := LeanCloudCli.BranchTree.current #[] #[steps[0]!.job.get!]
     assertEq current.size 3 "Paged telemetry hid pending children from the current scheduler snapshot"
-    assertEq (LeanCloudCli.BranchTree.rows current {}).size 4
+    assertEq (LeanCloudCli.BranchTree.rows current expandedTree).size 4
     let compact := Trace.latest #[steps[0]!, steps[10]!]
     assertEq (LeanCloudCli.BranchTree.current compact).size 3 "Completion erased the parallel group when child observations were missing"
     let entries := LeanCloudCli.BranchTree.current steps
-    let rows := LeanCloudCli.BranchTree.rows entries {}
+    let rows := LeanCloudCli.BranchTree.rows entries expandedTree
     assertEq rows.size 6
     assertEq (rows.filter (·.fork.isSome)).size 2
     assertEq (rows.find? (·.branch == grandchild) |>.map (·.depth)) (some 4)
     let laterFork := Location.next fork
     let trace := steps.push (jobStep 11 ⟨Location.root, laterFork, false, .waiting #[laterFork.child 0]⟩)
-    assertEq ((LeanCloudCli.BranchTree.rows (LeanCloudCli.BranchTree.current trace) {}).filter (·.fork.isSome)).size 3
+    assertEq ((LeanCloudCli.BranchTree.rows (LeanCloudCli.BranchTree.current trace) expandedTree).filter (·.fork.isSome)).size 3
     assertEq (LeanCloudCli.BranchTree.current (trace.extract 0 steps.size)).size entries.size⟩,
+  ⟨"console.tree.parallel-defaults-and-refresh", do
+    let early := LeanCloudCli.BranchTree.current (steps.extract 0 1)
+    let visible := LeanCloudCli.BranchTree.rows early {}
+    assertEq (visible.map (·.key)) #["branch/0:0", "parallel/0:2"]
+    let initial := text {}
+    assertTrue (has initial "▸ parallel @2" && !has initial "branch 0") "Initial frame did not show a collapsed group"
+    let group := LeanCloudCli.BranchTree.navigate early {} .down
+    let opened := LeanCloudCli.BranchTree.navigate early group .right
+    assertEq opened.selected group.selected "Expanding moved the selection"
+    assertEq (LeanCloudCli.BranchTree.rows early opened).size 4
+    -- A nested parallel discovered on refresh stays closed; the parent stays open.
+    let refreshed := LeanCloudCli.BranchTree.current steps
+    let visible := LeanCloudCli.BranchTree.rows refreshed opened
+    assertEq (visible.map (·.key)) #["branch/0:0", "parallel/0:2", "branch/0:2/0:0",
+      "parallel/0:2/0:1", "branch/0:2/1:0"]
+    let nested := { opened with selected := some "parallel/0:2/0:1" }
+    let nestedOpen := LeanCloudCli.BranchTree.navigate refreshed nested .enter
+    assertEq (LeanCloudCli.BranchTree.rows refreshed nestedOpen).size 6
+    let folded := LeanCloudCli.BranchTree.navigate refreshed
+      { nestedOpen with selected := some "parallel/0:2" } .left
+    let later := fork.next
+    let refreshed := LeanCloudCli.BranchTree.current
+      (steps.push (jobStep 11 ⟨Location.root, later, false, .waiting #[later.child 0]⟩))
+    assertEq ((LeanCloudCli.BranchTree.rows refreshed folded).map (·.key))
+      #["branch/0:0", "parallel/0:2", "parallel/0:3"] "Refresh reopened a group"
+    let reopened := LeanCloudCli.BranchTree.navigate refreshed folded .right
+    assertTrue ((LeanCloudCli.BranchTree.rows refreshed reopened).any (·.branch == grandchild))
+      "Reopening the parent forgot a nested expansion"
+    assertTrue (!(LeanCloudCli.BranchTree.rows refreshed reopened).any (·.branch == later.child 0))
+      "New parallel group expanded automatically"⟩,
+  ⟨"console.tree.wraps-visible-rows", do
+    let entries := LeanCloudCli.BranchTree.current steps
+    let nav := LeanCloudCli.BranchTree.navigate entries {} .up
+    assertEq nav.selected (some "parallel/0:2")
+    assertEq (LeanCloudCli.BranchTree.navigate entries nav .down).selected (some "branch/0:0")
+    let opened := LeanCloudCli.BranchTree.navigate entries nav .right
+    let first := { opened with selected := some "branch/0:0" }
+    let last := LeanCloudCli.BranchTree.navigate entries first .up
+    assertEq last.selected (some "branch/0:2/1:0") "Wrap selected a hidden descendant"
+    assertEq (LeanCloudCli.BranchTree.navigate entries last .down).selected first.selected
+    assertTrue (LeanCloudCli.BranchTree.navigate entries last .right == last) "Right on a leaf wrapped unexpectedly"
+    let one := LeanCloudCli.BranchTree.navigate entries first .left
+    for key in [Input.Key.up, .down] do
+      assertEq (LeanCloudCli.BranchTree.navigate entries one key).selected (some "branch/0:0")
+      assertTrue (LeanCloudCli.BranchTree.navigate #[] one key == one) "Empty tree changed selection"
+    let watch := Watch.navigate steps 1 { tree := first, offset := 20, workers := 2 } .up
+    assertEq watch.tree.selected last.selected
+    assertEq watch.offset 0
+    assertEq watch.workers 0⟩,
   ⟨"console.tree.assignment-ownership-during-replay", do
     assertEq steps[3]!.owner (some child)
     let own := LeanCloudCli.BranchTree.observations steps child
@@ -122,7 +179,7 @@ public def cases : Array TestCase := #[
     assertTrue (orphan.all (·.job.isNone)) "Inferred ancestry fabricated scheduler status"⟩,
   ⟨"console.tree.navigation-and-code-selection", do
     let active := steps.extract 0 5
-    let nav : Watch.Navigation := { tree := { selected := some "branch/0:2/0:0" } }
+    let nav : Watch.Navigation := { tree := { expandedTree with selected := some "branch/0:2/0:0" } }
     let view := text nav (trace := active)
     assertTrue (has view "Branch 0:2/0:0" && has view "3   >   child_code") "Selected branch did not show its own code"
     let up := Watch.navigate active 1 nav .up
@@ -167,7 +224,7 @@ public def cases : Array TestCase := #[
     assertEq entries.size 1001 "Parallel child count did not reconstruct all branch locations"
     assertTrue (entries.any (·.branch == fork.child 999)) "Last pending branch is missing"⟩,
   ⟨"console.tree.sidebar-layout-and-bounded-frames", do
-    let view := text {} (trace := steps.extract 0 7)
+    let view := text { tree := expandedTree } (trace := steps.extract 0 7)
     let lines := view.splitOn "\n"
     assertTrue (lines.any (fun line => has line "BRANCHES" && has line "Branch" && has line "│"))
       "Tree and worker code were not placed side by side"

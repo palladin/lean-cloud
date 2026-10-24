@@ -41,9 +41,10 @@ The prompt and completion footer remain anchored. Scroll output with the mouse
 wheel, select by dragging, or Ctrl-A on an empty prompt to select the transcript.
 Ctrl-C copies a selection. Tab/Shift-Tab complete; up/down recall commands.
 
-Watch selects branches with up/down and folds groups with left/right. A parallel
-group shows all its workers; a branch shows its executing worker. Completed runs
-show the last view with frozen metrics. There is no history timeline. Source,
+Watch starts parallel groups collapsed. Use right or Enter to expand, and left
+to collapse. Up/down select visible rows, wrapping from first to last and back.
+A parallel group shows all its workers; a branch shows its executing worker.
+Completed runs show the last view with frozen metrics. There is no history timeline. Source,
 telemetry and outcomes come from the API; caches allow a clearly labeled last
 view during an outage. `logs` is not a complete container-log archive.
 

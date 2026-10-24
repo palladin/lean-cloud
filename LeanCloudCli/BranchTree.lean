@@ -63,8 +63,12 @@ def observations (observed : Array Trace.Step) (location : Location) : Array Tra
 
 structure Navigation where
   selected : Option String := none
-  collapsed : Array String := #[]
+  /-- Explicit choices survive refreshes. Branches default open; parallel groups closed. -/
+  expanded : Std.HashMap String Bool := {}
   deriving BEq, Inhabited
+
+private def Navigation.isExpanded (nav : Navigation) (key : String) (default : Bool) : Bool :=
+  nav.expanded[key]?.getD default
 
 structure Row where
   key : String
@@ -123,13 +127,13 @@ private def descend (index : Index) (nav : Navigation) :
     let key := branchKey entry.branch
     let title := if entry.branch == Location.root then "root" else s!"branch {entry.branch.back!.1}"
     let mut rows := #[{ key, parent, branch := entry.branch, depth, title, status := label index entry, expandable := !groups.isEmpty : Row }]
-    unless nav.collapsed.contains key do
+    if nav.isExpanded key true then
       for fork in groups do
         let key := forkKey fork
         let children := children index fork
         let done := children.filter (fun e => e.job.any (·.status == .done))
         rows := rows.push { key, parent := some (branchKey entry.branch), branch := entry.branch, fork := some fork, depth := depth + 1, title := s!"parallel @{fork.back!.2}", status := s!"{done.size}/{children.size}", expandable := true }
-        unless nav.collapsed.contains key do
+        if nav.isExpanded key false then
           for child in children do
             rows := rows ++ descend index nav fuel child (depth + 2) (some key)
     return rows
@@ -153,16 +157,17 @@ def navigate (entries : Array Entry) (nav : Navigation)
   let some row := visible[index]? | return nav
   let select (index : Nat) := { nav with selected := (visible[min index (visible.size - 1)]?).map (·.key) }
   return match key with
-    | .up => select (index - 1)
-    | .down => select (index + 1)
+    | .up => select (if index == 0 then visible.size - 1 else index - 1)
+    | .down => select ((index + 1) % visible.size)
     | .left =>
-      if row.expandable && !nav.collapsed.contains row.key then
-        { nav with selected := some row.key, collapsed := nav.collapsed.push row.key }
+      if row.expandable && nav.isExpanded row.key row.fork.isNone then
+        { nav with selected := some row.key, expanded := nav.expanded.insert row.key false }
       else { nav with selected := row.parent.orElse (fun _ => some row.key) }
     | .right | .enter =>
-      if nav.collapsed.contains row.key then
-        { nav with selected := some row.key, collapsed := nav.collapsed.filter (· != row.key) }
-      else if row.expandable then select (index + 1) else nav
+      if !row.expandable then nav
+      else if !nav.isExpanded row.key row.fork.isNone then
+        { nav with selected := some row.key, expanded := nav.expanded.insert row.key true }
+      else select (index + 1)
     | _ => nav
 
 def lines (entries : Array Entry) (nav : Navigation)
@@ -177,7 +182,7 @@ def lines (entries : Array Entry) (nav : Navigation)
   let start := min (index - count / 2) (visible.size - count)
   for i in [start:min visible.size (start + count)] do
     let row := visible[i]!
-    let marker := if row.expandable then (if nav.collapsed.contains row.key then "▸" else "▾") else "·"
+    let marker := if row.expandable then (if nav.isExpanded row.key row.fork.isNone then "▾" else "▸") else "·"
     let indent := String.ofList (List.replicate (min (width / 3) (row.depth * 2)) ' ')
     let heading := s!"{indent}{marker} {row.title} "
     let color := if i == index then Styled.Color.selected else .normal
@@ -193,7 +198,7 @@ def lines (entries : Array Entry) (nav : Navigation)
     result := result.push (label ++ Styled.text padding color ++
       Styled.text (String.ofList (List.replicate (10 - elapsed.length) ' ') ++ elapsed)
         (if i == index then .selected else .cyan))
-  result := result.push (Styled.text s!"{index + 1}/{visible.size} · ↑↓ select · ←→ fold" .muted)
+  result := result.push (Styled.text s!"{index + 1}/{visible.size} · ↑↓ wrap · ←→ fold" .muted)
   return result
 
 end LeanCloudCli.BranchTree

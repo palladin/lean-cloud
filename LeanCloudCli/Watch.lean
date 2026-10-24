@@ -200,7 +200,7 @@ def frame (ctx : Context) (run : Run) (steps : Array Trace.Step)
   let live := status == "result pending"
   let mut lines := #[
     Styled.text (pad width s!" {run.id} · {status} · {run.program.entry} / {ctx.project}") .header,
-    Styled.text "↑↓: branch · ←→: fold · PgUp/PgDn: workers · j/k: code · a: follow source · q: back" .cyan,
+    Styled.text "↑↓: branch (wrap) · ←→: fold · PgUp/PgDn: workers · j/k: code · a: follow source · q: back" .cyan,
     Styled.text (if live then "LIVE" else "LAST VIEW") .muted]
   if width < 39 || height < 16 then
     lines := lines.push (Styled.text "Enlarge terminal to at least 40 × 16." .yellow)

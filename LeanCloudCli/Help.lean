@@ -53,7 +53,7 @@ def commands : Array Command := #[
     details := "Prints pending, a completed value, or the failure/cancellation reason. Blob results are read as text."
     examples := #["result example-1"] },
   { name := "watch", arguments := "RUN [--once]", summary := "Watch live branches, source, and workers; keep the final view."
-    details := "Select a parallel group to see all workers and their code; select a branch to see its executing worker. Up/down select branches; left/right collapse or expand groups. PgUp/PgDn page workers when space is limited. j/k scroll code; a follows its source line; q returns.\nCompleted runs show the last view with frozen statistics. Only the latest snapshot is saved; there is no execution history or timeline. Watching never resumes execution."
+    details := "Parallel groups start collapsed. Select a group to see all workers and their code; select a branch to see its executing worker. Up/down select visible rows and wrap at either end; left/right collapse or expand groups. Enter also expands. PgUp/PgDn page workers when space is limited. j/k scroll code; a follows its source line; q returns.\nCompleted runs show the last view with frozen statistics. Only the latest snapshot is saved; there is no execution history or timeline. Watching never resumes execution."
     options := #[("--once", "Print one plain-text frame and return.")]
     examples := #["watch example-1", "watch example-1 --once"] },
   { name := "top", arguments := "[--once]", summary := "Show live worker and scheduler graphs across all runs."
