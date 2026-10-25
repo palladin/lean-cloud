@@ -162,12 +162,12 @@ if bash deploy/new-app.sh "$work/example" 2>/dev/null; then echo 'Replaced an ex
 # LeanBuild accepts newer source releases independently of the worker SDK pin.
 for version in 4.35.0 4.35.1 4.36.0 4.100.0 5.0.0; do
   : > "$HELPER_TEST_LOG"
-  bash Applications/LeanBuild/build.sh checker:test "$version"
+  bash Applications/LeanBuild/build.sh lean-build:test "$version"
   [[ $(wc -l < "$HELPER_TEST_LOG") -eq 2 ]]
-  grep -Fq -- "--build-arg SOURCE_LEAN_VERSION=$version -t checker:test" "$HELPER_TEST_LOG"
+  grep -Fq -- "--build-arg SOURCE_LEAN_VERSION=$version -t lean-build:test" "$HELPER_TEST_LOG"
 done
 : > "$HELPER_TEST_LOG"
-if HELPER_BAD_RELEASE=1 bash Applications/LeanBuild/build.sh checker:test 4.35.0; then
+if HELPER_BAD_RELEASE=1 bash Applications/LeanBuild/build.sh lean-build:test 4.35.0; then
   echo 'Built an image without official release checksums'; exit 1
 fi
 [[ ! -s "$HELPER_TEST_LOG" ]]
@@ -176,7 +176,7 @@ bash Applications/LeanBuild/build.sh
 grep -Fq -- "--build-arg SOURCE_LEAN_VERSION=$(sed 's|leanprover/lean4:v||' Applications/LeanBuild/source-toolchain)" "$HELPER_TEST_LOG"
 for version in 3.99.0 4.9.0 4.34.99 4.35 04.35.0 4.035.0 4.35.00 4.35.0-rc1 nightly; do
   : > "$HELPER_TEST_LOG"
-  if bash Applications/LeanBuild/build.sh checker:test "$version" 2>/dev/null; then
+  if bash Applications/LeanBuild/build.sh lean-build:test "$version" 2>/dev/null; then
     echo "Unsupported source version accepted: $version"; exit 1
   fi
   [[ ! -s "$HELPER_TEST_LOG" ]] || { echo 'Invalid version reached Docker'; exit 1; }

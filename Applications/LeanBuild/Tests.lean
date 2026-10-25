@@ -20,13 +20,15 @@ private def journal (ref : IO.Ref (List (String × ReplayRecord))) : ReplayStore
     | some old => (old, saved)
     | none => (value, (key, value) :: saved)
 
-private def objects (ref : IO.Ref (Std.HashMap String ByteArray)) : ObjectStore where
+private def objects (ref : Std.Mutex (Std.HashMap String ByteArray)) : ObjectStore where
   ensureContainer := pure ()
-  read key := return (← ref.get)[key]?
-  create key bytes := ref.modifyGet fun saved => match saved[key]? with
-    | some old => (old, saved)
-    | none => (bytes, saved.insert key bytes)
-  erase key := ref.modify (·.erase key)
+  read key := ref.atomically do return (← get)[key]?
+  create key bytes := ref.atomically do
+    let saved ← get
+    if let some old := saved[key]? then return old
+    set (saved.insert key bytes)
+    return bytes
+  erase key := ref.atomically (modify (·.erase key))
   list _ := return #[]
 
 private def request : LeanBuild.Request := {
@@ -40,8 +42,7 @@ private def fixturePlan : Plan := {
 private def stub : Backend IO := {
   prepare := fun _ _ => pure { plan := some fixturePlan }
   build := fun _ _ _ group _ => pure (group.map fun m => { name := m.name, status := .built })
-  finish := fun _ _ _ _ => pure { name := "targets", status := .built }
-  check := fun _ r _ _ => pure { mode := r.check.mode, success := true } }
+  finish := fun _ _ _ _ => pure { name := "targets", status := .built } }
 
 private def pool (cpus : Array Nat) : ExecContext IO :=
   let workers := cpus.mapIdx fun i n => { id := s!"worker{i}", cpus := n : WorkerCapacity }
@@ -180,11 +181,22 @@ private def generatedTests : IO Unit := do
     check ((Tools.sourceRelease s!"leanprover/lean4:v{version}").toOption.isNone) "Unsupported release accepted"
   let minimal : LeanBuild.Request ← IO.ofExcept (fromJson? (Json.mkObj [
     ("repository", toJson request.repository), ("revision", toJson "main")]))
-  check (minimal.targets.isEmpty && minimal.check.mode == .none && minimal.cache == .rebuild &&
+  check (minimal.targets.isEmpty && minimal.cache == .rebuild && minimal.limits.helperMemoryMiB == 4096 &&
     minimal.options.isEmpty && minimal.subdirectory == "." && minimal.modulesPerJob == 0) "Wrong request defaults"
-  let encoded ← IO.ofExcept (Json.parse "{\"repository\":\"https://github.com/a/b\",\"revision\":\"main\",\"options\":{\"greeting\":\"42\"},\"check\":{\"mode\":\"kernel\"}}")
+  let encoded ← IO.ofExcept (Json.parse "{\"repository\":\"https://github.com/a/b\",\"revision\":\"main\",\"options\":{\"greeting\":\"42\"},\"limits\":{\"helperMemoryMiB\":2048}}")
   let decoded : LeanBuild.Request ← IO.ofExcept (fromJson? encoded)
-  check (decoded.options["greeting"]? == some "42" && decoded.check.mode == .kernel) "JSON options/check mode"
+  check (decoded.options["greeting"]? == some "42" && decoded.limits.helperMemoryMiB == 2048) "JSON options/limits"
+  for old in ["check", "theorems", "allowedAxioms", "paranoid", "modules"] do
+    let legacy := (toJson request).setObjVal! old (Json.mkObj [])
+    check ((fromJson? (α := LeanBuild.Request) legacy).toOption.isNone) "Removed request field was silently ignored"
+  let legacy := (toJson request).setObjVal! "limits" (Json.mkObj [("checkerMemoryMiB", toJson (1024 : Nat))])
+  check ((fromJson? (α := LeanBuild.Request) legacy).toOption.isNone) "Old memory limit was silently ignored"
+  let finishFailure := { stub with
+    finish := fun _ _ _ _ => pure { name := "targets", status := .failed, message := "Link failed" } }
+  let .ok failed ← (DirectInterpreter.interpret noBlobs (workflow finishFailure) request).run
+    | throw (IO.userError "Target failure was not returned as a build report")
+  check (!failed.success && failed.build.status == .failed && failed.build.message == "Link failed")
+    "Successful module jobs hid a failed target build"
   for seed in [:80] do
     let modules := (Array.range (4 + seed % 12)).map fun i => {
       name := s!"M{i}"
@@ -211,13 +223,9 @@ private def generatedTests : IO Unit := do
       finish := fun _ _ _ done => do
         check (done.size == modules.size && done.all (·.status == .built)) "Premature target completion"
         calls.modify (·.push "finish")
-        return { name := "targets", status := .built }
-      check := fun _ r _ _ => do
-        calls.modify (·.push "check")
-        return { mode := r.check.mode, success := true } }
+        return { name := "targets", status := .built } }
     let req := { request with
-      modulesPerJob := if seed % 3 == 0 then 0 else 1 + seed % 7
-      check := { mode := if seed % 3 == 0 then .kernel else .none } }
+      modulesPerJob := if seed % 3 == 0 then 0 else 1 + seed % 7 }
     let environment := pool ((Array.range (1 + seed % 4)).map fun i => 1 + (seed + i) % 8)
     let direct ← (DirectInterpreter.interpret environment (workflow backend) req).run
     let saved ← IO.mkRef []
@@ -233,9 +241,10 @@ private def generatedTests : IO Unit := do
     check (report.modules.map (fun r => (r.name, r.status)) == expected.map (fun r => (r.name, r.status)))
       "Batched results differ from sequential dependency evaluation"
     let before ← calls.get
+    check (report.success == expected.all (·.status == .built) &&
+      before.contains "finish" == report.success) "Success did not match completed build targets"
     discard <| (replayReport (journal saved) (workflow backend req) (pool #[2])).run
     check ((← calls.get) == before) "Replay reran recorded jobs"
-    if req.check.mode == .none then check (!before.contains "check") "Build-only invoked proof checker"
   -- Stop after recording the partition, then resume on a differently sized
   -- worker. Planning stays stable; native execution gets the replacement budget.
   let planned := pool #[1, 3]
@@ -264,7 +273,7 @@ private def generatedTests : IO Unit := do
   check (report.success && (← groups.get) ==
     ((partition modules #[] (planned.workers.map (·.cpus)) 0).filter (!·.isEmpty)).map (·.map (·.name)))
     "Replay repartitioned an existing batch using the replacement pool"
-  for stage in ["prepare", "build", "finish", "check"] do
+  for stage in ["prepare", "build", "finish"] do
     let calls ← IO.mkRef (0 : Nat)
     let fail : IO Unit := do calls.modify (· + 1); throw (IO.userError "Job exception")
     let backend := { stub with
@@ -276,14 +285,10 @@ private def generatedTests : IO Unit := do
         stub.build env r p m done
       finish := fun env r p done => do
         if stage == "finish" then fail
-        stub.finish env r p done
-      check := fun env r p b => do
-        if stage == "check" then fail
-        stub.check env r p b }
+        stub.finish env r p done }
     let saved ← IO.mkRef []
-    let req := { request with check := { mode := .kernel } }
     for _ in [:2] do
-      let .error error ← (SequentialReplay.interpret (journal saved) noBlobs 1000 (workflow backend) req).run
+      let .error error ← (SequentialReplay.interpret (journal saved) noBlobs 1000 (workflow backend) request).run
         | throw (IO.userError s!"{stage} exception not propagated")
       check (error == ⟨.application, "Job exception"⟩) "Wrong exception outcome"
     check ((← calls.get) == 1) s!"{stage} exception retried as a crash"
@@ -293,13 +298,14 @@ private def generatedTests : IO Unit := do
       { request with subdirectory := "../escape" },
       { request with targets := #["--run=evil"] },
       { request with modulesPerJob := 100001 },
-      { request with check := { mode := .kernel, allowedAxioms := #["sorryAx"] } }] do
+      { request with limits := { helperMemoryMiB := 0 } },
+      { request with limits := { helperMemoryMiB := 65537 } }] do
     check req.validate.toOption.isNone "Invalid request accepted"
   for path in ["/etc/passwd", "../escape", "a/../../escape", "a//b"] do
     check (!Bundle.safePath path) "Unsafe artifact path accepted"
   check ((validateModules #[⟨"A", #["B"]⟩, ⟨"B", #["A"]⟩]).toOption.isNone) "Cycle accepted"
   check ((validateModules #[⟨"A", #[]⟩, ⟨"A", #[]⟩]).toOption.isNone) "Duplicate accepted"
-  IO.println "PASS 80 generated DAGs: dependencies, direct/replay agreement, optional checking, durable exceptions"
+  IO.println "PASS 80 generated DAGs: dependencies, direct/replay agreement, build completion, durable exceptions"
 
 private def copyFixture (source destination : System.FilePath) : IO Unit := do
   let out ← IO.Process.output { cmd := "cp", args := #["-R", source.toString ++ "/.", destination.toString] }
@@ -318,7 +324,7 @@ private def nativeTest (tools : Tools) (store : ObjectStore) (fixture : System.F
     IO.FS.createDirAll cwd
     copyFixture fixture cwd
     change cwd
-    let prepared ← tools.prepareDirectory store req directory "fixture-commit"
+    let prepared ← { tools with threads := max 1 environment.currentWorker.cpus }.prepareDirectory store req directory "fixture-commit"
     let backend := { tools.backend store with prepare := fun _ _ => pure prepared }
     let result ← (DirectInterpreter.interpret environment (workflow backend) req).run
     let .ok report := result | throw (IO.userError s!"Native workflow failed: {repr result}")
@@ -384,13 +390,17 @@ private def publicationTests (tools : Tools) (store : ObjectStore) (fixture : Sy
     IO.FS.createDir directory
     copyFixture fixture directory
     for artifact in [false, true] do
-      let pending ← IO.mkRef true
+      let pending ← Std.Mutex.new true
       let preparing ← IO.mkRef true
       let flaky := { store with create := fun key bytes => do
         let saved ← store.create key bytes
         let target := artifact != (← preparing.get)
         if target then
-          if ← pending.modifyGet fun old => (old, false) then throw (IO.userError "Publication failure")
+          let inject ← pending.atomically do
+            let old ← get
+            set false
+            return old
+          if inject then throw (IO.userError "Publication failure")
         return saved }
       let backend := { tools.backend flaky with
         prepare := fun _ r => do
@@ -402,7 +412,7 @@ private def publicationTests (tools : Tools) (store : ObjectStore) (fixture : Sy
         let .error error ← (SequentialReplay.interpret (journal saved) noBlobs 1000 (workflow backend) request).run
           | throw (IO.userError "Publication failure was swallowed")
         check (error == ⟨.application, "Publication failure"⟩) "Wrong publication error"
-      check (!(← pending.get)) "Publication fault was not exercised"
+      check (!(← pending.atomically get)) "Publication fault was not exercised"
 
 private def bundleTests (store : ObjectStore) : IO Unit :=
   IO.FS.withTempDir fun root => do
@@ -601,6 +611,114 @@ private def workspaceTests (store : ObjectStore) : IO Unit := IO.FS.withTempDir 
     check (!(← (session.directory / "input").pathExists)) "Different build reused a workspace"
   IO.println "PASS reusable workspaces: no redundant transfers, replay isolation, corruption repair, interrupted/failed attempts"
 
+private def parallelIOTests (store : ObjectStore) : IO Unit := do
+  -- A rendezvous proves actual overlap, without relying on elapsed speedup.
+  let counts ← Std.Mutex.new ((0, 0) : Nat × Nat)
+  let values ← Parallel.map 3 (Array.range 12) fun i => do
+    counts.atomically do modify fun (active, peak) => (active + 1, max peak (active + 1))
+    try
+      if i < 3 then
+        let deadline := (← IO.monoMsNow) + 3000
+        while (← counts.atomically get).2 < 3 do
+          if (← IO.monoMsNow) > deadline then throw (IO.userError "IO tasks did not overlap")
+          IO.sleep 1
+      IO.sleep (12 - i).toUInt32
+      return i * 2
+    finally
+      counts.atomically do modify fun (active, peak) => (active - 1, peak)
+  check (values == (Array.range 12).map (· * 2) && (← counts.atomically get) == (0, 3))
+    "Bounded IO lost ordering, exceeded its budget, or left tasks running"
+  for _ in [:3] do
+    counts.atomically (set (0, 0))
+    let failed ← try
+      discard <| Parallel.map 3 (Array.range 12) fun i => do
+        counts.atomically do modify fun (active, peak) => (active + 1, max peak (active + 1))
+        try
+          if i < 3 then
+            let deadline := (← IO.monoMsNow) + 3000
+            while (← counts.atomically get).2 < 3 do
+              if (← IO.monoMsNow) > deadline then throw (IO.userError "IO tasks did not overlap")
+              IO.sleep 1
+          if i == 0 then throw (IO.userError "Expected IO failure")
+          IO.sleep 40
+        finally
+          counts.atomically do modify fun (active, peak) => (active - 1, peak)
+      pure false
+    catch _ => pure true
+    check (failed && (← counts.atomically get) == (0, 3)) "Failure returned before IO tasks stopped"
+  IO.FS.withTempDir fun root => do
+    let traffic ← Std.Mutex.new ((0, 0) : Nat × Nat)
+    let observe : {α : Type} → IO α → IO α := fun {_} action => do
+      traffic.atomically do modify fun (active, peak) => (active + 1, max peak (active + 1))
+      try IO.sleep 10; action
+      finally traffic.atomically do modify fun (active, peak) => (active - 1, peak)
+    let remote := { store with
+      create := fun key bytes => observe (store.create key bytes)
+      read := fun key => observe (store.read key) }
+    let original := root / "original"
+    let bytes := ByteArray.mk ((Array.range (Files.chunkSize * 3 + 19)).map fun i => (i % 251).toUInt8)
+    IO.FS.writeBinFile original bytes
+    let ref ← Files.upload remote original bytes.size 3
+    let (_, peak) ← traffic.atomically get
+    check (peak > 1 && peak ≤ 3) "File upload did not use bounded concurrent chunk transfers"
+    traffic.atomically (set (0, 0))
+    Files.download remote ref (root / "download") bytes.size 3
+    let (_, peak) ← traffic.atomically get
+    check (peak > 1 && peak ≤ 3 && (← IO.FS.readBinFile (root / "download")) == bytes)
+      "Parallel download lost order or exceeded its budget"
+    let source := root / "source"
+    IO.FS.createDir source
+    for i in [:30] do IO.FS.writeFile (source / s!"file-{i}") s!"content-{i}"
+    let cache : Bundle.Cache := { directory := root / "cache", bytes := 10000 }
+    let manifest ← (← Bundle.snapshot source 10000).publish remote (some cache) 3
+    let packs := manifest.foldl (fun set entry => set.insert entry.file.pack.sha256) ({} : Std.HashSet String)
+    check (packs.size == 3) "Publication did not distribute files across packs"
+    let offline := { store with read := fun _ => throw (IO.userError "Producer downloaded its own artifacts") }
+    let restored := root / "restored"
+    Bundle.restore offline restored manifest 10000 (some cache) 3
+    traffic.atomically (set (0, 0))
+    Bundle.restore remote (root / "cold") manifest 10000
+      (some { directory := root / "cold-cache", bytes := 1 }) 3
+    let (_, peak) ← traffic.atomically get
+    check (peak > 1 && peak ≤ 3) "Separate artifact packs did not restore concurrently"
+    check (← (root / "cold-cache").readDir).isEmpty "Concurrent restore exceeded the pack cache budget"
+    for i in [:30] do
+      check ((← IO.FS.readFile (restored / s!"file-{i}")) == s!"content-{i}") "Parallel restore changed content"
+    Bundle.synchronize offline restored manifest 10000 (some cache) 3
+    check (← Bundle.delta restored 10000 manifest manifest 3).paths.isEmpty "Parallel delta changed clean inputs"
+    IO.FS.writeFile (restored / "file-0") "altered input"
+    let rejected ← try discard <| Bundle.delta restored 10000 manifest manifest 3; pure false catch _ => pure true
+    check rejected "Parallel verification accepted changed prerequisites"
+    Bundle.synchronize offline restored manifest 10000 (some cache) 3
+    let some first := manifest[0]? | throw (IO.userError "Missing parallel pack entry")
+    let rejected ← try
+      Bundle.restore store (root / "conflict") #[{ first with path := "a" }, { first with path := "a/b" }]
+        10000 none 3
+      pure false
+    catch _ => pure true
+    check rejected "Parallel restoration accepted overlapping output paths"
+  IO.println "PASS bounded IO overlap, failure joins, parallel chunk transfers, producer cache, parallel artifact verification"
+
+private def backendCacheTests (tools : Tools) (store : ObjectStore) (fixture : System.FilePath) : IO Unit :=
+  IO.FS.withTempDir fun root => do
+    let directory := root / "project"
+    IO.FS.createDir directory
+    copyFixture fixture directory
+    let tools := { tools with threads := 2, cache := some { directory := root / "packs" } }
+    let req := request
+    let prepared ← tools.prepareDirectory store req directory "fixture"
+    let some plan := prepared.plan | throw (IO.userError s!"Cache fixture preparation failed: {prepared.error}")
+    let built ← tools.build store req plan plan.modules #[]
+    check (built.all (·.status == .built)) "Cache fixture build failed"
+    let offline := { store with read := fun _ => throw (IO.userError "Redundant artifact download") }
+    let finished ← tools.finish offline req plan built
+    check (finished.status == .built) s!"Finish did not reuse local artifacts: {finished.message}"
+    -- A repeated finish still runs Lake and publishes its final manifest, while
+    -- reusing committed sources and module outputs from this worker's cache.
+    let again ← tools.finish offline req plan built
+    check (again.status == .built) s!"Repeated finish lost its cache: {again.message}"
+    IO.println "PASS prepare/build producer cache and finish with all artifact downloads disabled"
+
 private def toolchainTests : IO Unit :=
   IO.FS.withTempDir fun root => do
     let source := root / "release/bin"
@@ -661,15 +779,16 @@ private def nativeTests : IO Unit := IO.FS.withTempDir fun cacheRoot => do
   let fixture ← IO.FS.realPath "fixtures/Diamond"
   let full ← IO.FS.realPath "fixtures/FullBuild"
   helperFailureTests tools fixture
-  let store := objects (← IO.mkRef {})
+  let store := objects (← Std.Mutex.new {})
   failedJobTests tools store fixture
   bundleTests store
   packCacheTests store
   workspaceTests store
+  parallelIOTests store
+  backendCacheTests tools store fixture
   let built ← nativeTest tools store fixture (environment := pool #[2, 2])
   requireSuccess store built
-  check (built.modules.size == 4 && built.verification.isNone && built.build.status == .built)
-    "Build-only report is incorrect"
+  check (built.modules.size == 4 && built.build.status == .built) "Build report is incorrect"
   let split ← nativeTest tools store fixture (req := { request with modulesPerJob := 2 })
   requireSuccess store split
   let [base, left, right, final] := split.modules.toList | throw (IO.userError "Missing split results")
@@ -710,8 +829,8 @@ private def nativeTests : IO Unit := IO.FS.withTempDir fun cacheRoot => do
   requireSuccess store qualified
   let oversized ← nativeTest tools store fixture (req := { request with limits := { request.limits with bytes := 1 } })
   check (!oversized.success && (oversized.message.splitOn "artifact byte limit").length > 1) "Oversized workspace accepted"
-  let req := { request with check := { mode := .kernel, theorems := #["Fixture.result"] } }
-  let report ← nativeTest tools store fixture (req := req)
+  let req := request
+  let report ← nativeTest { tools with helper } store fixture (req := req)
   requireSuccess store report
   let cached ← nativeTest tools store fixture (fun d => do
     IO.FS.writeFile (d / "Fixture/Unrelated.lean") "theorem unrelated : False := by sorry\n"
@@ -722,13 +841,18 @@ private def nativeTests : IO Unit := IO.FS.withTempDir fun cacheRoot => do
     { req with cache := .reuse }
   requireSuccess store cached
   check (!cached.build.builtModules.contains "Fixture.Unrelated" && cached.build.builtModules.size == 4)
-    "Unrelated cached modules entered the verification closure"
-  let some verified := report.verification | throw (IO.userError "No verification report")
-  check (verified.theorems.map (·.name) == #["Fixture.result"] && verified.exportFile.isSome)
-    "Missing theorem or combined export"
+    "Unrelated cached modules were reported as build targets"
   let some ref := report.build.artifacts | throw (IO.userError "No completed artifacts")
   let manifest : Bundle.Manifest ← Files.readJson store ref
   check (manifest.any (·.path.endsWith "Fixture/Final.olean")) "No final olean"
+  IO.FS.withTempDir fun root => do
+    Bundle.restore store root manifest req.limits.bytes
+    IO.FS.writeFile (root / "Consumer.lean")
+      "import Fixture.Final\nexample : Fixture.twice 1 + Fixture.twice 2 = 6 := Fixture.result\n"
+    let imported ← IO.Process.output {
+      cmd := (tools.toolchain / "bin/lake").toString
+      cwd := root, args := #["--no-cache", "env", "lean", "Consumer.lean"] }
+    check (imported.exitCode == 0) s!"Restored olean artifacts cannot be imported: {imported.stderr}"
   publicationTests tools store fixture
   -- Native output must agree with an ordinary Lake build, including -K options,
   -- generated sources, default executable targets, C FFI and project subdirectories.
@@ -783,8 +907,6 @@ private def nativeTests : IO Unit := IO.FS.withTempDir fun cacheRoot => do
     "An overlapping build directory was cleaned"
   let unknown ← nativeTest tools store fixture (req := { request with targets := #["missing"] })
   check (!unknown.success) "Unknown Lake target accepted"
-  let noProofs ← nativeTest tools store full (req := { request with targets := #["receipt"], check := { mode := .kernel } })
-  check (!noProofs.success && noProofs.build.status == .built) "Vacuous proof-check success on a native-only target"
   let changedInput ← nativeTest tools store fixture (fun d => do
     IO.FS.writeFile (d / "prepared-input") "original"
     let code ← IO.FS.readFile (d / "Fixture/Base.lean")
@@ -811,74 +933,23 @@ private def nativeTests : IO Unit := IO.FS.withTempDir fun cacheRoot => do
   requireSuccess store runtime
   let sorryReport ← nativeTest tools store fixture (fun d =>
     IO.FS.writeFile (d / "Fixture/Left.lean") "import Fixture.Base\nnamespace Fixture\ntheorem left : twice 1 = 2 := by sorry\n") req
-  check (!sorryReport.success && sorryReport.build.status == .built &&
-    sorryReport.verification.any (!·.success)) "Build success and proof rejection conflated"
+  requireSuccess store sorryReport
+  check (sorryReport.build.status == .built) "Lean's ordinary sorry warning was turned into a build failure"
   let bad ← nativeTest tools store fixture (fun d =>
     IO.FS.writeFile (d / "Fixture/Left.lean") "import Fixture.Base\nexample : False := True.intro\n")
   check (!bad.success && bad.modules.any (fun m => m.name == "Fixture.Final" && m.status == .blocked) &&
     bad.modules.any (fun m => m.name == "Fixture.Left" && m.status == .failed) &&
     bad.modules.any (fun m => m.name == "Fixture.Right" && m.status == .built))
     "Batched failure blocked an independent module or lost the dependent failure"
-  for name in ["Fixture.missing", "Fixture.twice"] do
-    let missing ← nativeTest tools store fixture (req := { req with check := { mode := .kernel, theorems := #[name] } })
-    check (!missing.success && missing.build.status == .built) "Missing/non-theorem requirement accepted"
-  let privateSorry ← nativeTest tools store fixture (fun d =>
-    IO.FS.writeFile (d / "Fixture/Left.lean")
-      "module\npublic import Fixture.Base\nprivate theorem hidden : False := by sorry\nnamespace Fixture\npublic theorem left : twice 1 = 2 := rfl\n") req
-  check (!privateSorry.success) "Private sorry escaped verification"
-  let assumption ← nativeTest tools store fixture (fun d =>
-    IO.FS.writeFile (d / "Fixture/Left.lean")
-      "import Fixture.Base\nnamespace Fixture\naxiom assumeLeft : twice 1 = 2\ntheorem left : twice 1 = 2 := assumeLeft\n") req
-  check (!assumption.success) "Undeclared axiom accepted"
-  let tighter ← nativeTest tools store fixture (fun d =>
-    IO.FS.writeFile (d / "Fixture/Base.lean")
-      "namespace Fixture\ndef twice (n : Nat) := n + n\ntheorem standardAxiom (p q : Prop) (h : p ↔ q) : p = q := propext h\n")
-    { req with check := { mode := .kernel, allowedAxioms := #[] } }
-  check (!tighter.success) "Stricter axiom policy ignored"
-  let paranoid ← nativeTest tools store fixture (req := { req with targets := #["+Fixture.Base"], check := { mode := .paranoid } })
-  requireSuccess store paranoid
-  let some verifiedParanoid := paranoid.verification | throw (IO.userError "Missing paranoid result")
-  let some log := verifiedParanoid.diagnostics | throw (IO.userError "Missing checker log")
-  let text ← Files.readText store log
-  for name in ["Lean paranoid", "lean4lean", "nanoda", "con-leche", "con-ron", "Lean default"] do
-    check ((text.splitOn s!"{name} kernel accepts").length > 1) s!"Skipped checker {name}"
-  -- Corrupt an exported proof: it must reach the kernel and be rejected.
-  IO.FS.withTempDir fun root => do
-    let directory := root / "check"
-    IO.FS.createDir directory
-    let some exportRef := verified.exportFile | throw (IO.userError "No export")
-    let path := root / "proof.ndjson"
-    Files.download store exportRef path req.limits.bytes
-    check (← tools.verifyExport directory req.limits path).isOk "Published export cannot be rechecked"
-    if System.Platform.isOSX then
-      check (!(← { tools with sandbox := true }.verifyExport directory req.limits path).isOk) "Sandbox silently bypassed"
-    let mut changed := false
-    let mut lines : Array String := #[]
-    for line in (← IO.FS.readFile path).splitOn "\n" do
-      if line.isEmpty then continue
-      let json ← IO.ofExcept (Json.parse line)
-      match json.getObjVal? "thm" with
-      | .error _ => lines := lines.push line
-      | .ok declaration =>
-        changed := true
-        let fields ← IO.ofExcept declaration.getObj?
-        let type ← IO.ofExcept (declaration.getObjVal? "type")
-        lines := lines.push (Json.mkObj [("thm", .obj (fields.insert "value" type))]).compress
-    check changed "No theorem to corrupt"
-    IO.FS.writeFile path (String.intercalate "\n" lines.toList ++ "\n")
-    check (!(← tools.verifyExport directory req.limits path).isOk) "Corrupt proof accepted"
-    check (((← IO.FS.readFile (root / "check.stdout")).splitOn "Lean default kernel rejected").length > 1)
-      "Corrupt proof did not reach kernel"
-    IO.FS.writeFile path "{}\nnot NDJSON\n"
-    check (!(← tools.verifyExport directory req.limits path).isOk) "Malformed export accepted"
   for version in ["4.34.1", "4.36.0"] do
     let mismatch ← nativeTest tools store fixture (fun d =>
       IO.FS.writeFile (d / "lean-toolchain") s!"leanprover/lean4:v{version}\n")
     check (!mismatch.success && mismatch.build.status == .failed) "Toolchain mismatch accepted"
-  IO.println "PASS native Lake builds, executable/FFI/generated/custom targets, subdirectories, exports and kernel rejection"
+  IO.println "PASS native Lake builds, executable/FFI/generated/custom targets, restored artifacts and build failures"
 
 def main (args : List String) : IO Unit := do
   generatedTests
+  if args.contains "--io" then parallelIOTests (objects (← Std.Mutex.new {}))
   if args.contains "--native" then nativeTests
   if let ["--plan", path] := args then
     let modules : Array LeanBuild.Module ← IO.ofExcept (Json.parse (← IO.FS.readFile path) >>= fromJson?)

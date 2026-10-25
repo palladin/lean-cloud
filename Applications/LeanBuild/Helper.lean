@@ -3,8 +3,6 @@
 import Lake
 import Lake.Load
 import Lake.CLI.Build
-import LeanExport.Basic
-import Lean.Util.CollectAxioms
 
 open Lean Lake System
 
@@ -82,7 +80,7 @@ private def targetModules (ws : Workspace) (cfg : BuildConfig) (key : BuildKey) 
   | .package _ => return #[]
 
 private partial def visit (root : FilePath) (limit : Nat) (mod : Lake.Module)
-    (active : List Name) (done : Array Name) (rows : Array Json) : FetchM (Array Name × Array Json) := do
+    (active : List Name) (done : Std.HashSet Name) (rows : Array Json) : FetchM (Std.HashSet Name × Array Json) := do
   if done.contains mod.name then return (done, rows)
   if active.contains mod.name then error s!"Import cycle: {mod.name}"
   unless done.size + active.length < limit do error "Module limit exceeded"
@@ -94,7 +92,7 @@ private partial def visit (root : FilePath) (limit : Nat) (mod : Lake.Module)
   let mut rows := rows
   for dep in imports do
     (done, rows) ← visit root limit dep (mod.name :: active) done rows
-  return (done.push mod.name, rows.push (Json.mkObj [
+  return (done.insert mod.name, rows.push (Json.mkObj [
     ("name", toJson mod.name.toString), ("imports", toJson (imports.map (·.name.toString)))]))
 
 private def plan (policy : Json) (output root : String) : IO Unit := do
@@ -124,7 +122,14 @@ private def plan (policy : Json) (output root : String) : IO Unit := do
     roots := roots ++ (← targetModules ws cfg spec.info.key)
   let limit : Nat ← IO.ofExcept (policy.getObjVal? "limits" >>= (·.getObjValAs? _ "modules"))
   let rows ← ws.runFetchM (do
-    let mut done := #[]
+    -- Start independent source scans together. Preserve generated-source
+    -- prerequisites first; `visit` still determines the topological row order.
+    let prerequisites ← roots.mapM fun mod => mod.lib.extraDep.fetch
+    for job in prerequisites do job.await
+    for mod in roots do
+      inside root mod.leanFile
+      discard mod.imports.fetch
+    let mut done : Std.HashSet Name := {}
     let mut rows := #[]
     for mod in roots do
       (done, rows) ← visit root limit mod [] done rows
@@ -178,45 +183,12 @@ private def buildModules (policy : Json) (input output : String) : IO Unit := do
   IO.FS.writeFile output (toJson (rows.map fun (name, built) =>
     Json.mkObj [("name", toJson name), ("built", toJson built)])).pretty
 
-/-- Export one combined environment, retaining safe private declarations and
-checking requested theorem/axiom requirements. Shared dependencies are exported once. -/
-private def exportModules (policy : Json) (modules : Array String)
-    (exportPath output : String) : IO Unit := do
-  unless !modules.isEmpty do throw (IO.userError "No built Lean modules to verify")
-  initSearchPath (← findSysroot)
-  let env ← importModules (modules.map fun m => { module := m.toName }) {} (level := .private)
-  let names := env.constants.toList.filterMap fun (name, info) =>
-    if !info.isUnsafe && (env.getModuleIdxFor? name).any
-        (fun i => modules.contains env.header.moduleNames[i.toNat]!.toString)
-    then some name else none
-  let requested : Array String ← IO.ofExcept (policy.getObjValAs? _ "theorems")
-  let allowed : Array String ← IO.ofExcept (policy.getObjValAs? _ "allowedAxioms")
-  let report : CoreM (Array Json) := do
-    let mut rows := #[]
-    for name in names do
-      let axioms := (← collectAxioms name).map Name.toString
-      unless axioms.all allowed.contains do throwError "{name} uses disallowed axioms: {axioms}"
-      if requested.contains name.toString then
-        unless (env.find? name).any (fun c => c matches .thmInfo _) do
-          throwError "{name} is not a theorem"
-        rows := rows.push (Json.mkObj [("name", toJson name.toString), ("axioms", toJson axioms)])
-    let found := rows.filterMap (fun r => (r.getObjValAs? String "name").toOption)
-    let missing := requested.filter (!found.contains ·)
-    unless missing.isEmpty do throwError "Missing theorem(s): {missing}"
-    return rows
-  let (rows, _) ← Core.CoreM.toIO report { fileName := "", fileMap := default } { env }
-  IO.FS.writeFile output (toJson rows).pretty
-  IO.FS.withFile exportPath .write fun handle =>
-    IO.withStdout (.ofHandle handle) (LeanExport.dumpEnv env (some names))
-
 def main (args : List String) : IO UInt32 := do
   try
     match args with
     | ["plan", policy, output, root] => plan (← readJson policy) output root
     | ["build", policy, output] => buildTargets (← readJson policy) output
     | ["modules", policy, input, output] => buildModules (← readJson policy) input output
-    | ["export", policy, modules, exportPath, output] =>
-      exportModules (← readJson policy) (← IO.ofExcept (fromJson? (← readJson modules))) exportPath output
-    | _ => throw (IO.userError "Expected plan POLICY OUTPUT ROOT | build POLICY OUTPUT | modules POLICY INPUT OUTPUT | export POLICY MODULES EXPORT OUTPUT")
+    | _ => throw (IO.userError "Expected plan POLICY OUTPUT ROOT | build POLICY OUTPUT | modules POLICY INPUT OUTPUT")
     return 0
   catch error => IO.eprintln s!"{error}"; return 1

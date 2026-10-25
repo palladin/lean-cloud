@@ -12,6 +12,7 @@ private structure Saved where
 structure Session where
   directory : System.FilePath
   readManifest : FileRef → IO Bundle.Manifest
+  rememberManifest : FileRef → Bundle.Manifest → IO Unit
   commit : IO Unit
 
 -- Each process owns its cache directory. Also serialize callers in that process.
@@ -20,22 +21,25 @@ initialize lock : Std.Mutex Unit ← Std.Mutex.new ()
 private def session (store : ObjectStore) (root : System.FilePath) (key : String)
     (saved : Option Saved) (persistent : Bool) (action : Session → IO α) : IO α := do
   IO.FS.createDirAll (root / "project")
-  let manifests ← IO.mkRef (saved.map (·.manifests) |>.getD #[])
+  let manifests ← Std.Mutex.new (saved.map (·.manifests) |>.getD #[])
+  let remember := fun ref manifest => manifests.atomically do
+    modify fun entries => (entries.filter (·.1 != ref)).push (ref, manifest)
   action {
     directory := root / "project"
     readManifest := fun ref => do
-      if let some (_, manifest) := (← manifests.get).find? (fun entry => entry.1 == ref) then
+      if let some (_, manifest) := (← manifests.atomically get).find? (fun entry => entry.1 == ref) then
         -- Manifests are published by Files.putJson. Treat cached metadata like
         -- cached files: corruption must never change the committed inputs.
         let bytes := (toJson manifest).pretty.toUTF8
         if bytes.size == ref.size && (← Digest.bytes bytes) == ref.sha256 then
           return manifest
       let manifest ← Files.readJson store ref
-      manifests.modify fun entries => (entries.filter (·.1 != ref)).push (ref, manifest)
+      remember ref manifest
       return manifest
+    rememberManifest := remember
     commit := do
       if persistent then
-        let value : Saved := { key, manifests := ← manifests.get }
+        let value : Saved := { key, manifests := ← manifests.atomically get }
         IO.FS.writeFile (root / "ready.pending") (toJson value).compress
         IO.FS.rename (root / "ready.pending") (root / "ready.json") }
 

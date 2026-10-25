@@ -4,25 +4,14 @@ namespace LeanBuild
 open Lean LeanCloud LeanCloudRuntime
 
 abbrev FileRef := LeanCloudRuntime.FileRef
-def standardAxioms : Array String := #["propext", "Classical.choice", "Quot.sound"]
-
-inductive CheckMode where
-  | none | kernel | paranoid
-  deriving Repr, BEq, ToJson, FromJson
 
 inductive CachePolicy where
   | rebuild | reuse
   deriving Repr, BEq, ToJson, FromJson
 
-structure CheckConfig where
-  mode : CheckMode := .none
-  theorems : Array String := #[]
-  allowedAxioms : Array String := standardAxioms
-  deriving Repr, ToJson
-
 structure Limits where
   seconds : Nat := 600
-  checkerMemoryMiB : Nat := 4096
+  helperMemoryMiB : Nat := 4096
   bytes : Nat := 2 * 1024 * 1024 * 1024
   modules : Nat := 10000
   deriving Repr, ToJson
@@ -36,7 +25,6 @@ structure Request where
   cache : CachePolicy := .rebuild
   /-- Zero balances CPU use and cloud barriers; nonzero also caps job size. -/
   modulesPerJob : Nat := 0
-  check : CheckConfig := {}
   limits : Limits := {}
   deriving Repr, ToJson
 
@@ -45,24 +33,23 @@ private def field [FromJson α] (json : Json) (name : String) (fallback : α) : 
   | none => pure fallback
   | some value => fromJson? value
 
-instance : FromJson CheckConfig where
-  fromJson? json := do return {
-    mode := ← field json "mode" .none
-    theorems := ← field json "theorems" #[]
-    allowedAxioms := ← field json "allowedAxioms" standardAxioms }
-
 instance : FromJson Limits where
-  fromJson? json := do return {
-    seconds := ← field json "seconds" 600
-    checkerMemoryMiB := ← field json "checkerMemoryMiB" 4096
-    bytes := ← field json "bytes" (2 * 1024 * 1024 * 1024)
-    modules := ← field json "modules" 10000 }
+  fromJson? json := do
+    if ((← json.getObj?)["checkerMemoryMiB"]?).isSome then
+      throw "Use limits.helperMemoryMiB instead of limits.checkerMemoryMiB"
+    return {
+      seconds := ← field json "seconds" 600
+      helperMemoryMiB := ← field json "helperMemoryMiB" 4096
+      bytes := ← field json "bytes" (2 * 1024 * 1024 * 1024)
+      modules := ← field json "modules" 10000 }
 
 instance : FromJson Request where
   fromJson? json := do
-    for old in ["modules", "theorems", "allowedAxioms", "paranoid"] do
+    for old in ["check", "theorems", "allowedAxioms", "paranoid"] do
       if ((← json.getObj?)[old]?).isSome then
-        throw s!"LeanBuild uses targets and an optional check object; remove the old {old} field"
+        throw s!"LeanBuild builds Lake targets; independent proof checking was removed. Remove the {old} field"
+    if ((← json.getObj?)["modules"]?).isSome then
+      throw "Use targets instead of modules"
     return {
       repository := ← json.getObjValAs? _ "repository"
       revision := ← json.getObjValAs? _ "revision"
@@ -71,7 +58,6 @@ instance : FromJson Request where
       options := ← field json "options" {}
       cache := ← field json "cache" .rebuild
       modulesPerJob := ← field json "modulesPerJob" 0
-      check := ← field json "check" {}
       limits := ← field json "limits" {} }
 
 def identifier (s : String) : Bool :=
@@ -103,13 +89,8 @@ def Request.validate (r : Request) : Except String Unit := do
     throw "Invalid Lake configuration option"
   unless r.modulesPerJob ≤ 100000 do
     throw "modulesPerJob must be 0 (automatic) or between 1 and 100000"
-  unless r.check.theorems.all identifier do throw "Invalid theorem name"
-  unless r.check.allowedAxioms.all standardAxioms.contains do
-    throw "Only propext, Classical.choice and Quot.sound may be allowed"
-  if r.check.mode == .none && (!r.check.theorems.isEmpty || r.check.allowedAxioms != standardAxioms) then
-    throw "Theorem and axiom requirements need check.mode kernel or paranoid"
   unless 0 < r.limits.seconds && r.limits.seconds ≤ 3600 &&
-      64 ≤ r.limits.checkerMemoryMiB && r.limits.checkerMemoryMiB ≤ 65536 &&
+      64 ≤ r.limits.helperMemoryMiB && r.limits.helperMemoryMiB ≤ 65536 &&
       0 < r.limits.bytes && r.limits.bytes ≤ 16 * 1024 * 1024 * 1024 &&
       0 < r.limits.modules && r.limits.modules ≤ 100000 do
     throw "Invalid job limits"
@@ -141,21 +122,6 @@ structure BuildResult where
   builtModules : Array String := #[]
   deriving Repr, ToJson, FromJson
 
-structure Theorem where
-  name : String
-  axioms : Array String
-  deriving Repr, ToJson, FromJson
-
-structure CheckResult where
-  mode : CheckMode
-  success : Bool
-  exportFile : Option FileRef := none
-  diagnostics : Option FileRef := none
-  theorems : Array Theorem := #[]
-  message : String := ""
-  milliseconds : Nat := 0
-  deriving Repr, ToJson, FromJson
-
 structure Report where
   request : Request
   commit : String := ""
@@ -166,7 +132,6 @@ structure Report where
   message : String := ""
   modules : Array BuildResult := #[]
   build : BuildResult := { name := "targets", status := .blocked }
-  verification : Option CheckResult := none
   deriving Repr, ToJson, FromJson
 
 structure Preparation where
@@ -175,11 +140,10 @@ structure Preparation where
   diagnostics : Option FileRef := none
   deriving Repr, ToJson, FromJson
 
-instance : Codec Request := jsonCodec _ "lean-build/request/v1"
+instance : Codec Request := jsonCodec _ "lean-build/request/v2"
 instance : Codec Preparation := jsonCodec _ "lean-build/preparation/v1"
 instance : Codec BuildResult := jsonCodec _ "lean-build/build-result/v1"
-instance : Codec CheckResult := jsonCodec _ "lean-build/check-result/v1"
-instance : Codec Report := jsonCodec _ "lean-build/report/v1"
+instance : Codec Report := jsonCodec _ "lean-build/report/v2"
 
 def validateModules (modules : Array Module) : Except String Unit := do
   let mut seen : Array String := #[]

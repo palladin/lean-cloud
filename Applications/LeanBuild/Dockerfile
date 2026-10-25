@@ -4,7 +4,7 @@ FROM ${APPLICATION_IMAGE} AS application
 # Workers download the pinned toolchain directly; it is not shipped in the image.
 FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git build-essential bubblewrap ca-certificates curl openssl tzdata libsqlite3-0 libcurl4t64 zstd \
+    git build-essential ca-certificates curl openssl tzdata libsqlite3-0 libcurl4t64 zstd \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 worker \
     && mkdir /data /mailbox && chown worker:worker /data /mailbox
@@ -26,10 +26,6 @@ ENV LEAN_BUILD_RELEASE=/opt/lean-build/toolchain.json
 ENV LEAN_BUILD_TOOLCHAINS=/data/toolchains
 ENV LEAN_BUILD_HELPER=/opt/lean-build/Helper.lean
 ENV LEAN_BUILD_CACHE=/data/build-cache
-# The default image checks trusted source in an isolated worker deployment.
-# Opt in to bubblewrap's nested namespaces with
-# LEAN_BUILD_SANDBOX=1 only on a host configured to support nested namespaces.
-ENV LEAN_BUILD_SANDBOX=0
 LABEL lean-cloud.node="http-inbox-v1"
 HEALTHCHECK --interval=3s --timeout=5s --start-period=12m --retries=40 CMD ["cloud-node", "health"]
 ENTRYPOINT ["cloud-node"]

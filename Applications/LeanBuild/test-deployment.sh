@@ -8,7 +8,7 @@ image=$1
 mkdir -p "$root/.lean-cloud"
 test_dir=$(mktemp -d "$root/.lean-cloud/build-integration.XXXXXX")
 deployment="$test_dir/deployment"
-name="build-check-$$"
+name="build-test-$$"
 cleanup() {
   local status=$?
   if [[ -f "$deployment/deployment.json" ]]; then
@@ -40,9 +40,9 @@ for ((attempt=0; attempt<300; attempt++)); do
 done
 compose logs --no-color > "$test_dir/containers.log" 2>&1
 [[ $ready == true ]] || { echo 'Timed out waiting for build' >&2; exit 1; }
-if ! jq -e '.success == true and .build.status == "built" and .verification.success == true and
+if ! jq -e '.success == true and .build.status == "built" and .build.artifacts != null and
     .toolchain == "leanprover/lean4:v4.35.0" and (.modules | length > 2) and
-    .verification.exportFile != null and all(.modules[]; .status == "built")' "$test_dir/report.json" >/dev/null; then
+    all(.modules[]; .status == "built")' "$test_dir/report.json" >/dev/null; then
   cat "$test_dir/report.json" >&2
   exit 1
 fi
@@ -53,4 +53,4 @@ cli inspect modules > "$test_dir/inspect.log"
 cli watch modules --once > "$test_dir/watch.log"
 cli logs modules > "$test_dir/logs.log"
 [[ $(compose ps -q | sort) == "$before" ]] || { echo 'Submission changed containers' >&2; exit 1; }
-echo 'PASS GitHub source checkout, module jobs, lake check, export publication and HTTP monitoring'
+echo 'PASS GitHub source checkout, parallel module jobs, build artifacts and HTTP monitoring'

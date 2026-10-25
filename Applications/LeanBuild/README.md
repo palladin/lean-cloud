@@ -3,6 +3,7 @@
 Build a Lean project from GitHub on lean-cloud. Give it a repository, revision,
 and Lake targets. Independent modules build on different workers; the completed
 workspace, executables, and diagnostics are saved in blob storage.
+Lean's normal elaboration and kernel checking run as part of compilation.
 
 ```json
 {
@@ -28,7 +29,6 @@ Use a commit hash when you want repeatable inputs.
 | `options` | Lake configuration values, e.g. `{"feature": "enabled"}` passes `-Kfeature=enabled` | `{}` |
 | `cache` | `"rebuild"` clears package build directories during preparation and disables external Lake artifact caches; `"reuse"` allows Lake's cache support | `"rebuild"` |
 | `modulesPerJob` | `0` groups work automatically using dependencies and available CPU capacity; a positive value caps modules per job (up to 100,000) | `0` |
-| `check` | Optional independent proof checking, described below | `{"mode": "none"}` |
 | `limits` | Per-command and artifact limits | See below |
 
 Native tools and system libraries belong in the deployment image. Jobs use the
@@ -56,15 +56,14 @@ not install toolchains or select a different execution platform.
    build engine, the same one used by `lake build`.
    Lake completes native compilation, C FFI, linking, custom targets, and dynamic
    dependencies. Publish the complete workspace as one file manifest.
-5. If requested, export the built modules together and run `lake check` once.
 
 For `Base → [Left, Right] → Final`, one job suffices if its worker has two CPUs.
 For `Base → 1,024 independent modules` on four eight-CPU workers, the first job
 publishes `Base`; the next round runs four jobs of 256 modules. Keeping that
 wide fan-out with `Base` would leave the other workers idle.
 
-The module stage is distributed. The final target build and proof check each run
-on one worker; Lake retains its own local parallelism. Custom targets and unusual
+The module stage is distributed. The final target build runs on one worker;
+Lake retains its own local parallelism. Custom targets and unusual
 facets are delegated to that final build rather than guessing their dependencies.
 Build hooks must work in a relocated workspace and declare their dependencies to
 Lake. Module jobs preserve the prepared inputs and their prerequisites. Differing
@@ -83,6 +82,19 @@ Configure budgets in `deployment.json` using `cpuMillis` and `memoryMiB`
 (see [worker resource budgets](../../deploy/README.md#worker-resource-budgets)).
 An unconfigured local worker advertises only one CPU.
 
+The same CPU budget bounds artifact hashing, file restoration and blob transfers
+in preparation, module builds and final target builds. Publication
+groups files into packs that can be hashed and uploaded concurrently; a single
+large pack uses concurrent chunk transfers. All started IO tasks stop before
+temporary files are removed, including when an operation fails.
+
+Workers retain their own published packs in `LEAN_BUILD_CACHE`, so later jobs
+can reuse them without downloading them again. Successful module jobs, final
+builds share a worker-local workspace and manifest cache.
+Every reuse checks committed content; an interrupted or failed job invalidates
+the workspace. Packs remain immutable and independently verified. This cache
+is local to each worker's filesystem, not a shared writable build directory.
+
 With four equal workers, 1,024 independent modules need four jobs by default.
 A manual `modulesPerJob: 64` cap instead produces 16 jobs. Long independent
 chains stay local without a cloud round for every module. Cross-worker joins
@@ -99,40 +111,8 @@ unit-cost compute estimate for a saved module DAG.
 
 Only job inputs and artifact references enter the replay journal. Completed jobs
 are reused after a worker crash. An interrupted job may execute again. A build
-error, checker rejection, or ordinary IO exception is a failure outcome, not a
+error or ordinary IO exception is a failure outcome, not a
 node-crash retry.
-
-## Optional proof checking
-
-Builds already elaborate Lean source and run its kernel. Independent checking is
-an additional step; enable it with:
-
-```json
-"check": {
-  "mode": "kernel",
-  "theorems": ["Nat.avg_comm"],
-  "allowedAxioms": ["propext", "Classical.choice", "Quot.sound"]
-}
-```
-
-`kernel` checks a combined NDJSON export using `lake check --from-export`.
-`paranoid` additionally requires all bundled checkers (`leanchecker-paranoid`,
-`lean4lean`, `nanoda`, `con-leche`, and `con-ron`). No requested checker is skipped.
-The export includes safe private declarations and their dependencies; shared
-proof dependencies are exported once. The checker reads NDJSON, not `.olean` files.
-Its module selection comes from Lake's build jobs, so unrelated files in a reused
-cache do not enter the check. Custom targets should express their Lean dependencies
-as Lake jobs for those modules to appear in the verification result.
-
-`theorems` optionally requires particular declarations to exist and be theorems.
-`allowedAxioms` defaults to the three shown above and may only restrict that set.
-`sorryAx` is rejected during checking, including in private declarations.
-A build can succeed while this additional verification fails. Build-only mode
-preserves Lake's normal behavior, including its warnings about `sorry`.
-
-This does not compare theorem statements with an external specification, certify
-native code, or verify unsafe implementations and compiler correctness. The
-report distinguishes the compiled artifacts from the independently checked export.
 
 ## Local deployment and first run
 
@@ -156,8 +136,8 @@ watch batteries
 result batteries
 ```
 
-The supplied example requests a small pinned Batteries build plus kernel checking.
-Remove its `check` field for build-only execution. The same image works with the
+The supplied example builds two modules from a pinned Batteries revision and
+publishes their artifacts. The same image works with the
 [Kubernetes helpers](../../deploy/README.md) and [Azure deployment](../../deploy/Azure.md);
 the console uses the same HTTP connection in each environment.
 
@@ -171,9 +151,7 @@ The report contains:
 - `build`: final target status, diagnostics, duration, built modules, and an
   `artifacts` reference to the complete workspace manifest. This includes sources,
   Lake outputs, executables, and custom outputs outside `.lake/build`.
-- `verification`: absent unless requested; contains checker mode, success,
-  diagnostics, duration, theorem/axiom results, and the accepted `exportFile`.
-- `success`: true only when the build and every requested check succeed.
+- `success`: true when all module jobs and the final target build succeed.
 
 To read diagnostics or a manifest, save its file-reference JSON from the report:
 
@@ -183,7 +161,8 @@ bash Applications/LeanBuild/local-files.sh .lean-cloud/build ref.json
 
 Each workspace manifest entry gives a relative path, a packed-file reference
 (pack, byte offset, length, and SHA-256), and an executable flag. Files from one
-snapshot share a pack, avoiding a separate remote transfer for each small file.
+snapshot share a bounded number of packs, avoiding a separate remote transfer
+for each small file while allowing concurrent transfers.
 The application's `files download CONFIG FILE_REF OUTPUT` command downloads a
 top-level file reference, such as diagnostics or a workspace manifest;
 `files restore CONFIG MANIFEST_REF DIRECTORY` restores the packed workspace into
@@ -191,8 +170,11 @@ a new directory. Run these inside the deployed image, where the storage
 configuration is available. Transfers verify sizes and SHA-256 hashes.
 Native executables require a compatible platform and runtime libraries.
 
-The CPU-aware workflow is `lean-build/v4`. Start new runs with the updated image;
-existing runs must finish with their original image because replay locations changed.
+The workflow is `lean-build/v5`. Start new runs with the updated image;
+existing runs must finish with their original image because the workflow and
+report schema changed. Independent proof checking and its `check` request field
+have been removed. Rename `limits.checkerMemoryMiB` to `limits.helperMemoryMiB`
+in existing request files.
 Packed workspace manifests remain compatible with `v2`; old `v1` manifests
 require the old application image to restore.
 
@@ -228,14 +210,10 @@ JSON and `LEAN_BUILD_TOOLCHAINS` selects the installation cache directory.
 lean-cloud worker SDK has its own separate, pinned toolchain.
 
 Run trusted repositories in dedicated deployments: Lake configuration, build
-hooks, plugins and metaprograms execute code. The default image explicitly sets
-`LEAN_BUILD_SANDBOX=0` for checking trusted exports without nested namespaces.
-Set it to `1` on Linux hosts configured for bubblewrap to sandbox export checking.
-An unavailable requested sandbox fails the check; it never silently falls back.
-This setting does not sandbox source compilation.
+hooks, plugins and metaprograms execute code inside the worker container.
 
-`limits` defaults to `seconds: 600` per command, `checkerMemoryMiB: 4096` for the
-helper, `bytes: 2147483648` per workspace/export, and `modules: 10000`.
+`limits` defaults to `seconds: 600` per command, `helperMemoryMiB: 4096` for the
+helper, `bytes: 2147483648` per workspace, and `modules: 10000`.
 The module build command now covers a whole job, not one module. Adjust `seconds`
 or `modulesPerJob` for expensive modules.
 Each command's diagnostics are capped at 16 MiB per stream. Container CPU, memory,
@@ -275,7 +253,6 @@ cd Applications/LeanBuild
 elan toolchain install "$(cat source-toolchain)"
 export LEAN_BUILD_TOOLCHAIN="$(elan run "$(cat source-toolchain)" lean --print-prefix)"
 export LEAN_BUILD_HELPER="$PWD/Helper.lean"
-export LEAN_BUILD_SANDBOX=0
 lake build cloud_app build_local build_tests
 .lake/build/bin/build_tests --native
 ```
@@ -284,8 +261,10 @@ Tests compare direct/replay execution on 80 generated module graphs and compare
 native executable output with ordinary Lake. Fixtures cover library/default/module
 and custom targets, generated sources, C FFI, configuration options, subdirectories,
 CPU-weighted batching, local joins, barrier merging, overlapping native builds, replay after a capacity change,
-and durable failures. Checking tests cover combined exports, every
-paranoid checker, corrupt proofs, private `sorry`, axiom policies and exact toolchains.
+bounded concurrent IO, producer caches, finish with downloads disabled,
+exact toolchains and durable failures. Invalid Lean modules fail the build and
+block dependent modules; independent modules can still succeed. Ordinary Lean
+warnings, including `sorry`, preserve Lake's normal build behavior.
 
 An optional [offline planner benchmark](Benchmarks/README.md) compares the
 heuristic with open-source constraint solvers on saved module graphs.

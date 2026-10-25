@@ -8,7 +8,6 @@ structure Backend (m : Type → Type) where
   prepare : Environment m → Request → m Preparation
   build : Environment m → Request → Plan → Array Module → Array BuildResult → m (Array BuildResult)
   finish : Environment m → Request → Plan → Array BuildResult → m BuildResult
-  check : Environment m → Request → Plan → BuildResult → m CheckResult
 
 /-- Completed modules at the start of this parallel round. -/
 def progressLabel (completed total : Nat) : String :=
@@ -60,15 +59,7 @@ def workflow [Monad m] [MonadCloudExec m] (backend : Backend m) (request : Reque
     return { report with message := "Module build failed; see diagnostics" }
   let build ← Cloud.exec (fun env => backend.finish env request plan modules) "complete Lake targets"
   if build.status != .built then return { report with build, message := "Target build failed" }
-  if request.check.mode == .none then
-    return { report with
-      build, success := true
-      message := "Build succeeded; independent verification was not requested" }
-  let verification ← Cloud.exec (fun env => backend.check env request plan build) "export and check proofs"
-  return { report with
-    build, verification := some verification
-    success := verification.success, message := if verification.success then "Build and verification succeeded"
-      else "Build succeeded; independent verification failed" }
+  return { report with build, success := true, message := "Build succeeded" }
 }
 
 end LeanBuild

@@ -1,4 +1,5 @@
 import LeanCloudRuntime.Storage
+import LeanCloudRuntime.Parallel
 
 namespace LeanCloudRuntime
 open Lean LeanCloud LeanCloudRuntime
@@ -98,9 +99,11 @@ def Reader.read (reader : Reader) (offset count : Nat) : IO ByteArray := do
   return result
 
 /-- Commit the manifest last. A failed upload cannot publish a partial file.
-Retrying uploads reuses immutable chunks. Data buffers are bounded by chunkSize;
-the small chunk index grows with file size. -/
-def upload (store : ObjectStore) (path : System.FilePath) (limit : Nat) : IO FileRef := do
+Retrying uploads reuses immutable chunks. At most `max 1 concurrency` chunk buffers
+are retained at once; transfers run in parallel but preserve chunk order.
+The small chunk index grows with file size. -/
+def upload (store : ObjectStore) (path : System.FilePath) (limit : Nat)
+    (concurrency : Nat := 1) : IO FileRef := do
   let size := (← path.metadata).byteSize.toNat
   unless size ≤ limit do throw (IO.userError "File exceeds configured byte limit")
   let sha256 ← digest path
@@ -108,11 +111,15 @@ def upload (store : ObjectStore) (path : System.FilePath) (limit : Nat) : IO Fil
   let mut chunks := #[]
   let mut total := 0
   repeat
-    let bytes ← handle.read chunkSize.toUSize
-    if bytes.isEmpty then break
-    total := total + bytes.size
-    unless total ≤ limit do throw (IO.userError "File grew beyond configured byte limit")
-    chunks := chunks.push (← store.putBytes bytes)
+    let mut batch := #[]
+    for _ in [:max 1 concurrency] do
+      let bytes ← handle.read chunkSize.toUSize
+      if bytes.isEmpty then break
+      total := total + bytes.size
+      unless total ≤ limit do throw (IO.userError "File grew beyond configured byte limit")
+      batch := batch.push bytes
+    if batch.isEmpty then break
+    chunks := chunks ++ (← Parallel.map concurrency batch store.putBytes)
   unless total == size && (← digest path) == sha256 do
     throw (IO.userError "File changed during upload")
   let manifest : FileManifest := { chunks, size, sha256 }
@@ -120,14 +127,21 @@ def upload (store : ObjectStore) (path : System.FilePath) (limit : Nat) : IO Fil
   return ⟨ref, size, sha256⟩
 
 /-- The destination is exclusively owned by the caller (normally a temporary
-workspace). Hash and length checks cover both individual chunks and the file. -/
-def download (store : ObjectStore) (ref : FileRef) (path : System.FilePath) (limit : Nat) : IO Unit := do
+workspace). Bounded batches fetch chunks concurrently and write them in order.
+Hash and length checks cover both individual chunks and the file. -/
+def download (store : ObjectStore) (ref : FileRef) (path : System.FilePath) (limit : Nat)
+    (concurrency : Nat := 1) : IO Unit := do
   IO.ofExcept ref.validate
   unless ref.size ≤ limit && ref.manifest.size ≤ 16 * 1024 * 1024 do
     throw (IO.userError "File reference exceeds configured limit")
   let reader ← openReader store ref
   let handle ← IO.FS.Handle.mk path .write
-  for chunk in reader.chunks do handle.write (← readBlob store chunk)
+  let width := max 1 concurrency
+  let mut index := 0
+  while index < reader.chunks.size do
+    let batch ← Parallel.map width (reader.chunks.extract index (index + width)) (readBlob store)
+    for bytes in batch do handle.write bytes
+    index := index + width
   handle.flush
   unless (← digest path) == ref.sha256 do throw (IO.userError "File digest mismatch")
   -- On failure the caller's private workspace owns any partial file. In

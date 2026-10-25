@@ -121,7 +121,7 @@ jobs:
       - name: Install LeanBuild source toolchain
         run: elan toolchain install "$(cat Applications/LeanBuild/source-toolchain)"
 
-      - name: Test LeanBuild targets and optional checking
+      - name: Test LeanBuild targets and artifact publication
         working-directory: Applications/LeanBuild
         timeout-minutes: 5
         run: |
@@ -130,13 +130,15 @@ jobs:
           LEAN_BUILD_TOOLCHAIN=$(elan run "$source_toolchain" lean --print-prefix)
           export LEAN_BUILD_TOOLCHAIN
           export LEAN_BUILD_HELPER="$PWD/Helper.lean"
-          # These are trusted regression fixtures, also run on macOS and Docker.
-          export LEAN_BUILD_SANDBOX=0
           elan run "$source_toolchain" lean Helper.lean
           lake build cloud_app build_local build_tests
           .lake/build/bin/build_tests --native
-          .lake/build/bin/cloud_app programs | jq -e '.[0].entry == "lean-build/v4"'
-          jq -c . example.json | .lake/build/bin/cloud_app validate lean-build/v4
+          .lake/build/bin/cloud_app programs | jq -e '.[0].entry == "lean-build/v5"'
+          jq -c . example.json | .lake/build/bin/cloud_app validate lean-build/v5
+          jq -c '.check = {mode: "kernel"}' example.json > /tmp/lean-build-legacy-request.json
+          if .lake/build/bin/cloud_app validate lean-build/v5 < /tmp/lean-build-legacy-request.json; then
+            echo 'Removed proof checking was silently accepted' >&2; exit 1
+          fi
 
   runtime_images:
     name: Runtime images

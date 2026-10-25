@@ -8,11 +8,10 @@ namespace LeanBuild
 open Lean LeanCloud LeanCloudRuntime
 
 /-- Deployment configuration. Source repositories, Lake targets and build hooks
-execute trusted code; the checker sandbox does not sandbox source builds. -/
+execute trusted code inside the worker container. -/
 structure Tools where
   toolchain : System.FilePath
   helper : System.FilePath
-  sandbox : Bool := true
   cache : Option Bundle.Cache := none
   threads : Nat := 1
 
@@ -27,7 +26,6 @@ private def project (directory : System.FilePath) (request : Request) : System.F
 
 private def run (tools : Tools) (directory : System.FilePath) (limits : Limits)
     (label command : String) (args : Array String)
-    (files : Array (System.FilePath × Nat) := #[])
     (cwd : Option System.FilePath := none) (cache : CachePolicy := .rebuild) :
     IO (Except String Unit) := do
   let home := directory / ".." / "home"
@@ -40,36 +38,25 @@ private def run (tools : Tools) (directory : System.FilePath) (limits : Limits)
       "LANG=C.UTF-8", "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1"] ++
       cacheEnv ++ #[command] ++ args
   } (limits.seconds * 1000) (directory / ".." / s!"{label}.stdout")
-    (directory / ".." / s!"{label}.stderr") (16 * 1024 * 1024) files
+    (directory / ".." / s!"{label}.stderr") (16 * 1024 * 1024)
   if out.stopped then return .error s!"{label}: time or output limit exceeded"
   if out.exitCode != 0 then
     return .error s!"{label} failed (exit {out.exitCode}): {out.stdout.takeEnd 2000}\n{out.stderr.takeEnd 4000}"
   return .ok ()
 
 private def lake (tools : Tools) (directory : System.FilePath) (request : Request)
-    (label : String) (args : Array String)
-    (files : Array (System.FilePath × Nat) := #[]) : IO (Except String Unit) :=
+    (label : String) (args : Array String) : IO (Except String Unit) :=
   run tools directory request.limits label (tools.toolchain / "bin/lake").toString
     (#[if request.cache == .rebuild then "--no-cache" else "--try-cache", "--keep-toolchain"] ++
       request.options.toArray.map (fun (key, value) => s!"-K{key}={value}") ++ args)
-    files (some (project directory request)) request.cache
+    (some (project directory request)) request.cache
 
 private def runHelper (tools : Tools) (directory : System.FilePath) (request : Request)
-    (label : String) (args : Array String)
-    (files : Array (System.FilePath × Nat) := #[]) : IO (Except String Unit) := do
+    (label : String) (args : Array String) : IO (Except String Unit) := do
   let library := tools.toolchain / "lib/lean" /
     (if System.Platform.isOSX then "libLake_shared.dylib" else "libLake_shared.so")
-  lake tools directory request label (#["env", "lean", s!"-j{max 1 tools.threads}", s!"-M{request.limits.checkerMemoryMiB}",
-    "--load-dynlib", library.toString, "--run", tools.helper.toString] ++ args) files
-
-/-- Check the export independently of the project. Never fall back from a
-requested sandbox or skip an unavailable checker. -/
-def Tools.verifyExport (tools : Tools) (directory : System.FilePath) (limits : Limits)
-    (exportPath : System.FilePath) (paranoid : Bool := false) : IO (Except String Unit) :=
-  lake tools directory { repository := "", revision := "", limits } "check"
-    (#["check", s!"--from-export={exportPath}"] ++
-      (if paranoid then #["--paranoid"] else #[]) ++
-      (if tools.sandbox then #[] else #["--inadvisably-no-sandbox"]))
+  lake tools directory request label (#["env", "lean", s!"-j{max 1 tools.threads}", s!"-M{request.limits.helperMemoryMiB}",
+    "--load-dynlib", library.toString, "--run", tools.helper.toString] ++ args)
 
 private def logs (store : ObjectStore) (directory : System.FilePath) : IO FileRef := do
   let mut texts : Array String := #[]
@@ -133,7 +120,7 @@ def Tools.prepareDirectory (tools : Tools) (store : ObjectStore) (request : Requ
   | .error reason => return { error := reason, diagnostics := ← logs store directory }
   | .ok (toolchain, platform, modules, snapshot) =>
     -- Publication exceptions propagate to Cloud.exec and are durable failures.
-    let source ← snapshot.publish store
+    let source ← snapshot.publish store tools.cache tools.threads
     return { plan := some { commit, toolchain, platform, modules, source := ← Files.putJson store source } }
 
 def Tools.prepare (tools : Tools) (store : ObjectStore) (request : Request) : IO Preparation :=
@@ -145,6 +132,8 @@ def Tools.prepare (tools : Tools) (store : ObjectStore) (request : Request) : IO
       ("git-checkout", #["checkout", "--detach", "--quiet", "FETCH_HEAD"]),
       ("git-revision", #["rev-parse", "HEAD"])]
     for (label, args) in steps do
+      let args := #["-c", s!"pack.threads={max 1 tools.threads}",
+        "-c", s!"index.threads={max 1 tools.threads}"] ++ args
       if let .error reason ← run tools directory request.limits label "git" args then
         return { error := reason, diagnostics := ← logs store directory }
     let commit := (← IO.FS.readFile (directory / ".." / "git-revision.stdout")).trimAscii.toString
@@ -167,7 +156,7 @@ private def restore (tools : Tools) (store : ObjectStore) (directory : System.Fi
   unless (← platform) == plan.platform do throw (IO.userError "Build worker platform changed")
   let source ← session.readManifest plan.source
   let workspace := Bundle.overlay source artifacts
-  Bundle.synchronize store directory workspace request.limits.bytes tools.cache
+  Bundle.synchronize store directory workspace request.limits.bytes tools.cache tools.threads
   unless (← verifyToolchain tools (project directory request)) == plan.toolchain do
     throw (IO.userError "Toolchain changed since preparation")
   return workspace
@@ -177,23 +166,28 @@ private structure ModuleOutcome where
   built : Bool
   deriving FromJson
 
+private def workspaceKey (tools : Tools) (request : Request) (plan : Plan) : IO String := do
+  return (toJson ("lean-build/workspace/v1", request, plan,
+    tools.toolchain.toString, ← Files.digest tools.helper)).compress
+
 private def buildJob (tools : Tools) (store : ObjectStore) (request : Request)
     (plan : Plan) (completed : Array BuildResult) (modules : Option (Array Module)) : IO (Array BuildResult) := do
-  let key := (toJson ("lean-build/workspace/v1", request, plan,
-    tools.toolchain.toString, ← Files.digest tools.helper)).compress
+  let key ← workspaceKey tools request plan
   let cache := tools.cache.map fun cache => cache.directory.addExtension "workspace"
   Workspace.use store cache key fun session => do
     let directory := session.directory
     let start ← IO.monoMsNow
-    let mut imports : Bundle.Manifest := #[]
     let needed := modules.map (prerequisites plan)
     let mut manifests : Std.HashSet String := {}
+    let mut references := #[]
     for result in completed do
       if needed.any (fun names => !names.contains result.name) then continue
       let some ref := result.artifacts | throw (IO.userError "Missing prerequisite artifacts")
       if manifests.contains ref.sha256 then continue
       manifests := manifests.insert ref.sha256
-      imports ← IO.ofExcept (Bundle.merge imports (← session.readManifest ref))
+      references := references.push ref
+    let downloaded ← Parallel.map tools.threads references session.readManifest
+    let imports ← downloaded.foldlM (fun imports manifest => IO.ofExcept (Bundle.merge imports manifest)) #[]
     let baseline ← restore tools store directory request plan imports session
     let result : Except String (Array BuildResult × Bundle.Snapshot) ← try
       let policy ← policyFile directory request
@@ -222,7 +216,7 @@ private def buildJob (tools : Tools) (store : ObjectStore) (request : Request)
         let names ← readJson output
         results := #[{ name := "targets", status := .built, builtModules := names }]
       let snapshot ← Bundle.delta directory request.limits.bytes baseline
-        (if modules.isSome then baseline else #[])
+        (if modules.isSome then baseline else #[]) tools.threads
       pure (.ok (results, snapshot))
     catch error => pure (.error (toString error))
     let diagnostics ← logs store directory
@@ -235,12 +229,13 @@ private def buildJob (tools : Tools) (store : ObjectStore) (request : Request)
       -- without uploading an unreachable pack of partial build outputs.
       if !results.any (·.status == .built) then
         return results.map fun result => { result with diagnostics, milliseconds }
-      let changes ← snapshot.publish store
+      let changes ← snapshot.publish store tools.cache tools.threads
       -- A final workspace manifest includes sources and all outputs, even custom
       -- outputs outside .lake/build. Deletions are respected by taking live paths.
       let artifacts ← if modules.isSome then pure changes else do
         Bundle.existing directory (Bundle.overlay baseline changes)
       let reference ← Files.putJson store artifacts
+      session.rememberManifest reference artifacts
       if results.all (·.status == .built) then
         session.commit
       return results.map fun result => { result with
@@ -258,37 +253,6 @@ def Tools.finish (tools : Tools) (store : ObjectStore) (request : Request)
   let some result := results[0]? | throw (IO.userError "Missing target result")
   return result
 
-def Tools.check (tools : Tools) (store : ObjectStore) (request : Request)
-    (plan : Plan) (built : BuildResult) : IO CheckResult :=
-  withWorkspace fun directory => do
-    let start ← IO.monoMsNow
-    let some ref := built.artifacts | throw (IO.userError "Missing completed build artifacts")
-    -- The final manifest describes the entire completed workspace, including deletions.
-    Bundle.restore store directory (← Files.readJson store ref) request.limits.bytes tools.cache
-    let exportPath := directory / ".." / "proofs.ndjson"
-    let result : Except String (Array Theorem) ← try
-      unless (← platform) == plan.platform &&
-          (← verifyToolchain tools (project directory request)) == plan.toolchain do
-        throw (IO.userError "Checker platform or toolchain changed")
-      let policy := directory / ".." / "check-policy.json"
-      let modules := directory / ".." / "check-modules.json"
-      let output := directory / ".." / "checked-theorems.json"
-      IO.FS.writeFile policy (toJson request.check).pretty
-      IO.FS.writeFile modules (toJson built.builtModules).pretty
-      IO.ofExcept (← runHelper tools directory request "export"
-        #["export", policy.toString, modules.toString, exportPath.toString, output.toString]
-        #[(exportPath, request.limits.bytes)])
-      IO.ofExcept (← tools.verifyExport directory request.limits exportPath (request.check.mode == .paranoid))
-      pure (.ok (← readJson output))
-    catch error => pure (.error (toString error))
-    let diagnostics ← logs store directory
-    let milliseconds := (← IO.monoMsNow) - start
-    match result with
-    | .error message => return { mode := request.check.mode, success := false, diagnostics, milliseconds, message }
-    | .ok theorems => return {
-        mode := request.check.mode, success := true, diagnostics, milliseconds, theorems
-        exportFile := ← Files.upload store exportPath request.limits.bytes }
-
 def Tools.fromEnvironment : IO Tools := do
   let helper := (← IO.getEnv "LEAN_BUILD_HELPER").getD "/opt/lean-build/Helper.lean"
   let toolchain : System.FilePath ← match ← IO.getEnv "LEAN_BUILD_TOOLCHAIN" with
@@ -299,23 +263,18 @@ def Tools.fromEnvironment : IO Tools := do
       | some spec => do
         let cache := (← IO.getEnv "LEAN_BUILD_TOOLCHAINS").getD "/data/toolchains"
         Toolchain.fromFile spec cache helper
-  let sandbox ← match (← IO.getEnv "LEAN_BUILD_SANDBOX").getD "1" with
-    | "1" => pure true
-    | "0" => pure false
-    | _ => throw (IO.userError "LEAN_BUILD_SANDBOX must be 0 or 1")
   let cache : Option Bundle.Cache ← match ← IO.getEnv "LEAN_BUILD_CACHE" with
     | none => pure none
     | some directory => do
       let value := (← IO.getEnv "LEAN_BUILD_CACHE_BYTES").getD "4294967296"
       let some bytes := value.toNat? | throw (IO.userError "Invalid LEAN_BUILD_CACHE_BYTES")
       pure (some { directory := directory, bytes : Bundle.Cache })
-  return { toolchain := ← IO.FS.realPath toolchain, helper := ← IO.FS.realPath helper, sandbox, cache }
+  return { toolchain := ← IO.FS.realPath toolchain, helper := ← IO.FS.realPath helper, cache }
 
 def Tools.backend (tools : Tools) (store : ObjectStore) : Backend IO :=
   let configured := fun env : LeanCloud.Environment IO => { tools with threads := max 1 env.currentWorker.cpus }
   { prepare := fun env => (configured env).prepare store
     build := fun env => (configured env).build store
-    finish := fun env => (configured env).finish store
-    check := fun env => (configured env).check store }
+    finish := fun env => (configured env).finish store }
 
 end LeanBuild

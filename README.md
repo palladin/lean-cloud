@@ -4,7 +4,7 @@
 [![Lean 4](https://img.shields.io/badge/Lean-%E2%89%A5%204.35.0-blue)](https://leanprover.github.io/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
-Parallel and distributed programming for Lean using the `Cloud` monad.
+Parallel and distributed programming for Lean using composable monadic programs.
 
 Write workflows with `cloud { ... }`, run independent computations with
 `Cloud.parallel`, and combine their results using ordinary Lean code. Parallel
