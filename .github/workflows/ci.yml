@@ -138,28 +138,13 @@ jobs:
           .lake/build/bin/cloud_app programs | jq -e '.[0].entry == "lean-build/v4"'
           jq -c . example.json | .lake/build/bin/cloud_app validate lean-build/v4
 
-  runtime:
-    name: Runtime
+  runtime_images:
+    name: Runtime images
     needs: test
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-
-      # Both jobs use the same Ubuntu image and architecture. The CLI loads the
-      # runner's libcurl runtime; it needs no headers or Lean installation here.
-      - name: Download runtime test executables
-        uses: actions/download-artifact@v5
-        with:
-          name: runtime-driver
-          path: .lean-cloud
-
-      - name: Unpack runtime test executables
-        run: |
-          mkdir -p .lake/build/bin
-          tar -C .lake/build/bin -xf .lean-cloud/runtime-driver.tar
-          test -x .lake/build/bin/lean_cloud
-          test -x .lake/build/bin/cloud_console_tests
 
       - name: Set up Docker build cache
         id: buildx
@@ -232,18 +217,91 @@ jobs:
           path: .lean-cloud/buildkit
           key: ${{ steps.layers.outputs.cache-primary-key }}
 
-      - name: Check deployed runtime suites concurrently
-        if: ${{ !cancelled() && steps.images.outcome == 'success' }}
+      - name: Export runtime images
+        run: |
+          mkdir -p .lean-cloud/runtime-images
+          docker image save lean-cloud-demo:test -o .lean-cloud/runtime-images/demo.tar
+          docker image save lean-cloud-chaos:test -o .lean-cloud/runtime-images/chaos.tar
+
+      - name: Share demo image
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-image-demo
+          path: .lean-cloud/runtime-images/demo.tar
+          include-hidden-files: true
+          compression-level: 1
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Share chaos image
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-image-chaos
+          path: .lean-cloud/runtime-images/chaos.tar
+          include-hidden-files: true
+          compression-level: 1
+          retention-days: 1
+          if-no-files-found: error
+
+  runtime:
+    name: Runtime (${{ matrix.suite }})
+    needs: [test, runtime_images]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    # Four complete deployments compete for CPU and disk on a single runner.
+    # Give each suite its own runner, reusing the same images and test driver.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: pool
+            image: demo
+          - suite: scaling
+            image: demo
+          - suite: chaos
+            image: chaos
+          - suite: maintenance
+            image: demo
+    steps:
+      - uses: actions/checkout@v4
+
+      # All jobs use the same Ubuntu image and architecture. The CLI needs only
+      # the runner's libcurl runtime; no Lean installation or rebuild is needed.
+      - name: Download runtime test executables
+        uses: actions/download-artifact@v5
+        with:
+          name: runtime-driver
+          path: .lean-cloud
+
+      - name: Unpack runtime test executables
+        run: |
+          mkdir -p .lake/build/bin
+          tar -C .lake/build/bin -xf .lean-cloud/runtime-driver.tar
+          test -x .lake/build/bin/lean_cloud
+          test -x .lake/build/bin/cloud_console_tests
+
+      - name: Download runtime image
+        uses: actions/download-artifact@v5
+        with:
+          name: runtime-image-${{ matrix.image }}
+          path: .lean-cloud/runtime-images
+
+      - name: Load runtime image
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: docker image load -i ".lean-cloud/runtime-images/$IMAGE.tar"
+
+      - name: Check deployed runtime suite
         timeout-minutes: 10
         env:
-          BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
-        run: bash .github/scripts/check-runtime.sh pool scaling chaos maintenance
+          SUITE: ${{ matrix.suite }}
+        run: bash .github/scripts/check-runtime.sh "$SUITE"
 
       - name: Upload runtime diagnostics on failure
         if: failure() || cancelled()
         uses: actions/upload-artifact@v4
         with:
-          name: runtime-logs
+          name: runtime-logs-${{ matrix.suite }}
           retention-days: 7
           path: |
             .lean-cloud/ci-runtime-logs/*.log
