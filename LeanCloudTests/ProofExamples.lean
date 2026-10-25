@@ -31,7 +31,7 @@ private theorem nested_meaning [Monad m] (captured : Bool) : Pure.Evaluation (ne
   · simpa [ArrsF.apply, ArrsF.viewL] using Pure.Evaluation.pure (info := none) (m := m) captured
 
 private def source [Monad m] (_ : Unit) : Cloud m Json :=
-  .impure none (.command (inferInstance : Codec Bool) (.exec "captured" fun _ => pure true))
+  .impure none (.command (inferInstance : Codec Bool) "captured" (fun _ => pure true))
     (.one fun captured =>
       .impure none (.parallel (inferInstance : Codec Bool) 2
         (fun index => if index.val = 0 then nested captured else child (!captured)) "0/2 · 0%")
@@ -55,20 +55,20 @@ private theorem source_meaning [Monad m] : Pure.Evaluation (source (m := m) ()) 
 -- All three theorem applications use the original program and input, from empty storage.
 example :
     ∃ sufficientFuel, ∀ fuel, sufficientFuel ≤ fuel →
-      ((SequentialReplay.interpret ReplayModel.store ReplayModel.noBlobs fuel source ()).run []).1 =
-        ((DirectInterpreter.interpret ReplayModel.noBlobs source ()).run []).1 :=
+      ((SequentialReplay.interpret ReplayModel.store ReplayModel.pureContext fuel source ()).run []).1 =
+        ((DirectInterpreter.interpret ReplayModel.pureContext source ()).run []).1 :=
   sequential_replay_matches_direct source () ⟨_, source_meaning⟩ (fun _ => rfl)
 
 example :
     ∃ sufficientFuel, ∀ fuel, sufficientFuel ≤ fuel →
       ((ParallelReplay.interpret fuel source ()).run []).1 =
-        ((DirectInterpreter.interpret ReplayModel.noBlobs source ()).run []).1 :=
+        ((DirectInterpreter.interpret ReplayModel.pureContext source ()).run []).1 :=
   parallel_replay_matches_direct source () ⟨_, source_meaning⟩ (fun _ => rfl)
 
 -- Faults may occur in any branch, before or after any journal operation.
 example (faults : ReplayFaults.Plan) :
     ∃ sufficientFuel, ∀ fuel, sufficientFuel ≤ fuel →
-      let direct := ((DirectInterpreter.interpret ReplayFaults.noBlobs source ()).run.run ⟨[], {}⟩).1
+      let direct := ((DirectInterpreter.interpret ReplayFaults.pureContext source ()).run.run ⟨[], {}⟩).1
       let replay := ((RestartingParallelReplay.interpret fuel source ()).run
         (ReplayFaults.Saved.initial faults)).1
       match direct with
@@ -77,7 +77,7 @@ example (faults : ReplayFaults.Plan) :
   obtain ⟨bound, agrees⟩ := restarting_parallel_replay_matches_direct source () ⟨_, source_meaning⟩ (fun _ => rfl) faults
   refine ⟨bound, fun fuel enough => ?_⟩
   have correct := agrees fuel enough
-  cases direct : ((DirectInterpreter.interpret ReplayFaults.noBlobs source ()).run.run ⟨[], {}⟩).1 with
+  cases direct : ((DirectInterpreter.interpret ReplayFaults.pureContext source ()).run.run ⟨[], {}⟩).1 with
   | ok expected => simpa only [direct] using correct
   | error side => simp only [direct] at correct
 

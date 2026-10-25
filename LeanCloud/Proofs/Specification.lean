@@ -32,10 +32,10 @@ inductive Complete {m : Type → Type u} [Monad m] (expected : Journal) :
       (next : ArrsF (Control m) SourceSiteId α β)
       (roundtrip : codec.decode (codec.encode (body ())) = .ok (body ()))
       (present : expected.lookup (ReplayStore.valueKey current) =
-        some ⟨ReplayInterpreter.Internal.request codec (.exec label (fun _ => pure (body ()) : Environment → ExceptT CloudError m α)),
+        some ⟨ReplayInterpreter.Internal.request codec label,
           .success (codec.encode (body ()))⟩)
       (rest : Complete expected current.next (next.apply (body ())) outcome budget) :
-      Complete expected current (.impure info (.command codec (.exec label (fun _ => pure (body ())))) next)
+      Complete expected current (.impure info (.command codec label (fun _ => pure (body ()))) next)
         outcome (budget + 1)
   | parallelOk {info : Option SourceSiteId} (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
       (label : String) (next : ArrsF (Control m) SourceSiteId (Array α) β) (outcomes : Fin count → Except CloudError α)
@@ -146,7 +146,7 @@ theorem complete_journal_exists {m : Type → Type u} [Monad m] {α : Type}
   | exec codec label body next roundtrip rest ih =>
     obtain ⟨journal, budget, complete, coverage⟩ := ih parent branch (command + 1)
     let record : ReplayRecord :=
-      ⟨ReplayInterpreter.Internal.request codec (.exec label (fun _ => pure (body ()) : Environment → ExceptT CloudError m _)),
+      ⟨ReplayInterpreter.Internal.request codec label,
         .success (codec.encode (body ()))⟩
     obtain ⟨_, extension, present, coverage⟩ := assemble parent branch command [] journal record (by simp [Covers]) coverage
     refine ⟨_, budget + 1, .exec codec label body next roundtrip present ?_, coverage⟩

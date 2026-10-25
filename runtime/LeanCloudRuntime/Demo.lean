@@ -17,17 +17,16 @@ def batches {α : Type} (items : Array α) (size : Nat) : Array (Array α) :=
 /-- Ordinary captured variables and global blobs; workers run this same code.
 The delay makes work distribution and interruption visible in the local demo. -/
 def workflow (input : Input) : Cloud IO BlobRef := cloud {
-  let counts ← Cloud.parallel fun _ => ((batches input.files input.batchSize).map fun batch => cloud {
-    let mut errors := 0
-    for name in batch do
-      let text ← CloudBlob.readTextByName name
-      errors := errors + ((text.splitOn "\n").filter (·.startsWith "ERROR")).length
-    Cloud.exec (fun _ => do
+  let counts ← Cloud.parallel ((batches input.files input.batchSize).map fun batch =>
+    Cloud.exec (fun env => do
+      let mut errors := 0
+      for name in batch do
+        let text ← env.blobs.readTextByName name
+        errors := errors + ((text.splitOn "\n").filter (·.startsWith "ERROR")).length
       IO.sleep input.pauseMs.toUInt32
-      return errors) "analyze-batch"
-  })
+      return errors) "analyze-batch")
   let total := counts.foldl (· + ·) 0
-  CloudBlob.putText s!"files={input.files.size}, errors={total}\n"
+  Cloud.exec fun env => env.blobs.putText s!"files={input.files.size}, errors={total}\n"
 }
 
 def sampleFiles : Array (String × String) := (Array.range 16).map fun i =>

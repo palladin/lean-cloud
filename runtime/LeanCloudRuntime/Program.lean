@@ -9,18 +9,18 @@ open Lean LeanCloud
 structure RegisteredProgram where
   info : ProgramInfo
   validate : Json → Except String Unit
-  execute : ExecutionConfig → RunDefinition → String → Worker.ObservedStore IO → BlobStorage IO → Trace.Sink → Assignment → LeanCloud.Environment → IO Report
+  execute : ExecutionConfig → RunDefinition → String → Worker.ObservedStore IO → Trace.Sink → Assignment → ExecContext IO → IO Report
 
 def registerProgram [Codec ι] [Codec α] (program : LeanCloud.CloudProgram ι α)
     (sources : Array ProgramSource := by exact cloud_sources%) : RegisteredProgram where
   info := { program.info with sources }
   validate input := (Codec.decode (α := ι) input).map (fun _ => ())
-  execute limits definition worker records blobs trace assignment environment := do
+  execute limits definition worker records trace assignment environment := do
     unless definition.entry == program.info.entry && definition.resultSchema == program.info.resultSchema do
       throw (IO.userError "Deployed program/codec does not match the submitted run")
     let input ← IO.ofExcept (Codec.decode (α := ι) definition.input)
-    Worker.execute worker records blobs limits.interpreterFuel
-      (fun input => trace.instrument limits.interpreterFuel (program.run input)) input assignment (some trace.visit) environment
+    Worker.execute worker records environment limits.interpreterFuel
+      (fun input => trace.instrument limits.interpreterFuel (program.run input)) input assignment (some trace.visit)
 
 structure Registry where
   programs : Array RegisteredProgram
@@ -57,7 +57,7 @@ def Registry.submit (registry : Registry) (config : Config) (run entry : String)
 /-- Take the pool snapshot once per assignment, rather than contacting the scheduler
 for every user command. Actual container restrictions can lower the local budget.
 Telemetry never enlarges the configured allocation or substitutes the host total. -/
-def executionEnvironment (config : Config) (worker : String) : IO LeanCloud.Environment := do
+def executionEnvironment (config : Config) (worker : String) : IO (ExecContext IO) := do
   let membership ← Pool.request config .workers
   let routes : Array HttpMailbox.WorkerEndpoint ← IO.ofExcept (membership.getObjValAs? _ "routes")
   let current := (routes.find? (·.worker == worker)).orElse
@@ -70,7 +70,7 @@ def executionEnvironment (config : Config) (worker : String) : IO LeanCloud.Envi
     if let some bytes := sample.memoryLimit then
       let limit := max 1 (bytes / (1024 * 1024))
       capacity := { capacity with memoryMiB := some (min (capacity.memoryMiB.getD limit) limit) }
-  return { currentWorker := capacity, workers := routes.map fun route =>
+  return { blobs := config.objects.executionContext.blobs, currentWorker := capacity, workers := routes.map fun route =>
     if route.worker == worker then capacity else route.capacity }
 
 /-- Execute one inbox assignment. User exceptions are already Cloud outcomes.
@@ -102,7 +102,7 @@ private def executeAssignment (registry : Registry) (config : Config) (cache : R
             throw (IO.userError "Worker image does not match the submitted run")
           let program ← IO.ofExcept (registry.find definition.entry)
           let environment ← executionEnvironment config id
-          program.execute config.worker definition id observed (trace.blobs (config.objects.storage)) trace assignment environment
+          program.execute config.worker definition id observed trace assignment environment
       match report.progress with
       | .ok (.fork location _) => trace.suspend location
       | .ok .done => trace.emit (if finalize.isSome then "sealed" else "returned") ""

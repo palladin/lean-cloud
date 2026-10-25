@@ -19,13 +19,13 @@ import LeanCloud
 open LeanCloud
 
 def summarizeLogs (files : Array String) : Cloud IO BlobRef := cloud {
-  let counts ← Cloud.parallel fun _ => (files.map fun name => cloud {
-    let text ← CloudBlob.readTextByName name
-    return ((text.splitOn "\n").filter (·.startsWith "ERROR")).length
-  })
+  let counts ← Cloud.parallel (files.map fun name =>
+    Cloud.exec fun env => do
+      let text ← env.blobs.readTextByName name
+      return ((text.splitOn "\n").filter (·.startsWith "ERROR")).length)
 
   let total := counts.foldl (· + ·) 0
-  CloudBlob.putText s!"files={files.size}, errors={total}\n"
+  Cloud.exec fun env => env.blobs.putText s!"files={files.size}, errors={total}\n"
 }
 ```
 

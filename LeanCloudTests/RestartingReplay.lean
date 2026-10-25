@@ -10,11 +10,11 @@ private def crashes (saved : Saved) : Nat :=
 
 private def differential [Codec α] [BEq α] [Repr α]
     (program : ι → Cloud WorkerM α) (input : ι) (plan : Plan := {}) : IO Saved := do
-  let (.ok expected, untouched) := ((DirectInterpreter.interpret noBlobs program input).run).run ⟨[], {}⟩
+  let (.ok expected, untouched) := ((DirectInterpreter.interpret pureContext program input).run).run ⟨[], {}⟩
     | throw (IO.userError "Direct interpreter was interrupted")
   assertTrue (untouched.durable.isEmpty && untouched.faults.visited.isEmpty) "Direct used replay storage"
   let (.ok clean, sequential) :=
-    ((SequentialReplay.interpret store noBlobs 10000 program input).run).run ⟨[], {}⟩
+    ((SequentialReplay.interpret store pureContext 10000 program input).run).run ⟨[], {}⟩
     | throw (IO.userError "Unfaulted sequential replay was interrupted")
   assertOutcome clean expected
   let (actual, saved) := (interpret 10000 program input).run (Saved.initial plan)
@@ -34,17 +34,17 @@ private def differential [Codec α] [BEq α] [Repr α]
 
 private def nested [Pure m] (input : Nat) : Cloud m Nat := do
   let captured ← Cloud.pure (fun _ => input * 2) "capture"
-  let values ← Cloud.parallel fun _ => #[
+  let values ← Cloud.parallel $ #[
     (do
       let value ← Cloud.pure (fun _ => captured + 1) "first"
-      let inner ← Cloud.parallel fun _ => #[pure value, Cloud.delay fun _ => pure (value + 1)]
+      let inner ← Cloud.parallel $ #[pure value, Cloud.delay fun _ => pure (value + 1)]
       return inner.foldl (· + ·) 0),
     Cloud.delay fun _ => Cloud.pure (fun _ => captured + 3) "second"]
-  let later ← Cloud.parallel fun _ => #[pure values.size, pure input]
+  let later ← Cloud.parallel $ #[pure values.size, pure input]
   Cloud.pure (fun _ => values.foldl (· + ·) 0 + later.foldl (· + ·) 0) "result"
 
 private def pair (_ : Unit) : Cloud WorkerM (Array Nat) :=
-  Cloud.parallel fun _ => #[Cloud.pure (fun _ => 7), Cloud.pure (fun _ => 9)]
+  Cloud.parallel $ #[Cloud.pure (fun _ => 7), Cloud.pure (fun _ => 9)]
 
 private def pureTree : Tree → Tree
   | .blob n => .effect n
@@ -75,14 +75,14 @@ def cases : Array TestCase := #[
       assertEq accepted (if side == .before then replacement else record)
       assertEq retried.durable.length 1 "Retry duplicated a committed key"⟩,
   ⟨"restarting-replay/worker-retry-stays-inside-spawn", do
-    let branch := Location.root.next.child 0
+    let branch := Location.root.child 0
     let key := ReplayStore.valueKey branch
     let saved ← differential pair () { workers := [(branch, [⟨.create key, .after⟩])] }
     assertEq (crashes saved) 1
     let worker := (saved.workers.lookup branch).getD {}
     assertEq (worker.visited.filter (· == .create key)).size 1 "Worker repeated a committed computation"
-    let sibling := (saved.workers.lookup (Location.root.next.child 1)).getD {}
-    assertEq (sibling.visited.filter (· == .read (ReplayStore.returnKey (Location.root.next.child 1)))).size 2
+    let sibling := (saved.workers.lookup (Location.root.child 1)).getD {}
+    assertEq (sibling.visited.filter (· == .read (ReplayStore.returnKey (Location.root.child 1)))).size 2
       "Worker crash restarted its sibling"⟩,
   ⟨"restarting-replay/completed-worker-returns-the-recorded-outcome", do
     let program (_ : Unit) : Cloud WorkerM Nat := Cloud.pure (fun _ => 7)
@@ -99,10 +99,10 @@ def cases : Array TestCase := #[
   ⟨"restarting-replay/suspension-retries-return-the-same-report", do
     let program (_ : Unit) : Cloud WorkerM (Array Nat) := do
       let n ← Cloud.pure (fun _ => 7)
-      Cloud.parallel fun _ => #[pure n, pure (n + 1)]
+      Cloud.parallel $ #[pure n, pure (n + 1)]
     let assignment : Assignment := ⟨0, Location.root⟩
     let (expected, clean) := (worker 1 20 program () assignment).run ⟨[], {}⟩
-    assertOutcome expected (.ok (.fork Location.root.next.next 2))
+    assertOutcome expected (.ok (.fork Location.root.next 2))
     for operation in clean.faults.visited.toList.eraseDups do
       for side in [Side.before, .after] do
         let initial : State ReplayModel.Journal := { durable := [], faults.remaining := [⟨operation, side⟩] }
@@ -117,11 +117,11 @@ def cases : Array TestCase := #[
     assertEq saved.faults.crashes 0
     assertEq saved.faults.visited.size 1 "Interpreter budget exhaustion was retried"⟩,
   ⟨"restarting-replay/exhausted-worker-keeps-completed-siblings", do
-    let branch := Location.root.next.child 0
+    let branch := Location.root.child 0
     let faults := List.replicate 20 ⟨.read (ReplayStore.returnKey branch), Side.before⟩
     let (result, saved) := (interpret 10 pair ()).run (Saved.initial { workers := [(branch, faults)] })
     assertError result .protocol
-    let sibling := Location.root.next.child 1
+    let sibling := Location.root.child 1
     assertTrue (saved.journal.lookup (ReplayStore.returnKey sibling)).isSome
       "Worker exhaustion discarded a completed sibling"
     assertTrue (saved.journal.lookup (ReplayStore.returnKey Location.root)).isNone
@@ -143,10 +143,10 @@ def cases : Array TestCase := #[
     assertTrue ((saved.workers.lookup Location.root).getD {}).remaining.isEmpty "Fault script was reset"⟩,
   ⟨"restarting-replay/application-failures-stay-in-source-order", do
     let program (_ : Unit) : Cloud WorkerM (Array Nat) :=
-      Cloud.parallel fun _ => #[Cloud.fail "first", Cloud.delay fun _ => Cloud.fail "second", Cloud.pure (fun _ => 42)]
-    let branches := (List.range 3).map Location.root.next.child
+      Cloud.parallel $ #[Cloud.fail "first", Cloud.delay fun _ => Cloud.fail "second", Cloud.pure (fun _ => 42)]
+    let branches := (List.range 3).map Location.root.child
     let saved ← differential program () {
-      workers := [(Location.root.next.child 0, [⟨.create (ReplayStore.returnKey (Location.root.next.child 0)), .after⟩])] }
+      workers := [(Location.root.child 0, [⟨.create (ReplayStore.returnKey (Location.root.child 0)), .after⟩])] }
     assertEq (crashes saved) 1
     for branch in branches do
       assertTrue (saved.journal.lookup (ReplayStore.returnKey branch)).isSome "Failure discarded a sibling"
@@ -154,14 +154,14 @@ def cases : Array TestCase := #[
       | throw (IO.userError "Missing failure")
     assertEq root.outcome (.failure ⟨.application, "first"⟩)⟩,
   ⟨"restarting-replay/empty-group-and-lost-return-reply", do
-    let program (_ : Unit) : Cloud WorkerM (Array Nat) := Cloud.parallel fun _ => #[]
+    let program (_ : Unit) : Cloud WorkerM (Array Nat) := Cloud.parallel $ #[]
     let saved ← differential program () { workers := [(Location.root,
       [⟨.create (ReplayStore.valueKey Location.root), .after⟩,
        ⟨.create (ReplayStore.returnKey Location.root), .after⟩])] }
     assertEq (crashes saved) 2
     assertEq saved.workers.length 1 "Empty group spawned child workers"⟩,
   ⟨"restarting-replay/overlapping-worker-writes-are-invalid", do
-    let branch := Location.root.next.child 0
+    let branch := Location.root.child 0
     let assignments : List Assignment := [⟨0, branch⟩, ⟨0, branch⟩]
     let (_, initial) := (worker 1 100 pair () ⟨0, Location.root⟩).run ⟨[], {}⟩
     let (result, saved) := (workers (pair ()) 100 assignments).run { journal := initial.durable }

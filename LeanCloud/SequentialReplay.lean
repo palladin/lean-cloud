@@ -12,17 +12,17 @@ def follow [Monad m] (resume : Assignment → ExceptT CloudError m Unit)
       (List.range count).forM fun index => resume ⟨0, location.child index⟩
       resume ⟨0, branch⟩
 
-def run [Monad m] [Codec α] (store : ReplayStore m) (blobs : BlobStorage m)
+def run [Monad m] [Codec α] (store : ReplayStore m) (context : ExecContext m)
     (source : Cloud m α) : Nat → Assignment → ExceptT CloudError m Unit
   | 0, _ => throw ⟨.protocol, "Sequential replay fuel exhausted"⟩
   | fuel + 1, assignment => do
-      let progress ← ReplayInterpreter.step store blobs (fuel + 1) (fun _ : Unit => source) () assignment
-      follow (run store blobs source fuel) assignment.branchStart progress
+      let progress ← ReplayInterpreter.step store context (fuel + 1) (fun _ : Unit => source) () assignment
+      follow (run store context source fuel) assignment.branchStart progress
 
 /-- Return the workflow result, including its recorded application failure. -/
-def interpret [Monad m] [Codec α] (store : ReplayStore m) (blobs : BlobStorage m)
+def interpret [Monad m] [Codec α] (store : ReplayStore m) (context : ExecContext m)
     (fuel : Nat) (program : ι → Cloud m α) (input : ι) : ExceptT CloudError m α := do
-  run store blobs (program input) fuel ⟨0, Location.root⟩
+  run store context (program input) fuel ⟨0, Location.root⟩
   let some outcome ← store.outcome | throw ⟨.protocol, "Missing root result"⟩
   ReplayInterpreter.result outcome
 

@@ -43,8 +43,8 @@ def contract (store : ObjectStore) (runPrefix : String) : IO Unit := do
     assertError (← (store.readBytes invalid).run) .integrity
   assertError (← (store.resolve (runPrefix ++ "/missing")).run) .missingBlob
   let invalidText ← store.putBytes (ByteArray.mk #[255])
-  assertError (← (DirectInterpreter.interpret (store.storage)
-    (fun _ : Unit => CloudBlob.readText invalidText) ()).run) .invalidUtf8
+  assertError (← (DirectInterpreter.interpret (store.executionContext)
+    (fun _ : Unit => Cloud.exec (fun env => env.blobs.readText invalidText)) ()).run) .application
 
 /-- A small atomic reference model; no provider, database, or transport involved. -/
 private def model : IO ObjectStore := do
@@ -87,10 +87,72 @@ private def digestTests : IO Unit := do
       assertTrue rejected "Out-of-bounds packed file range accepted"
   IO.println "Native SHA-256: known vectors, OpenSSL comparison, and bounded range copies passed."
 
+/-- Two blob reads must overlap within a single command. A lost command commit
+may repeat them; a successful commit is reused without any further user IO. -/
+private def executionBoundary (objects : ObjectStore) : IO Unit := do
+  let ref ← objects.putBytes "parallel blob IO".toUTF8
+  for afterCommit in [false, true] do
+    let entered ← Std.Mutex.new (0 : Nat)
+    let generation ← IO.mkRef 0
+    let read : BlobRef → ExceptT CloudError IO ByteArray := fun ref => do
+      let ticket ← entered.atomically do
+        let count ← get
+        set (count + 1)
+        return count
+      -- Both dedicated tasks must enter before either is allowed to finish.
+      let target := ticket / 2 * 2 + 2
+      let started ← IO.monoMsNow
+      repeat
+        if (← entered.atomically get) ≥ target then break
+        if (← IO.monoMsNow) - started > 5000 then
+          throw ⟨.application, "Blob reads did not run concurrently"⟩
+        IO.sleep 1
+      objects.executionContext.blobs.readBlob ref
+    let context : ExecContext IO := { objects.executionContext with
+      blobs := { objects.executionContext.blobs with readBlob := read } }
+    let program (_ : Unit) : Cloud IO BlobRef := Cloud.exec (fun env => do
+      generation.modify (· + 1)
+      let tasks ← #[ref, ref].mapM fun input => IO.asTask (env.blobs.readText input) .dedicated
+      -- Drain every task before propagating a user exception.
+      let outcomes ← tasks.mapM fun task => (IO.wait task : IO _)
+      let values ← outcomes.mapM IO.ofExcept
+      env.blobs.putText (String.intercalate "\n" values.toList)) "parallel blob IO"
+    let saved ← IO.mkRef ([] : List (String × ReplayRecord))
+    let crashed ← IO.mkRef false
+    let store : ReplayStore IO := {
+      read := fun key => return (← saved.get).lookup key
+      create := fun key proposed => do
+        let first ← crashed.modifyGet fun old => (!old, true)
+        if first && !afterCommit then throw (IO.userError "Worker stopped before commit")
+        let accepted ← saved.modifyGet fun records => match records.lookup key with
+          | some old => (old, records)
+          | none => (proposed, (key, proposed) :: records)
+        if first && afterCommit then throw (IO.userError "Worker stopped after commit")
+        return accepted }
+    let run := (SequentialReplay.interpret store context 100 program ()).run
+    let stopped ← try discard run; pure false catch _ => pure true
+    assertTrue stopped "Journal interruption became a user failure"
+    let .ok result ← run | throw (IO.userError "Restart did not complete")
+    assertEq (← generation.get) (if afterCommit then 1 else 2)
+    assertEq (← entered.atomically get) (if afterCommit then 2 else 4)
+    assertEq (← saved.get).length 2 "Blob IO produced intermediate replay records"
+    assertEq ((← saved.get).lookup (ReplayStore.valueKey Location.root)).isSome true
+    assertEq (String.fromUTF8? (← IO.ofExcept ((← objects.readBytes result |>.run).mapError (·.message))))
+      (some "parallel blob IO\nparallel blob IO")
+    assertOutcome (← run) (.ok result)
+    assertEq (← generation.get) (if afterCommit then 1 else 2) "Warm replay ran the IO body"
+  -- Blob exceptions are catchable by ordinary IO code inside the callback.
+  let unavailable := { objects with read := fun _ => throw (IO.userError "Unavailable") }
+  let handled (_ : Unit) : Cloud IO String := Cloud.exec fun env => do
+    try env.blobs.readText ref catch _ => pure "fallback"
+  assertOutcome (← (DirectInterpreter.interpret unavailable.executionContext handled ()).run) (.ok "fallback")
+  IO.println "Execution environment: concurrent blob IO, command-only journaling, crash replay and user recovery passed."
+
 def run : IO Unit := do
   digestTests
   let store ← model
   contract store "model"
+  executionBoundary store
   let ref ← store.putBytes "original".toUTF8
   -- Raw journal IO must escape; user-facing blob IO must become a recorded failure.
   let unavailable := { store with
@@ -99,18 +161,18 @@ def run : IO Unit := do
   let failed ← try discard (unavailable.readBytes ref).run; pure false catch _ => pure true
   assertTrue failed "Raw storage swallowed a transport exception"
   for program in #[
-      (do discard <| CloudBlob.putText "value" : Cloud IO Unit),
-      (do discard <| CloudBlob.readBytes ref : Cloud IO Unit),
-      (do discard <| CloudBlob.resolve "input" : Cloud IO Unit)] do
+      (do discard <| Cloud.exec (fun env => env.blobs.putText "value") : Cloud IO Unit),
+      (do discard <| Cloud.exec (fun env => env.blobs.readBlob ref) : Cloud IO Unit),
+      (do discard <| Cloud.exec (fun env => env.blobs.resolveBlob "input") : Cloud IO Unit)] do
     let records ← model
     let journal := records.records "blob-exception"
-    let run (blobs : BlobStorage IO) :=
+    let run (blobs : ExecContext IO) :=
       (SequentialReplay.interpret journal blobs 100 (fun _ : Unit => program) ()).run
-    assertOutcome (← (DirectInterpreter.interpret unavailable.storage (fun _ : Unit => program) ()).run)
+    assertOutcome (← (DirectInterpreter.interpret unavailable.executionContext (fun _ : Unit => program) ()).run)
       (.error ⟨.application, "Offline"⟩)
-    assertOutcome (← run unavailable.storage) (.error ⟨.application, "Offline"⟩)
+    assertOutcome (← run unavailable.executionContext) (.error ⟨.application, "Offline"⟩)
     -- The provider recovers, but replay keeps the original failure.
-    assertOutcome (← run store.storage) (.error ⟨.application, "Offline"⟩)
+    assertOutcome (← run store.executionContext) (.error ⟨.application, "Offline"⟩)
   let failed ← try discard <| (unavailable.records "journal-failure").read "key"; pure false catch _ => pure true
   assertTrue failed "Journal failure was confused with a user blob outcome"
   let corrupt := { store with read := fun _ => pure (some "corrupt!".toUTF8) }

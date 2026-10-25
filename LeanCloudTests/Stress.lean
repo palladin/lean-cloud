@@ -26,10 +26,10 @@ Each branch loses a read response and a committed return response in recovery. -
 def measure (input : Input) : IO Json := do
   let fuel := 100000
   let ((expected, untouched), directMs) ← timed fun _ =>
-    (DirectInterpreter.interpret ReplayModel.noBlobs workflow input).run []
+    (DirectInterpreter.interpret ReplayModel.pureContext workflow input).run []
   assertTrue untouched.isEmpty "Direct evaluation used the journal"
   let ((sequential, journal), sequentialMs) ← timed fun _ =>
-    (SequentialReplay.interpret ReplayModel.store ReplayModel.noBlobs fuel workflow input).run []
+    (SequentialReplay.interpret ReplayModel.store ReplayModel.pureContext fuel workflow input).run []
   assertOutcome sequential expected
   let ((parallel, merged), parallelMs) ← timed fun _ =>
     (ParallelReplay.interpret fuel workflow input).run []

@@ -25,9 +25,9 @@ private def checkPrograms (config : Config) (runPrefix : String) : IO Unit := do
   let process ← sumSquares.submit config (runPrefix ++ "-typed") input
   assertTrue (← process.poll).isNone "New typed process already completed"
   let trace ← Trace.create "registry-test"
-  let direct ← (DirectInterpreter.interpret (config.objects.storage) Squares.workflow input).run
+  let direct ← (DirectInterpreter.interpret (config.objects.executionContext) Squares.workflow input).run
   let recorded ← (SequentialReplay.interpret (trace.records (config.objects.records process.id))
-    (trace.blobs (config.objects.storage)) 1000
+    config.objects.executionContext 1000
     (fun values => trace.instrument 1000 (Squares.workflow values)) input).run
   assertOutcome recorded direct
   assertOutcome (← process.await) (.ok 29)
@@ -139,7 +139,7 @@ private def checkIsolation (config : Config) (run : String) : IO Unit := do
 /-- Real HTTP/SQLite ports and S3 exercise the same scheduling core and replay step as Sim. -/
 private def compareProgram (config : Config) (run : String) (tree : Tree) (input : Nat) : IO Unit := do
   let program (_ : Unit) : Cloud IO Nat := lower tree input
-  let expected ← (DirectInterpreter.interpret (config.objects.storage) program ()).run
+  let expected ← (DirectInterpreter.interpret (config.objects.executionContext) program ()).run
   IO.FS.withTempFile fun _ path => do
     let conn ← LeanLinq.Sqlite.connect path.toString
     try
@@ -154,7 +154,7 @@ private def compareProgram (config : Config) (run : String) (tree : Tree) (input
         inbox := HttpMailbox.inbox handle
         send := fun message => HttpMailbox.send config.mailboxes.scheduler run "scheduler" message
         observe := ⟨records, pure #[]⟩
-        blobs := config.objects.storage : Worker.Ports IO }
+        context := config.objects.executionContext : Worker.Ports IO }
       let scheduler : SchedulerPorts IO := {
         inbox := HttpMailbox.inbox schedulerHandle
         localDb := ← TestServices.schedulerStore conn run
@@ -195,7 +195,7 @@ def main (args : List String) : IO UInt32 := do
     | _ => throw (IO.userError "Invalid integration test arguments")
     TestServices.withMailboxes 4 fun endpoints => do
       let config := { config with mailboxes := ⟨endpoints[0]!,
-        (endpoints.extract 1 4).mapIdx fun i endpoint => ⟨s!"worker{i + 1}", endpoint⟩⟩ }
+        (endpoints.extract 1 4).mapIdx fun i endpoint => { worker := s!"worker{i + 1}", endpoint }⟩ }
       let runPrefix := s!"properties-{← IO.Process.getPID}-{← IO.monoMsNow}"
       IO.println "Checking storage adapters and paginated run removal"
       checkAdapters config runPrefix

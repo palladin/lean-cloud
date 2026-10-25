@@ -10,17 +10,17 @@ open Lean LeanEff ReplayInterpreter
 /-- A proof cursor may already lie inside the assigned branch, after replaying
 its recorded prefix. This selects the corresponding *actual* interpreter phase;
 it does not evaluate effects or add a runtime interpreter. -/
-def atPoint [Monad m] (store : ReplayStore m) (blobs : BlobStorage m) (point : ReplayTarget)
+def atPoint [Monad m] (store : ReplayStore m) (context : ExecContext m) (point : ReplayTarget)
     (fuel : Nat) (encode : α → Json) (program : Cloud m α) (current : Location) :
     ExceptT CloudError m Progress :=
   if current.size == point.location.size then
-    replay store blobs point.branchStart fuel encode program current
-  else reconstruct store blobs point.branchStart fuel encode program current
+    replay store context point.branchStart fuel encode program current
+  else reconstruct store context point.branchStart fuel encode program current
 
-theorem at_target [Monad m] (store : ReplayStore m) (blobs : BlobStorage m)
+theorem at_target [Monad m] (store : ReplayStore m) (context : ExecContext m)
     (point : ReplayTarget) (fuel : Nat) (encode : α → Json) (program : Cloud m α) :
-    atPoint store blobs point fuel encode program point.location =
-      replay store blobs point.branchStart fuel encode program point.location := by simp [atPoint]
+    atPoint store context point fuel encode program point.location =
+      replay store context point.branchStart fuel encode program point.location := by simp [atPoint]
 
 theorem before_branch {point : ReplayTarget} {current : Location}
     (branch : point.branchStart = Location.branchStart point.location)
@@ -29,30 +29,30 @@ theorem before_branch {point : ReplayTarget} {current : Location}
   apply different
   simpa [branch] using congrArg Array.size same
 
-theorem delay [Monad m] (store : ReplayStore m) (blobs : BlobStorage m)
+theorem delay [Monad m] (store : ReplayStore m) (context : ExecContext m)
     (point : ReplayTarget) (branch : point.branchStart = Location.branchStart point.location)
     (fuel : Nat) (encode : α → Json) (next : ArrsF (Control m) SourceSiteId Unit α)
     (info : Option SourceSiteId) (current : Location) :
-    atPoint store blobs point (fuel + 1) encode (.impure info .delay next) current =
-      atPoint store blobs point fuel encode (next.apply ()) current := by
+    atPoint store context point (fuel + 1) encode (.impure info .delay next) current =
+      atPoint store context point fuel encode (next.apply ()) current := by
   by_cases same : current.size = point.location.size
   · simp [atPoint, same, replay]
   · simp [atPoint, same, reconstruct, beq_eq_false_iff_ne.mpr (before_branch branch same)]
 
 /-- At a branch boundary this proof cursor is exactly real reconstruction. -/
-theorem boundary [Monad m] (store : ReplayStore m) (blobs : BlobStorage m)
+theorem boundary [Monad m] (store : ReplayStore m) (context : ExecContext m)
     (point : ReplayTarget) (branch : point.branchStart = Location.branchStart point.location)
     (fuel : Nat) (encode : α → Json) (program : Cloud m α) (current : Location)
     (route : Routing.Follows current point.location)
     (start : Location.branchStart current = current) :
-    atPoint store blobs point fuel encode program current =
-      reconstruct store blobs point.branchStart fuel encode program current := by
+    atPoint store context point fuel encode program current =
+      reconstruct store context point.branchStart fuel encode program current := by
   by_cases depth : current.size = point.location.size
   · have same : point.branchStart = current := branch.trans ((route.same_branch depth).symm.trans start)
     cases fuel <;> simp [atPoint, depth, same, reconstruct, replay]
   · simp [atPoint, depth]
 
-theorem child [Monad m] (store : ReplayStore m) (blobs : BlobStorage m)
+theorem child [Monad m] (store : ReplayStore m) (context : ExecContext m)
     (point : ReplayTarget) (branch : point.branchStart = Location.branchStart point.location)
     (fuel : Nat) (encode : β → Json) (codec : Codec α) (count : Nat)
     (branches : Fin count → Cloud m α) (next : ArrsF (Control m) SourceSiteId (Array α) β)
@@ -60,29 +60,29 @@ theorem child [Monad m] (store : ReplayStore m) (blobs : BlobStorage m)
     (enters : current.entersChild point.location = true)
     (selected : point.location[current.size]!.1 = index.val)
     (route : Routing.Follows (current.child index) point.location) :
-    atPoint store blobs point (fuel + 1) encode (.impure info (.parallel codec count branches label) next) current =
-      atPoint store blobs point fuel codec.encode (branches index) (current.child index) := by
+    atPoint store context point (fuel + 1) encode (.impure info (.parallel codec count branches label) next) current =
+      atPoint store context point fuel codec.encode (branches index) (current.child index) := by
   have depth := ((Routing.entersChild_iff _ _).mp enters).1
   have ancestor : current.entersChild point.branchStart = true := by
     rw [branch, Routing.enters_branchStart depth, enters]
   have chosen : point.branchStart[current.size]!.1 = index.val := by
     simpa [branch, Location.branchStart_index _ _ depth] using selected
-  rw [boundary store blobs point branch fuel codec.encode (branches index) _ route (by simp)]
+  rw [boundary store context point branch fuel codec.encode (branches index) _ route (by simp)]
   simp [atPoint, Nat.ne_of_lt depth, reconstruct,
     beq_eq_false_iff_ne.mpr (before_branch branch (Nat.ne_of_lt depth)), ancestor, chosen, index.isLt]
 
 open ReplayModel
 
-theorem command (journal : Journal) (blobs : BlobStorage M) (point : ReplayTarget)
+theorem command (journal : Journal) (context : ExecContext M) (point : ReplayTarget)
     (branch : point.branchStart = Location.branchStart point.location)
     (current : Location) (fuel : Nat) (encode : β → Json) (codec : Codec α)
-    (operation : Operation M α) (next : ArrsF (Control M) SourceSiteId α β) (info : Option SourceSiteId)
+    (label : String) (action : ExecContext M → ExceptT CloudError M α) (next : ArrsF (Control M) SourceSiteId α β) (info : Option SourceSiteId)
     (record : ReplayRecord) (wire : Json) (value : α)
     (present : journal.lookup (ReplayStore.valueKey current) = some record)
-    (checked : (record.request == Internal.request codec operation) = true)
+    (checked : (record.request == Internal.request codec label) = true)
     (success : record.outcome = .success wire) (decoded : codec.decode wire = .ok value) :
-    (atPoint store blobs point (fuel + 1) encode (.impure info (.command codec operation) next) current).run journal =
-      (atPoint store blobs point fuel encode (next.apply value) current.next).run journal := by
+    (atPoint store context point (fuel + 1) encode (.impure info (.command codec label action) next) current).run journal =
+      (atPoint store context point fuel encode (next.apply value) current.next).run journal := by
   by_cases same : current.size = point.location.size
   · simp only [atPoint, same, beq_self_eq_true, ite_true, LeanCloud.Location.next, Array.size_set!, replay]
     simp only [Internal.command, bind_assoc]
@@ -94,7 +94,7 @@ theorem command (journal : Journal) (blobs : BlobStorage M) (point : ReplayTarge
     erw [read_then]
     simp [present, Internal.check, checked, success, Internal.decode, decoded]
 
-theorem joined (journal : Journal) (blobs : BlobStorage M) (point : ReplayTarget)
+theorem joined (journal : Journal) (context : ExecContext M) (point : ReplayTarget)
     (branch : point.branchStart = Location.branchStart point.location)
     (current : Location) (fuel : Nat) (encode : β → Json) (codec : Codec α) (count : Nat)
     (branches : Fin count → Cloud M α) (next : ArrsF (Control M) SourceSiteId (Array α) β) (info : Option SourceSiteId)
@@ -104,8 +104,8 @@ theorem joined (journal : Journal) (blobs : BlobStorage M) (point : ReplayTarget
     (checked : (record.request == ⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩) = true)
     (success : record.outcome = .success wire)
     (decoded : (@instCodecArray α codec).decode wire = .ok values) (size : values.size = count) :
-    (atPoint store blobs point (fuel + 1) encode (.impure info (.parallel codec count branches label) next) current).run journal =
-      (atPoint store blobs point fuel encode (next.apply values) current.next).run journal := by
+    (atPoint store context point (fuel + 1) encode (.impure info (.parallel codec count branches label) next) current).run journal =
+      (atPoint store context point fuel encode (next.apply values) current.next).run journal := by
   by_cases same : current.size = point.location.size
   · simp only [atPoint, same, beq_self_eq_true, ite_true, LeanCloud.Location.next, Array.size_set!, replay]
     erw [read_then]

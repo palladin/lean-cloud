@@ -45,7 +45,7 @@ open LeanCloud ReplayFaults
 open RestartingParallelReplay (interpret)
 
 def workflow (n : Nat) : Cloud WorkerM Nat := cloud {
-  let values ← Cloud.parallel fun _ => #[
+  let values ← Cloud.parallel $ #[
     Cloud.pure (fun _ => n * n),
     Cloud.pure (fun _ => (n + 1) * (n + 1))]
   return values.foldl (· + ·) 0

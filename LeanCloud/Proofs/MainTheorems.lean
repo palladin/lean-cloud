@@ -15,14 +15,14 @@ theorem sequential_replay_matches_direct [codec : Codec α]
     (pureProgram : ∃ outcome, Pure.Evaluation (program input) outcome)
     (roundtrip : Pure.RoundTrips codec) :
     ∃ sufficientFuel, ∀ fuel, sufficientFuel ≤ fuel →
-      let direct := ((DirectInterpreter.interpret ReplayModel.noBlobs program input).run []).1
-      let replay := ((SequentialReplay.interpret ReplayModel.store ReplayModel.noBlobs fuel program input).run []).1
+      let direct := ((DirectInterpreter.interpret ReplayModel.pureContext program input).run []).1
+      let replay := ((SequentialReplay.interpret ReplayModel.store ReplayModel.pureContext fuel program input).run []).1
       replay = direct := by
   obtain ⟨outcome, evaluation⟩ := pureProgram
   obtain ⟨bound, replay⟩ := ReplayCompletion.evaluates_from_empty (program input) .sequential evaluation roundtrip
   refine ⟨bound, fun fuel enough => ?_⟩
-  have direct := congrFun (Pure.evaluation_matches_direct ReplayModel.noBlobs evaluation) []
-  change (DirectInterpreter.interpret ReplayModel.noBlobs program input).run [] = (outcome, []) at direct
+  have direct := congrFun (Pure.evaluation_matches_direct ReplayModel.pureContext evaluation) []
+  change (DirectInterpreter.interpret ReplayModel.pureContext program input).run [] = (outcome, []) at direct
   dsimp only
   rw [direct]
   exact replay fuel enough
@@ -35,14 +35,14 @@ theorem parallel_replay_matches_direct [codec : Codec α]
     (pureProgram : ∃ outcome, Pure.Evaluation (program input) outcome)
     (roundtrip : Pure.RoundTrips codec) :
     ∃ sufficientFuel, ∀ fuel, sufficientFuel ≤ fuel →
-      let direct := ((DirectInterpreter.interpret ReplayModel.noBlobs program input).run []).1
+      let direct := ((DirectInterpreter.interpret ReplayModel.pureContext program input).run []).1
       let replay := ((ParallelReplay.interpret fuel program input).run []).1
       replay = direct := by
   obtain ⟨outcome, evaluation⟩ := pureProgram
   obtain ⟨bound, replay⟩ := ReplayCompletion.evaluates_from_empty (program input) .parallel evaluation roundtrip
   refine ⟨bound, fun fuel enough => ?_⟩
-  have direct := congrFun (Pure.evaluation_matches_direct ReplayModel.noBlobs evaluation) []
-  change (DirectInterpreter.interpret ReplayModel.noBlobs program input).run [] = (outcome, []) at direct
+  have direct := congrFun (Pure.evaluation_matches_direct ReplayModel.pureContext evaluation) []
+  change (DirectInterpreter.interpret ReplayModel.pureContext program input).run [] = (outcome, []) at direct
   dsimp only
   rw [direct]
   exact replay fuel enough
@@ -55,7 +55,7 @@ theorem restarting_parallel_replay_matches_direct [codec : Codec α]
     (pureProgram : ∃ outcome, Pure.Evaluation (program input) outcome)
     (roundtrip : Pure.RoundTrips codec) (faults : ReplayFaults.Plan) :
     ∃ sufficientFuel, ∀ fuel, sufficientFuel ≤ fuel →
-      let direct := ((DirectInterpreter.interpret ReplayFaults.noBlobs program input).run.run ⟨[], {}⟩).1
+      let direct := ((DirectInterpreter.interpret ReplayFaults.pureContext program input).run.run ⟨[], {}⟩).1
       let replay := ((RestartingParallelReplay.interpret fuel program input).run
         (ReplayFaults.Saved.initial faults)).1
       match direct with
@@ -64,8 +64,8 @@ theorem restarting_parallel_replay_matches_direct [codec : Codec α]
   obtain ⟨outcome, evaluation⟩ := pureProgram
   obtain ⟨bound, replay⟩ := RecoveryCompletion.evaluates_from_empty (program input) evaluation roundtrip faults
   refine ⟨bound, fun fuel enough => ?_⟩
-  have direct := congrFun (Pure.evaluation_matches_direct ReplayFaults.noBlobs evaluation) ⟨[], {}⟩
-  change (DirectInterpreter.interpret ReplayFaults.noBlobs program input).run.run ⟨[], {}⟩ =
+  have direct := congrFun (Pure.evaluation_matches_direct ReplayFaults.pureContext evaluation) ⟨[], {}⟩
+  change (DirectInterpreter.interpret ReplayFaults.pureContext program input).run.run ⟨[], {}⟩ =
     (.ok outcome, ⟨[], {}⟩) at direct
   dsimp only
   rw [direct]

@@ -57,7 +57,7 @@ partition. This gives `sum = 0` and `toArray = #[]`.
 Partitions and results retain input order, including for noncommutative folds.
 Arbitrary IO operations still need their own independence/idempotency contract.
 
-Cloud batches use the **recorded planning environment**, keeping partition
+Cloud batches use the **explicitly recorded worker count**, keeping partition
 boundaries stable on replay. Local tasks use the **executing attempt's CPU
 budget**, including after replacement by a different worker. This is advisory
 concurrency, not worker affinity. IO errors are recorded application failures;

@@ -17,11 +17,11 @@ structure Config where
   combineLabel : String := "combine partitions"
 
 /-- Contiguous, bounded batches preserve source order. The caller's recorded
-planning environment makes these boundaries stable across replay. -/
-def batches (values : Array σ) (weight : σ → Nat) (env : Environment)
+worker count makes these boundaries stable across replay. -/
+def batches (values : Array σ) (weight : σ → Nat) (workerCount : Nat)
     (cfg : Config) : Array (Array σ) := Id.run do
   let total := values.foldl (fun n value => n + max 1 (weight value)) 0
-  let jobs := max 1 env.workers.size * max 1 cfg.batchesPerWorker
+  let jobs := max 1 workerCount * max 1 cfg.batchesPerWorker
   let target := max 1 (min cfg.maxBatchWeight ((total + jobs - 1) / jobs))
   let mut result := #[]
   let mut batch := #[]
@@ -53,13 +53,13 @@ private def tree [Codec β] (leaf : Array σ → Cloud m β)
 termination_by count
 decreasing_by all_goals omega
 
-/-- Plan once using a recorded environment, then reduce through binary forks.
+/-- Plan once using a recorded worker count, then reduce through binary forks.
 Every leaf and internal combiner is a worker effect with a durable result. -/
 private def reduce [Monad m] [MonadCloudExec m] [Codec β]
     (values : Array σ) (weight : σ → Nat) (cfg : Config)
-    (leaf : Environment → Array σ → m β)
-    (combine : Environment → β → β → m β) : Cloud m β := do
-  let planning ← Cloud.exec (fun env => pure env) "plan reduction"
+    (leaf : Environment m → Array σ → m β)
+    (combine : Environment m → β → β → m β) : Cloud m β := do
+  let planning ← Cloud.exec (fun env => pure env.workers.size) "plan reduction"
   let parts := batches values weight planning cfg
   tree
     (fun batch => Cloud.exec (fun env => leaf env batch) cfg.label)
@@ -73,14 +73,14 @@ accumulators; parent workers combine the finalized results through a tree.
 Only those results need a codec, so large accumulators can stay in blobs. -/
 structure ReducerCloudM (m : Type → Type) (α : Type) where
   run : {ρ β : Type} → [Codec β] → ReducerCloud.Config → FoldSpec α ρ →
-    (Environment → ρ → m β) → (Environment → β → β → m β) → Cloud m β
+    (Environment m → ρ → m β) → (Environment m → β → β → m β) → Cloud m β
 
 abbrev ReducerCloudIO := ReducerCloudM IO
 
 namespace ReducerCloud
 
 def ofPartitions [Monad m] [MonadCloudExec m] (values : Array σ)
-    (read : Environment → Array σ → ReducerParM m α)
+    (read : Environment m → Array σ → ReducerParM m α)
     (weight : σ → Nat := fun _ => 1) : ReducerCloudM m α where
   run := fun cfg fold finish combine =>
     reduce values weight cfg (fun actual batch => do
@@ -94,7 +94,7 @@ def ofArray [Monad m] [MonadCloudExec m] (values : Array α) : ReducerCloudM m �
 
 /-- Independent IO work over bounded batches, using the executing worker's CPU
 budget. Each operation owns its resources; no IO exception triggers crash retry. -/
-def ofArrayIO (values : Array σ) (read : Environment → σ → IO α)
+def ofArrayIO (values : Array σ) (read : Environment IO → σ → IO α)
     (weight : σ → Nat := fun _ => 1) : ReducerCloudIO α :=
   ofPartitions values (fun env batch => ReducerPar.ofArrayIO batch (read env)) weight
 
@@ -121,7 +121,7 @@ For grouping-independent results, `q` must be a compatible monoid fold and
 worker's environment and run as recorded effects; only `β` enters the journal. -/
 @[cloud_func (descr := "Reduce tree") (opaque := true)]
 def foldWith [Codec β] (xs : ReducerCloudM m α) (q : FoldSpec α ρ)
-    (finish : Environment → ρ → m β) (combine : Environment → β → β → m β)
+    (finish : Environment m → ρ → m β) (combine : Environment m → β → β → m β)
     (cfg : ReducerCloud.Config := {}) : Cloud m β :=
   xs.run cfg q finish combine
 

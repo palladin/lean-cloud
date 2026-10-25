@@ -38,7 +38,7 @@ private def solve [Monad m] [MonadCloudExec m] (backend : Backend m) (request : 
             match validateSplit cube (min request.splitDepth (request.depth - cube.length)) children with
             | .error reason => Cloud.fail reason
             | .ok () =>
-                let results ← Cloud.parallel fun _ => (children.map fun child => cloud {
+                let results ← Cloud.parallel $ (children.map fun child => cloud {
                   solve backend request rounds (cube ++ child)
                 })
                 return results.flatten

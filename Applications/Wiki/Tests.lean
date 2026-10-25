@@ -30,12 +30,12 @@ private def journal (ref : Std.Mutex (List (String × ReplayRecord))) : ReplaySt
 
 /-- Same worker step, concurrently dispatched child assignments. This exercises
 real IO effects and the production replay interpreter without HTTP infrastructure. -/
-private def dispatch [Codec α] (store : ReplayStore IO) (blobs : BlobStorage IO)
+private def dispatch [Codec α] (store : ReplayStore IO) (blobs : ExecContext IO)
     (program : Cloud IO α) : Nat → Assignment → ExceptT CloudError IO Unit
   | 0, _ => throw ⟨.protocol, "Test fuel exhausted"⟩
   | fuel + 1, assignment => do
-    match ← ReplayInterpreter.step store blobs 10000 (fun _ : Unit => program) () assignment
-        (environment := { currentWorker := { cpus := 2 }, workers := #[{ cpus := 2 }, { cpus := 2 }] }) with
+    let context := { blobs with currentWorker := { cpus := 2 }, workers := #[{ cpus := 2 }, { cpus := 2 }] }
+    match ← ReplayInterpreter.step store context 10000 (fun _ : Unit => program) () assignment with
     | .done => pure ()
     | .fork location count =>
       let jobs ← (List.range count).mapM fun i =>
@@ -47,7 +47,7 @@ private def dispatch [Codec α] (store : ReplayStore IO) (blobs : BlobStorage IO
         liftExcept result
       dispatch store blobs program fuel ⟨0, assignment.branchStart⟩
 
-private def concurrent [Codec α] (store : ReplayStore IO) (blobs : BlobStorage IO)
+private def concurrent [Codec α] (store : ReplayStore IO) (blobs : ExecContext IO)
     (program : Cloud IO α) : IO α := do
   let result ← (dispatch store blobs program 100 ⟨0, Location.root⟩).run
   let .ok () := result | throw (IO.userError s!"Concurrent worker failed: {repr result}")
@@ -55,8 +55,8 @@ private def concurrent [Codec α] (store : ReplayStore IO) (blobs : BlobStorage 
   IO.ofExcept ((← (ReplayInterpreter.result outcome : ExceptT CloudError IO α).run).mapError (·.message))
 
 private def direct (store : ObjectStore) (program : Cloud IO α) : IO α := do
-  match ← (DirectInterpreter.Internal.eval store.storage program {
-    currentWorker := { cpus := 4 }, workers := #[{ cpus := 4 }, { cpus := 4 }] }).run with
+  match ← (DirectInterpreter.Internal.eval { store.executionContext with
+    currentWorker := { cpus := 4 }, workers := #[{ cpus := 4 }, { cpus := 4 }] } program).run with
   | .ok value => return value
   | .error e => throw (IO.userError e.message)
 
@@ -98,10 +98,10 @@ private def nativeTests (store : ObjectStore) : IO Unit := IO.FS.withTempDir fun
   check ((← direct store (count treeBackend r)) == counted) "Byte-range count differs from whole-shard count"
   check ((← merged.atomically get) > 1) "Wiki did not combine count blobs through multiple tree nodes"
   let treeLog ← Std.Mutex.new []
-  check ((← concurrent (journal treeLog) store.storage (count treeBackend r)) == counted)
+  check ((← concurrent (journal treeLog) store.executionContext (count treeBackend r)) == counted)
     "Concurrent count tree differs from direct"
   let before ← merged.atomically get
-  discard (concurrent (journal treeLog) store.storage (count treeBackend r))
+  discard (concurrent (journal treeLog) store.executionContext (count treeBackend r))
   check ((← merged.atomically get) == before) "Replay repeated a recorded count-blob merge"
   let dataset ← b.dataset prepared.dataset
   -- Expiry during source setup must stop before the first blob request,
@@ -186,10 +186,10 @@ private def nativeTests (store : ObjectStore) : IO Unit := IO.FS.withTempDir fun
   let countedBackend := { b with saveCounts := fun value => do calls.atomically (modify (· + 1)); b.saveCounts value }
   let log ← Std.Mutex.new []
   let r := { r with dataset := preparedSplit.dataset }
-  let actual ← concurrent (journal log) store.storage (count countedBackend r)
+  let actual ← concurrent (journal log) store.executionContext (count countedBackend r)
   check (actual == counted) "Concurrent replay differs from direct"
   let before ← calls.atomically get
-  discard (concurrent (journal log) store.storage (count countedBackend r))
+  discard (concurrent (journal log) store.executionContext (count countedBackend r))
   check ((← calls.atomically get) == before) "Replay executed recorded analysis again"
   -- Simulate a worker stopping after committing an effect but before its next
   -- journal read: restart the assignment against the surviving journal.
@@ -204,8 +204,8 @@ private def nativeTests (store : ObjectStore) : IO Unit := IO.FS.withTempDir fun
       return stop
     if stop then throw (IO.userError "injected node stop")
     original.read key }
-  rejects (concurrent crashing store.storage (count b r)) "Crash injection did not fire"
-  check ((← concurrent original store.storage (count b r)) == counted) "Local restart changed output"
+  rejects (concurrent crashing store.executionContext (count b r)) "Crash injection did not fire"
+  check ((← concurrent original store.executionContext (count b r)) == counted) "Local restart changed output"
   let afterLog ← Std.Mutex.new []
   let committed := journal afterLog
   let armed ← Std.Mutex.new true
@@ -214,8 +214,8 @@ private def nativeTests (store : ObjectStore) : IO Unit := IO.FS.withTempDir fun
     let stop ← armed.atomically do let old ← get; set false; return old
     if stop then throw (IO.userError "node stopped after commit")
     return recorded }
-  rejects (concurrent afterCommit store.storage (count b r)) "Post-commit stop did not fire"
-  check ((← concurrent committed store.storage (count b r)) == counted) "Post-commit restart changed output"
+  rejects (concurrent afterCommit store.executionContext (count b r)) "Post-commit stop did not fire"
+  check ((← concurrent committed store.executionContext (count b r)) == counted) "Post-commit restart changed output"
   -- An exception from the user's effect is a recorded failure, never a crash retry.
   let failedCalls ← IO.mkRef (0 : Nat)
   let failedLog ← Std.Mutex.new []
@@ -224,7 +224,7 @@ private def nativeTests (store : ObjectStore) : IO Unit := IO.FS.withTempDir fun
     throw (IO.userError "analysis failed") }
   let mut firstCalls := 0
   for attempt in [:2] do
-    let result ← (SequentialReplay.interpret (journal failedLog) store.storage 10000 (count failing) r).run
+    let result ← (SequentialReplay.interpret (journal failedLog) store.executionContext 10000 (count failing) r).run
     match result with
     | .ok _ => throw (IO.userError "Analysis exception was lost")
     | .error e => check (e == ⟨.application, "analysis failed"⟩) "Wrong recorded failure"

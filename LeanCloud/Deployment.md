@@ -31,45 +31,48 @@ ownership, and creates always publish to durable storage before caching a value.
 
 ## Planning work and using local resources
 
-`Cloud.exec` receives an `Environment` with `currentWorker` and `workers`.
-Each worker has an `id`, a `cpus` concurrency budget, and optional `memoryMiB`.
-The runtime refreshes this snapshot once per assignment. It describes configured
-pool capacity, not currently idle workers or free memory. Visible container
-limits can lower the executing worker's budget.
+`Cloud.exec` receives `Environment IO`: `currentWorker`, `workers`, and `blobs`.
+Each worker advertises an `id`, a `cpus` concurrency budget, and optional
+`memoryMiB`. The runtime refreshes capacity once per assignment; these are
+configured budgets, not instantaneous utilization or free memory.
 
-Use `Cloud.parallel fun env => ...` to partition work using a recorded pool
-snapshot, and `Cloud.exec fun env => ...` to use the executing worker's resources:
+`Cloud.parallel` takes an array. When planning depends on capacity, explicitly
+record only the data you need:
 
 ```lean
 def batches (items : Array Nat) (process : Nat → Array Nat → IO Nat) :
     Cloud IO (Array Nat) := cloud {
-  Cloud.parallel fun planning =>
-    let count := max 1 (min items.size planning.workers.size)
-    let width := (items.size + count - 1) / count
-    (Array.range count).map fun i => cloud {
-      Cloud.exec fun executing =>
-        process executing.currentWorker.cpus
-          (items.extract (i * width) ((i + 1) * width))
-    }
+  let workers ← Cloud.exec (fun env => pure env.workers.size) "plan"
+  let count := max 1 (min items.size workers)
+  let width := (items.size + count - 1) / count
+  Cloud.parallel ((Array.range count).map fun i =>
+    Cloud.exec fun env =>
+      process env.currentWorker.cpus
+        (items.extract (i * width) ((i + 1) * width)))
 }
 ```
 
-Here `process` is your local computation; its first argument is the number of
-concurrent jobs it may use. Lean Cloud does not automatically parallelize that
-computation or pin it to a CPU. A planned branch can execute on any worker, so
-use the executing worker's budget inside `exec`.
+Replay reuses the recorded worker count, preserving the planned branches after a
+pool change. Each unrecorded `exec` receives the executing worker's current
+context. A branch may execute on any worker; CPU budgets do not pin placement.
+For fixed branches, use `Cloud.parallel #[...]` or `left || right`.
 
-Parallel planning records its environment through an ordinary `exec` before
-forking. Replay reuses it, preserving the original branches after a pool change.
-An ordinary `exec` records only its outcome: a completed call is never invoked
-on replay; an interrupted, uncommitted call receives its replacement attempt's
-environment. Exceptions from the user computation remain recorded failures.
+Blob operations are ordinary IO inside `exec`: `env.blobs.putBlob`, `readBlob`,
+`resolveBlob`, `putText`, `readText`, and `readTextByName`. User code can run them
+concurrently with local tasks. Join all those tasks before returning. Only the
+final `exec` result is recorded, so large reads and intermediate values stay out
+of the journal. `Environment` contains capabilities and has no codec; return
+serializable capacity data or blob references instead.
 
-For fixed branches, use `Cloud.parallel fun _ => #[...]`. A named planning
-function is passed directly as `Cloud.parallel plan`. The `||` operator still
-combines two fixed branches. No environment primitive or new parallel effect
-is needed. See [resource settings](../deploy/README.md#worker-resource-budgets)
-for deployment configuration.
+An uncaught IO exception becomes a recorded application failure. To handle or
+retry it, catch it inside `exec`. A worker crash before the result is committed
+can repeat the entire body, including blob writes; design those actions to
+support repetition. A committed result is reused without executing the body.
+Replay-journal failures remain outside this user exception boundary.
+
+See [resource settings](../deploy/README.md#worker-resource-budgets) for deployment
+configuration. Existing unfinished workflows must continue with their original
+image: removing implicit planning and blob records changes replay locations.
 
 Removing a run clears replay records and the last views on every active worker
 and the scheduler. Partial failures are reported; retry `remove` after restoring

@@ -92,10 +92,11 @@ def run : IO Unit := IO.FS.withTempFile fun _ inboxPath =>
             match all.lookup key with
             | some existing => (existing, all)
             | none => (proposed, (key, proposed) :: all) }
-        let blobs : BlobStorage IO := {
-          putBlob := fun _ => throw ⟨.unsupported, "No user blobs in this test"⟩
-          readBlob := fun _ => throw ⟨.unsupported, "No user blobs in this test"⟩
-          resolveBlob := fun _ => throw ⟨.unsupported, "No user blobs in this test"⟩ }
+        let blobs : ExecContext IO := {
+          blobs := {
+            putBlob := fun _ => throw ⟨.unsupported, "No user blobs in this test"⟩
+            readBlob := fun _ => throw ⟨.unsupported, "No user blobs in this test"⟩
+            resolveBlob := fun _ => throw ⟨.unsupported, "No user blobs in this test"⟩ } }
         let execute (worker : String) (job : Assignment) :=
           Worker.execute worker ⟨store, pure #[]⟩ blobs 1000 Squares.workflow #[2, 3] job
         let ready (worker : String) (handle : HttpMailbox.Handle) := do
@@ -109,8 +110,8 @@ def run : IO Unit := IO.FS.withTempFile fun _ inboxPath =>
         report (← execute "worker1" root)
         let left ← assigned (← ready "worker1" first)
         let right ← assigned (← ready "worker2" second)
-        assertEq left.branchStart (Location.root.next.child 0)
-        assertEq right.branchStart (Location.root.next.child 1)
+        assertEq left.branchStart (Location.root.child 0)
+        assertEq right.branchStart (Location.root.child 1)
         report (← execute "worker1" left)
         -- The second worker commits its result but has not delivered its reply.
         let late ← execute "worker2" right

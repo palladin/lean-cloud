@@ -14,7 +14,7 @@ def write [ToJson α] (path : String) (value : α) : IO Unit :=
 
 private def run [FromJson ι] [ToJson α] (store : ObjectStore)
     (program : ι → Cloud IO α) (input output : String) : IO Unit := do
-  let result ← (DirectInterpreter.interpret store.storage program (← decode input)).run
+  let result ← (DirectInterpreter.interpret store.executionContext program (← decode input)).run
   match result with
   | .error e => throw (IO.userError e.message)
   | .ok value => write output value

@@ -15,13 +15,13 @@ private theorem command (expected base : Journal) (branch current : Location) (c
     (monotone : ∀ before after, property before → Extends before after → property after)
     (owned : Owns branch (ReplayStore.valueKey current))
     (known : expected.lookup (ReplayStore.valueKey current) =
-      some ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Environment → ExceptT CloudError WorkerM β)),
+      some ⟨Internal.request codec label,
         .success (codec.encode (body ()))⟩) :
     Ensures (Valid expected base branch) (fun j => Valid expected base branch j ∧ property j)
-      (Internal.command ReplayFaults.store ReplayFaults.noBlobs current codec (.exec label (fun _ => pure (body ()))))
+      (Internal.command ReplayFaults.store ReplayFaults.pureContext current codec label (fun _ => pure (body ())))
       (fun value j => property j ∧ value = .success (codec.encode (body ())) ∧
         j.lookup (ReplayStore.valueKey current) =
-          some ⟨Internal.request codec (.exec label (fun _ => pure (body ()) : Environment → ExceptT CloudError WorkerM β)),
+          some ⟨Internal.request codec label,
             .success (codec.encode (body ()))⟩) := by
   unfold Internal.command
   apply Ensures.read_bind _ _ (fun j h => h.1)
@@ -38,7 +38,7 @@ private theorem command (expected base : Journal) (branch current : Location) (c
         property saved.durable ∧ (Exit.success (codec.encode (body ()))) = .success (codec.encode (body ())) ∧
         saved.durable.lookup (ReplayStore.valueKey current) = _ from ⟨valid, Nat.le_refl _, holds, rfl, got.symm⟩)
   | none =>
-    simp only [Internal.execute, BlobStorage.execute, pure_bind]
+    simp only [Internal.execute, pure_bind]
     simp only [catch_pure, pure_bind]
     apply ((create_preserving property monotone owned known).consequence
       (fun j h => h.1) (fun _ _ h => h)).bind
@@ -122,7 +122,7 @@ theorem replay_safe [rootCodec : Codec α] (source : Cloud WorkerM α)
       expected.lookup (ReplayStore.returnKey branch) = some ⟨ReplayStore.returnRequest, Parallel.recorded encode outcome⟩ →
       Ensures (Valid expected base branch)
         (fun journal => Valid expected base branch journal ∧ Cursor source journal current encode program cost)
-        (replay ReplayFaults.store ReplayFaults.noBlobs branch fuel encode program current)
+        (replay ReplayFaults.store ReplayFaults.pureContext branch fuel encode program current)
         (ProgressValid source expected limit branch) := by
   induction meaning with
   | pure value =>
@@ -146,7 +146,7 @@ theorem replay_safe [rootCodec : Codec α] (source : Cloud WorkerM α)
     obtain ⟨n, rfl⟩ := Nat.exists_eq_succ_of_ne_zero (show fuel ≠ 0 by omega)
     rw [replay]
     apply (command expected base branch _ codec label body
-      (fun journal => Cursor source journal _ encode (.impure _ (.command codec (.exec label (fun _ => pure (body ())))) next) cost)
+      (fun journal => Cursor source journal _ encode (.impure _ (.command codec label (fun _ => pure (body ()))) next) cost)
       (fun _ _ cursor extension => cursor.extend source extension) (Owns.value same) present).bind
     intro result saved ⟨valid, cursor, correct, recorded⟩
     subst result

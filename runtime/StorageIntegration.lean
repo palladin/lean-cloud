@@ -19,11 +19,11 @@ def main (args : List String) : IO UInt32 := do
       IO.println s!"Comparing provider replay for seed {seed}"
       let tree := (generate 3 seed).1
       let program (_ : Unit) : Cloud IO Nat := lower tree (seed % 7)
-      let expected ← (DirectInterpreter.interpret store.storage program ()).run
+      let expected ← (DirectInterpreter.interpret store.executionContext program ()).run
       let records := store.records s!"{run}-{seed}"
-      let actual ← (SequentialReplay.interpret records store.storage 10000 program ()).run
+      let actual ← (SequentialReplay.interpret records store.executionContext 10000 program ()).run
       assertOutcome actual expected
-      let replayed ← (SequentialReplay.interpret records store.storage 1 program ()).run
+      let replayed ← (SequentialReplay.interpret records store.executionContext 1 program ()).run
       assertOutcome replayed expected
     IO.println "Storage contract and 8 direct/replay/warm-replay comparisons passed."
     return 0

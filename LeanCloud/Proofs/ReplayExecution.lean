@@ -54,14 +54,14 @@ theorem Execution.replace {step mode branch action replacement before middle aft
   | done returned => exact .done (transfer _ _ returned)
   | fork returned children resumed => exact .fork (transfer _ _ returned) children resumed
 
-variable [Codec α] (blobs : BlobStorage M) (program : ι → Cloud M α) (input : ι)
+variable [Codec α] (context : ExecContext M) (program : ι → Cloud M α) (input : ι)
 
-abbrev steps : Step := fun assignment fuel => ReplayInterpreter.step store blobs fuel program input assignment
+abbrev steps : Step := fun assignment fuel => ReplayInterpreter.step store context fuel program input assignment
 
 def run (mode : Mode) (fuel : Nat) (assignment : Assignment) : ExceptT CloudError M Unit :=
   match mode with
-  | .sequential => SequentialReplay.run store blobs (program input) fuel assignment
-  | .parallel => ParallelReplay.run blobs (program input) fuel assignment
+  | .sequential => SequentialReplay.run store context (program input) fuel assignment
+  | .parallel => ParallelReplay.run context (program input) fuel assignment
 
 def batch (mode : Mode) (resume : Assignment → ExceptT CloudError M Unit)
     (assignments : List Assignment) : ExceptT CloudError M Unit :=
@@ -78,11 +78,11 @@ def follow (mode : Mode) (resume : Assignment → ExceptT CloudError M Unit)
 
 def finish (mode : Mode) (fuel : Nat) (branch : Location) (action : Action) : ExceptT CloudError M Unit := do
   let progress ← action fuel
-  follow mode (run blobs program input mode (fuel - 1)) branch progress
+  follow mode (run context program input mode (fuel - 1)) branch progress
 
 theorem run_succ (mode : Mode) (fuel : Nat) (assignment : Assignment) :
-    run blobs program input mode (fuel + 1) assignment =
-      finish blobs program input mode (fuel + 1) assignment.branchStart (steps blobs program input assignment) := by
+    run context program input mode (fuel + 1) assignment =
+      finish context program input mode (fuel + 1) assignment.branchStart (steps context program input assignment) := by
   cases mode <;>
     simp [run, finish, steps, SequentialReplay.run, ParallelReplay.run, SequentialReplay.follow,
       ParallelReplay.follow, follow, batch, List.forM_map] <;> rfl
@@ -104,12 +104,12 @@ private theorem common_bound (items : List κ) (property : κ → Nat → Prop)
 /-- Both executable drivers realize the same finite replay reasoning. Their
 only difference is how a batch supplies its child journals to the parent. -/
 theorem Execution.runs {mode branch action before after}
-      (execution : Execution (steps blobs program input) mode branch action before after) :
-      ∃ bound, ∀ fuel, bound ≤ fuel → (finish blobs program input mode fuel branch action).run before = (.ok (), after) := by
+      (execution : Execution (steps context program input) mode branch action before after) :
+      ∃ bound, ∀ fuel, bound ≤ fuel → (finish context program input mode fuel branch action).run before = (.ok (), after) := by
     induction execution using Execution.rec
       (motive_2 := fun mode assignments before after _ =>
         ∃ bound, ∀ fuel, bound ≤ fuel →
-          ((batch mode (run blobs program input mode fuel) assignments).run before) = (.ok (), after)) with
+          ((batch mode (run context program input mode fuel) assignments).run before) = (.ok (), after)) with
     | done returned =>
       obtain ⟨bound, returned⟩ := returned
       refine ⟨bound, fun fuel enough => ?_⟩
@@ -138,7 +138,7 @@ theorem Execution.runs {mode branch action before after}
       refine ⟨bound + 1, fun fuel enough => ?_⟩
       obtain ⟨n, rfl⟩ := Nat.exists_eq_succ_of_ne_zero (show fuel ≠ 0 by omega)
       have results : items.map (fun item =>
-          ParallelReplay.worker (run blobs program input .parallel (n + 1)) before (job item)) =
+          ParallelReplay.worker (run context program input .parallel (n + 1)) before (job item)) =
           items.map (fun item => (.ok (), newRecords before (journals item))) := by
         apply List.map_congr_left
         intro item member

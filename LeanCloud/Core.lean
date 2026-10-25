@@ -56,24 +56,18 @@ def fail (message : String) : Cloud m α := send (.fail ⟨.application, message
 /-- Run with this attempt's worker environment; record only the outcome.
 An uncaught computation exception is a recorded failure. To recover or retry,
 handle the exception inside `body`; only node crashes trigger replay recovery. -/
-def exec [MonadCloudExec m] [Codec α] (body : Environment → m α) (label : String := "") : Cloud m α :=
-  send (.command inferInstance (.exec label fun environment => MonadCloudExec.capture (body environment)))
+def exec [MonadCloudExec m] [Codec α] (body : Environment m → m α) (label : String := "") : Cloud m α :=
+  send (.command inferInstance label fun context =>
+    MonadCloudExec.capture (body (context.map MonadCloudExec.restore)))
 
-private def fork [Codec α] (branches : Array (Cloud m α)) (label : String := "") : Cloud m (Array α) :=
+/-- Fork an explicit array. The optional label is display metadata, not a replay
+record. Planning that depends on live capacity must use an explicit `exec`. -/
+def parallel [Codec α] (branches : Array (Cloud m α)) (label : String := "") : Cloud m (Array α) :=
   send (.parallel inferInstance branches.size (fun index => branches[index]) label)
-
-/-- Record the planning environment before creating branches. Reconstructing any
-child uses the same snapshot, even after pool membership or worker capacity changes.
-The optional label is display metadata for `watch`; it does not change replay records. -/
-def parallel [Pure m] [Codec α]
-    (plan : Environment → Array (Cloud m α)) (label : String := "") : Cloud m (Array α) := do
-  let environment ← send (.command (inferInstance : Codec Environment)
-    (.exec "parallel" fun environment => ExceptT.mk (Pure.pure (.ok environment))))
-  fork (plan environment) label
 
 /-- Heterogeneous pairing uses the same collection-parallel primitive. -/
 def both [Codec α] [Codec β] (left : Cloud m α) (right : Cloud m β) : Cloud m (α × β) := do
-  let values ← fork #[Sum.inl <$> left, Sum.inr <$> right]
+  let values ← parallel #[Sum.inl <$> left, Sum.inr <$> right]
   match values.toList with
   | [.inl a, .inr b] => return (a, b)
   | _ => send (.fail ⟨.protocol, "Invalid parallel pair result"⟩)
@@ -81,30 +75,9 @@ def both [Codec α] [Codec β] (left : Cloud m α) (right : Cloud m β) : Cloud 
 /-- Compute a pure value and record it for replay. Unlike the ordinary monadic
 `pure value`, this is a delayed computation with a persisted result. -/
 def pure [Pure m] [Codec α] (body : Unit → α) (label : String := "") : Cloud m α :=
-  send (.command inferInstance (.exec label fun _ => ExceptT.mk (Pure.pure (.ok (body ())))))
+  send (.command inferInstance label fun _ => ExceptT.mk (Pure.pure (.ok (body ()))))
 
 end Cloud
-
-namespace CloudBlob
-
-def putBytes (bytes : ByteArray) : Cloud m BlobRef :=
-  Cloud.send (.command inferInstance (.putBlob bytes))
-def readBytes (ref : BlobRef) : Cloud m ByteArray :=
-  Cloud.send (.command inferInstance (.readBlob ref))
-def resolve (name : String) : Cloud m BlobRef :=
-  Cloud.send (.command inferInstance (.resolveBlob name))
-def putText (text : String) : Cloud m BlobRef := putBytes text.toUTF8
-def readText (ref : BlobRef) : Cloud m String := do
-  let bytes ← readBytes ref
-  match String.fromUTF8? bytes with
-  | some text => pure text
-  | none => Cloud.send (.fail ⟨.invalidUtf8, "Blob is not valid UTF-8"⟩)
-
-/-- Resolve a blob name and read its UTF-8 text. -/
-def readTextByName (name : String) : Cloud m String := do
-  readText (← resolve name)
-
-end CloudBlob
 
 scoped infixl:30 " || " => Cloud.both
 

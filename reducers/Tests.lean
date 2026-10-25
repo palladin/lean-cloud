@@ -27,13 +27,14 @@ private def objects (data : Std.Mutex (Std.HashMap String ByteArray))
   erase key := data.atomically (modify (·.erase key))
   list _ := pure #[]
 
-private def environment (cpus workers : Nat) : LeanCloud.Environment := {
+private def environment (store : ObjectStore) (cpus workers : Nat) : ExecContext IO := {
+  store.executionContext with
   currentWorker := { id := "executing", cpus }
   workers := (Array.range workers).map fun i => { id := s!"worker{i}", cpus } }
 
 private def direct (store : ObjectStore) (program : Cloud IO α)
-    (env : LeanCloud.Environment := environment 4 3) : IO α := do
-  let value ← (DirectInterpreter.Internal.eval store.storage program env).run
+    (env : ExecContext IO := environment store 4 3) : IO α := do
+  let value ← (DirectInterpreter.Internal.eval env program).run
   IO.ofExcept (value.mapError (·.message))
 
 private def journal (state : Std.Mutex (List (String × ReplayRecord))) : ReplayStore IO where
@@ -98,17 +99,16 @@ private def replay (store : ObjectStore) : IO Unit := do
     return (n, env.currentWorker.cpus)).toArray
   let log ← Std.Mutex.new []
   let records := journal log
-  let step location env := (ReplayInterpreter.step records store.storage 10000 program ()
-    ⟨0, location⟩ (environment := env)).run
-  let .ok (.fork fork count) ← step Location.root (environment 2 3)
+  let step location env := (ReplayInterpreter.step records env 10000 program () ⟨0, location⟩).run
+  let .ok (.fork fork count) ← step Location.root (environment store 2 3)
     | throw (IO.userError "Expected a partition fork")
   check (count > 1) "Cloud reducer did not distribute work"
   discard <| mapTasks count (Array.range count) fun i =>
-    resume (fun location => step location (environment 4 9)) 100 (fork.child i)
-  let .ok .done ← step Location.root (environment 8 1)
+    resume (fun location => step location (environment store 4 9)) 100 (fork.child i)
+  let .ok .done ← step Location.root (environment store 8 1)
     | throw (IO.userError "Join failed after environment change")
   let before ← calls.atomically get
-  let .ok .done ← step Location.root (environment 1 1)
+  let .ok .done ← step Location.root (environment store 1 1)
     | throw (IO.userError "Completed replay failed")
   check ((← calls.atomically get) == before && before == 9) "Replay repeated recorded inputs"
   let .ok (some outcome) ← records.outcome.run | throw (IO.userError "No result")
@@ -119,7 +119,7 @@ private def replay (store : ObjectStore) : IO Unit := do
     failedCalls.atomically (modify (· + 1))
     throw (IO.userError "valid application failure") : ReducerCloudIO Nat).sum
   let log ← Std.Mutex.new []
-  let run := (SequentialReplay.interpret (journal log) store.storage 10000 failing ()).run
+  let run := (SequentialReplay.interpret (journal log) store.executionContext 10000 failing ()).run
   let first ← run
   let before ← failedCalls.atomically get
   let second ← run
@@ -159,8 +159,7 @@ private def treeReduction (store : ObjectStore) : IO Unit := do
         if crash then throw (IO.userError "node stopped after recording combiner")
       return stored }
     let run records := resume (fun location =>
-      (ReplayInterpreter.step records store.storage 10000 program () ⟨0, location⟩
-        (environment := environment 4 3)).run) 100 Location.root
+      (ReplayInterpreter.step records (environment store 4 3) 10000 program () ⟨0, location⟩).run) 100 Location.root
     if size > 1 then rejects (run crashStore) "Combiner crash injection did not fire"
     run records
     let .ok (some outcome) ← records.outcome.run | throw (IO.userError "Missing tree result")
@@ -183,10 +182,10 @@ private def treeReduction (store : ObjectStore) : IO Unit := do
     (fun _ xs => pure xs.toArray)
     (fun _ _ _ => do
       calls.atomically (modify (· + 1))
-      throw (IO.userError "combiner failed") : LeanCloud.Environment → Array Nat → Array Nat → IO (Array Nat))
+      throw (IO.userError "combiner failed") : LeanCloud.Environment IO → Array Nat → Array Nat → IO (Array Nat))
     { maxBatchItems := 1 }
   let log ← Std.Mutex.new []
-  let run := (SequentialReplay.interpret (journal log) store.storage 10000 failing ()).run
+  let run := (SequentialReplay.interpret (journal log) store.executionContext 10000 failing ()).run
   let first ← run
   let before ← calls.atomically get
   let second ← run
@@ -204,12 +203,12 @@ private def emptyAndFailingTrees (store : ObjectStore) : IO Unit := do
     if n == 1 then throw (IO.userError "first branch error")
     if n == 5 then throw (IO.userError "later branch error")
     return n).sum { maxBatchItems := 1, maxBatchWeight := 1 }
-  let expected ← (DirectInterpreter.Internal.eval store.storage (program ())).run
+  let expected ← (DirectInterpreter.Internal.eval store.executionContext (program ())).run
   check (expected == .error ⟨.application, "first branch error"⟩) "Direct tree selected the wrong failure"
   calls.atomically (set (#[] : Array Nat))
   let log ← Std.Mutex.new []
   let records := journal log
-  let step location := (ReplayInterpreter.step records store.storage 10000 program () ⟨0, location⟩).run
+  let step location := (ReplayInterpreter.step records store.executionContext 10000 program () ⟨0, location⟩).run
   resume step 100 Location.root
   let .ok (some outcome) ← records.outcome.run | throw (IO.userError "Missing failed tree result")
   let actual ← (ReplayInterpreter.result outcome : ExceptT CloudError IO Nat).run

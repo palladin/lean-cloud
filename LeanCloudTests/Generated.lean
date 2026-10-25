@@ -23,16 +23,16 @@ def compositionCases : Array TestCase := Id.run do
           pure ()⟩
   return cases
 
-/-- Blob failures must be durable workflow outcomes, unlike base-monad IO errors. -/
+/-- Blob failures must be durable workflow outcomes, including ordinary IO exceptions. -/
 def blobFailureCases : Array TestCase :=
   let programs : Array (String × Cloud (SimM SimulationBackend.World) String × ErrorKind) := #[
-    ("missing-name", CloudBlob.readTextByName "missing", .missingBlob),
-    ("integrity", (do
-      let ref ← CloudBlob.putText "content"
-      CloudBlob.readText { ref with checksum := ref.checksum + 1 }), .integrity),
-    ("invalid-utf8", (do
-      let ref ← CloudBlob.putBytes (ByteArray.mk #[255])
-      CloudBlob.readText ref), .invalidUtf8)]
+    ("missing-name", modelExec (fun env => env.blobs.readTextByName "missing"), .missingBlob),
+    ("integrity", (modelExec fun env => do
+      let ref ← env.blobs.putText "content"
+      env.blobs.readText { ref with checksum := ref.checksum + 1 }), .integrity),
+    ("invalid-utf8", (modelExec fun env => do
+      let ref ← env.blobs.putBlob (ByteArray.mk #[255])
+      env.blobs.readText ref), .invalidUtf8)]
   programs.flatMap fun (name, source, kind) => #[false, true].map fun chaos =>
     ⟨s!"blobs/{name}/{if chaos then "chaos" else "clean"}", do
       let world ← differential (fun _ => source) 71 chaos

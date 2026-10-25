@@ -53,10 +53,11 @@ def resolve (store : ObjectStore) (name : String) : ExceptT CloudError IO BlobRe
     return ref
   | .error _ => throw ⟨.codec, "Invalid blob name record"⟩
 
-def storage (store : ObjectStore) : BlobStorage IO where
-  putBlob bytes := captureIO (liftM (store.putBytes bytes))
-  readBlob ref := captureIO (store.readBytes ref)
-  resolveBlob name := captureIO (store.resolve name)
+def executionContext (store : ObjectStore) : ExecContext IO where
+  blobs := {
+    putBlob bytes := captureIO (liftM (store.putBytes bytes))
+    readBlob ref := captureIO (store.readBytes ref)
+    resolveBlob name := captureIO (store.resolve name) }
 
 def runPrefix (run : String) : Except String String := do
   unless !run.isEmpty && run.length ≤ 100 && run.toList.all (fun c =>

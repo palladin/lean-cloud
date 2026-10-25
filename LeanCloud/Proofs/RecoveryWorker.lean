@@ -10,7 +10,7 @@ variable [rootCodec : Codec α] (source : Cloud WorkerM α)
 theorem step_safe {expected base branch budget fuel}
     (ready : Ready source expected budget base branch) (enough : budget ≤ fuel) :
     Attempt (Valid expected base branch) (ProgressValid source expected budget branch)
-      (ReplayInterpreter.step ReplayFaults.store ReplayFaults.noBlobs fuel (fun _ : Unit => source) () ⟨0, branch⟩) := by
+      (ReplayInterpreter.step ReplayFaults.store ReplayFaults.pureContext fuel (fun _ : Unit => source) () ⟨0, branch⟩) := by
   obtain ⟨β, encode, program, result, current, cost, remaining, same, bounded, cursor, meaning, known⟩ := ready
   have route := (cursor.route source).1
   have nonempty : 0 < current.size := Nat.lt_of_lt_of_le (by decide) route.depth
@@ -34,7 +34,7 @@ theorem step_safe {expected base branch budget fuel}
   | none =>
     simp only [Option.isSome_none, Bool.false_eq_true, ↓reduceIte]
     let point : ReplayTarget := ⟨branch, current⟩
-    have atBoundary := ReplayCursor.boundary ReplayFaults.store ReplayFaults.noBlobs point same fuel
+    have atBoundary := ReplayCursor.boundary ReplayFaults.store ReplayFaults.pureContext point same fuel
       rootCodec.encode source Location.root route (by simp)
     rw [← atBoundary]
     obtain ⟨spare, eq⟩ := Nat.exists_eq_add_of_le (show cost ≤ fuel by omega)

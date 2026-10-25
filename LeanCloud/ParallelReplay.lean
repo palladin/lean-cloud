@@ -36,14 +36,14 @@ def follow (resume : Assignment → ExceptT CloudError M Unit)
 
 /-- The same replay step as the sequential driver. Children contribute disjoint
 new records before the parent resumes and records the join. -/
-def run [Codec α] (blobs : BlobStorage M) (source : Cloud M α) : Nat → Assignment → ExceptT CloudError M Unit
+def run [Codec α] (context : ExecContext M) (source : Cloud M α) : Nat → Assignment → ExceptT CloudError M Unit
   | 0, _ => throw ⟨.protocol, "Parallel replay fuel exhausted"⟩
   | fuel + 1, assignment => do
-      let progress ← ReplayInterpreter.step store blobs (fuel + 1) (fun _ : Unit => source) () assignment
-      follow (run blobs source fuel) assignment.branchStart progress
+      let progress ← ReplayInterpreter.step store context (fuel + 1) (fun _ : Unit => source) () assignment
+      follow (run context source fuel) assignment.branchStart progress
 
 def interpret [Codec α] (fuel : Nat) (program : ι → Cloud M α) (input : ι) : ExceptT CloudError M α := do
-  run noBlobs (program input) fuel ⟨0, Location.root⟩
+  run pureContext (program input) fuel ⟨0, Location.root⟩
   let some outcome ← store.outcome | throw ⟨.protocol, "Missing root result"⟩
   ReplayInterpreter.result outcome
 

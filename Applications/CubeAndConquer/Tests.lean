@@ -14,10 +14,11 @@ private def same [BEq α] : Except CloudError α → Except CloudError α → Bo
   | .error a, .error b => a == b
   | _, _ => false
 
-private def noBlobs : BlobStorage IO where
-  putBlob _ := throw ⟨.unsupported, "Unexpected blob operation"⟩
-  readBlob _ := throw ⟨.unsupported, "Unexpected blob operation"⟩
-  resolveBlob _ := throw ⟨.unsupported, "Unexpected blob operation"⟩
+private def noBlobs : ExecContext IO where
+  blobs := {
+    putBlob _ := throw ⟨.unsupported, "Unexpected blob operation"⟩
+    readBlob _ := throw ⟨.unsupported, "Unexpected blob operation"⟩
+    resolveBlob _ := throw ⟨.unsupported, "Unexpected blob operation"⟩ }
 
 private def assignment (variables bits : Nat) : Array Bool :=
   (Array.range variables).map fun i => (bits / 2 ^ i) % 2 == 1

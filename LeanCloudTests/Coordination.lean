@@ -17,7 +17,7 @@ private def rootRecord (value : Nat) : ReplayRecord :=
 private def typedWorkflow (_ : Unit) : Cloud (SimM SimulationBackend.World) (Nat × String) := cloud {
   let captured ← Cloud.pure (fun _ => 7)
   cloud {
-    let values ← Cloud.parallel fun _ => #[cloud { return captured + 1 }, cloud { return captured + 2 }]
+    let values ← Cloud.parallel $ #[cloud { return captured + 1 }, cloud { return captured + 2 }]
     return values.foldl (· + ·) 0
   } || cloud { return s!"value={captured}" }
 }
@@ -25,19 +25,14 @@ private def typedWorkflow (_ : Unit) : Cloud (SimM SimulationBackend.World) (Nat
 def coordinationCases : Array TestCase := #[
   ⟨"replay/child-does-not-read-ancestor-joins", do
     let program (input : Nat) : Cloud IO (Array (Array Nat)) :=
-      Cloud.parallel fun _ => #[Cloud.parallel fun _ => #[cloud { return input + 1 }, cloud { return input + 2 }]]
-    let outer := Location.root.next
-    let inner := (outer.child 0).next
+      Cloud.parallel $ #[Cloud.parallel $ #[cloud { return input + 1 }, cloud { return input + 2 }]]
+    let outer := Location.root
+    let inner := outer.child 0
     let branch := inner.child 1
-    let planning : ReplayRecord := ⟨⟨"exec", "environment/v1", toJson "parallel"⟩,
-      .success (toJson ({} : LeanCloud.Environment))⟩
-    let planningRecords := [(ReplayStore.valueKey Location.root, planning),
-      (ReplayStore.valueKey (outer.child 0), planning)]
     let key := ReplayStore.returnKey branch
     let saved ← IO.mkRef (none : Option ReplayRecord)
     let records : ReplayStore IO := {
       read := fun requested => do
-        if let some record := planningRecords.lookup requested then return some record
         unless requested == key do
           throw (IO.userError s!"Child depends on an unrelated record: {requested}")
         saved.get
@@ -46,10 +41,11 @@ def coordinationCases : Array TestCase := #[
         saved.modifyGet fun existing =>
           let accepted := existing.getD proposed
           (accepted, some accepted) }
-    let blobs : BlobStorage IO := {
-      putBlob := fun _ => throw ⟨.unsupported, "Unexpected blob operation"⟩
-      readBlob := fun _ => throw ⟨.unsupported, "Unexpected blob operation"⟩
-      resolveBlob := fun _ => throw ⟨.unsupported, "Unexpected blob operation"⟩ }
+    let blobs : ExecContext IO := {
+      blobs := {
+        putBlob := fun _ => throw ⟨.unsupported, "Unexpected blob operation"⟩
+        readBlob := fun _ => throw ⟨.unsupported, "Unexpected blob operation"⟩
+        resolveBlob := fun _ => throw ⟨.unsupported, "Unexpected blob operation"⟩ } }
     let result ← (ReplayInterpreter.step records blobs 100 program 7 ⟨0, branch⟩).run
     assertOutcome result (.ok .done)
     assertEq (← saved.get) (some (rootRecord 9))⟩,
@@ -58,7 +54,7 @@ def coordinationCases : Array TestCase := #[
       let world ← differential typedWorkflow 71 chaos
       let resultAt (location : Location) := (world.records.lookup (ReplayStore.returnKey location)).map (·.outcome)
       let fork := Location.root.next
-      assertEq (resultAt ((fork.child 0).next.child 1)) (some (.success (Codec.encode (9 : Nat))))
+      assertEq (resultAt ((fork.child 0).child 1)) (some (.success (Codec.encode (9 : Nat))))
       assertEq (resultAt (fork.child 0)) (some (.success (Codec.encode (Sum.inl (17 : Nat) : Sum Nat String))))
       assertEq (resultAt (fork.child 1)) (some (.success (Codec.encode (Sum.inr "value=7" : Sum Nat String))))
       assertEq (resultAt Location.root) (some (.success (Codec.encode ((17 : Nat), "value=7"))))⟩,
@@ -242,10 +238,10 @@ def coordinationCases : Array TestCase := #[
 
 private def workflow (_ : Unit) : Cloud (SimM SimulationBackend.World) Nat := cloud {
   let captured ← Cloud.pure (fun _ => 7)
-  let values ← Cloud.parallel fun _ => #[
+  let values ← Cloud.parallel $ #[
     cloud { return captured * 2 },
     cloud {
-      let nested ← Cloud.parallel fun _ => #[cloud { return captured + 1 }, cloud { return captured + 2 }]
+      let nested ← Cloud.parallel $ #[cloud { return captured + 1 }, cloud { return captured + 2 }]
       return nested.foldl (· + ·) 0
     }]
   return values.foldl (· + ·) captured

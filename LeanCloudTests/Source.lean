@@ -12,7 +12,7 @@ private def repeated [Monad m] : Cloud m Nat := cloud {
 }
 
 private def branching [Monad m] : Cloud m (Array Nat) := cloud {
-  Cloud.parallel fun _ => #[cloud { return 11 }, cloud { return 22 }]
+  Cloud.parallel $ #[cloud { return 11 }, cloud { return 22 }]
 }
 
 private def loopAndReturn [Monad m] (stop : Nat) : Cloud m Nat := cloud {
@@ -31,8 +31,8 @@ private def nestedIO : Cloud IO Nat := cloud {
     return ← ref.get
 }
 
-private def files : Cloud Id String := cloud {
-  CloudBlob.readTextByName "log.txt"
+private def files : Cloud IO String := cloud {
+  Cloud.exec fun env => env.blobs.readTextByName "log.txt"
 }
 
 private def implementationDetail [Monad m] (n : Nat) : Cloud m Nat := cloud {
@@ -85,7 +85,7 @@ private def recursiveCaller : Cloud Id Nat := cloud {
 @[cloud_func] private def opaqueBranches [Monad m] (branches : Array (Cloud m Nat)) :
     Cloud m (Array Nat) := cloud {
   let _ ← Cloud.pure (fun _ => 1) "helper setup"
-  Cloud.parallel fun _ => branches
+  Cloud.parallel $ branches
 }
 
 private def suppliedBranch : Cloud Id Nat := cloud { return 123 }
@@ -94,9 +94,9 @@ private def branchCaller : Cloud Id (Array Nat) := cloud {
   opaqueBranches #[suppliedBranch, cloud { return 456 }]
 }
 
-private def plannedBranches : Cloud Id (Array Nat) := cloud {
-  Cloud.parallel fun environment =>
-    environment.workers.map fun worker => cloud { return worker.cpus }
+private def plannedBranches : Cloud IO (Array Nat) := cloud {
+  let workers ← Cloud.exec (fun env => pure env.workers) "plan"
+  Cloud.parallel $ workers.map fun worker => cloud { return worker.cpus }
 }
 
 private abbrev Job := Cloud Id Nat
@@ -110,7 +110,7 @@ private abbrev Jobs := Array Job
 private def internalBranches : Jobs := #[cloud { Cloud.pure (fun _ => 3) "internal branch" }]
 
 @[cloud_func] private def containerHelper : Cloud Id (Array Nat) := cloud {
-  Cloud.parallel fun _ => internalBranches
+  Cloud.parallel $ internalBranches
 }
 
 private def containerCaller : Cloud Id (Array Nat) := cloud { containerHelper }
@@ -120,7 +120,7 @@ private def sharedDetail : Cloud Id Nat := cloud { Cloud.pure (fun _ => 5) "shar
 @[cloud_func]
 private def sharedBranches (user : Cloud Id Nat) : Cloud Id (Array Nat) := cloud {
   let _ ← sharedDetail
-  Cloud.parallel fun _ => #[user]
+  Cloud.parallel $ #[user]
 }
 
 private def sharedCaller : Cloud Id (Array Nat) := cloud { sharedBranches sharedDetail }
@@ -166,20 +166,34 @@ private def skipDelay (program : Cloud m α) : Cloud m α :=
   | .impure _ .delay next => next.apply ()
   | program => program
 
+private def inspectNext (program : Cloud IO α) (context : ExecContext IO)
+    (inspect : Cloud IO α → IO Unit) : IO Unit :=
+  match program with
+  | .impure _ (.command _ _ body) next => do
+    match ← (body context).run with
+    | .ok value => inspect (next.apply value)
+    | .error error => inspect (Cloud.send (.fail error))
+  | program => inspect program
+
 private def nextExec (program : Cloud Id α) : Cloud Id α :=
   match program with
-  | .impure _ (.command _ (.exec _ body)) next =>
-    match (body {}).run with
+  | .impure _ (.command _ _ body) next =>
+    let context : ExecContext Id := { blobs := {
+      putBlob := fun _ => throw ⟨.unsupported, "blob"⟩
+      readBlob := fun _ => throw ⟨.unsupported, "blob"⟩
+      resolveBlob := fun _ => throw ⟨.unsupported, "blob"⟩ } }
+    match (body context).run with
     | .ok value => next.apply value
     | .error error => Cloud.send (.fail error)
   | program => program
 
 private def has (text fragment : String) : Bool := (text.splitOn fragment).length > 1
 
-private def ioBlobs : BlobStorage IO where
-  putBlob _ := throw ⟨.unsupported, "blob"⟩
-  readBlob _ := throw ⟨.unsupported, "blob"⟩
-  resolveBlob _ := throw ⟨.unsupported, "blob"⟩
+private def ioBlobs : ExecContext IO where
+  blobs := {
+    putBlob _ := throw ⟨.unsupported, "blob"⟩
+    readBlob _ := throw ⟨.unsupported, "blob"⟩
+    resolveBlob _ := throw ⟨.unsupported, "blob"⟩ }
 
 private def observeReplay : IO Unit := do
   let saved ← IO.mkRef ([] : Journal)
@@ -299,18 +313,19 @@ def cases : Array TestCase := #[
           "Inline user branch was hidden"
       else throw (IO.userError "Missing supplied branches")
     | _ => throw (IO.userError "Expected helper parallel")⟩,
-  ⟨"source.environment-planning-is-opaque", do
+  ⟨"source.explicit-planning-and-parallel-sites", do
     let setup := skipDelay plannedBranches
-    let fork := nextExec setup
-    assertTrue (has (textAt setup.metadata) "Cloud.parallel fun") "Planning exposed library source"
-    assertEq fork.metadata setup.metadata "Environment record and fork have different call sites"
-    match fork with
-    | .impure _ (.parallel _ count branches _) _ =>
-      if h : 0 < count then
-        assertTrue (has (textAt (skipDelay (branches ⟨0, h⟩)).metadata) "return worker.cpus")
-          "User callback source was hidden"
-      else throw (IO.userError "Empty planning environment")
-    | _ => throw (IO.userError "Expected planned parallel")⟩,
+    inspectNext setup ioBlobs fun fork => do
+      assertTrue (has (textAt setup.metadata) "let workers ← Cloud.exec") "Explicit planning source missing"
+      assertTrue (has (textAt fork.metadata) "Cloud.parallel") "Fork source missing"
+      assertTrue (fork.metadata != setup.metadata) "Planning and fork share a source site"
+      match fork with
+      | .impure _ (.parallel _ count branches _) _ =>
+        if h : 0 < count then
+          assertTrue (has (textAt (skipDelay (branches ⟨0, h⟩)).metadata) "return worker.cpus")
+            "User callback source was hidden"
+        else throw (IO.userError "Empty planning environment")
+      | _ => throw (IO.userError "Expected planned parallel")⟩,
   ⟨"source.observer-replay", observeReplay⟩,
   ⟨"source.console-multiple-files-and-unknown-sites", do
     let a : ProgramSource := ⟨"A.lean", "first\nread a", #[{ id := "a", line := 2, endLine := 2, endColumn := 6 }]⟩
@@ -338,10 +353,9 @@ def cases : Array TestCase := #[
     assertTrue ((site first.metadata).any fun s => s.column > 0 && s.endColumn > s.column) "Source span missing"⟩,
   ⟨"source.helper-and-parallel-children", do
     let program := skipDelay files
-    assertTrue (has (textAt program.metadata) "CloudBlob.readTextByName") "Helper lacks caller source"
+    assertTrue (has (textAt program.metadata) "Cloud.exec fun env") "Helper lacks caller source"
     match program with
-    | .impure _ (.command _ (.resolveBlob _)) next =>
-      assertEq (next.apply ⟨"log", 0, 0⟩).metadata program.metadata "Helper lost call site between operations"
+    | .impure _ (.command _ _ _) _ => pure ()
     | _ => throw (IO.userError "Expected blob helper")
     match nextExec (skipDelay (branching (m := Id))) with
     | .impure info (.parallel _ count branches _) _ =>
@@ -353,16 +367,18 @@ def cases : Array TestCase := #[
       else throw (IO.userError "Empty test fork")
     | _ => throw (IO.userError "Expected fork")⟩,
   ⟨"source.control-flow-and-io-thunks", do
-    let noBlobs : BlobStorage Id := {
-      putBlob := fun _ => throw ⟨.unsupported, "blob"⟩
-      readBlob := fun _ => throw ⟨.unsupported, "blob"⟩
-      resolveBlob := fun _ => throw ⟨.unsupported, "blob"⟩ }
+    let noBlobs : ExecContext Id := {
+      blobs := {
+        putBlob := fun _ => throw ⟨.unsupported, "blob"⟩
+        readBlob := fun _ => throw ⟨.unsupported, "blob"⟩
+        resolveBlob := fun _ => throw ⟨.unsupported, "blob"⟩ } }
     assertOutcome (DirectInterpreter.interpret noBlobs loopAndReturn 3).run (.ok 3)
     assertOutcome (DirectInterpreter.interpret noBlobs loopAndReturn 9).run (.ok 10)
-    let ioBlobs : BlobStorage IO := {
-      putBlob := fun _ => throw ⟨.unsupported, "blob"⟩
-      readBlob := fun _ => throw ⟨.unsupported, "blob"⟩
-      resolveBlob := fun _ => throw ⟨.unsupported, "blob"⟩ }
+    let ioBlobs : ExecContext IO := {
+      blobs := {
+        putBlob := fun _ => throw ⟨.unsupported, "blob"⟩
+        readBlob := fun _ => throw ⟨.unsupported, "blob"⟩
+        resolveBlob := fun _ => throw ⟨.unsupported, "blob"⟩ } }
     assertOutcome (← (DirectInterpreter.interpret ioBlobs (fun _ => nestedIO) ()).run) (.ok 7)⟩,
   ⟨"source.annotation-preserves-replay", do
     for fuel in [:18] do
@@ -371,16 +387,16 @@ def cases : Array TestCase := #[
         let b ← Cloud.pure (fun _ => 20) "same"
         return a + b
       let annotated := fun input => Cloud.withSource "test" (plain input)
-      let (before, recordsBefore) := (SequentialReplay.interpret store noBlobs fuel plain ()).run []
-      let (after, recordsAfter) := (SequentialReplay.interpret store noBlobs fuel annotated ()).run []
+      let (before, recordsBefore) := (SequentialReplay.interpret store pureContext fuel plain ()).run []
+      let (after, recordsAfter) := (SequentialReplay.interpret store pureContext fuel annotated ()).run []
       assertOutcome after before
       assertEq recordsAfter recordsBefore "Metadata changed replay records or the fuel boundary"
       let raw (_ : Unit) : Cloud M Nat := cloud { helperImplementation 10 }
       let opaqueProgram (_ : Unit) : Cloud M Nat := cloud { opaqueHelper 10 }
       let visibleProgram (_ : Unit) : Cloud M Nat := cloud { visibleHelper 10 }
-      let expected := (SequentialReplay.interpret store noBlobs fuel raw ()).run []
+      let expected := (SequentialReplay.interpret store pureContext fuel raw ()).run []
       for program in [opaqueProgram, visibleProgram] do
-        let actual := (SequentialReplay.interpret store noBlobs fuel program ()).run []
+        let actual := (SequentialReplay.interpret store pureContext fuel program ()).run []
         assertOutcome actual.1 expected.1
         assertEq actual.2 expected.2 "cloud_func changed replay records or fuel"⟩
 ]

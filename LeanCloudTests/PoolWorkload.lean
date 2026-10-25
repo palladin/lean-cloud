@@ -42,14 +42,15 @@ def tree (input : Input) : Tree :=
         (if input.failing && i == 2 && (j == 0 || j == 2) then
           .fail (seed % 1009) else .effect (j + 1)))))))
 
-def workflow [Pure m] (input : Input) : Cloud m Nat :=
+def workflow [Monad m] (input : Input) : Cloud m Nat :=
   lower (tree input) (input.seed % 17)
 
 /-- Reject any accidental use of external effects in the reference program. -/
-private def noBlobs : BlobStorage Id := {
-  putBlob := fun _ => throw ⟨.unsupported, "Pure chaos workflow used blobs"⟩
-  readBlob := fun _ => throw ⟨.unsupported, "Pure chaos workflow used blobs"⟩
-  resolveBlob := fun _ => throw ⟨.unsupported, "Pure chaos workflow used blobs"⟩ }
+private def noBlobs : ExecContext Id := {
+  blobs := {
+    putBlob := fun _ => throw ⟨.unsupported, "Pure chaos workflow used blobs"⟩
+    readBlob := fun _ => throw ⟨.unsupported, "Pure chaos workflow used blobs"⟩
+    resolveBlob := fun _ => throw ⟨.unsupported, "Pure chaos workflow used blobs"⟩ } }
 
 def expected (input : Input) : Exit :=
   match (DirectInterpreter.interpret noBlobs workflow input).run with

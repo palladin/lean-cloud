@@ -51,7 +51,7 @@ private def control (model : Model) (command : Pool.Command) : Except String Mod
   | .error error => .error error
 
 private def execute (model : Model) (worker run : Nat) (assignment : Assignment) : SimM World Report :=
-  Worker.execute workers[worker]! (SimulationBackend.observed workers[worker]!) SimulationBackend.blobs 10000
+  Worker.execute workers[worker]! (SimulationBackend.observed workers[worker]!) SimulationBackend.context 10000
     (lower model.workflows[run]!.source) model.workflows[run]!.input assignment
 
 private def acquire (model : Model) (worker : Nat) : Except String Model := do
@@ -283,7 +283,7 @@ private def setup (seed : Nat) (count : Nat := 3) : Except String (Array Workflo
     let generated := (generate (2 + seed % 2) (seed * 17 + run * 71)).1
     let source := Tree.parallel [.effect (seed + run), .parallel [generated, .value (run + 1)]]
     let input := seed % 17 + run * 29
-    let .ok (outcome, _) := evaluate 1000000 (DirectInterpreter.interpret SimulationBackend.blobs (lower source) input).run {}
+    let .ok (outcome, _) := evaluate 1000000 (DirectInterpreter.interpret SimulationBackend.context (lower source) input).run {}
       | throw "Direct evaluation exhausted its test budget"
     let expected := match outcome with | .ok value => Exit.success (toJson value) | .error error => .failure error
     workflows := workflows.push ⟨id, source, input, expected⟩

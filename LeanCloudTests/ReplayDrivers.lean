@@ -16,9 +16,9 @@ private def pureTree : Tree → Tree
 
 private def replayDifferential [Codec α] [BEq α] [Repr α]
     (program : ι → Cloud M α) (input : ι) : IO Journal := do
-  let (expected, directJournal) := (DirectInterpreter.interpret noBlobs program input).run []
+  let (expected, directJournal) := (DirectInterpreter.interpret pureContext program input).run []
   assertTrue directJournal.isEmpty "Direct evaluation touched replay storage"
-  let (sequential, journal) := (SequentialReplay.interpret store noBlobs 10000 program input).run []
+  let (sequential, journal) := (SequentialReplay.interpret store pureContext 10000 program input).run []
   let (parallel, parallelJournal) := (ParallelReplay.interpret 10000 program input).run []
   assertOutcome sequential expected
   assertOutcome parallel expected
@@ -26,7 +26,7 @@ private def replayDifferential [Codec α] [BEq α] [Repr α]
     assertEq (parallelJournal.lookup key) (some record) s!"Parallel replay lost or changed {key}"
   assertEq parallelJournal.length journal.length "Parallel replay duplicated or invented records"
   for (run, records) in [
-      (fun fuel => SequentialReplay.interpret store noBlobs fuel program input, journal),
+      (fun fuel => SequentialReplay.interpret store pureContext fuel program input, journal),
       (fun fuel => ParallelReplay.interpret fuel program input, parallelJournal)] do
     let some record := records.lookup (ReplayStore.returnKey Location.root)
       | throw (IO.userError "Replay returned without a root record")
@@ -40,16 +40,16 @@ private def nestedReplay (input : Nat) : Cloud M (Nat × String) := cloud {
   let captured ← Cloud.pure (fun _ => input * 2)
   Cloud.delay fun _ => cloud {
     let (total, label) ← cloud {
-      let values ← Cloud.parallel fun _ => #[
+      let values ← Cloud.parallel $ #[
         Cloud.delay fun _ => cloud { return captured + 1 },
         cloud {
-          let empty ← Cloud.parallel fun _ => (#[] : Array (Cloud M Nat))
-          let nested ← Cloud.parallel fun _ => #[cloud { return captured + 2 }, cloud { return captured + 3 }]
+          let empty ← Cloud.parallel $ (#[] : Array (Cloud M Nat))
+          let nested ← Cloud.parallel $ #[cloud { return captured + 2 }, cloud { return captured + 3 }]
           return nested.foldl (· + ·) empty.size
         }]
       return values.foldl (· + ·) 0
     } || cloud { return s!"input={input}" }
-    let final ← Cloud.parallel fun _ => #[cloud { return total }, cloud { return input }]
+    let final ← Cloud.parallel $ #[cloud { return total }, cloud { return input }]
     return (final.foldl (· + ·) 0, label)
   }
 }
@@ -62,16 +62,16 @@ def replayDriverCases : Array TestCase := #[
     assertEq record.outcome (.success (Codec.encode ((55 : Nat), "input=7")))⟩,
   ⟨"replay-drivers/source-ordered-errors-and-all-child-results", do
     let program (_ : Unit) : Cloud M (Array Nat) :=
-      Cloud.parallel fun _ => #[Cloud.delay fun _ => Cloud.fail "first", Cloud.fail "second", cloud { return 42 }]
+      Cloud.parallel $ #[Cloud.delay fun _ => Cloud.fail "first", Cloud.fail "second", cloud { return 42 }]
     let journal ← replayDifferential program ()
     let some record := journal.lookup (ReplayStore.returnKey Location.root)
       | throw (IO.userError "Missing failure")
     assertEq record.outcome (.failure ⟨.application, "first"⟩)
     for index in [:3] do
-      assertTrue (journal.lookup (ReplayStore.returnKey (Location.root.next.child index))).isSome
+      assertTrue (journal.lookup (ReplayStore.returnKey (Location.root.child index))).isSome
         "An error skipped an unfinished sibling"⟩,
   ⟨"replay-drivers/insufficient-fuel-is-not-completion", do
-    for run in [SequentialReplay.interpret store noBlobs 1 nestedReplay 7,
+    for run in [SequentialReplay.interpret store pureContext 1 nestedReplay 7,
         ParallelReplay.interpret 1 nestedReplay 7] do
       let (result, journal) := run.run []
       assertError result .protocol
@@ -80,10 +80,10 @@ def replayDriverCases : Array TestCase := #[
     let slow : Cloud M Nat := (List.range 20).foldl (fun child _ => Cloud.delay fun _ => child) (pure 2)
     for (children, completedIndex, expected) in [
         (#[pure 1, slow], 0, #[1, 2]), (#[slow, pure 1], 1, #[2, 1])] do
-      let program (_ : Unit) := Cloud.parallel fun _ => children
+      let program (_ : Unit) := Cloud.parallel $ children
       let (stopped, partialJournal) := (ParallelReplay.interpret 4 program ()).run []
       assertError stopped .protocol
-      assertTrue (partialJournal.lookup (ReplayStore.returnKey (Location.root.next.child completedIndex))).isSome
+      assertTrue (partialJournal.lookup (ReplayStore.returnKey (Location.root.child completedIndex))).isSome
         "Completed sibling records were lost on fuel exhaustion"
       assertTrue (partialJournal.lookup (ReplayStore.returnKey Location.root)).isNone
         "Incomplete parent was marked complete"

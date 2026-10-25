@@ -7,10 +7,11 @@ open Lean LeanCloud LeanCloudRuntime LeanBuild
 private def check (p : Bool) (message : String) : IO Unit :=
   unless p do throw (IO.userError message)
 
-private def noBlobs : BlobStorage IO where
-  putBlob _ := throw ⟨.unsupported, "Unexpected blob operation"⟩
-  readBlob _ := throw ⟨.unsupported, "Unexpected blob operation"⟩
-  resolveBlob _ := throw ⟨.unsupported, "Unexpected blob operation"⟩
+private def noBlobs : ExecContext IO where
+  blobs := {
+    putBlob _ := throw ⟨.unsupported, "Unexpected blob operation"⟩
+    readBlob _ := throw ⟨.unsupported, "Unexpected blob operation"⟩
+    resolveBlob _ := throw ⟨.unsupported, "Unexpected blob operation"⟩ }
 
 private def journal (ref : IO.Ref (List (String × ReplayRecord))) : ReplayStore IO where
   read key := return (← ref.get).lookup key
@@ -42,21 +43,20 @@ private def stub : Backend IO := {
   finish := fun _ _ _ _ => pure { name := "targets", status := .built }
   check := fun _ r _ _ => pure { mode := r.check.mode, success := true } }
 
-private def pool (cpus : Array Nat) : LeanCloud.Environment :=
+private def pool (cpus : Array Nat) : ExecContext IO :=
   let workers := cpus.mapIdx fun i n => { id := s!"worker{i}", cpus := n : WorkerCapacity }
-  { workers, currentWorker := workers[0]?.getD {} }
+  { noBlobs with workers, currentWorker := workers[0]?.getD {} }
 
 /-- Resume with a supplied execution environment, including after a restart. -/
 private def replayAt (store : ReplayStore IO) (source : Cloud IO LeanBuild.Report)
-    (environment : LeanCloud.Environment) : Nat → Assignment → ExceptT CloudError IO Unit
+    (environment : ExecContext IO) : Nat → Assignment → ExceptT CloudError IO Unit
   | 0, _ => throw ⟨.protocol, "Test fuel exhausted"⟩
   | fuel + 1, assignment => do
-      let progress ← ReplayInterpreter.step store noBlobs (fuel + 1) (fun _ : Unit => source) () assignment
-        (environment := environment)
+      let progress ← ReplayInterpreter.step store environment (fuel + 1) (fun _ : Unit => source) () assignment
       SequentialReplay.follow (replayAt store source environment fuel) assignment.branchStart progress
 
 private def replayReport (store : ReplayStore IO) (source : Cloud IO LeanBuild.Report)
-    (environment : LeanCloud.Environment) : ExceptT CloudError IO LeanBuild.Report := do
+    (environment : ExecContext IO) : ExceptT CloudError IO LeanBuild.Report := do
   replayAt store source environment 10000 ⟨0, Location.root⟩
   let some outcome ← store.outcome | throw ⟨.protocol, "Missing test outcome"⟩
   ReplayInterpreter.result outcome
@@ -83,16 +83,16 @@ private structure PlanStats where
   ticks : Nat := 0
   deriving BEq, Repr
 
-private def checkPartition (modules : Array LeanBuild.Module) (environment : LeanCloud.Environment)
+private def checkPartition (modules : Array LeanBuild.Module) (environment : ExecContext IO)
     (limit : Nat := 0) : IO PlanStats := do
   let mut pending := modules
   let mut done : Array BuildResult := #[]
   let mut stats : PlanStats := {}
-  let cpus := workerCpus environment
+  let cpus := environment.workers.map (max 1 ·.cpus)
   let ordered := criticalOrder modules
   for _ in [:modules.size] do
     if pending.isEmpty then break
-    let groups := partition pending done environment limit
+    let groups := partition pending done cpus limit
     check (groups.any (!·.isEmpty) && groups.size == cpus.size) "No progress or mismatched CPU slots"
     for group in groups do
       check (limit == 0 || group.size ≤ limit) "Job exceeds explicit cap"
@@ -120,17 +120,17 @@ private def partitionTests : IO Unit := do
   check ((← checkPartition wide (pool #[8, 8, 8, 8])) == ⟨1, 4, 32⟩) "Independent modules lost CPUs or gained barriers"
   check ((← checkPartition wide (pool #[8, 8, 8, 8]) 64) == ⟨4, 16, 32⟩) "Explicit job cap ignored"
   let shared := #[⟨"Base", #[]⟩] ++ wide.map fun m => { m with imports := #["Base"] }
-  check ((partition shared #[] (pool #[8, 8, 8, 8]) 0).flatten.map (·.name) == #["Base"])
+  check ((partition shared #[] #[8, 8, 8, 8] 0).flatten.map (·.name) == #["Base"])
     "Shared prerequisite trapped parallel work on its worker"
   check ((← checkPartition shared (pool #[8, 8, 8, 8])) == ⟨2, 5, 33⟩)
     "Wide fan-out did not use all CPUs after publishing the shared prerequisite"
   let chains := (Array.range 4).flatMap fun c => (Array.range 256).map fun i => {
     name := s!"C{c}_{i}", imports := if i == 0 then #[] else #[s!"C{c}_{i - 1}"] : LeanBuild.Module }
   check ((← checkPartition chains (pool #[8, 8, 8, 8])) == ⟨1, 4, 256⟩) "Dependency chains fragmented"
-  check ((partition (wide.extract 0 10) #[] (pool #[1, 4]) 0).map (·.size) == #[2, 8]) "CPU weighting ignored"
-  check ((partition (wide.extract 0 2) #[] (pool #[1, 16]) 0).map (·.size) == #[1, 1]) "Small frontier lost parallelism"
+  check ((partition (wide.extract 0 10) #[] #[1, 4] 0).map (·.size) == #[2, 8]) "CPU weighting ignored"
+  check ((partition (wide.extract 0 2) #[] #[1, 16] 0).map (·.size) == #[1, 1]) "Small frontier lost parallelism"
   let fork : Array LeanBuild.Module := #[⟨"A", #[]⟩, ⟨"B", #["A"]⟩, ⟨"C", #["A"]⟩]
-  check ((partition fork #[] (pool #[4, 4]) 0).flatten.map (·.name) == #["A", "B", "C"])
+  check ((partition fork #[] #[4, 4] 0).flatten.map (·.name) == #["A", "B", "C"])
     "Small fan-out introduced an unnecessary cloud barrier"
   let diamond : Array LeanBuild.Module := #[⟨"A", #[]⟩, ⟨"B", #[]⟩, ⟨"C", #["A", "B"]⟩, ⟨"D", #["C"]⟩]
   check ((← checkPartition diamond (pool #[4, 4])) == ⟨1, 1, 3⟩) "Shared consumers were split despite free local CPUs"
@@ -140,17 +140,17 @@ private def partitionTests : IO Unit := do
   check ((← checkPartition joined (pool #[2, 2])) == ⟨1, 2, 3⟩)
     "A removable join barrier survived despite unchanged compute time"
   let smallJoin := diamond.extract 0 3
-  check ((partition smallJoin #[] (pool #[1, 4]) 0).map (·.size) == #[0, 3])
+  check ((partition smallJoin #[] #[1, 4] 0).map (·.size) == #[0, 3])
     "Repacked component lost the faster worker's CPU slot"
   check ((← checkPartition smallJoin (pool #[1, 4])) == ⟨1, 1, 2⟩) "Repacking increased the join's compute span"
   let priority : Array LeanBuild.Module := #[⟨"short", #[]⟩, ⟨"base", #[]⟩,
     ⟨"middle", #["base"]⟩, ⟨"tip", #["middle"]⟩]
-  check ((partition priority #[] (pool #[1]) 1).flatten.map (·.name) == #["base"])
+  check ((partition priority #[] #[1] 1).flatten.map (·.name) == #["base"])
     "Short independent work displaced the critical path"
   let mixed := shared ++ chains
   let result ← checkPartition mixed (pool #[8, 8, 8, 8])
   check (result.ticks < 290) "Independent chains prevented useful work during the wide fan-out"
-  let emptyPool : LeanCloud.Environment := { workers := #[], currentWorker := { cpus := 0 } }
+  let emptyPool : Array Nat := #[]
   check ((partition wide #[] emptyPool 5).map (·.size) == #[5]) "Empty pool/zero CPU fallback"
   for seed in [:100] do
     let modules := (Array.range 80).map fun i => {
@@ -219,7 +219,7 @@ private def generatedTests : IO Unit := do
       modulesPerJob := if seed % 3 == 0 then 0 else 1 + seed % 7
       check := { mode := if seed % 3 == 0 then .kernel else .none } }
     let environment := pool ((Array.range (1 + seed % 4)).map fun i => 1 + (seed + i) % 8)
-    let direct ← (DirectInterpreter.interpret noBlobs (workflow backend) req environment).run
+    let direct ← (DirectInterpreter.interpret environment (workflow backend) req).run
     let saved ← IO.mkRef []
     let run := (replayReport (journal saved) (workflow backend req) environment).run
     let actual ← run
@@ -244,25 +244,25 @@ private def generatedTests : IO Unit := do
   let groups ← IO.mkRef (#[] : Array (Array String))
   let backend := { stub with
     prepare := fun env _ => do
-      check (env == planned) "Wrong planning context"
+      check (env.workers == planned.workers && env.currentWorker == planned.currentWorker) "Wrong planning context"
       return { plan := some { fixturePlan with modules } }
     build := fun env _ _ group _ => do
-      check (env == replacement) "Stale execution CPU budget after restart"
+      check (env.workers == replacement.workers && env.currentWorker == replacement.currentWorker) "Stale execution CPU budget after restart"
       groups.modify (·.push (group.map (·.name)))
       return group.map fun m => { name := m.name, status := .built }
     finish := fun env _ _ _ => do
-      check (env == replacement) "Target build lost the execution environment"
+      check (env.workers == replacement.workers && env.currentWorker == replacement.currentWorker) "Target build lost the execution environment"
       return { name := "targets", status := .built } }
   let saved ← IO.mkRef []
   let source := workflow backend request
-  let .ok (.fork _ count) ← (ReplayInterpreter.step (journal saved) noBlobs 10000
-      (fun _ : Unit => source) () ⟨0, Location.root⟩ (environment := planned)).run
+  let .ok (.fork _ count) ← (ReplayInterpreter.step (journal saved) planned 10000
+      (fun _ : Unit => source) () ⟨0, Location.root⟩).run
     | throw (IO.userError "Expected a recorded batch before restart")
   check (count == 2) "Wrong planned worker count"
   let .ok report ← (replayReport (journal saved) source replacement).run
     | throw (IO.userError "Could not resume batch on replacement worker")
   check (report.success && (← groups.get) ==
-    ((partition modules #[] planned 0).filter (!·.isEmpty)).map (·.map (·.name)))
+    ((partition modules #[] (planned.workers.map (·.cpus)) 0).filter (!·.isEmpty)).map (·.map (·.name)))
     "Replay repartitioned an existing batch using the replacement pool"
   for stage in ["prepare", "build", "finish", "check"] do
     let calls ← IO.mkRef (0 : Nat)
@@ -310,7 +310,7 @@ private def copyFixture (source destination : System.FilePath) : IO Unit := do
 private def nativeTest (tools : Tools) (store : ObjectStore) (fixture : System.FilePath)
     (change : System.FilePath → IO Unit := fun _ => pure ())
     (req : LeanBuild.Request := request)
-    (environment : LeanCloud.Environment := pool #[2]) : IO LeanBuild.Report :=
+    (environment : ExecContext IO := pool #[2]) : IO LeanBuild.Report :=
   IO.FS.withTempDir fun root => do
     let directory := root / "project"
     IO.FS.createDir directory
@@ -320,7 +320,7 @@ private def nativeTest (tools : Tools) (store : ObjectStore) (fixture : System.F
     change cwd
     let prepared ← tools.prepareDirectory store req directory "fixture-commit"
     let backend := { tools.backend store with prepare := fun _ _ => pure prepared }
-    let result ← (DirectInterpreter.interpret noBlobs (workflow backend) req environment).run
+    let result ← (DirectInterpreter.interpret environment (workflow backend) req).run
     let .ok report := result | throw (IO.userError s!"Native workflow failed: {repr result}")
     return report
 

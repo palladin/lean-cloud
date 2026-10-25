@@ -125,7 +125,7 @@ actors. Compare the durable final outcome, not just a worker's transient return.
 def differential [Codec α] [BEq α] [Repr α]
     (program : Unit → Cloud (SimM SimulationBackend.World) α) (seed := 0) (chaos := false) : IO SimulationBackend.World := do
   let (expected, direct) ← unwrap (evaluate 1000000
-    (DirectInterpreter.interpret SimulationBackend.blobs program ()).run {})
+    (DirectInterpreter.interpret SimulationBackend.context program ()).run {})
   assertEq direct.writes 0 "Direct interpreter wrote replay records"
   assertEq direct.reads 0 "Direct interpreter read replay records"
   let start := SimulationBackend.start (workers := 3) 100000 10000 1000 program ()
@@ -142,7 +142,7 @@ def differential [Codec α] [BEq α] [Repr α]
     assertEq job.status .done "Scheduler finished with unfinished branches"
     let assignment : Assignment := ⟨9999999, job.branch⟩
     let (repeated, after) ← unwrap (evaluate 100000
-      (ReplayInterpreter.step SimulationBackend.records SimulationBackend.blobs 10000 program () assignment).run
+      (ReplayInterpreter.step SimulationBackend.records SimulationBackend.context 10000 program () assignment).run
       finished)
     match repeated with
     | .ok .done => pure ()

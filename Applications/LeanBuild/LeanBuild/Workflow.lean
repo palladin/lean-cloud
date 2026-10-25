@@ -5,10 +5,10 @@ namespace LeanBuild
 open LeanCloud
 
 structure Backend (m : Type → Type) where
-  prepare : Environment → Request → m Preparation
-  build : Environment → Request → Plan → Array Module → Array BuildResult → m (Array BuildResult)
-  finish : Environment → Request → Plan → Array BuildResult → m BuildResult
-  check : Environment → Request → Plan → BuildResult → m CheckResult
+  prepare : Environment m → Request → m Preparation
+  build : Environment m → Request → Plan → Array Module → Array BuildResult → m (Array BuildResult)
+  finish : Environment m → Request → Plan → Array BuildResult → m BuildResult
+  check : Environment m → Request → Plan → BuildResult → m CheckResult
 
 /-- Completed modules at the start of this parallel round. -/
 def progressLabel (completed total : Nat) : String :=
@@ -23,8 +23,10 @@ private def batches [Monad m] [MonadCloudExec m] (backend : Backend m) (request 
   | rounds + 1, pending, done => cloud {
       let (pending, done) := skipBlocked pending done
       if pending.isEmpty then return done
-      let groups ← Cloud.parallel (label := progressLabel done.size plan.modules.size) fun environment =>
-        ((partition pending done environment request.modulesPerJob).filter (!·.isEmpty)).map fun group => cloud {
+      let cpus ← Cloud.exec (fun env => pure <|
+        (if env.workers.isEmpty then #[env.currentWorker] else env.workers).map (max 1 ·.cpus)) "plan build round"
+      let groups ← Cloud.parallel (label := progressLabel done.size plan.modules.size) $
+        ((partition pending done cpus request.modulesPerJob).filter (!·.isEmpty)).map fun group => cloud {
           let results ← Cloud.exec (fun executing => backend.build executing request plan group done)
             s!"build {group.size} modules from {(group[0]?.map (·.name)).getD ""}"
           if results.map (·.name) != group.map (·.name) then

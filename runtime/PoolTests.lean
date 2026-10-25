@@ -78,7 +78,7 @@ private def finalize (config : Config) (handle : HttpMailbox.Handle) (worker run
 
 private def execute (config : Config) (run worker : String) (fuel : Nat) (input : Array Nat)
     (job : Assignment) : IO Report := do
-  Worker.execute worker (← observe (config.objects.records run)) (config.objects.storage)
+  Worker.execute worker (← observe (config.objects.records run)) (config.objects.executionContext)
     fuel Squares.workflow input job
 
 private def liveFailure (config : Config) (runPrefix : String) : IO Unit := do
@@ -142,7 +142,7 @@ private def liveFailure (config : Config) (runPrefix : String) : IO Unit := do
     let job ← assignment config first "worker1" healthy.id
     let broken : ReplayStore IO := { (config.objects.records healthy.id) with
       read := fun _ => throw (IO.userError "Temporary connection failure") }
-    rejects (Worker.execute "worker1" ⟨broken, pure #[]⟩ (config.objects.storage)
+    rejects (Worker.execute "worker1" ⟨broken, pure #[]⟩ (config.objects.executionContext)
       1000 Squares.workflow #[2, 3] job)
     assertTrue (← healthy.poll).isNone "Journal exception became a workflow result"
     assertTrue (← LeanCloudRuntime.Pool.status config healthy.id).error.isNone "Journal exception terminated the run"

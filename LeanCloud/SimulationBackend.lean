@@ -60,21 +60,22 @@ def observed (worker : WorkerId) : Worker.ObservedStore (SimM World) where
   confirmed := SimM.local (fun world => ((world.observations.lookup worker).getD #[], world))
     "worker.confirmed"
 
-def blobs : BlobStorage (SimM World) where
-  putBlob bytes := liftM (m := SimM World) <| SimM.atomic (fun world =>
-    let key := s!"blob/{modelChecksum bytes}/{bytes.size}"
-    let ref := { key, size := bytes.size, checksum := modelChecksum bytes : BlobRef }
-    (ref, { world with blobs := setEntry world.blobs key bytes })) "blob.put"
-  readBlob ref := do
-    let bytes ← liftM (m := SimM World) <| SimM.atomic (fun world => (world.blobs.lookup ref.key, world)) "blob.read"
-    let some bytes := bytes | throw ⟨.missingBlob, "Missing blob"⟩
-    unless bytes.size == ref.size && modelChecksum bytes == ref.checksum do
-      throw ⟨.integrity, "Invalid blob reference"⟩
-    return bytes
-  resolveBlob name := do
-    let ref ← liftM (m := SimM World) <| SimM.atomic (fun world => (world.names.lookup name, world)) "blob.resolve"
-    let some ref := ref | throw ⟨.missingBlob, "Missing blob name"⟩
-    return ref
+def context : ExecContext (SimM World) where
+  blobs := {
+    putBlob bytes := liftM (m := SimM World) <| SimM.atomic (fun world =>
+      let key := s!"blob/{modelChecksum bytes}/{bytes.size}"
+      let ref := { key, size := bytes.size, checksum := modelChecksum bytes : BlobRef }
+      (ref, { world with blobs := setEntry world.blobs key bytes })) "blob.put"
+    readBlob ref := do
+      let bytes ← liftM (m := SimM World) <| SimM.atomic (fun world => (world.blobs.lookup ref.key, world)) "blob.read"
+      let some bytes := bytes | throw ⟨.missingBlob, "Missing blob"⟩
+      unless bytes.size == ref.size && modelChecksum bytes == ref.checksum do
+        throw ⟨.integrity, "Invalid blob reference"⟩
+      return bytes
+    resolveBlob name := do
+      let ref ← liftM (m := SimM World) <| SimM.atomic (fun world => (world.names.lookup name, world)) "blob.resolve"
+      let some ref := ref | throw ⟨.missingBlob, "Missing blob name"⟩
+      return ref }
 
 def schedulerPorts (generation : Nat) : SchedulerPorts (SimM World) where
   inbox.receive := SimM.atomic (fun world =>
@@ -99,7 +100,7 @@ def workerPorts (id : WorkerId) (generation : Nat) : Worker.Ports (SimM World) w
   send message := SimM.atomic (fun world =>
     ((), { world with network := world.network.push (.scheduler message) })) "worker.send"
   observe := observed id
-  blobs
+  context
 
 /-- Each actor has a finite run budget. Exhaustion pauses the simulation; it is
 not evidence of workflow completion. Restart gives a fresh volatile continuation. -/

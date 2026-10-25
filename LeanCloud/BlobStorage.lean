@@ -1,25 +1,34 @@
-import LeanCloud.Control
+import LeanCloud.Execution
 
-universe u
+universe u v
 
 namespace LeanCloud
 
-/-- User-visible blob operations. Return ordinary failures as Cloud errors;
-IO adapters use `captureIO` to include IO exceptions. This interface has no access
-to interpreter records. The backend owns blob keys and validates references. -/
+/-- User blob capabilities. These ordinary monadic actions may run concurrently
+inside `Cloud.exec`. They cannot access the replay journal. -/
 structure BlobStorage (m : Type → Type u) where
-  putBlob : ByteArray → ExceptT CloudError m BlobRef
-  readBlob : BlobRef → ExceptT CloudError m ByteArray
-  resolveBlob : String → ExceptT CloudError m BlobRef
+  putBlob : ByteArray → m BlobRef
+  readBlob : BlobRef → m ByteArray
+  resolveBlob : String → m BlobRef
 
-/-- Execute a user operation whose adapter returns failures as Cloud errors.
-The interpreter records both success and failure before continuing. -/
-def BlobStorage.execute {m : Type → Type u} {α : Type} [Monad m]
-    (blobs : BlobStorage m) (request : Operation m α) (environment : Environment := {}) : ExceptT CloudError m α :=
-  match request with
-  | .exec _ body => body environment
-  | .putBlob bytes => blobs.putBlob bytes
-  | .readBlob ref => blobs.readBlob ref
-  | .resolveBlob name => blobs.resolveBlob name
+/-- Change how capability failures are represented at an execution boundary. -/
+def BlobStorage.map (f : {α : Type} → m α → n α) (blobs : BlobStorage m) : BlobStorage n where
+  putBlob bytes := f (blobs.putBlob bytes)
+  readBlob ref := f (blobs.readBlob ref)
+  resolveBlob name := f (blobs.resolveBlob name)
+
+def BlobStorage.putText (blobs : BlobStorage m) (text : String) : m BlobRef :=
+  blobs.putBlob text.toUTF8
+
+def BlobStorage.readText [Monad m] [MonadCloudExec m]
+    (blobs : BlobStorage m) (ref : BlobRef) : m String := do
+  let bytes ← blobs.readBlob ref
+  match String.fromUTF8? bytes with
+  | some text => pure text
+  | none => MonadCloudExec.restore (throw ⟨.invalidUtf8, "Blob is not valid UTF-8"⟩)
+
+def BlobStorage.readTextByName [Monad m] [MonadCloudExec m]
+    (blobs : BlobStorage m) (name : String) : m String := do
+  blobs.readText (← blobs.resolveBlob name)
 
 end LeanCloud

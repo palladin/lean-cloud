@@ -124,8 +124,8 @@ private def interruptedRemoval : IO Unit := do
 
 private def workload (_ : Unit) : Cloud IO Nat := cloud {
   let base ← Cloud.pure (fun _ => 10) "prefix"
-  let values ← Cloud.parallel fun _ => ((Array.range 24).map fun n => cloud {
-    let inner ← Cloud.parallel fun _ => ((Array.range 3).map fun k => cloud {
+  let values ← Cloud.parallel $ ((Array.range 24).map fun n => cloud {
+    let inner ← Cloud.parallel $ ((Array.range 3).map fun k => cloud {
       Cloud.pure (fun _ => base + n + k) "leaf"
     })
     return inner.foldl (· + ·) 0
@@ -136,10 +136,11 @@ private def workload (_ : Unit) : Cloud IO Nat := cloud {
 /-- Count real interpreter store calls, with the same persistent state and
 ownership checks. Caching changes reads only, never results or journal contents. -/
 private def differential : IO Unit := do
-  let blobs : BlobStorage IO := {
-    putBlob := fun _ => throw ⟨.unsupported, "unused"⟩
-    readBlob := fun _ => throw ⟨.unsupported, "unused"⟩
-    resolveBlob := fun _ => throw ⟨.unsupported, "unused"⟩ }
+  let blobs : ExecContext IO := {
+    blobs := {
+      putBlob := fun _ => throw ⟨.unsupported, "unused"⟩
+      readBlob := fun _ => throw ⟨.unsupported, "unused"⟩
+      resolveBlob := fun _ => throw ⟨.unsupported, "unused"⟩ } }
   let execute (cached : Bool) := do
     let journal ← IO.mkRef ({} : Std.HashMap String ReplayRecord)
     let reads ← IO.mkRef 0

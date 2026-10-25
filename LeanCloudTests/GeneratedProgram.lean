@@ -18,14 +18,20 @@ inductive Tree where
   | parallel (children : List Tree)
   deriving Repr
 
+/-- Model user IO with typed failures. The interpreter still executes the same
+single command node as `Cloud.exec`; journal operations remain outside it. -/
+def modelExec [Codec α] (body : ExecContext m → ExceptT CloudError m α) : Cloud m α :=
+  Cloud.send (.command inferInstance "model IO" body)
+
 mutual
-  def lower [Pure m] (tree : Tree) (input : Nat) : Cloud m Nat :=
+
+  def lower [Monad m] (tree : Tree) (input : Nat) : Cloud m Nat :=
     match tree with
     | .value n => pure (input + n)
     | .effect n => Cloud.pure (fun _ => input + n) s!"generated/{n}"
-    | .blob n => do
-      let blob ← CloudBlob.putText s!"{input}:{n}"
-      return (← CloudBlob.readText blob).length
+    | .blob n => modelExec fun env => do
+      let blob ← env.blobs.putText s!"{input}:{n}"
+      return (← env.blobs.readText blob).length
     | .fail n => Cloud.fail s!"generated-failure/{n}"
     | .delay child => Cloud.delay fun _ => lower child input
     | .bind first next => do
@@ -33,12 +39,12 @@ mutual
       lower next (value + input)
     | .branch even odd => if input % 2 == 0 then lower even input else lower odd input
     | .parallel children => do
-      let values ← Cloud.parallel fun _ => (lowerChildren children input).toArray
+      let values ← Cloud.parallel $ (lowerChildren children input).toArray
       -- An order-sensitive result exposes reordered children; summing hid them.
       Cloud.pure (fun _ => values.foldl (fun acc value => acc * 31 + value + 1) input) "generated/join"
   termination_by structural tree
 
-  def lowerChildren [Pure m] (children : List Tree) (input : Nat) : List (Cloud m Nat) :=
+  def lowerChildren [Monad m] (children : List Tree) (input : Nat) : List (Cloud m Nat) :=
     match children with
     | [] => []
     | child :: rest => lower child input :: lowerChildren rest input

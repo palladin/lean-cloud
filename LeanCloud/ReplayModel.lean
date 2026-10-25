@@ -9,10 +9,12 @@ abbrev M := StateM Journal
 
 /-- The pure reference model has no user blob effects. Pure evaluation never
 calls these operations; rejecting them also makes accidental use explicit. -/
-def noBlobs : BlobStorage M where
-  putBlob _ := throw ⟨.unsupported, "User blobs are outside the pure replay model"⟩
-  readBlob _ := throw ⟨.unsupported, "User blobs are outside the pure replay model"⟩
-  resolveBlob _ := throw ⟨.unsupported, "User blobs are outside the pure replay model"⟩
+def pureContext : ExecContext M where
+  blobs := {
+    putBlob _ := throw ⟨.unsupported, "User blobs are outside the pure replay model"⟩
+    readBlob _ := throw ⟨.unsupported, "User blobs are outside the pure replay model"⟩
+    resolveBlob _ := throw ⟨.unsupported, "User blobs are outside the pure replay model"⟩
+  }
 
 def store : ReplayStore M where
   read key := fun journal => (journal.lookup key, journal)

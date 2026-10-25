@@ -13,15 +13,15 @@ variable {info : Option SourceSiteId}
 private theorem command (point : ReplayTarget)
     (branch : point.branchStart = Proofs.Location.branchStart point.location)
     (current : Location) (fuel : Nat) (encode : β → Json) (codec : Codec α)
-    (operation : LeanCloud.Operation WorkerM α) (next : ArrsF (Control WorkerM) SourceSiteId α β)
+    (label : String) (action : ExecContext WorkerM → ExceptT CloudError WorkerM α) (next : ArrsF (Control WorkerM) SourceSiteId α β)
     (wire : Json) (value : α)
     (valid : ∀ journal, pre journal → invariant journal)
     (present : ∀ journal, pre journal → journal.lookup (ReplayStore.valueKey current) =
-      some ⟨Internal.request codec operation, .success wire⟩)
+      some ⟨Internal.request codec label, .success wire⟩)
     (decoded : codec.decode wire = .ok value)
-    (rest : Ensures invariant pre (atPoint ReplayFaults.store ReplayFaults.noBlobs point fuel encode (next.apply value) current.next) post) :
-    Ensures invariant pre (atPoint ReplayFaults.store ReplayFaults.noBlobs point (fuel + 1) encode
-      (.impure info (.command codec operation) next) current) post := by
+    (rest : Ensures invariant pre (atPoint ReplayFaults.store ReplayFaults.pureContext point fuel encode (next.apply value) current.next) post) :
+    Ensures invariant pre (atPoint ReplayFaults.store ReplayFaults.pureContext point (fuel + 1) encode
+      (.impure info (.command codec label action) next) current) post := by
   have nextSize : current.next.size = current.size := by simp [LeanCloud.Location.next]
   by_cases same : current.size = point.location.size
   · simp only [atPoint, same, beq_self_eq_true, ite_true, nextSize] at rest ⊢
@@ -50,8 +50,8 @@ private theorem joined (point : ReplayTarget)
       some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, .success (Json.arr (values.map codec.encode))⟩)
     (decoded : (@instCodecArray α codec).decode (Json.arr (values.map codec.encode)) = .ok values)
     (size : values.size = count)
-    (rest : Ensures invariant pre (atPoint ReplayFaults.store ReplayFaults.noBlobs point fuel encode (next.apply values) current.next) post) :
-    Ensures invariant pre (atPoint ReplayFaults.store ReplayFaults.noBlobs point (fuel + 1) encode
+    (rest : Ensures invariant pre (atPoint ReplayFaults.store ReplayFaults.pureContext point fuel encode (next.apply values) current.next) post) :
+    Ensures invariant pre (atPoint ReplayFaults.store ReplayFaults.pureContext point (fuel + 1) encode
       (.impure info (.parallel codec count branches label) next) current) post := by
   have nextSize : current.next.size = current.size := by simp [LeanCloud.Location.next]
   by_cases same : current.size = point.location.size
@@ -84,8 +84,8 @@ theorem transport [rootCodec : Codec α] (source : Cloud WorkerM α)
     (follows : Follows current point.location) (fuel : Nat)
     (valid : ∀ after, pre after → invariant after)
     (extension : ∀ after, pre after → Extends journal after)
-    (rest : Ensures invariant pre (atPoint ReplayFaults.store ReplayFaults.noBlobs point fuel encode program current) post) :
-    Ensures invariant pre (atPoint ReplayFaults.store ReplayFaults.noBlobs point (cost + fuel)
+    (rest : Ensures invariant pre (atPoint ReplayFaults.store ReplayFaults.pureContext point fuel encode program current) post) :
+    Ensures invariant pre (atPoint ReplayFaults.store ReplayFaults.pureContext point (cost + fuel)
       rootCodec.encode source Location.root) post := by
   induction cursor generalizing point fuel with
   | root => simpa using rest
@@ -99,7 +99,7 @@ theorem transport [rootCodec : Codec α] (source : Cloud WorkerM α)
     rw [Nat.add_assoc]
     apply ih point branch (edge.trans follows) (1 + fuel) extension
     rw [Nat.add_comm 1]
-    exact command point branch _ fuel _ codec _ next _ _ valid
+    exact command point branch _ fuel _ codec label _ next _ _ valid
       (fun after h => extension after h _ _ present) decoded rest
   | joined codec count branches next values cursor present decoded size ih =>
     have route := (cursor.route source).1

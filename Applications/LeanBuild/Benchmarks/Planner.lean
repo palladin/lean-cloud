@@ -123,8 +123,6 @@ def rescore (g : Graph) (cpus : Array Nat) (penalty : Nat) (s : Schedule) :
 
 def prepare (g : Graph) (cpus : Array Nat) (penalty : Nat) : IO Case := do
   IO.ofExcept <| require (!cpus.isEmpty && cpus.all (· > 0)) "CPUs must be positive"
-  let workers := cpus.mapIdx fun i n => { id := s!"w{i}", cpus := n : WorkerCapacity }
-  let env : LeanCloud.Environment := { workers, currentWorker := workers[0]! }
   let ids := (g.modules.zipIdx).foldl (fun m (node, i) => m.insert node.name i)
     ({} : Std.HashMap String Nat)
   let n := g.modules.size
@@ -137,7 +135,7 @@ def prepare (g : Graph) (cpus : Array Nat) (penalty : Nat) : IO Case := do
   let started ← IO.monoMsNow
   for r in [:n] do
     if pending.isEmpty then break
-    let groups := partition pending done env 0
+    let groups := partition pending done cpus 0
     IO.ofExcept <| require (groups.size == cpus.size && groups.any (!·.isEmpty)) "Planner made no progress"
     let mut duration := 0
     let mut chosen : Std.HashSet String := {}

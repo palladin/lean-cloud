@@ -312,7 +312,7 @@ def Tools.fromEnvironment : IO Tools := do
   return { toolchain := ← IO.FS.realPath toolchain, helper := ← IO.FS.realPath helper, sandbox, cache }
 
 def Tools.backend (tools : Tools) (store : ObjectStore) : Backend IO :=
-  let configured := fun env : LeanCloud.Environment => { tools with threads := max 1 env.currentWorker.cpus }
+  let configured := fun env : LeanCloud.Environment IO => { tools with threads := max 1 env.currentWorker.cpus }
   { prepare := fun env => (configured env).prepare store
     build := fun env => (configured env).build store
     finish := fun env => (configured env).finish store

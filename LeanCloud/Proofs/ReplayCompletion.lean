@@ -9,43 +9,43 @@ open Lean LeanEff ReplayModel ReplayInterpreter ProgramCursor ReplayExecution Jo
 
 variable {info : Option SourceSiteId}
 
-variable [rootCodec : Codec α] (blobs : BlobStorage M) (source : Cloud M α) (mode : Mode)
+variable [rootCodec : Codec α] (context : ExecContext M) (source : Cloud M α) (mode : Mode)
 
-abbrev sourceSteps : Step := steps blobs (fun _ : Unit => source) ()
+abbrev sourceSteps : Step := steps context (fun _ : Unit => source) ()
 
 def Verified (expected : Journal) (branch : Location) (outcome : Exit) (action : Action) (before : Journal) : Prop :=
   ∃ after, Extends before after ∧ Extends after expected ∧
     after.lookup (ReplayStore.returnKey branch) = some ⟨ReplayStore.returnRequest, outcome⟩ ∧
     Writes (Owns branch) before after ∧
-    Execution (sourceSteps blobs source) mode branch action before after
+    Execution (sourceSteps context source) mode branch action before after
 
 theorem Verified.replace {expected branch outcome action replacement before}
-    (verified : Verified blobs source mode expected branch outcome action before)
+    (verified : Verified context source mode expected branch outcome action before)
     (same : ∃ offset, ∀ fuel, (replacement (offset + fuel)).run before = (action fuel).run before) :
-    Verified blobs source mode expected branch outcome replacement before := by
+    Verified context source mode expected branch outcome replacement before := by
   obtain ⟨after, grows, consistent, returned, writes, execution⟩ := verified
   obtain ⟨offset, same⟩ := same
   exact ⟨after, grows, consistent, returned, writes, execution.replace ⟨offset, 0, fun fuel _ => same fuel⟩⟩
 
 theorem Verified.extend_before {expected branch outcome action before middle}
-    (verified : Verified blobs source mode expected branch outcome action middle)
+    (verified : Verified context source mode expected branch outcome action middle)
     (written : Writes (Owns branch) before middle)
     (same : ∃ offset minimum, ∀ fuel, minimum ≤ fuel → (replacement (offset + fuel)).run before = (action fuel).run middle) :
-    Verified blobs source mode expected branch outcome replacement before := by
+    Verified context source mode expected branch outcome replacement before := by
   obtain ⟨after, extension, consistent, returned, writes, execution⟩ := verified
   exact ⟨after, written.extends.trans extension, consistent, returned, written.trans writes, execution.replace same⟩
 
 theorem Verified.step {expected journal current} {encode : β → Json} {remaining : Cloud M β}
-    (cursor : Cursor blobs source journal current encode remaining) (assignment : Assignment)
+    (cursor : Cursor context source journal current encode remaining) (assignment : Assignment)
     (branch : assignment.branchStart = Location.branchStart current) (outcome : Exit)
     (consistent : Extends journal expected)
     (known : expected.lookup (ReplayStore.returnKey assignment.branchStart) = some ⟨ReplayStore.returnRequest, outcome⟩)
-    (verified : Verified blobs source mode expected assignment.branchStart outcome
-      (fun fuel => replay store blobs assignment.branchStart fuel encode remaining current) journal) :
-    Verified blobs source mode expected assignment.branchStart outcome (sourceSteps blobs source assignment) journal := by
+    (verified : Verified context source mode expected assignment.branchStart outcome
+      (fun fuel => replay store context assignment.branchStart fuel encode remaining current) journal) :
+    Verified context source mode expected assignment.branchStart outcome (sourceSteps context source assignment) journal := by
   let point : ReplayTarget := ⟨assignment.branchStart, current⟩
   cases found : journal.lookup (ReplayStore.returnKey assignment.branchStart) with
-  | none => exact verified.replace blobs source mode (cursor.step blobs source point branch rfl found)
+  | none => exact verified.replace context source mode (cursor.step context source point branch rfl found)
   | some record =>
     have same := Option.some.inj ((consistent _ _ found).symm.trans known)
     subst record
@@ -55,7 +55,7 @@ theorem Verified.step {expected journal current} {encode : β → Json} {remaini
     have valid : (!point.branchStart.isEmpty && point.branchStart[0]!.1 == 0) = true := by
       simp [point, branch, Array.isEmpty, Nat.ne_of_gt nonempty, Location.branchStart_index _ 0 nonempty, first]
     exact ⟨journal, .refl _, consistent, found, .refl _ _, .done ⟨0, fun fuel _ =>
-      completed_step_reuses_record journal blobs point (fun _ : Unit => source) () fuel _ valid found (by simp)⟩⟩
+      completed_step_reuses_record journal context point (fun _ : Unit => source) () fuel _ valid found (by simp)⟩⟩
 
 private theorem run_list {κ : Type} (expected initial : Journal) (items : List κ)
     (job : κ → Assignment) (outcome : κ → Exit) (region : String → Prop)
@@ -63,12 +63,12 @@ private theorem run_list {κ : Type} (expected initial : Journal) (items : List 
     (separate : items.Pairwise (fun i j => ∀ key, Owns (job i).branchStart key → Owns (job j).branchStart key → False))
     (consistent : Extends initial expected)
     (each : ∀ item ∈ items, ∀ journal, Extends initial journal → Extends journal expected →
-      Verified blobs source mode expected (job item).branchStart (outcome item) (sourceSteps blobs source (job item)) journal) :
+      Verified context source mode expected (job item).branchStart (outcome item) (sourceSteps context source (job item)) journal) :
     ∃ after, Extends initial after ∧ Extends after expected ∧
       (∀ item ∈ items, after.lookup (ReplayStore.returnKey (job item).branchStart) =
         some ⟨ReplayStore.returnRequest, outcome item⟩) ∧
       Writes region initial after ∧
-      Batch (sourceSteps blobs source) mode (items.map job) initial after := by
+      Batch (sourceSteps context source) mode (items.map job) initial after := by
   cases mode with
   | sequential =>
     induction items generalizing initial with
@@ -91,7 +91,7 @@ private theorem run_list {κ : Type} (expected initial : Journal) (items : List 
         Extends initial after ∧ Extends after expected ∧
         after.lookup (ReplayStore.returnKey (job item).branchStart) = some ⟨ReplayStore.returnRequest, outcome item⟩ ∧
         Writes (Owns (job item).branchStart) initial after ∧
-        Execution (sourceSteps blobs source) .parallel (job item).branchStart (sourceSteps blobs source (job item)) initial after := by
+        Execution (sourceSteps context source) .parallel (job item).branchStart (sourceSteps context source (job item)) initial after := by
       intro item
       by_cases member : item ∈ items
       · obtain ⟨after, valid⟩ := each item member initial (.refl _) consistent
@@ -118,8 +118,8 @@ private theorem join_records (expected journal : Journal) (branch current : Loca
       Writes (fun key => key = ReplayStore.valueKey current) journal after ∧
       after.lookup (ReplayStore.valueKey current) =
         some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, outcome⟩ ∧
-      ∀ fuel, (replay store blobs branch (fuel + 1) encode (.impure info (.parallel codec count branches label) next) current).run journal =
-        (replay store blobs branch (fuel + 1) encode (.impure info (.parallel codec count branches label) next) current).run after := by
+      ∀ fuel, (replay store context branch (fuel + 1) encode (.impure info (.parallel codec count branches label) next) current).run journal =
+        (replay store context branch (fuel + 1) encode (.impure info (.parallel codec count branches label) next) current).run after := by
   cases found : journal.lookup (ReplayStore.valueKey current) with
   | some record =>
     exact ⟨journal, .refl _, consistent, .refl _ _, found.trans ((consistent _ _ found).symm.trans known), by intros; rfl⟩
@@ -130,14 +130,14 @@ private theorem join_records (expected journal : Journal) (branch current : Loca
       (create_visible journal _ _).trans (congrArg some accepted.1), ?_⟩
     intro fuel
     simpa [collected, store, StateT.run, found] using
-      Recording.join_missing_is_cached encode journal blobs branch current fuel codec count branches next children found completed
+      Recording.join_missing_is_cached encode journal context branch current fuel codec count branches next children found completed
 
 private theorem parallel_runs (expected journal : Journal) (branch current : Location)
     (sameBranch : branch = Location.branchStart current)
     (encode : β → Json) (codec : Codec γ) (count : Nat)
     (branches : Fin count → Cloud M γ) (next : ArrsF (Control M) SourceSiteId (Array γ) β)
     (outcomes : Fin count → Except CloudError γ) (outcome : Exit)
-    (cursor : Cursor blobs source journal current encode (.impure info (.parallel codec count branches label) next))
+    (cursor : Cursor context source journal current encode (.impure info (.parallel codec count branches label) next))
     (consistent : Extends journal expected)
     (known : expected.lookup (ReplayStore.returnKey branch) = some ⟨ReplayStore.returnRequest, outcome⟩)
     (group : expected.lookup (ReplayStore.valueKey current) =
@@ -146,25 +146,25 @@ private theorem parallel_runs (expected journal : Journal) (branch current : Loc
     (childKnown : ∀ index : Fin count, expected.lookup (ReplayStore.returnKey (current.child index)) =
       some ⟨ReplayStore.returnRequest, Parallel.recorded codec.encode (outcomes index)⟩)
     (children : ∀ index : Fin count, ∀ after, Extends journal after → Extends after expected →
-      Verified blobs source mode expected (current.child index) (Parallel.recorded codec.encode (outcomes index))
-        (sourceSteps blobs source ⟨0, current.child index⟩) after)
+      Verified context source mode expected (current.child index) (Parallel.recorded codec.encode (outcomes index))
+        (sourceSteps context source ⟨0, current.child index⟩) after)
     (cached : ∀ after, Extends journal after → Extends after expected →
       after.lookup (ReplayStore.valueKey current) =
         some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩,
           Parallel.recorded (fun values => Json.arr (values.map codec.encode)) ((Array.ofFn outcomes).mapM id)⟩ →
-      Verified blobs source mode expected branch outcome
-        (fun fuel => replay store blobs branch fuel encode (.impure info (.parallel codec count branches label) next) current) after) :
-    Verified blobs source mode expected branch outcome
-      (fun fuel => replay store blobs branch fuel encode (.impure info (.parallel codec count branches label) next) current) journal := by
+      Verified context source mode expected branch outcome
+        (fun fuel => replay store context branch fuel encode (.impure info (.parallel codec count branches label) next) current) after) :
+    Verified context source mode expected branch outcome
+      (fun fuel => replay store context branch fuel encode (.impure info (.parallel codec count branches label) next) current) journal := by
   have joinRun : ∀ after, Extends journal after → Extends after expected →
       Recording.JoinReady expected after current →
-      Verified blobs source mode expected branch outcome
-        (fun fuel => replay store blobs branch fuel encode (.impure info (.parallel codec count branches label) next) current) after := by
+      Verified context source mode expected branch outcome
+        (fun fuel => replay store context branch fuel encode (.impure info (.parallel codec count branches label) next) current) after := by
     intro after grows compatible ready
-    obtain ⟨recorded, extension, consistentAfter, written, present, executes⟩ := join_records blobs expected after branch current encode codec count branches next _
+    obtain ⟨recorded, extension, consistentAfter, written, present, executes⟩ := join_records context expected after branch current encode codec count branches next _
       compatible group ready
     have complete := cached recorded (grows.trans extension) consistentAfter present
-    apply complete.extend_before blobs source mode (written.mono (fun key eq => eq ▸ Owns.value sameBranch))
+    apply complete.extend_before context source mode (written.mono (fun key eq => eq ▸ Owns.value sameBranch))
     refine ⟨0, 1, fun fuel enough => ?_⟩
     obtain ⟨n, rfl⟩ := Nat.exists_eq_succ_of_ne_zero (show fuel ≠ 0 by omega)
     simpa only [Nat.zero_add] using executes n
@@ -175,7 +175,7 @@ private theorem parallel_runs (expected journal : Journal) (branch current : Loc
     classical
     by_cases ready : Recording.JoinReady expected journal current
     · exact joinRun journal (.refl _) consistent ready
-    · obtain ⟨joined, grows, compatible, returns, childWrites, batch⟩ := run_list blobs source mode expected journal (List.finRange count)
+    · obtain ⟨joined, grows, compatible, returns, childWrites, batch⟩ := run_list context source mode expected journal (List.finRange count)
         (fun index => ⟨0, current.child index⟩)
         (fun index => Parallel.recorded codec.encode (outcomes index)) (Owns branch)
         (fun _ _ _ owned => Owns.child sameBranch owned)
@@ -188,8 +188,8 @@ private theorem parallel_runs (expected journal : Journal) (branch current : Loc
       have childRecords := fun index => returns index (List.mem_finRange index)
       have joinReady := Recording.JoinReady.of_children expected joined current codec count outcomes group childRecords
       have active := joinRun joined grows compatible joinReady
-      obtain ⟨after, extension, consistentAfter, returned, written, resumed⟩ := Verified.step blobs source mode
-        (cursor.extend blobs source grows) ⟨0, branch⟩ sameBranch outcome compatible known active
+      obtain ⟨after, extension, consistentAfter, returned, written, resumed⟩ := Verified.step context source mode
+        (cursor.extend context source grows) ⟨0, branch⟩ sameBranch outcome compatible known active
       refine ⟨after, grows.trans extension, consistentAfter, returned, childWrites.trans written, .fork (location := current) (count := count) (forked := journal) ?_ ?_ resumed⟩
       · refine ⟨1, fun fuel enough => ?_⟩
         obtain ⟨n, rfl⟩ := Nat.exists_eq_succ_of_ne_zero (show fuel ≠ 0 by omega)
@@ -207,7 +207,7 @@ private theorem parallel_runs (expected journal : Journal) (branch current : Loc
 private theorem finish_verified (expected journal : Journal) (branch : Location) (outcome : Exit)
     (consistent : Extends journal expected)
     (known : expected.lookup (ReplayStore.returnKey branch) = some ⟨ReplayStore.returnRequest, outcome⟩) :
-    Verified blobs source mode expected branch outcome (fun _ => Internal.finish store branch outcome) journal := by
+    Verified context source mode expected branch outcome (fun _ => Internal.finish store branch outcome) journal := by
   obtain ⟨after, grows, compatible, written, returned, finishes⟩ := Recording.finish_within journal expected branch outcome consistent known
   exact ⟨after, grows, compatible, returned, written, .done ⟨0, fun _ _ => finishes⟩⟩
 
@@ -217,37 +217,37 @@ theorem complete_runs {expected current} {program : Cloud M β} {outcome budget}
     (meaning : Specification.Complete expected current program outcome budget) :
     ∀ (encode : β → Json) journal branch, Extends journal expected →
       branch = Location.branchStart current →
-      Cursor blobs source journal current encode program →
+      Cursor context source journal current encode program →
       expected.lookup (ReplayStore.returnKey branch) =
         some ⟨ReplayStore.returnRequest, Parallel.recorded encode outcome⟩ →
-      Verified blobs source mode expected branch (Parallel.recorded encode outcome)
-        (fun fuel => replay store blobs branch fuel encode program current) journal := by
+      Verified context source mode expected branch (Parallel.recorded encode outcome)
+        (fun fuel => replay store context branch fuel encode program current) journal := by
   induction meaning with
   | pure value =>
     intro encode journal branch consistent same cursor known
-    apply (finish_verified blobs source mode expected journal branch _ consistent known).replace blobs source mode
+    apply (finish_verified context source mode expected journal branch _ consistent known).replace context source mode
     exact ⟨1, fun fuel => by simp [Nat.add_comm 1 fuel, replay, Parallel.recorded]⟩
   | fail error next =>
     intro encode journal branch consistent same cursor known
-    apply (finish_verified blobs source mode expected journal branch _ consistent known).replace blobs source mode
+    apply (finish_verified context source mode expected journal branch _ consistent known).replace context source mode
     exact ⟨1, fun fuel => by simp [Nat.add_comm 1 fuel, replay, Parallel.recorded]⟩
   | delay next rest ih =>
     intro encode journal branch consistent same cursor known
-    apply (ih encode journal branch consistent same (cursor.delay blobs source next) known).replace blobs source mode
+    apply (ih encode journal branch consistent same (cursor.delay context source next) known).replace context source mode
     exact ⟨1, fun fuel => by simp [Nat.add_comm 1 fuel, replay]⟩
   | exec codec label body next roundtrip present rest ih =>
     intro encode journal branch consistent same cursor known
-    obtain ⟨after, grows, compatible, written, recorded, executes⟩ := Recording.exec_within encode journal expected blobs branch _ codec label body next roundtrip consistent present
+    obtain ⟨after, grows, compatible, written, recorded, executes⟩ := Recording.exec_within encode journal expected context branch _ codec label body next roundtrip consistent present
     have continues := ih encode after branch compatible (by simpa using same)
-      ((cursor.extend blobs source grows).exec blobs source codec label body next recorded roundtrip) known
-    exact continues.extend_before blobs source mode (written.mono (fun key eq => eq ▸ Owns.value same)) ⟨1, 0, fun fuel _ => by simpa [Nat.add_comm] using executes fuel⟩
+      ((cursor.extend context source grows).exec context source codec label body next recorded roundtrip) known
+    exact continues.extend_before context source mode (written.mono (fun key eq => eq ▸ Owns.value same)) ⟨1, 0, fun fuel _ => by simpa [Nat.add_comm] using executes fuel⟩
   | parallelOk codec count branches label next outcomes roundtrip children returned collected present rest ihChildren ih =>
     intro encode journal branch consistent same cursor known
-    apply parallel_runs blobs source mode expected journal branch _ same encode codec count branches next outcomes _ cursor consistent known
+    apply parallel_runs context source mode expected journal branch _ same encode codec count branches next outcomes _ cursor consistent known
       (by simpa [collected, Parallel.recorded] using present) returned
     · intro index after grows compatible
-      have childCursor := (cursor.extend blobs source grows).child blobs source codec count branches next index
-      exact Verified.step blobs source mode childCursor ⟨0, _⟩ (Location.branchStart_child _ _).symm _ compatible (returned index)
+      have childCursor := (cursor.extend context source grows).child context source codec count branches next index
+      exact Verified.step context source mode childCursor ⟨0, _⟩ (Location.branchStart_child _ _).symm _ compatible (returned index)
         (ihChildren index codec.encode after _ compatible (Location.branchStart_child _ _).symm childCursor (returned index))
     · intro after grows compatible recorded
       have presentAfter := recorded
@@ -255,39 +255,39 @@ theorem complete_runs {expected current} {program : Cloud M β} {outcome budget}
       have size : _ := Parallel.sequence_size _ _ collected
       simp only [Array.size_ofFn] at size
       have continues := ih encode after branch compatible (by simpa using same)
-        ((cursor.extend blobs source grows).joined blobs source codec count branches next _ presentAfter (roundtrip.array codec _) size)
+        ((cursor.extend context source grows).joined context source codec count branches next _ presentAfter (roundtrip.array codec _) size)
         known
-      apply continues.replace blobs source mode
+      apply continues.replace context source mode
       exact ⟨1, fun fuel => by simpa only [Nat.add_comm 1, Parallel.recorded] using
-        Recording.group_success encode after blobs branch _ fuel codec count branches next _ roundtrip size presentAfter⟩
+        Recording.group_success encode after context branch _ fuel codec count branches next _ roundtrip size presentAfter⟩
   | parallelError codec count branches label next outcomes roundtrip children returned collected present ihChildren =>
     intro encode journal branch consistent same cursor known
-    apply parallel_runs blobs source mode expected journal branch _ same encode codec count branches next outcomes _ cursor consistent known
+    apply parallel_runs context source mode expected journal branch _ same encode codec count branches next outcomes _ cursor consistent known
       (by simpa [collected, Parallel.recorded] using present) returned
     · intro index after grows compatible
-      have childCursor := (cursor.extend blobs source grows).child blobs source codec count branches next index
-      exact Verified.step blobs source mode childCursor ⟨0, _⟩ (Location.branchStart_child _ _).symm _ compatible (returned index)
+      have childCursor := (cursor.extend context source grows).child context source codec count branches next index
+      exact Verified.step context source mode childCursor ⟨0, _⟩ (Location.branchStart_child _ _).symm _ compatible (returned index)
         (ihChildren index codec.encode after _ compatible (Location.branchStart_child _ _).symm childCursor (returned index))
     · intro after grows compatible recorded
       simp only [collected, Parallel.recorded] at recorded
-      apply (finish_verified blobs source mode expected after branch _ compatible known).replace blobs source mode
+      apply (finish_verified context source mode expected after branch _ compatible known).replace context source mode
       exact ⟨1, fun fuel => by simpa only [Nat.add_comm 1, Parallel.recorded] using
-        Recording.group_failure encode after blobs branch _ fuel codec count branches next _ recorded⟩
+        Recording.group_failure encode after context branch _ fuel codec count branches next _ recorded⟩
   | weaken complete enough ih => exact ih
 
 /-- From empty storage, the reference driver finishes and durably records the
 pure result. No correct cache, successful execution, or fairness is a premise. -/
 theorem finishes_from_empty {outcome} (evaluation : Pure.Evaluation source outcome) :
     ∃ bound journal, ∀ fuel, bound ≤ fuel →
-      (ReplayExecution.run blobs (fun _ : Unit => source) () mode fuel
+      (ReplayExecution.run context (fun _ : Unit => source) () mode fuel
         ⟨0, Location.root⟩).run [] = (.ok (), journal) ∧
       journal.lookup (ReplayStore.returnKey Location.root) =
         some ⟨ReplayStore.returnRequest, Parallel.recorded rootCodec.encode outcome⟩ := by
   obtain ⟨expected, budget, meaning, known⟩ := Specification.workflow_journal_exists evaluation rootCodec.encode
   let assignment : Assignment := ⟨0, Location.root⟩
-  have cursor := Cursor.root blobs source []
-  have active := complete_runs blobs source mode meaning rootCodec.encode [] Location.root (.empty _) (by simp) cursor known
-  obtain ⟨journal, _, _, returned, _, execution⟩ := Verified.step blobs source mode cursor assignment (by simp [assignment]) _ (.empty _) known active
+  have cursor := Cursor.root context source []
+  have active := complete_runs context source mode meaning rootCodec.encode [] Location.root (.empty _) (by simp) cursor known
+  obtain ⟨journal, _, _, returned, _, execution⟩ := Verified.step context source mode cursor assignment (by simp [assignment]) _ (.empty _) known active
   obtain ⟨bound, finishes⟩ := execution.runs
   refine ⟨bound + 1, journal, fun fuel enough => ⟨?_, returned⟩⟩
   obtain ⟨n, rfl⟩ := Nat.exists_eq_succ_of_ne_zero (show fuel ≠ 0 by omega)
@@ -298,10 +298,10 @@ theorem evaluates_from_empty {outcome} (evaluation : Pure.Evaluation source outc
     (roundtrip : Pure.RoundTrips rootCodec) :
     ∃ bound, ∀ fuel, bound ≤ fuel →
       let replay := match mode with
-        | .sequential => SequentialReplay.interpret store noBlobs fuel (fun _ : Unit => source) ()
+        | .sequential => SequentialReplay.interpret store pureContext fuel (fun _ : Unit => source) ()
         | .parallel => ParallelReplay.interpret fuel (fun _ : Unit => source) ()
       (replay.run []).1 = outcome := by
-  obtain ⟨bound, journal, finishes⟩ := finishes_from_empty noBlobs source mode evaluation
+  obtain ⟨bound, journal, finishes⟩ := finishes_from_empty pureContext source mode evaluation
   refine ⟨bound, fun fuel enough => ?_⟩
   obtain ⟨finished, returned⟩ := finishes fuel enough
   cases mode <;>

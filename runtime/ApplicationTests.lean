@@ -82,10 +82,11 @@ def run : IO Unit := do
       match (← journal.get).lookup key with
       | some existing => return existing
       | none => journal.modify ((key, record) :: ·); return record }
-  let blobs : BlobStorage IO := {
-    putBlob := fun _ => throw ⟨.unsupported, "unexpected blob"⟩
-    readBlob := fun _ => throw ⟨.unsupported, "unexpected blob"⟩
-    resolveBlob := fun _ => throw ⟨.unsupported, "unexpected blob"⟩ }
+  let blobs : ExecContext IO := {
+    blobs := {
+      putBlob := fun _ => throw ⟨.unsupported, "unexpected blob"⟩
+      readBlob := fun _ => throw ⟨.unsupported, "unexpected blob"⟩
+      resolveBlob := fun _ => throw ⟨.unsupported, "unexpected blob"⟩ } }
   let definition : RunDefinition := { entry := entry.info.entry, input := toJson (5 : Nat), resultSchema := entry.info.resultSchema }
   let historical : RunDefinition := { definition with image := some "sha256:old", program := some entry.info }
   let recovered : RunDefinition ← unwrap (fromJson? (toJson historical))
@@ -99,11 +100,11 @@ def run : IO Unit := do
   assertTrue (legacyDefinition.image.isNone && legacyDefinition.program.isNone) "Legacy source/release invented"
   let trace ← Trace.create "config-test"
   let assignment : Assignment := ⟨0, Location.root⟩
-  let limited ← registered.execute { interpreterFuel := 1 } definition "test" ⟨store, pure #[]⟩ blobs trace assignment {}
+  let limited ← registered.execute { interpreterFuel := 1 } definition "test" ⟨store, pure #[]⟩ trace assignment blobs
   assertError limited.progress .protocol
   assertTrue ((← journal.get).lookup (ReplayStore.returnKey Location.root)).isNone
     "Fuel exhaustion published completion"
-  let completed ← registered.execute { interpreterFuel := 10 } definition "test" ⟨store, pure #[]⟩ blobs trace assignment {}
+  let completed ← registered.execute { interpreterFuel := 10 } definition "test" ⟨store, pure #[]⟩ trace assignment blobs
   assertOutcome completed.progress (.ok .done)
   let some root := (← journal.get).lookup (ReplayStore.returnKey Location.root)
     | throw (IO.userError "Configured worker did not finish")
@@ -122,13 +123,13 @@ def run : IO Unit := do
     entry := throwing.info.entry, input := toJson (5 : Nat), resultSchema := throwing.info.resultSchema }
   for _ in [:2] do
     let done ← (registerProgram throwing #[]).execute {} throwingDefinition "test"
-      ⟨store, pure #[]⟩ blobs trace assignment {}
+      ⟨store, pure #[]⟩ trace assignment blobs
     assertOutcome done.progress (.ok .done)
   assertEq (← calls.get) 1 "Registered worker retried user IO"
   assertOutcome (← store.outcome.run) (.ok (some (.failure ⟨.application, "application exception"⟩)))
   -- The same worker can execute another workflow after that failure.
   journal.set []
-  let next ← registered.execute {} definition "test" ⟨store, pure #[]⟩ blobs trace assignment {}
+  let next ← registered.execute {} definition "test" ⟨store, pure #[]⟩ trace assignment blobs
   assertOutcome next.progress (.ok .done)
   assertOutcome (← store.outcome.run) (.ok (some (.success (toJson (7 : Nat)))))
   journal.set []
@@ -137,9 +138,9 @@ def run : IO Unit := do
     run := fun _ => Cloud.exec fun env => pure env.currentWorker.cpus }
   let resourceDefinition : RunDefinition := {
     entry := resources.info.entry, input := toJson (), resultSchema := resources.info.resultSchema }
-  let environment : LeanCloud.Environment := { currentWorker := { id := "test", cpus := 6 } }
+  let environment : ExecContext IO := { blobs with currentWorker := { id := "test", cpus := 6 } }
   let used ← (registerProgram resources #[]).execute {} resourceDefinition "test"
-    ⟨store, pure #[]⟩ blobs trace assignment environment
+    ⟨store, pure #[]⟩ trace assignment environment
   assertOutcome used.progress (.ok .done)
   assertOutcome (← store.outcome.run) (.ok (some (.success (toJson (6 : Nat)))))
   let registry : Registry := ⟨#[program.register]⟩

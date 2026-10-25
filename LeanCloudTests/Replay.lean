@@ -12,10 +12,11 @@ private def memoryStore (saved : IO.Ref Records) : ReplayStore IO where
     | some existing => (existing, records)
     | none => (proposed, (key, proposed) :: records)
 
-private def noBlobs : BlobStorage IO where
-  putBlob _ := throw ⟨.unsupported, "Unexpected blob operation"⟩
-  readBlob _ := throw ⟨.unsupported, "Unexpected blob operation"⟩
-  resolveBlob _ := throw ⟨.unsupported, "Unexpected blob operation"⟩
+private def noBlobs : ExecContext IO where
+  blobs := {
+    putBlob _ := throw ⟨.unsupported, "Unexpected blob operation"⟩
+    readBlob _ := throw ⟨.unsupported, "Unexpected blob operation"⟩
+    resolveBlob _ := throw ⟨.unsupported, "Unexpected blob operation"⟩ }
 
 private def root : Assignment := ⟨0, Location.root⟩
 
@@ -32,11 +33,9 @@ private def rejectReplay [Codec α] (name : String) (source : Cloud IO α)
 
 private def captured : Cloud IO Nat := Cloud.pure (fun _ => 7) "capture"
 private def capturedRequest : Request := ⟨"exec", "nat/v1", toJson "capture"⟩
-private def group : Cloud IO (Array Nat) := Cloud.parallel fun _ => #[pure 10, pure 20]
+private def group : Cloud IO (Array Nat) := Cloud.parallel $ #[pure 10, pure 20]
 private def groupRequest : Request := ⟨"parallel", "array(nat/v1)/v1", toJson (2 : Nat)⟩
-private def groupLocation : Location := Location.root.next
-private def planningRecords : Records := [(ReplayStore.valueKey Location.root,
-  ⟨⟨"exec", "environment/v1", toJson "parallel"⟩, .success (toJson ({} : LeanCloud.Environment))⟩)]
+private def groupLocation : Location := Location.root
 
 private def invalidReplayCases : Array TestCase :=
   let valueKey := ReplayStore.valueKey Location.root
@@ -60,23 +59,23 @@ private def invalidReplayCases : Array TestCase :=
     rejectReplay "invalid-return-record" captured root
       [(ReplayStore.returnKey Location.root, ⟨capturedRequest, .success (toJson (7 : Nat))⟩)] .divergence,
     rejectReplay "child-outside-group" group
-      ⟨0, groupLocation.child 2⟩ planningRecords .divergence,
+      ⟨0, groupLocation.child 2⟩ ([] : Records) .divergence,
     rejectReplay "missing-joined-prefix" group
-      ⟨0, groupLocation.next.child 0⟩ planningRecords .divergence,
+      ⟨0, groupLocation.next.child 0⟩ ([] : Records) .divergence,
     rejectReplay "changed-child-count" group root
       ((ReplayStore.valueKey groupLocation,
-        ⟨{ groupRequest with payload := toJson (1 : Nat) }, .success (toJson (#[10] : Array Nat))⟩) :: planningRecords) .divergence,
+        ⟨{ groupRequest with payload := toJson (1 : Nat) }, .success (toJson (#[10] : Array Nat))⟩) :: ([] : Records)) .divergence,
     rejectReplay "wrong-result-count" group root
-      ((ReplayStore.valueKey groupLocation, ⟨groupRequest, .success (toJson (#[10] : Array Nat))⟩) :: planningRecords) .divergence,
+      ((ReplayStore.valueKey groupLocation, ⟨groupRequest, .success (toJson (#[10] : Array Nat))⟩) :: ([] : Records)) .divergence,
     rejectReplay "invalid-child-value" group root
-      ((ReplayStore.valueKey groupLocation, ⟨groupRequest, .success (toJson #["ten", "twenty"])⟩) :: planningRecords) .codec
+      ((ReplayStore.valueKey groupLocation, ⟨groupRequest, .success (toJson #["ten", "twenty"])⟩) :: ([] : Records)) .codec
   ]
 
 /-- Exercise real worker steps in a chosen completion order, then compare with
 both the direct interpreter and an explicit expected outcome. -/
 private def reverseCompletion (fails : Bool) : TestCase :=
   ⟨s!"replay/reverse-completion/{if fails then "errors" else "values"}", do
-    let source : Cloud IO (Array Nat) := Cloud.parallel fun _ =>
+    let source : Cloud IO (Array Nat) := Cloud.parallel $
       if fails then #[Cloud.fail "first", Cloud.fail "second", pure 30]
       else #[pure 10, pure 20, pure 30]
     let expected : Except CloudError (Array Nat) :=
@@ -109,7 +108,7 @@ def replayCases : Array TestCase := invalidReplayCases ++ #[
     let saved ← IO.mkRef ([] : Records)
     let store := memoryStore saved
     assertOutcome (← resume store group) (.ok (.fork groupLocation 2))
-    assertEq (← saved.get) planningRecords "Suspension created more than the planning record"
+    assertEq (← saved.get) ([] : Records) "Suspension wrote a journal record"
     assertOutcome (← resume store group ⟨1, groupLocation.child 1⟩) (.ok .done)
     let partialRecords ← saved.get
     assertOutcome (← resume store group) (.ok (.fork groupLocation 2))
@@ -124,11 +123,11 @@ def replayCases : Array TestCase := invalidReplayCases ++ #[
     let saved ← IO.mkRef ([] : Records)
     let store := memoryStore saved
     let source : Cloud IO Nat := do
-      let values ← Cloud.parallel fun _ => (#[] : Array (Cloud IO Nat))
+      let values ← Cloud.parallel $ (#[] : Array (Cloud IO Nat))
       return values.size + 42
     assertOutcome (← resume store source) (.ok .done)
     assertOutcome (← store.outcome.run) (.ok (some (.success (toJson (42 : Nat)))))
-    assertEq (← saved.get).length 3 "Expected planning, empty join, and root return only"⟩,
+    assertEq (← saved.get).length 2 "Expected empty join and root return only"⟩,
   ⟨"replay/reconstruction-fuel-and-observations", do
     let calls ← IO.mkRef (#[] : Array String)
     let counted (label : String) (value : Nat) : Cloud IO Nat := Cloud.exec (fun _ => do
@@ -136,16 +135,16 @@ def replayCases : Array TestCase := invalidReplayCases ++ #[
       return value) label
     let source : Cloud IO Nat := do
       let value ← counted "prefix" 7
-      let values ← Cloud.parallel fun _ => #[counted "child" (value + 1)]
+      let values ← Cloud.parallel $ #[counted "child" (value + 1)]
       return values[0]!
     let saved ← IO.mkRef ([] : Records)
-    let fork := Location.root.next.next
+    let fork := Location.root.next
     assertOutcome (← resume (memoryStore saved) source) (.ok (.fork fork 1))
     let prefixRecords ← saved.get
     let child := fork.child 0
     let assignment : Assignment := ⟨1, child⟩
-    -- Replay prefix and planning, descend at the fork, execute child, return.
-    let path := #[Location.root, Location.root.next, fork, child, child.next]
+    -- Replay prefix, descend at the fork, execute child, return.
+    let path := #[Location.root, fork, child, child.next]
     for fuel in [:7] do
       saved.set prefixRecords
       calls.set #[]
@@ -153,11 +152,11 @@ def replayCases : Array TestCase := invalidReplayCases ++ #[
       let observer : ReplayInterpreter.Observer IO := fun location _ _ => visits.modify (·.push location)
       let outcome ← (ReplayInterpreter.step (memoryStore saved) noBlobs fuel
         (fun _ : Unit => source) () assignment (some observer)).run
-      if fuel < 5 then assertError outcome .protocol
+      if fuel < 4 then assertError outcome .protocol
       else assertOutcome outcome (.ok .done)
       assertEq (← visits.get) (path.extract 0 fuel) "Phase transition changed source observations"
-      assertEq (← calls.get) (if fuel < 4 then #[] else #["child"]) "Reconstruction executed user code"
-      assertEq ((← saved.get).lookup (ReplayStore.returnKey child)).isSome (fuel ≥ 5)
+      assertEq (← calls.get) (if fuel < 3 then #[] else #["child"]) "Reconstruction executed user code"
+      assertEq ((← saved.get).lookup (ReplayStore.returnKey child)).isSome (fuel ≥ 4)
         "Phase transition consumed extra fuel"
     -- An already completed assignment bypasses both phases, even without fuel.
     let visit : ReplayInterpreter.Observer IO := fun _ _ _ => throw (IO.userError "Observed a completed assignment")
@@ -184,12 +183,12 @@ def replayCases : Array TestCase := invalidReplayCases ++ #[
       return value) label
     let source : Cloud IO (Array Nat) := do
       let value ← counted "prefix" 10
-      let values ← Cloud.parallel fun _ => #[counted "child-0" (value + 1), counted "child-1" (value + 2)]
+      let values ← Cloud.parallel $ #[counted "child-0" (value + 1), counted "child-1" (value + 2)]
       let _ ← counted "after" 0
       return values
     let saved ← IO.mkRef ([] : Records)
     let store := memoryStore saved
-    let fork := Location.root.next.next
+    let fork := Location.root.next
     for _ in [:2] do assertOutcome (← resume store source) (.ok (.fork fork 2))
     for index in [1, 0] do
       let child := fork.child index
@@ -254,7 +253,7 @@ def replayCases : Array TestCase := invalidReplayCases ++ #[
       calls.modify (·.push index)
       if index < 2 then throw (IO.userError s!"error-{index}")
       return index) s!"branch-{index}"
-    let source : Cloud IO (Array Nat) := Cloud.parallel fun _ => branches
+    let source : Cloud IO (Array Nat) := Cloud.parallel $ branches
     let expected : Except CloudError (Array Nat) := .error ⟨.application, "error-0"⟩
     assertOutcome (← (DirectInterpreter.interpret noBlobs (fun _ : Unit => source) ()).run) expected
     assertEq (← calls.get) #[0, 1, 2] "A throwing branch skipped later siblings"

@@ -22,14 +22,13 @@ structure Ports (m : Type → Type u) where
   inbox : Mailbox m WorkerMessage
   send : SchedulerMessage → m Unit
   observe : ObservedStore m
-  blobs : BlobStorage m
+  context : ExecContext m
   retryPolls : Nat := 16
 
 def execute [Monad m] [Codec α] (id : WorkerId) (store : ObservedStore m)
-    (blobs : BlobStorage m) (fuel : Nat) (program : ι → Cloud m α) (input : ι)
-    (assignment : Assignment) (observer : Option (ReplayInterpreter.Observer m) := none)
-    (environment : Environment := {}) : m Report := do
-  let progress ← (ReplayInterpreter.step store.records blobs fuel program input assignment observer environment).run
+    (context : ExecContext m) (fuel : Nat) (program : ι → Cloud m α) (input : ι)
+    (assignment : Assignment) (observer : Option (ReplayInterpreter.Observer m) := none) : m Report := do
+  let progress ← (ReplayInterpreter.step store.records context fuel program input assignment observer).run
   return ⟨id, assignment.attempt, progress, ← store.confirmed⟩
 
 /-- Publish a terminal coordination intent. Only a worker touches the root
@@ -52,7 +51,7 @@ def turn [Monad m] [Codec α] (ports : Ports m) (fuel : Nat)
     match delivery.message with
     | .execute assignment =>
       unless (state.cancelledThrough.any (assignment.attempt ≤ ·) || state.reported.any (assignment.attempt ≤ ·) : Bool) do
-        let report ← execute ports.id ports.observe ports.blobs fuel program input assignment observer
+        let report ← execute ports.id ports.observe ports.context fuel program input assignment observer
         ports.send (.report report)
         state := { state with reported := some assignment.attempt, awaitingAck := true }
       state := { state with retryIn := max 1 ports.retryPolls }

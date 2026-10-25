@@ -11,11 +11,6 @@ private abbrev Affinity := Std.HashMap String (Array Nat)
 private def moduleNames (modules : Array Module) (initial : Names := {}) : Names :=
   modules.foldl (fun names m => names.insert m.name) initial
 
-/-- Use every advertised CPU; a missing pool falls back to the executing worker. -/
-def workerCpus (environment : Environment) : Array Nat :=
-  let workers := if environment.workers.isEmpty then #[environment.currentWorker] else environment.workers
-  workers.map (max 1 ·.cpus)
-
 /-- Longest remaining dependency paths first, with input order breaking ties.
 The input is topological. Each module initially costs one CPU time unit. -/
 def criticalOrder (modules : Array Module) : Array Module :=
@@ -209,8 +204,8 @@ There is one slot per advertised worker; the caller omits empty slots. Costs
 assume one CPU time unit per module, not measured compilation or transfer times.
 This is a deterministic heuristic, not an optimality or placement guarantee. -/
 def partition (pending : Array Module) (done : Array BuildResult)
-    (environment : Environment) (limit : Nat) : Array (Array Module) :=
-  let cpus := workerCpus environment
+    (cpus : Array Nat) (limit : Nat) : Array (Array Module) :=
+  let cpus := if cpus.isEmpty then #[1] else cpus.map (max 1 ·)
   let ordered := criticalOrder pending
   let completed := done.foldl (fun names r => names.insert r.name) ({} : Names)
   let first := fillRound ordered completed cpus limit

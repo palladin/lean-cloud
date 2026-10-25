@@ -37,7 +37,7 @@ inductive Evaluation {m : Type → Type u} [Monad m] :
       (next : ArrsF (Control m) SourceSiteId α β)
       (roundtrip : codec.decode (codec.encode (body ())) = .ok (body ()))
       (rest : Evaluation (next.apply (body ())) outcome) :
-      Evaluation (.impure info (.command codec (.exec label (fun _ => pure (body ())))) next) outcome
+      Evaluation (.impure info (.command codec label (fun _ => pure (body ()))) next) outcome
   | parallelOk {info : Option SourceSiteId} (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
       (label : String) (next : ArrsF (Control m) SourceSiteId (Array α) β) (outcomes : Fin count → Except CloudError α)
       (roundtrip : RoundTrips codec)
@@ -53,10 +53,10 @@ inductive Evaluation {m : Type → Type u} [Monad m] :
       Evaluation (.impure info (.parallel codec count branches label) next) (.error error)
 
 private theorem eval_parallel {m : Type → Type u} [Monad m] [LawfulMonad m]
-    (blobs : BlobStorage m) (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
+    (context : ExecContext m) (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
     (outcomes : Fin count → Except CloudError α)
-    (children : ∀ index, (eval blobs (branches index)).run = pure (outcomes index)) :
-    (evalControl blobs (.parallel codec count branches label)).run =
+    (children : ∀ index, (eval context (branches index)).run = pure (outcomes index)) :
+    (evalControl context (.parallel codec count branches label)).run =
       pure ((Array.ofFn outcomes).mapM id) := by
   have same := funext children
   simp only [evalControl]
@@ -67,9 +67,9 @@ private theorem eval_parallel {m : Type → Type u} [Monad m] [LawfulMonad m]
 /-- The actual direct interpreter returns the witnessed outcome without any
 base-monad effects. In particular it does not read or modify an external world. -/
 theorem evaluation_matches_direct {m : Type → Type u} [Monad m] [LawfulMonad m]
-    (blobs : BlobStorage m) {program : Cloud m α} {outcome}
+    (context : ExecContext m) {program : Cloud m α} {outcome}
     (evaluation : Evaluation program outcome) :
-    (eval blobs program).run = pure outcome := by
+    (eval context program).run = pure outcome := by
   induction evaluation with
   | pure value => rfl
   | fail error next => simp [eval, evalControl]
@@ -78,16 +78,16 @@ theorem evaluation_matches_direct {m : Type → Type u} [Monad m] [LawfulMonad m
     simpa [evalControl] using ih
   | exec codec label body next roundtrip rest ih =>
     rw [Direct.eval_impure]
-    simpa [evalControl, BlobStorage.execute] using ih
+    simpa [evalControl] using ih
   | parallelOk codec count branches label next outcomes roundtrip children collected rest ihChildren ih =>
     rw [Direct.eval_impure]
-    change (evalControl blobs (.parallel codec count branches label)).run >>= _ = _
-    rw [eval_parallel blobs codec count branches outcomes ihChildren, collected]
+    change (evalControl context (.parallel codec count branches label)).run >>= _ = _
+    rw [eval_parallel context codec count branches outcomes ihChildren, collected]
     simpa [ExceptT.bindCont, ExceptT.run] using ih
   | parallelError codec count branches label next outcomes roundtrip children collected ihChildren =>
     rw [Direct.eval_impure]
-    change (evalControl blobs (.parallel codec count branches label)).run >>= _ = _
-    rw [eval_parallel blobs codec count branches outcomes ihChildren, collected]
+    change (evalControl context (.parallel codec count branches label)).run >>= _ = _
+    rw [eval_parallel context codec count branches outcomes ihChildren, collected]
     simp [ExceptT.bindCont]
 
 end LeanCloud.Proofs.Pure

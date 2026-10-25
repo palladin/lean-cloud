@@ -150,7 +150,7 @@ def poolCases : Array TestCase := #[
     let source := lower (.parallel [.value 7, .value 9]) (m := SimM SimulationBackend.World)
     let runJob (world : SimulationBackend.World) (worker : String) (fuel : Nat) (job : Assignment) :=
       unwrap (evaluate 10000 (Worker.execute worker (SimulationBackend.observed worker)
-        SimulationBackend.blobs fuel source 0 job) world)
+        SimulationBackend.context fuel source 0 job) world)
     let state ← change {} (.submit "failed")
     let (state, id, root) ← takeJob state "worker1"
     let (fork, world) ← runJob {} "worker1" 1000 root

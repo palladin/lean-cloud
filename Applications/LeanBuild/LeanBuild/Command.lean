@@ -18,7 +18,7 @@ def main (args : List String) : IO UInt32 := do
       let tools ← Tools.fromEnvironment
       let request : Request ← decode input
       IO.ofExcept request.validate
-      let .ok report ← (LeanCloud.DirectInterpreter.interpret cfg.objects.storage
+      let .ok report ← (LeanCloud.DirectInterpreter.interpret cfg.objects.executionContext
         (workflow (tools.backend cfg.objects)) request).run
         | throw (IO.userError "Build workflow failed")
       IO.FS.writeFile output (toJson report).pretty

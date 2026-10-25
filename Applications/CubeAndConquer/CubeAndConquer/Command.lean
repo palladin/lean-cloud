@@ -59,7 +59,7 @@ def main (args : List String) : IO UInt32 := do
       let store ← objects config
       let tools ← Tools.fromEnvironment
       let request : Request ← readJson requestPath
-      let outcome ← (DirectInterpreter.interpret store.storage (workflow (backend tools store)) request).run
+      let outcome ← (DirectInterpreter.interpret store.executionContext (workflow (backend tools store)) request).run
       match outcome with
       | .ok report => IO.println (toJson report).pretty
       | .error error => throw (IO.userError error.message)

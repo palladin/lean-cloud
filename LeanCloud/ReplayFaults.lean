@@ -64,10 +64,12 @@ def store : ReplayStore WorkerM where
   read key := atomic (.read key) (fun journal => (journal.lookup key, journal))
   create key record := atomic (.create key) (ReplayModel.store.create key record)
 
-def noBlobs : BlobStorage WorkerM where
-  putBlob _ := throw ⟨.unsupported, "User blobs are outside the pure replay model"⟩
-  readBlob _ := throw ⟨.unsupported, "User blobs are outside the pure replay model"⟩
-  resolveBlob _ := throw ⟨.unsupported, "User blobs are outside the pure replay model"⟩
+def pureContext : ExecContext WorkerM where
+  blobs := {
+    putBlob _ := throw ⟨.unsupported, "User blobs are outside the pure replay model"⟩
+    readBlob _ := throw ⟨.unsupported, "User blobs are outside the pure replay model"⟩
+    resolveBlob _ := throw ⟨.unsupported, "User blobs are outside the pure replay model"⟩
+  }
 
 /-- A completed worker returns the recorded outcome. Scheduling never reads the
 journal to retrieve it. A suspended worker reports which children are needed. -/
@@ -79,7 +81,7 @@ inductive Report where
 /-- One attempt, including reading the durable result into the worker's reply. -/
 def attempt [Codec α] (fuel : Nat) (program : ι → Cloud WorkerM α) (input : ι)
     (assignment : Assignment) : ExceptT CloudError WorkerM Report := do
-  match ← ReplayInterpreter.step store noBlobs fuel program input assignment with
+  match ← ReplayInterpreter.step store pureContext fuel program input assignment with
   | .fork location count => return .fork location count
   | .done =>
       let some outcome ← store.outcome assignment.branchStart

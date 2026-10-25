@@ -111,17 +111,6 @@ def Sink.records (sink : Sink) (store : ReplayStore IO) : ReplayStore IO where
     sink.emit "recorded" (operation recorded.request)
     return recorded
 
-def Sink.blobs (sink : Sink) (storage : BlobStorage IO) : BlobStorage IO where
-  putBlob bytes := do
-    sink.emit "execute" "putBlob"
-    storage.putBlob bytes
-  readBlob ref := do
-    sink.emit "execute" "readBlob"
-    storage.readBlob ref
-  resolveBlob name := do
-    sink.emit "execute" "resolveBlob"
-    storage.resolveBlob name
-
 /-- Wrap only IO bodies, preserving the effect tree, requests, and record keys.
 The bound limits diagnostic traversal; exhausting it leaves the program intact. -/
 def Sink.instrument (sink : Sink) (fuel : Nat) (program : Cloud IO α) : Cloud IO α :=
@@ -130,9 +119,9 @@ def Sink.instrument (sink : Sink) (fuel : Nat) (program : Cloud IO α) : Cloud I
   | _, EffF.pure _ _ => program
   | fuel + 1, EffF.impure info control next =>
     let control := match control with
-      | .command codec (.exec label body) => .command codec (.exec label fun environment => do
+      | .command codec label body => .command codec label fun environment => do
           sink.emit "execute" label
-          body environment)
+          body environment
       | .parallel codec count branches label =>
           .parallel codec count (fun i => sink.instrument fuel (branches i)) label
       | other => other
