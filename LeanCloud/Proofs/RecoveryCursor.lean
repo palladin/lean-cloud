@@ -21,7 +21,7 @@ inductive Cursor : Journal → {β : Type} → Location → (β → Json) → Cl
       (decoded : codec.decode (codec.encode (body ())) = .ok (body ())) :
       Cursor journal current.next encode (next.apply (body ())) (cost + 1)
   | joined {info} (codec : Codec β) (count : Nat) (branches : Fin count → Cloud WorkerM β)
-      {label : String} (next : ArrsF (Control WorkerM) SourceSiteId (Array β) γ) (values : Array β)
+      {label : ParallelLabel} (next : ArrsF (Control WorkerM) SourceSiteId (Array β) γ) (values : Array β)
       (cursor : Cursor journal current encode (.impure info (.parallel codec count branches label) next) cost)
       (present : journal.lookup (ReplayStore.valueKey current) =
         some ⟨⟨"parallel", s!"array({codec.schema})/v1", toJson count⟩, .success (Json.arr (values.map codec.encode))⟩)
@@ -29,7 +29,7 @@ inductive Cursor : Journal → {β : Type} → Location → (β → Json) → Cl
       (size : values.size = count) :
       Cursor journal current.next encode (next.apply values) (cost + 1)
   | child {info} (codec : Codec β) (count : Nat) (branches : Fin count → Cloud WorkerM β)
-      {label : String} (next : ArrsF (Control WorkerM) SourceSiteId (Array β) γ)
+      {label : ParallelLabel} (next : ArrsF (Control WorkerM) SourceSiteId (Array β) γ)
       (cursor : Cursor journal current encode (.impure info (.parallel codec count branches label) next) cost)
       (index : Fin count) : Cursor journal (current.child index) codec.encode (branches index) (cost + 1)
 

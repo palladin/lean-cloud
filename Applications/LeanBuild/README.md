@@ -57,6 +57,10 @@ not install toolchains or select a different execution platform.
    Lake completes native compilation, C FFI, linking, custom targets, and dynamic
    dependencies. Publish the complete workspace as one file manifest.
 
+In `watch`, each round's module count advances when all its jobs finish, so the
+last round reaches `100%`. The workflow completes after the final Lake target
+build and artifact publication also finish.
+
 For `Base → [Left, Right] → Final`, one job suffices if its worker has two CPUs.
 For `Base → 1,024 independent modules` on four eight-CPU workers, the first job
 publishes `Base`; the next round runs four jobs of 256 modules. Keeping that

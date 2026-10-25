@@ -50,6 +50,36 @@ private def text (nav : Watch.Navigation) (width := 180) (height := 40) (trace :
 private def has (text fragment : String) : Bool := (text.splitOn fragment).length > 1
 
 public def cases : Array TestCase := #[
+  ⟨"console.tree.progress-changes-only-after-all-children-finish", do
+    let start := "9,030/9,031 · 99%"
+    let finish := "9,031/9,031 · 100%"
+    let labeled : Trace.Step := { workerStep 0 child fork with
+      event := { (workerStep 0 child fork).event with activity := "parallel-label", operation := start }
+      parallel := some ⟨1, ⟨start, finish⟩⟩ }
+    let title (trace : Array Trace.Step) (jobs : Array BranchObservation := #[]) :=
+      let entries := LeanCloudCli.BranchTree.current trace jobs
+      (LeanCloudCli.BranchTree.rows entries {}).find? (·.fork == some fork) |>.map (·.title)
+    let running := #[labeled, jobStep 1 ⟨child, child, false, .running "worker2" 1 100⟩]
+    assertEq (title running) (some start) "Running final module prematurely displayed 100%"
+    let done := running.push (jobStep 2 ⟨child, child, false, .done⟩)
+    -- Completion survives compaction, JSON/cache round trips and subsequent replay.
+    let compact := Trace.latest (Trace.merge #[] (done.push { labeled with
+      event := { labeled.event with seq := 3 }, timestamp := "2026-01-01T00:00:03Z" }))
+    let cached ← unwrap (fromJson? (α := Array Trace.Step) (toJson compact))
+    assertEq (title cached) (some finish) "Completed final module stayed at 99%"
+    let view := text { tree := { selected := some "parallel/0:2" } } (trace := cached)
+    assertTrue (has view finish && !has view start) "Tree and code panel disagreed on completed progress"
+    -- The current scheduler snapshot must override stale completed observations.
+    assertEq (title cached #[BranchObservation.ofJob ⟨child, child, false, .pending⟩]) (some start)
+    let incomplete := done.set! 0 { labeled with parallel := some ⟨2, ⟨start, finish⟩⟩ }
+    assertEq (title incomplete) (some start) "An incomplete child page prematurely displayed completion"
+    let stopped := running.push { jobStep 2 ⟨Location.root, fork, false, .waiting #[child]⟩ with
+      event := { (jobStep 2 ⟨Location.root, fork, false, .waiting #[child]⟩).event with activity := "killed" } }
+    assertEq (title stopped) (some start) "Killing a running group fabricated completed progress"
+    -- Old observations have only a string; do not guess a progress count from it.
+    let legacy := toJson labeled |>.setObjVal! "parallel" Json.null
+    let legacy ← unwrap (fromJson? (α := Trace.Step) legacy)
+    assertEq (title (done.set! 0 legacy)) (some start)⟩,
   ⟨"console.tree.parallel-labels-survive-replay-and-completion", do
     let labeled (seq : Nat) (owner location : Location) (label : String) :=
       { workerStep seq owner location with event := {

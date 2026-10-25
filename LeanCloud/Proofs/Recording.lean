@@ -4,7 +4,7 @@ import LeanCloud.Proofs.JournalMerge
 
 namespace LeanCloud.Proofs.Recording
 
-variable {label : String}
+variable {label : ParallelLabel}
 open Lean LeanEff ReplayModel ReplayInterpreter JournalMerge JournalRegion
 
 variable {info : Option SourceSiteId}

@@ -1,4 +1,5 @@
 import LeanCloud.Telemetry
+import LeanCloud.ParallelLabel
 
 namespace LeanCloud.Observations
 open Lean
@@ -12,9 +13,11 @@ structure Step where
   branch : Option Location := none
   /-- A scheduler observation after persisting a branch transition. -/
   job : Option BranchObservation := none
+  /-- Optional labels carried by a parallel observation, including its final text. -/
+  parallel : Option ParallelDisplay := none
   deriving ToJson
 
-instance : Inhabited Step := ⟨⟨"", ⟨"", 0, 0, "", none, "", "", "", "", none⟩, none, none, none⟩⟩
+instance : Inhabited Step := ⟨{ timestamp := "", event := ⟨"", 0, 0, "", none, "", "", "", "", none⟩ }⟩
 
 /-- Old trace caches remain readable. Absent or malformed telemetry never
 fabricates metrics or discards an otherwise valid execution observation. -/
@@ -24,7 +27,8 @@ instance : FromJson Step where
              event := ← json.getObjValAs? ExecutionEvent "event"
              resources := (json.getObjValAs? ResourceSample "resources").toOption
              branch := (json.getObjValAs? Location "branch").toOption
-             job := (json.getObjValAs? BranchObservation "job").toOption }
+             job := (json.getObjValAs? BranchObservation "job").toOption
+             parallel := (json.getObjValAs? ParallelDisplay "parallel").toOption }
 
 def Step.id (step : Step) : String :=
   (toJson (step.timestamp, step.event.worker, step.event.session, step.event.seq)).compress

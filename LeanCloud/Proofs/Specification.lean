@@ -38,7 +38,7 @@ inductive Complete {m : Type → Type u} [Monad m] (expected : Journal) :
       Complete expected current (.impure info (.command codec label (fun _ => pure (body ()))) next)
         outcome (budget + 1)
   | parallelOk {info : Option SourceSiteId} (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
-      (label : String) (next : ArrsF (Control m) SourceSiteId (Array α) β) (outcomes : Fin count → Except CloudError α)
+      (label : ParallelLabel) (next : ArrsF (Control m) SourceSiteId (Array α) β) (outcomes : Fin count → Except CloudError α)
       (roundtrip : Pure.RoundTrips codec)
       (children : ∀ index, Complete expected (current.child index) (branches index) (outcomes index) childBudget)
       (returned : ∀ index, expected.lookup (ReplayStore.returnKey (current.child index)) =
@@ -50,7 +50,7 @@ inductive Complete {m : Type → Type u} [Monad m] (expected : Journal) :
       Complete expected current (.impure info (.parallel codec count branches label) next) outcome
         (childBudget + budget + 1)
   | parallelError {info : Option SourceSiteId} (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
-      (label : String) (next : ArrsF (Control m) SourceSiteId (Array α) β) (outcomes : Fin count → Except CloudError α)
+      (label : ParallelLabel) (next : ArrsF (Control m) SourceSiteId (Array α) β) (outcomes : Fin count → Except CloudError α)
       (roundtrip : Pure.RoundTrips codec)
       (children : ∀ index, Complete expected (current.child index) (branches index) (outcomes index) childBudget)
       (returned : ∀ index, expected.lookup (ReplayStore.returnKey (current.child index)) =

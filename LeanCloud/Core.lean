@@ -60,10 +60,12 @@ def exec [MonadCloudExec m] [Codec α] (body : Environment m → m α) (label : 
   send (.command inferInstance label fun context =>
     MonadCloudExec.capture (body (context.map MonadCloudExec.restore)))
 
-/-- Fork an explicit array. The optional label is display metadata, not a replay
-record. Planning that depends on live capacity must use an explicit `exec`. -/
-def parallel [Codec α] (branches : Array (Cloud m α)) (label : String := "") : Cloud m (Array α) :=
-  send (.parallel inferInstance branches.size (fun index => branches[index]) label)
+/-- Fork an explicit array. Labels are display metadata, not replay records.
+`completedLabel`, when supplied, replaces `label` once all children finish.
+Planning that depends on live capacity must use an explicit `exec`. -/
+def parallel [Codec α] (branches : Array (Cloud m α)) (label : String := "")
+    (completedLabel : String := "") : Cloud m (Array α) :=
+  send (.parallel inferInstance branches.size (fun index => branches[index]) ⟨label, completedLabel⟩)
 
 /-- Heterogeneous pairing uses the same collection-parallel primitive. -/
 def both [Codec α] [Codec β] (left : Cloud m α) (right : Cloud m β) : Cloud m (α × β) := do

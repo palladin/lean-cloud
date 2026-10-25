@@ -11,7 +11,7 @@ structure Entry where
   branch : Location
   job : Option BranchObservation := none
   control : String := ""
-  labels : Std.HashMap String String := {}
+  labels : Std.HashMap String ParallelDisplay := {}
   deriving Inhabited
 
 private def ensure (entries : Array Entry) (known : Std.HashMap String Nat)
@@ -40,12 +40,13 @@ def current (observed : Array Trace.Step) (jobs : Array BranchObservation := #[]
   let mut entries := #[]
   let mut known : Std.HashMap String Nat := {}
   let mut control := ""
-  let mut labels : Std.HashMap String (Std.HashMap String String) := {}
+  let mut labels : Std.HashMap String (Std.HashMap String ParallelDisplay) := {}
   for step in observed do
     if step.event.worker != "scheduler" && step.event.activity == "parallel-label" then
       if let some fork := Trace.location? step.event.location then
         let parent := (branch fork).key
-        labels := labels.insert parent ((labels[parent]?.getD {}).insert fork.key step.event.operation)
+        let display := step.parallel.getD ⟨0, { running := step.event.operation }⟩
+        labels := labels.insert parent ((labels[parent]?.getD {}).insert fork.key display)
     if step.event.worker == "scheduler" then
       match step.event.activity with
       | "paused" => control := "paused"
@@ -138,7 +139,10 @@ private def descend (index : Index) (nav : Navigation) :
         let key := forkKey fork
         let children := children index fork
         let done := children.filter (fun e => e.job.any (·.status == .done))
-        let title := entry.labels[fork.key]?.filter (!·.isEmpty) |>.getD "parallel"
+        let display := entry.labels[fork.key]?.getD default
+        let completed := display.count > 0 && done.size == display.count && children.size == display.count
+        let title := if completed && !display.label.completed.isEmpty then display.label.completed else display.label.running
+        let title := if title.isEmpty then "parallel" else title
         rows := rows.push { key, parent := some (branchKey entry.branch), branch := entry.branch, fork := some fork, depth := depth + 1, title, status := s!"{done.size}/{children.size}", expandable := true }
         if nav.isExpanded key false then
           for child in children do

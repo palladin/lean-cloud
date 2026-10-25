@@ -115,11 +115,11 @@ def result [Monad m] [codec : Codec α] (outcome : Exit) : ExceptT CloudError m 
 
 /-- Optional diagnostic context: location, source site, and parallel display label.
 It is not part of the replay journal and never affects routing. -/
-abbrev Observer (m : Type → Type u) := Location → Option SourceSiteId → Option String → m Unit
+abbrev Observer (m : Type → Type u) := Location → Option SourceSiteId → Option ParallelDisplay → m Unit
 
-private def parallelLabel (program : Cloud m α) : Option String :=
+private def parallelLabel (program : Cloud m α) : Option ParallelDisplay :=
   match program with
-  | .impure _ (.parallel _ _ _ label) _ => some label
+  | .impure _ (.parallel _ count _ label) _ => some ⟨count, label⟩
   | _ => none
 
 /-- Replay the assigned branch until its next suspension or completion.

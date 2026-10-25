@@ -4,7 +4,7 @@ import LeanCloud.Proofs.WorkerRecovery
 
 namespace LeanCloud.Proofs.RecoveryPrefix
 
-variable {label : String}
+variable {label : ParallelLabel}
 open Lean LeanEff ReplayFaults ReplayModel ReplayInterpreter WorkerRecovery
 open ReplayCursor Routing
 

@@ -2,7 +2,7 @@ import LeanCloud.Proofs.ReplayCursor
 
 namespace LeanCloud.Proofs.ProgramCursor
 
-variable {label : String}
+variable {label : ParallelLabel}
 open Lean LeanEff ReplayModel ReplayInterpreter Routing
 
 variable {info : Option SourceSiteId}

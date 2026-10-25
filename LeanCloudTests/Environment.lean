@@ -79,11 +79,11 @@ def cases : Array TestCase := #[
       assertEq (← calls.get) 1 "Replay repeated the recorded blob failure/recovery"⟩,
 
   ⟨"environment.parallel-label-is-display-only", do
-    let labels ← IO.mkRef (#[] : Array (Location × String))
+    let labels ← IO.mkRef (#[] : Array (Location × ParallelDisplay))
     let observe : ReplayInterpreter.Observer IO := fun location _ label =>
       if let some label := label then labels.modify (·.push (location, label)) else pure ()
     let program (label : String) (_ : Unit) : Cloud IO (Array Nat) := cloud {
-      Cloud.parallel (label := label) $ #[pure 3, pure 5]
+      Cloud.parallel (label := label) (completedLabel := label ++ " done") $ #[pure 3, pure 5]
     }
     let saved ← IO.mkRef ([] : Journal)
     let store := journalStore saved
@@ -98,8 +98,10 @@ def cases : Array TestCase := #[
     saved.modify (·.filter (·.1 != ReplayStore.returnKey Location.root))
     assertOutcome (← step "final label" Location.root) (.ok .done)
     assertTrue ((← saved.get) == before) "Display label changed replay records"
-    assertTrue ((← labels.get).contains (location, "200/9,031 · 2%")) "Source annotation lost parallel label"
-    assertTrue ((← labels.get).contains (location, "final label")) "Cached join lost its label"
+    assertTrue ((← labels.get).contains (location, ⟨2, ⟨"200/9,031 · 2%", "200/9,031 · 2% done"⟩⟩))
+      "Source annotation lost parallel labels or count"
+    assertTrue ((← labels.get).contains (location, ⟨2, ⟨"final label", "final label done"⟩⟩))
+      "Cached join lost its labels"
     let .ok (some outcome) ← store.outcome.run | throw (IO.userError "Missing root result")
     assertOutcome (ReplayInterpreter.result (m := Id) (α := Array Nat) outcome).run (.ok #[3, 5])
     assertOutcome (← (DirectInterpreter.interpret noBlobs (program "direct label") ()).run) (.ok #[3, 5])⟩,

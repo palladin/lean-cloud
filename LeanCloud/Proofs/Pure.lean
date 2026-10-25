@@ -2,7 +2,7 @@ import LeanCloud.Proofs.Direct
 
 namespace LeanCloud.Proofs.Pure
 
-variable {label : String}
+variable {label : ParallelLabel}
 open LeanEff DirectInterpreter.Internal
 
 variable {info : Option SourceSiteId}
@@ -39,14 +39,14 @@ inductive Evaluation {m : Type → Type u} [Monad m] :
       (rest : Evaluation (next.apply (body ())) outcome) :
       Evaluation (.impure info (.command codec label (fun _ => pure (body ()))) next) outcome
   | parallelOk {info : Option SourceSiteId} (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
-      (label : String) (next : ArrsF (Control m) SourceSiteId (Array α) β) (outcomes : Fin count → Except CloudError α)
+      (label : ParallelLabel) (next : ArrsF (Control m) SourceSiteId (Array α) β) (outcomes : Fin count → Except CloudError α)
       (roundtrip : RoundTrips codec)
       (children : ∀ index, Evaluation (branches index) (outcomes index))
       (collected : (Array.ofFn outcomes).mapM id = .ok values)
       (rest : Evaluation (next.apply values) outcome) :
       Evaluation (.impure info (.parallel codec count branches label) next) outcome
   | parallelError {info : Option SourceSiteId} (codec : Codec α) (count : Nat) (branches : Fin count → Cloud m α)
-      (label : String) (next : ArrsF (Control m) SourceSiteId (Array α) β) (outcomes : Fin count → Except CloudError α)
+      (label : ParallelLabel) (next : ArrsF (Control m) SourceSiteId (Array α) β) (outcomes : Fin count → Except CloudError α)
       (roundtrip : RoundTrips codec)
       (children : ∀ index, Evaluation (branches index) (outcomes index))
       (collected : (Array.ofFn outcomes).mapM id = .error error) :

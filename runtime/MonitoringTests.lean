@@ -88,14 +88,16 @@ def run : IO Unit := IO.FS.withTempFile fun _ path => do
   let trace ← Trace.create "worker1" "parallel-source" (fun step => captured.modify (·.push step))
   let fork := Location.root.next
   trace.assign ⟨0, Location.root⟩
-  trace.visit fork (some "parallel-site") (some "200/9,031 · 2%")
+  let display : ParallelDisplay := ⟨1, ⟨"200/9,031 · 2%", "201/9,031 · 2%"⟩⟩
+  trace.visit fork (some "parallel-site") (some display)
   let records := trace.records { read := fun _ => pure none, create := fun _ record => pure record }
   discard <| records.read (ReplayStore.returnKey (fork.child 0))
   trace.suspend fork
   trace.emit "idle" ""
   let retained := Observations.latest (← captured.get)
   assertTrue (retained.any fun step => step.keys.contains ("label/" ++ fork.key) &&
-    step.event.operation == "200/9,031 · 2%") "Parallel label was lost after suspension"
+    step.event.operation == "200/9,031 · 2%" && step.parallel == some display)
+    "Parallel labels or count were lost after suspension"
   assertTrue (retained.any fun step => step.keys.contains ("fork/" ++ fork.key) &&
     step.event.source == some "parallel-site" && step.event.location == fork.key)
     "Suspended parallel source was lost or attributed to a child return"
@@ -104,8 +106,9 @@ def run : IO Unit := IO.FS.withTempFile fun _ path => do
     let store ← ObservationStore.create conn "worker1"
     for observed in retained do store.record observed
     assertTrue ((← all store "parallel-source").any fun step =>
-      step.event.activity == "parallel-label" && step.event.operation == "200/9,031 · 2%")
-      "SQLite observation storage lost the parallel label"
+      step.event.activity == "parallel-label" && step.event.operation == "200/9,031 · 2%" &&
+        step.parallel == some display)
+      "SQLite observation storage lost the parallel labels or count"
     -- Rapid updates replace slots; they never grow an event history.
     for seq in [:3000] do store.record (step 0 seq)
     for index in [1:130] do store.record (step index 3000)

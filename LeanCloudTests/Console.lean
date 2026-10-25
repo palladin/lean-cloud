@@ -37,7 +37,7 @@ def consoleCases : Array TestCase := #[
     let info : ProgramInfo := ⟨"example/v1", "unit/v1", "nat/v1", "", none, #[source]⟩
     let run : Run := ⟨"run-1", "image", info, Json.null⟩
     let event : ExecutionEvent := ⟨"boot", 1, 20, "worker1", some 2, "0:1", "execute", "work", run.id, some "work"⟩
-    let step : LeanCloudCli.Trace.Step := ⟨"2026-01-01T00:00:00.000000000Z", event, none, none, none⟩
+    let step : LeanCloudCli.Trace.Step := { timestamp := "2026-01-01T00:00:00.000000000Z", event }
     for status in ["completed", "paused", "cancelled", "result pending"] do
       let lines := Watch.frame ctx run #[step] #[] {} 120 35 status
       assertTrue (lines.any (fun l => (l.splitOn "2   > ").length > 1)) "Final source marker absent"
@@ -58,8 +58,10 @@ def consoleCases : Array TestCase := #[
     assertEq (Watch.navigate #[] 1 { workers := 3 } .home).workers 0⟩,
   ⟨"console.trace-order-and-dedup", do
     let event : ExecutionEvent := ⟨"old", 90, 9999, "worker1", some 2, "0:1", "execute", "work", "run", some "work"⟩
-    let old : LeanCloudCli.Trace.Step := ⟨"2026-01-01T00:00:01.000000000Z", event, none, none, none⟩
-    let new : LeanCloudCli.Trace.Step := ⟨"2026-01-01T00:00:02.000000000Z", { event with session := "new", seq := 0, elapsedMs := 0 }, none, none, none⟩
+    let old : LeanCloudCli.Trace.Step := { timestamp := "2026-01-01T00:00:01.000000000Z", event }
+    let new : LeanCloudCli.Trace.Step := {
+      timestamp := "2026-01-01T00:00:02.000000000Z"
+      event := { event with session := "new", seq := 0, elapsedMs := 0 } }
     assertEq ((LeanCloudCli.Trace.merge #[new] #[old, new]).map (·.id)) #[old.id, new.id]⟩,
   ⟨"console.recorded-metric-rates-and-restarts", do
     let before : ResourceSample := {

@@ -42,7 +42,8 @@ def create (worker : String) (run : String := "") (record : Recorder := fun _ =>
 
 /-- Diagnostics never turn a successful operation into a workflow error.
 Docker's bounded log driver retains recent events; gaps are allowed. -/
-def Sink.emit (sink : Sink) (activity operation : String) (job : Option BranchObservation := none) : IO Unit := do
+def Sink.emit (sink : Sink) (activity operation : String) (job : Option BranchObservation := none)
+    (parallel : Option ParallelDisplay := none) : IO Unit := do
   try
     let state ← sink.state.get
     sink.state.set { state with seq := state.seq + 1 }
@@ -51,10 +52,11 @@ def Sink.emit (sink : Sink) (activity operation : String) (job : Option BranchOb
     let resources ← Trace.resources
     let now := toString (← Std.Time.Timestamp.now).toMillisecondsSinceUnixEpoch.val
     let timestamp := String.ofList (List.replicate (20 - now.length) '0') ++ now
-    sink.record { timestamp, event, resources, branch := state.branch, job }
+    sink.record { timestamp, event, resources, branch := state.branch, job, parallel }
     let json := (toJson event).setObjVal! "resources" (toJson resources)
     let json := json.setObjVal! "branch" (toJson state.branch)
     let json := json.setObjVal! "job" (toJson job)
+    let json := json.setObjVal! "parallel" (toJson parallel)
     emitLine ("@lean-cloud " ++ json.compress ++ "\n")
   catch _ => pure ()
 
@@ -80,9 +82,10 @@ def Sink.branches (sink : Sink) (before after : Array Scheduler.Job) : IO Unit :
 
 /-- Set context before the interpreter touches a record, including replay hits. -/
 def Sink.visit (sink : Sink) (location : Location) (source : Option SourceSiteId)
-    (parallelLabel : Option String) : IO Unit := do
+    (parallel : Option ParallelDisplay) : IO Unit := do
   sink.state.modify fun state => { state with location := location.key, source }
-  if let some label := parallelLabel then sink.emit "parallel-label" label
+  if let some display := parallel then
+    sink.emit "parallel-label" display.label.running (parallel := some display)
 
 /-- Joining probes child returns. Restore the parallel location before retaining
 its source, rather than attributing the suspension to the last child read. -/

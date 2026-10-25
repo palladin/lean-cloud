@@ -4,7 +4,7 @@ import LeanCloud.Proofs.Routing
 
 namespace LeanCloud.Proofs.ReplayCursor
 
-variable {label : String}
+variable {label : ParallelLabel}
 open Lean LeanEff ReplayInterpreter
 
 /-- A proof cursor may already lie inside the assigned branch, after replaying
