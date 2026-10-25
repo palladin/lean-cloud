@@ -97,13 +97,13 @@ private def modelBackend (cnf : CNF) (calls : IO.Ref Nat) : Backend IO where
       let value := Int.ofNat (parent.length + literal.natAbs)
       if literal > 0 then value else -value
     return .split children
-  conquer _ cube := do
+  conquer _ _ cubes := cubes.mapM fun cube => do
     calls.modify (· + 1)
     let answer := match oracle cnf cube with
       | some model => Answer.sat (fakeRef (toJson model).compress)
       | none => Answer.unsat (fakeRef "cnf") (fakeRef "proof") (fakeRef "verified")
     return { cube, answer, log := fakeRef "log" }
-  verify _ result := do calls.modify (· + 1); return result
+  verify _ _ results := do calls.modify (· + 1); return results
   finish request results := do
     calls.modify (· + 1)
     IO.ofExcept (validateCubes cnf.variables (results.map (·.cube)))
@@ -125,7 +125,9 @@ private def memoryStore (saved : IO.Ref (List (String × ReplayRecord)))
 
 private def replayTests : IO Unit := do
   for seed in [:40] do
-    let request : CubeAndConquer.Request := { cnf := fakeRef "input", depth := seed % 6, splitDepth := 1 + seed % 3 }
+    let request : CubeAndConquer.Request := {
+      cnf := fakeRef "input", depth := seed % 6
+      splitDepth := 1 + seed % 3, cubesPerJob := 1 + seed % 5 }
     let calls ← IO.mkRef 0
     let run := workflow (modelBackend (formula seed) calls)
     let expected ← (DirectInterpreter.interpret noBlobs run request).run
@@ -168,10 +170,10 @@ private def exceptionTests : IO Unit := do
   let checks ← IO.mkRef 0
   let reliable := modelBackend ⟨1, #[#[1], #[-1]]⟩ calls
   let failing := { reliable with
-    verify := fun request result => do
+    verify := fun env request result => do
       let attempt ← checks.modifyGet fun n => (n, n + 1)
       if attempt == 0 then throw (IO.userError "Checker IO failed")
-      reliable.verify request result }
+      reliable.verify env request result }
   let journal ← IO.mkRef []
   let writes ← IO.mkRef 0
   let request : CubeAndConquer.Request := { cnf := fakeRef "input", depth := 0 }
@@ -189,7 +191,8 @@ private def exceptionTests : IO Unit := do
 private def depthTests : IO Unit := do
   let request : CubeAndConquer.Request := { cnf := fakeRef "input", depth := 3, splitDepth := 2 }
   for invalid in [{ request with splitDepth := 0 }, { request with splitDepth := 9 },
-      { request with depth := 65 }, { request with maxCubes := 7 }] do
+      { request with depth := 65 }, { request with maxCubes := 7 },
+      { request with cubesPerJob := 0 }, { request with cubesPerJob := 257 }] do
     check (!invalid.validate.isOk) "Accepted invalid depth/split/leaf budget"
   check ({ request with depth := 0, maxCubes := 1 }.validate.isOk) "Rejected depth zero"
   check (validateSplit [1] 2 #[[2], [-2, 3], [-2, -3]]).isOk "Rejected uneven split"
@@ -205,9 +208,9 @@ private def depthTests : IO Unit := do
       if request.depth - parent.length ≥ 2 then
         return .split #[[v], [-v, v + 1], [-v, -(v + 1)]]
       else return .split #[[v], [-v]]
-    conquer := fun request cube => do
-      leaves.modify (·.push cube)
-      basic.conquer request cube }
+    conquer := fun env request cubes => do
+      leaves.modify (· ++ cubes)
+      basic.conquer env request cubes }
   let .ok report ← (DirectInterpreter.interpret noBlobs (workflow uneven) request).run
     | throw (IO.userError "Uneven recursive split failed")
   check (report.outcome == .unsat && report.totalCubes == 8 &&
@@ -231,6 +234,33 @@ private def depthTests : IO Unit := do
     check (!actual.isOk) "Workflow accepted malformed cubing output"
   IO.println "PASS total/split depth, leaf limits, uneven recursion and stalled/terminal cubing"
 
+private def batchWorkflowTests : IO Unit := do
+  let cubes := splitCubes 4
+  for size in [1:20] do
+    let groups := batches cubes size
+    check (groups.flatten == cubes && groups.all (fun group => !group.isEmpty && group.size ≤ size))
+      "Batching lost, reordered or exceeded its cube budget"
+  let calls ← IO.mkRef 0
+  let sizes ← IO.mkRef (#[] : Array Nat)
+  let reliable := modelBackend ⟨4, #[#[1], #[-1]]⟩ calls
+  let grouped := { reliable with conquer := fun env request cubes => do
+    check (env.currentWorker.cpus == 3) "Worker CPU budget was not passed to the batch"
+    sizes.modify (·.push cubes.size)
+    reliable.conquer env request cubes }
+  let context := { noBlobs with currentWorker := { id := "batch-worker", cpus := 3 } }
+  let request : CubeAndConquer.Request := {
+    cnf := fakeRef "input", depth := 4, splitDepth := 2, cubesPerJob := 3 }
+  let .ok report ← (DirectInterpreter.interpret context (workflow grouped) request).run
+    | throw (IO.userError "Batched workflow failed")
+  check (report.totalCubes == 16 && (← sizes.get) == #[3, 1, 3, 1, 3, 1, 3, 1])
+    "Expected eight cloud solver batches for sixteen leaves"
+  for invalid in [
+      { reliable with conquer := fun _ _ _ => pure #[] },
+      { reliable with verify := fun _ _ _ => pure #[] }] do
+    let result ← (DirectInterpreter.interpret noBlobs (workflow invalid) request).run
+    check (!result.isOk) "Missing batch results were accepted"
+  IO.println "PASS bounded cloud batches, worker environment and batch result identity"
+
 private def processTests : IO Unit := IO.FS.withTempDir fun directory => do
   let output := directory / "stdout"
   let errors := directory / "stderr"
@@ -248,15 +278,17 @@ private def processTests : IO Unit := IO.FS.withTempDir fun directory => do
   check oversized.stopped "Proof artifact size was not monitored"
   IO.println "PASS streamed subprocess output, file limits and process-group termination"
 
+private initialize objectsLock : Std.Mutex Unit ← Std.Mutex.new ()
+
 private def memoryObjects (saved : IO.Ref (Std.HashMap String ByteArray)) : LeanCloudRuntime.ObjectStore where
   ensureContainer := pure ()
-  read key := return (← saved.get)[key]?
-  create key bytes := saved.modifyGet fun records =>
+  read key := objectsLock.atomically do return (← saved.get)[key]?
+  create key bytes := objectsLock.atomically do saved.modifyGet fun records =>
     match records[key]? with
     | some existing => (existing, records)
     | none => (bytes, records.insert key bytes)
   list _ := return #[]
-  erase key := saved.modify (·.erase key)
+  erase key := objectsLock.atomically do saved.modify (·.erase key)
 
 private def rejects (action : IO α) (message : String) : IO Unit := do
   let failed ← try discard action; pure false catch _ => pure true
@@ -298,8 +330,77 @@ private def fileTests : IO Unit := IO.FS.withTempDir fun directory => do
   check ((← Files.upload store source ref.size) == ref) "Interrupted upload changed artifact identity"
   IO.println "PASS 10 MiB chunked files, retry, limits, corruption and missing artifacts"
 
-private def realTools : IO Unit := do
-  let tools ← Tools.fromEnvironment
+private def inputCacheTests : IO Unit := IO.FS.withTempDir fun directory => do
+  let saved ← IO.mkRef ({} : Std.HashMap String ByteArray)
+  let store := memoryObjects saved
+  let ref ← Files.putText store "p cnf 2 1\n1 2 0\n"
+  let reads ← IO.mkRef 0
+  let counted := { store with read := fun key => do
+    reads.modify (· + 1)
+    store.read key }
+  let use (ref : FileRef) (limit : Nat) := Input.withFile counted (some directory) ref limit 2 fun path => do
+    check ((← Files.digest path) == ref.sha256) "Invalid cached input"
+    discard <| Dimacs.scan path
+  use ref 1024
+  let before ← reads.get
+  use ref 1024
+  check ((← reads.get) == before) "Cached CNF was downloaded twice"
+  rejects (use ref 1) "Cache hit bypassed the input byte limit"
+  -- A corrupt hit and an interrupted fill must both be recoverable.
+  IO.FS.writeFile (directory / "original.cnf") "corrupt"
+  use ref 1024
+  check ((← reads.get) > before) "Corrupt input was not downloaded again"
+  let other ← Files.putText store "p cnf 1 1\n-1 0\n"
+  let broken := { counted with read := fun _ => throw (IO.userError "Interrupted download") }
+  rejects (Input.withFile broken (some directory) other 1024 2 fun _ => pure ())
+    "Cache download interruption did not fire"
+  check (!(← (directory / "original.cnf").pathExists) && !(← (directory / "original.pending").pathExists))
+    "Interrupted cache entry was published"
+  use other 1024
+  check ((← directory.readDir).size == 1) "CNF cache accumulated old inputs"
+  IO.println "PASS shared CNF cache reuse, limits, corruption, interrupted fills and eviction"
+
+/-- Exercise the actual batch backend with rendezvousing subprocess fixtures.
+No certificate claims depend on these fixtures; real tools are tested below. -/
+private def poolTests : IO Unit := do
+  let script ← IO.FS.readFile "tests/pool-tool.sh"
+  for cpus in [0, 1, 2] do
+    IO.FS.withTempDir fun directory => do
+      let saved ← IO.mkRef ({} : Std.HashMap String ByteArray)
+      let store := memoryObjects saved
+      let request : CubeAndConquer.Request := {
+        cnf := ← Files.putText store "p cnf 2 2\n1 0\n-1 0\n", seconds := 5, verifySeconds := 5 }
+      for tool in ["kissat", "drat-trim"] do
+        let path := directory / tool
+        IO.FS.writeFile path script
+        let out ← IO.Process.output { cmd := "chmod", args := #["+x", path.toString] }
+        check (out.exitCode == 0) "Cannot prepare test tool"
+      IO.FS.writeFile (directory / "width") (toString (max 1 cpus))
+      let tools : Tools := { directory, identity := { binaries := "test fixture" }, cache := some (directory / "cache") }
+      let env : Environment IO := { store.executionContext.map MonadCloudExec.restore with
+        currentWorker := { cpus } }
+      let cubes := splitCubes 2
+      let solved ← tools.conquerBatch store env request cubes
+      check (solved.map (·.cube) == cubes && solved.all (fun result =>
+        match result.answer with | .unverified .. => true | _ => false)) "Local solver pool failed"
+      let checked ← tools.verifyBatch store env request solved
+      check (checked.map (·.cube) == cubes && checked.all (fun result =>
+        match result.answer with | .unsat .. => true | _ => false)) "Local checker pool failed"
+      for tool in ["kissat", "drat-trim"] do
+        let changes := words (← IO.FS.readFile (directory / s!"{tool}.events"))
+        let mut active : Int := 0
+        let mut peak : Int := 0
+        for change in changes do
+          let some delta := change.toInt? | throw (IO.userError "Invalid pool event")
+          active := active + delta
+          peak := max peak active
+          check (0 ≤ active && active ≤ Int.ofNat (max 1 cpus)) "Tool pool exceeded its CPU budget"
+        check (active == 0 && peak == Int.ofNat (max 1 cpus) && changes.size == 8)
+          "Pool did not run all cubes, overlap processes or join every child"
+  IO.println "PASS actual solver/checker pools overlap work and respect 0/1/2 CPU budgets"
+
+private def realTools : IO Unit := IO.FS.withTempDir fun cache => do
+  let tools := { (← Tools.fromEnvironment) with cache := some cache }
   let saved ← IO.mkRef ({} : Std.HashMap String ByteArray)
   let store := memoryObjects saved
   for seed in [:15] do
@@ -322,7 +423,8 @@ private def realTools : IO Unit := do
     let .split grandchildren ← tools.cube store request parent | throw (IO.userError "Expected parallel recubing")
     discard <| get (validateSplit parent 1 grandchildren)
   let count := 2 ^ request.depth
-  let report ← (DirectInterpreter.interpret noBlobs (workflow (backend tools store)) request).run
+  let context := { noBlobs with currentWorker := { cpus := 2 } }
+  let report ← (DirectInterpreter.interpret context (workflow (backend tools store)) request).run
   let .ok report := report | throw (IO.userError "Workflow failed")
   check (report.outcome == .unsat && report.totalCubes == count) "Split/conquer failed"
   check ((← tools.verifyBundle store report.bundle) == .unsat) "Independent bundle recheck failed"
@@ -358,18 +460,18 @@ private def realTools : IO Unit := do
   -- Crash outside user IO, immediately before/after the checker result's
   -- journal commit. A committed result replays; an uncommitted one runs again.
   let request : CubeAndConquer.Request := {
-    cnf := ← Files.putText store "p cnf 1 2\n1 0\n-1 0\n", depth := 0 }
+    cnf := ← Files.putText store cnf.dimacs, depth := 2, splitDepth := 2, cubesPerJob := 4 }
   for afterCommit in [false, true] do
     let solves ← IO.mkRef 0
     let checks ← IO.mkRef 0
-    let reliable := backend tools store
+    let reliable := { backend tools store with cube := fun _ _ => pure (.split (splitCubes 2)) }
     let counted := { reliable with
-      conquer := fun request cube => do
+      conquer := fun env request cube => do
         solves.modify (· + 1)
-        reliable.conquer request cube
-      verify := fun request result => do
+        reliable.conquer env request cube
+      verify := fun env request result => do
         checks.modify (· + 1)
-        reliable.verify request result }
+        reliable.verify env request result }
     let journal ← IO.mkRef []
     let writes ← IO.mkRef 0
     let pending ← IO.mkRef true
@@ -381,7 +483,7 @@ private def realTools : IO Unit := do
             if afterCommit then discard (base.create key record)
             throw (IO.userError "Worker stopped at checker journal commit")
         base.create key record }
-    let replay := SequentialReplay.interpret interrupted noBlobs 10000 (workflow counted) request
+    let replay := SequentialReplay.interpret interrupted context 10000 (workflow counted) request
     try
       discard replay.run
       throw (IO.userError "Worker crash did not fire")
@@ -390,7 +492,7 @@ private def realTools : IO Unit := do
     check (!(← pending.get) && (← solves.get) == 1 && (← checks.get) == 1) "Missed the checker commit"
     for _ in [:2] do
       let .ok recovered ← replay.run | throw (IO.userError "Checker recovery failed")
-      check (recovered.outcome == .unsat && (← solves.get) == 1 &&
+      check (recovered.outcome == .unsat && recovered.totalCubes == 4 && (← solves.get) == 1 &&
         (← checks.get) == (if afterCommit then 1 else 2))
         "Recovery repeated a committed action or lost an uncommitted check"
     for (_, record) in ← journal.get do
@@ -402,10 +504,13 @@ def main (args : List String) : IO UInt32 := do
   try
     modelTests
     depthTests
+    batchWorkflowTests
     replayTests
     exceptionTests
     processTests
     fileTests
+    inputCacheTests
+    poolTests
     if args == ["--tools"] then realTools
     else unless args.isEmpty do throw (IO.userError "Usage: sat_tests [--tools]")
     return 0

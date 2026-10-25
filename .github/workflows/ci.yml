@@ -103,7 +103,7 @@ jobs:
         working-directory: Applications/CubeAndConquer
         timeout-minutes: 3
         run: |
-          shellcheck -x build-tools.sh local-files.sh test-deployment.sh
+          shellcheck -x build-tools.sh local-files.sh test-deployment.sh tests/pool-tool.sh
           bash build-tools.sh
           export LEAN_CLOUD_SAT_TOOLS="$GITHUB_WORKSPACE/.lean-cloud/sat-tools/bin"
           lake build cloud_app sat_files sat_tests
@@ -111,12 +111,12 @@ jobs:
           # Registry/schema checks do not need a live blob service. Transfers,
           # artifact tampering and real certificate rechecking run in sat_tests.
           jq -cn '{cnf:{manifest:{key:("objects/" + ("a" * 64)),size:0,checksum:0},size:0,sha256:("a" * 64)},depth:4,maxCubes:64,splitDepth:2,seconds:20,verifySeconds:20}' > /tmp/sat-input.json
-          .lake/build/bin/cloud_app validate cube-and-conquer/v3 < /tmp/sat-input.json
+          .lake/build/bin/cloud_app validate cube-and-conquer/v4 < /tmp/sat-input.json
           jq -c '.splitDepth=0' /tmp/sat-input.json > /tmp/sat-invalid.json
-          if .lake/build/bin/cloud_app validate cube-and-conquer/v3 < /tmp/sat-invalid.json; then
+          if .lake/build/bin/cloud_app validate cube-and-conquer/v4 < /tmp/sat-invalid.json; then
             echo 'Invalid cube split depth was accepted' >&2; exit 1
           fi
-          .lake/build/bin/cloud_app programs | jq -e '.[0].entry == "cube-and-conquer/v3"'
+          .lake/build/bin/cloud_app programs | jq -e '.[0].entry == "cube-and-conquer/v4"'
 
       - name: Install LeanBuild source toolchain
         run: elan toolchain install "$(cat Applications/LeanBuild/source-toolchain)"

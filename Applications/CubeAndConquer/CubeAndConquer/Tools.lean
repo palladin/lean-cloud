@@ -1,5 +1,6 @@
 import CubeAndConquer.Dimacs
 import CubeAndConquer.Process
+import CubeAndConquer.Input
 
 namespace CubeAndConquer
 open Lean LeanCloud LeanCloudRuntime
@@ -15,6 +16,7 @@ structure Tools where
   directory : System.FilePath
   identity : Toolchain
   limits : Limits := {}
+  cache : Option System.FilePath := none
 
 private def limitEnv (name : String) (fallback : Nat) : IO Nat := do
   match ← IO.getEnv name with
@@ -42,16 +44,16 @@ def Tools.fromEnvironment : IO Tools := do
     proofBytes := ← limitEnv "LEAN_CLOUD_SAT_PROOF_BYTES" ({} : Limits).proofBytes
     logBytes := ← limitEnv "LEAN_CLOUD_SAT_LOG_BYTES" ({} : Limits).logBytes
     variables := ← limitEnv "LEAN_CLOUD_SAT_VARIABLES" ({} : Limits).variables }
-  return { directory, identity, limits }
+  let cache := (← IO.getEnv "LEAN_CLOUD_SAT_CACHE").filter (!·.isEmpty) |>.map System.FilePath.mk
+  return { directory, identity, limits, cache }
 
-private def inputFile (tools : Tools) (store : ObjectStore) (request : Request)
-    (directory : System.FilePath) : IO (System.FilePath × Dimacs.Info) := do
+private def withInput (tools : Tools) (store : ObjectStore) (request : Request)
+    (concurrency : Nat) (action : System.FilePath → Dimacs.Info → IO α) : IO α := do
   IO.ofExcept request.validate
-  let path := directory / "original.cnf"
-  Files.download store request.cnf path tools.limits.inputBytes
-  let info ← Dimacs.scan path
-  unless info.variables ≤ tools.limits.variables do throw (IO.userError "CNF exceeds configured variable limit")
-  return (path, info)
+  Input.withFile store tools.cache request.cnf tools.limits.inputBytes concurrency fun path => do
+    let info ← Dimacs.scan path
+    unless info.variables ≤ tools.limits.variables do throw (IO.userError "CNF exceeds configured variable limit")
+    action path info
 
 private def solverStatus (path : System.FilePath) : IO String := do
   let statuses ← IO.mkRef (#[] : Array String)
@@ -101,10 +103,9 @@ private def loadPlan (store : ObjectStore) (request : Request) (ref : FileRef) :
   IO.ofExcept (validateCubes plan.variables plan.cubes)
   return plan
 
-def Tools.conquer (tools : Tools) (store : ObjectStore) (request : Request)
-    (cube : Cube) : IO CubeResult :=
+private def conquerFromFile (tools : Tools) (store : ObjectStore) (request : Request)
+    (original : System.FilePath) (info : Dimacs.Info) (cube : Cube) : IO CubeResult :=
   IO.FS.withTempDir fun directory => do
-    let (original, info) ← inputFile tools store request directory
     IO.ofExcept (validateCube info.variables cube)
     let formula := directory / "cube.cnf"
     let proof := directory / "proof.drat"
@@ -135,15 +136,26 @@ def Tools.conquer (tools : Tools) (store : ObjectStore) (request : Request)
       | code, _ => pure (.error s!"Unexpected Kissat exit/status: {code}/{status}"))
     return { cube, answer, log }
 
+def Tools.conquer (tools : Tools) (store : ObjectStore) (request : Request)
+    (cube : Cube) : IO CubeResult :=
+  withInput tools store request 1 fun original info =>
+    conquerFromFile tools store request original info cube
+
+/-- One private solver workspace per cube. The shared CNF remains read-only,
+and the bounded pool joins every started task before releasing it. -/
+def Tools.conquerBatch (tools : Tools) (store : ObjectStore) (env : Environment IO)
+    (request : Request) (cubes : Array Cube) : IO (Array CubeResult) :=
+  withInput tools store request env.currentWorker.cpus fun original info =>
+    Parallel.map env.currentWorker.cpus cubes (conquerFromFile tools store request original info)
+
 /-- A separate durable action reuses the published certificate after a node
 crashes during checking. No solver workspace or local pathname crosses this boundary. -/
-def Tools.verify (tools : Tools) (store : ObjectStore) (request : Request)
-    (result : CubeResult) : IO CubeResult := do
+private def verifyFromFile (tools : Tools) (store : ObjectStore) (request : Request)
+    (original : System.FilePath) (info : Dimacs.Info) (result : CubeResult) : IO CubeResult := do
   let .unverified formula proof := result.answer | return result
   IO.FS.withTempDir fun directory => do
     let cnf := directory / "cube.cnf"
     let certificate := directory / "proof.drat"
-    let (original, info) ← inputFile tools store request directory
     let expected := directory / "expected.cnf"
     IO.ofExcept (validateCube info.variables result.cube)
     Dimacs.withCube original expected info result.cube
@@ -162,11 +174,24 @@ def Tools.verify (tools : Tools) (store : ObjectStore) (request : Request)
       answer := if verified then .unsat formula proof verification
         else .unknown "UNSAT proof verification failed or exceeded its budget; see task log" }
 
+def Tools.verify (tools : Tools) (store : ObjectStore) (request : Request)
+    (result : CubeResult) : IO CubeResult := do
+  let .unverified .. := result.answer | return result
+  withInput tools store request 1 fun original info =>
+    verifyFromFile tools store request original info result
+
+def Tools.verifyBatch (tools : Tools) (store : ObjectStore) (env : Environment IO)
+    (request : Request) (results : Array CubeResult) : IO (Array CubeResult) := do
+  unless results.any (fun result => match result.answer with | .unverified .. => true | _ => false) do
+    return results
+  withInput tools store request env.currentWorker.cpus fun original info =>
+    Parallel.map env.currentWorker.cpus results (verifyFromFile tools store request original info)
+
 /-- Cubing is local to the supplied assumptions. Its output contains only new
 choices; the workflow appends them to the parent before dispatching children. -/
 def Tools.cube (tools : Tools) (store : ObjectStore) (request : Request) (parent : Cube) : IO Cubing :=
+  withInput tools store request 1 fun original info =>
   IO.FS.withTempDir fun directory => do
-    let (original, info) ← inputFile tools store request directory
     IO.ofExcept (validateCube info.variables parent)
     let depth := min request.splitDepth (request.depth - parent.length)
     if depth == 0 || info.variables == 0 then return .leaf
@@ -213,8 +238,7 @@ def validateResults (plan : CubePlan) (results : Array CubeResult) : Except Stri
     seen := seen.insert result.cube
 
 def Tools.finish (tools : Tools) (store : ObjectStore) (request : Request)
-    (results : Array CubeResult) : IO Report := IO.FS.withTempDir fun directory => do
-  let (_, info) ← inputFile tools store request directory
+    (results : Array CubeResult) : IO Report := withInput tools store request 1 fun _ info => do
   let plan : CubePlan := { input := request.cnf, variables := info.variables, cubes := results.map (·.cube) }
   unless plan.cubes.size ≤ request.maxCubes && plan.cubes.all (fun cube => cube.length ≤ request.depth) do
     throw (IO.userError "Final cube plan exceeds request limits")
@@ -228,11 +252,11 @@ def Tools.finish (tools : Tools) (store : ObjectStore) (request : Request)
 
 /-- Recheck downloaded evidence from scratch, including exact cube-CNF binding.
 This command does not trust the original worker or the report's status. -/
-def Tools.verifyBundle (tools : Tools) (store : ObjectStore) (ref : FileRef) : IO Conclusion :=
+def Tools.verifyBundle (tools : Tools) (store : ObjectStore) (ref : FileRef) : IO Conclusion := do
+  let bundle : Bundle ← Files.readJson store ref
+  unless bundle.format == "cube-and-conquer/bundle/v2" do throw (IO.userError "Unknown bundle format")
+  withInput tools store bundle.request 1 fun original info =>
   IO.FS.withTempDir fun directory => do
-    let bundle : Bundle ← Files.readJson store ref
-    unless bundle.format == "cube-and-conquer/bundle/v2" do throw (IO.userError "Unknown bundle format")
-    let (original, info) ← inputFile tools store bundle.request directory
     let plan ← loadPlan store bundle.request bundle.plan
     unless plan.variables == info.variables do throw (IO.userError "Plan variables mismatch")
     IO.ofExcept (validateResults plan bundle.results)

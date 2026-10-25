@@ -121,7 +121,8 @@ def parseCubes (variables maxCubes : Nat) (text : String) : Except String (Array
 structure Request where
   cnf : FileRef
   depth : Nat := 10
-  splitDepth : Nat := 2
+  splitDepth : Nat := 5
+  cubesPerJob : Nat := 32
   maxCubes : Nat := 4096
   seconds : Nat := 300
   verifySeconds : Nat := 600
@@ -131,6 +132,7 @@ def Request.validate (request : Request) : Except String Unit := do
   request.cnf.validate
   unless request.depth ≤ 64 do throw "depth must be between 0 and 64"
   unless 0 < request.splitDepth && request.splitDepth ≤ 8 do throw "splitDepth must be between 1 and 8"
+  unless 0 < request.cubesPerJob && request.cubesPerJob ≤ 256 do throw "cubesPerJob must be between 1 and 256"
   unless 0 < request.maxCubes && request.maxCubes ≤ 100000 do throw "maxCubes must be between 1 and 100000"
   unless 2 ^ request.depth ≤ request.maxCubes do
     throw "The depth's maximum leaf count (2^depth) exceeds maxCubes"

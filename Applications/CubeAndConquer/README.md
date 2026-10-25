@@ -62,13 +62,14 @@ or executable names. Edit its parameters before submission:
 | --- | --- | --- |
 | `depth` | 10 | Total decision-depth budget; 0 goes directly to Kissat |
 | `maxCubes` | 4096 | Leaf safeguard, 1–100000; must accommodate `2^depth` |
-| `splitDepth` | 2 | Decision levels per `march` invocation, 1–8 |
+| `splitDepth` | 5 | Decision levels per `march` invocation, 1–8 |
+| `cubesPerJob` | 32 | Maximum sibling leaves per cloud solver/checker batch, 1–256 |
 | `seconds` | 300 | Cuber/solver time budget per invocation, 1–86400 |
 | `verifySeconds` | 600 | Per-cube checker time budget, 1–86400 |
 
 For example, `depth = 4` and `splitDepth = 2` first generate up to four cubes.
-Each cube gets a cloud branch which can split into up to four more leaves. Each
-leaf runs Kissat, then a separately recorded certificate check. The tree contains
+Each cube gets a cloud branch which can split into up to four more leaves. Those
+four leaves share a solver batch, then a separately recorded checker batch. The tree contains
 at most 16 leaves, and may be smaller if cubing finishes early. `depth = 0`
 creates one solver task without invoking march. Zero is never passed as march's
 `-d` argument (which would select its dynamic cutoff).
@@ -79,9 +80,25 @@ children. A split that makes no progress becomes a solver leaf. `maxCubes` is a
 conservative preflight bound: for example, depth 13 requires at least 8192. A
 request exceeding the bound is rejected before any tools run.
 
-The workflow uses nested `Cloud.parallel`, with no wave-size setting. Sibling
-cubing actions run across available workers; the current scheduler processes
-nested subtrees batch by batch. Worker count is a deployment setting. Repeated
+The workflow uses nested `Cloud.parallel`. Sibling cubing actions run across
+available workers; terminal siblings are grouped up to `cubesPerJob` per cloud
+branch. Each batch runs a bounded pool of Kissat processes using
+`env.currentWorker.cpus`, and the checker batch uses the same CPU budget.
+Every cube has its own formula, proof, logs and private workspace. Results retain
+input order even when processes finish out of order.
+
+With `depth = 10`, `splitDepth = 5` and `cubesPerJob = 32`, a full split creates
+32 subtrees, each ending in a batch of 32 cubes. An eight-CPU worker solves up to
+eight cubes at a time, taking another cube as soon as one finishes. Uneven or
+early-terminal splits may produce smaller batches; depth zero remains one solver.
+Smaller batches provide more cloud scheduling opportunities and reduce work
+repeated after an interrupted solver batch. Larger batches reduce replay and
+scheduling overhead. This does not make a single Kissat process multicore.
+
+Worker CPU budgets are deployment settings. The local helper defaults to one
+CPU per worker; set `cpuMillis` in its generated `deployment.json`
+(for example, `2000` advertises two CPUs), then apply the edited policy with
+`bash deploy/local.sh scale .sat-deployment 3`. Repeated
 march calls reload and preprocess the restricted CNF, so `splitDepth` controls
 the tradeoff between task granularity and parallelism.
 
@@ -110,6 +127,12 @@ published; retries reuse chunks. Solver workspaces, CNF contents and proof bytes
 never enter replay records. A published result is reusable after worker restart.
 Unreferenced files left by interrupted attempts currently require operator-managed
 retention/garbage collection; the application never deletes shared input blobs.
+
+The application image caches the original CNF under `/data/sat-input`, shared by
+the local solvers and checkers. This disposable cache holds one input per worker;
+each hit is checked against its size and SHA-256. A different input replaces the
+previous one, and interrupted fills are discarded. Artifact references remain
+in blob storage, so another worker can resume a batch without this cache.
 
 ## Other deployments and native use
 
@@ -150,6 +173,7 @@ own memory. Worker administrators can set:
 | `LEAN_CLOUD_SAT_PROOF_BYTES` | 16 GiB per cube |
 | `LEAN_CLOUD_SAT_LOG_BYTES` | 256 MiB per stdout/stderr/model file |
 | `LEAN_CLOUD_SAT_VARIABLES` | 10 million |
+| `LEAN_CLOUD_SAT_CACHE` | `/data/sat-input` in the image; disabled in native use unless set |
 
 Use container memory, CPU, PID and storage quotas for hard isolation. File sizes
 are monitored while tools run; the monitor can overshoot before killing a process,
@@ -158,6 +182,11 @@ Proof checking has its own deadline. Timeout kills/reaps the entire subprocess
 group. Immediate cancellation of an arbitrary `Cloud.exec` is still a runtime
 limitation; calls finish or hit their deadline. Cuber output is bounded to 16 MiB, JSON metadata
 to 256 MiB, and text lines to 8 MiB (DIMACS clauses may span lines).
+
+Proof, log and workspace limits apply per cube. A worker can have up to its CPU
+budget of these workspaces active simultaneously. Keep the cache directory
+private to one worker process. Program version `v4` records whole solver/checker
+batches; start a new run when upgrading from `v3`.
 
 ```sh
 lake exe sat_tests --tools

@@ -9,9 +9,9 @@ a checked SAT model or an independently verifiable UNSAT bundle. See the
 A branch is identified by its accumulated cube assumptions. Starting with the
 empty cube, it either:
 
-1. Runs Kissat and checks its certificate when the total depth is reached.
+1. Batches terminal siblings for local Kissat and certificate-checker pools.
 2. Runs `march_cu` for a bounded additional depth and creates a cloud branch for
-   each child using `Cloud.parallel`.
+   each unfinished child using `Cloud.parallel`.
 3. Returns a checked SAT model, timeout, or error if march terminates early.
 
 A cuber that produces the single empty extension has not split its input. That
@@ -23,9 +23,9 @@ refutation is not a certificate we accept.
                        /         \
                   cube [x]      cube [-x]
                   /     \        /      \
-              conquer conquer conquer conquer
-                 +       +       +       +
-               check   check   check   check
+              [cube, cube]    [cube, cube]
+              conquer batch   conquer batch
+              check batch     check batch
 ```
 
 Each cubing action restores the original CNF and appends its parent assumptions
@@ -44,9 +44,11 @@ A binary tree of depth `d` has at most `2^d` leaves. Request validation requires
 that bound to fit `maxCubes`, keeping the safeguard independent of completion
 order and avoiding shared counters. The actual tree can finish much earlier.
 
-Sibling cubing actions run in parallel on available workers. The current runtime
-scheduler finishes a batch and then visits its nested subtrees in order. The
-application uses that existing behavior; it does not add another scheduler.
+Sibling cubing actions and leaf batches run on available workers. Within one
+batch, a bounded local pool uses the executing worker's CPU budget. A free slot
+takes the next cube immediately; result order remains deterministic. Batch size
+and CPU concurrency are independent: `cubesPerJob` bounds cloud work, while
+`env.currentWorker.cpus` bounds simultaneously running solvers/checkers.
 All branches finish before their parent combines results, even after SAT is found.
 
 ## Coverage and evidence
@@ -79,7 +81,11 @@ These checks use external tools and application validation, not Lean kernel proo
 ## Durable actions and tooling
 
 Cubing, solving, verification and final publication are separate `Cloud.exec`
-actions. Each restores its immutable input into a private temporary workspace.
+actions. Solving and verification each record the entire batch, retaining a
+separate certificate for every cube. All local tasks join before returning or
+propagating an IO exception. A crash before the batch commit can repeat that
+batch; committed solver batches survive interruptions during verification.
+Each cube uses a private temporary workspace and reads a shared original CNF.
 Only cube descriptions and artifact references enter the replay journal. A
 recorded solver result can be reused if the node crashes during verification,
 without rerunning Kissat. An uncaught IO exception is recorded as an execution
@@ -95,8 +101,10 @@ Commands have deadlines and output limits; deployment-level memory/disk/CPU
 quotas provide hard isolation. Credentials remain in deployment configuration.
 
 Use larger `splitDepth` values to amortize repeated CNF loading and preprocessing.
-Local caches and adaptive recubing of solver timeouts can be added after
-measurement; neither is required by this workflow.
+The disposable, single-input cache validates size and SHA-256 on every hit and
+publishes complete downloads atomically. A lease keeps the file alive until the
+whole local pool finishes. Cache directories are private to each worker process.
+Adaptive recubing of solver timeouts remains future work.
 
 Tests cover generated formula oracles, direct/replay equivalence, recorded IO
 failures, every-write recovery, crashes before/after checker-result commits,

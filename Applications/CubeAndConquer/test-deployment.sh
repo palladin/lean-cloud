@@ -35,14 +35,17 @@ wait_result() {
   return 1
 }
 bash "$root/deploy/local.sh" init "$deployment" "$image" "$name" 3 0 > "$test_dir/deploy.log" 2>&1
-bash "$root/deploy/local.sh" up "$deployment" >> "$test_dir/deploy.log" 2>&1
+jq '.cpuMillis=2000' "$deployment/deployment.json" > "$deployment/deployment.next"
+mv "$deployment/deployment.next" "$deployment/deployment.json"
+# scale re-renders the edited resource policy before starting the three nodes.
+bash "$root/deploy/local.sh" scale "$deployment" 3 >> "$test_dir/deploy.log" 2>&1
 address=$(compose port scheduler 8080)
 cli connect sat-test "http://$address" --token-file "$deployment/client.token" > "$test_dir/connect.log"
 cli programs > "$test_dir/programs.log"
 before=$(compose ps -q | sort)
 bash "$app/local-files.sh" "$deployment" prepare "$app/examples/pigeonhole.cnf" > "$test_dir/pigeons-input.json"
 bash "$app/local-files.sh" "$deployment" prepare "$app/examples/sat.cnf" > "$test_dir/sat-input.json"
-jq ' .depth=4 | .splitDepth=2 | .seconds=20 | .verifySeconds=20 ' "$test_dir/pigeons-input.json" > "$test_dir/parameters.json"
+jq ' .depth=4 | .splitDepth=2 | .cubesPerJob=4 | .seconds=20 | .verifySeconds=20 ' "$test_dir/pigeons-input.json" > "$test_dir/parameters.json"
 cli run cube-and-conquer --input "$test_dir/parameters.json" --id pigeons
 cli run cube-and-conquer --input "$test_dir/sat-input.json" --id sat
 wait_result pigeons
