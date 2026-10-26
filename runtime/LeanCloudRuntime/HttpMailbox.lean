@@ -4,6 +4,7 @@ import LeanCloudRuntime.Inbox
 import LeanCloudRuntime.ProcessLock
 import Std.Http
 import LeanCloudRuntime.HttpServer
+import Std.Time
 
 namespace LeanCloudRuntime.HttpMailbox
 open Lean LeanCloud
@@ -66,6 +67,27 @@ def call (config : Config) (request : Inbox.Request) : IO Json := do
     config.token (toJson request).compress 5000
   let result : Except String Json ← IO.ofExcept (Json.parse response >>= fromJson?)
   IO.ofExcept result
+
+private def workCall (config : Config) (run name : String) (operation : WorkQueueStore.Operation) : IO Json := do
+  let request : WorkQueueStore.Request := ⟨(toJson (run, name)).compress, operation⟩
+  let response ← LeanCloudCli.Http.post s!"http://{config.host}:{config.port}/work"
+    config.token (toJson request).compress 5000
+  IO.ofExcept (← IO.ofExcept (Json.parse response >>= fromJson? (α := Except String Json)))
+
+/-- The same queue service is used locally and in cloud deployments. Its short
+transactions are independent of the Cloud scheduler's actor loop. -/
+def workQueues (config : Config) (run : String) : QueueProvider IO := ⟨fun name =>
+  let call := workCall config run name
+  {
+    send values := do discard (call (.send values))
+    receive count := do IO.ofExcept (fromJson? (← call (.receive count)))
+    isIdle := do IO.ofExcept (fromJson? (← call .idle))
+    acknowledge receipt := do discard (call (.acknowledge receipt))
+    renew receipt := do discard (call (.renew receipt))
+    release receipt := do discard (call (.release receipt)) }⟩
+
+def retireWorkQueues (config : Config) (run : String) : IO Unit :=
+  discard (workCall config run "" .retire)
 
 structure Handle where
   config : Config
@@ -184,6 +206,11 @@ private def respond (handler : ServerHandler) (path : String) (json : Json) : IO
   let result : Except String Json ← try
     IO.ofExcept (LeanCloud.Version.check "protocolVersion" "HTTP protocol" json)
     match path with
+    | "/work" =>
+      let command ← IO.ofExcept (fromJson? json)
+      pure (.ok (← handler.store.state.atomically do
+        let now := (← Std.Time.Timestamp.now).toMillisecondsSinceUnixEpoch.val.toNat
+        WorkQueueStore.apply handler.store.conn now command))
     | "/mailbox" =>
       let command ← IO.ofExcept (fromJson? json)
       pure (.ok (← Inbox.apply handler.store (← IO.monoMsNow) command))

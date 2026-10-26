@@ -6,6 +6,26 @@ namespace LeanCloudTests
 open Lean LeanCloud LeanCloudCli
 
 def consoleCases : Array TestCase := #[
+  ⟨"console.watch-progress-command-and-attempt", do
+    let event : ExecutionEvent := ⟨"boot", 1, 0, "worker1", some 2, "0:1", "execute", "build", "run", some "site"⟩
+    let current : Trace.Step := { timestamp := "1", event }
+    let progress : Trace.Step := { current with
+      event := { event with seq := 2, activity := "progress" }
+      progress := some ("lane", { completed := 3, total := some 4, message := "Module" }) }
+    let render := fun steps => String.intercalate "\n" ((Watch.progressLines steps).map (fun line => Styled.render line 120 false)).toList
+    assertTrue ((render #[current, progress]).contains '3') "Progress is missing"
+    assertTrue (((render #[current, progress]).splitOn "75%").length > 1) "Percentage is missing"
+    for stale in #[{ progress with event := { progress.event with attempt := some 1 } },
+        { progress with event := { progress.event with session := "old" } },
+        { progress with event := { progress.event with location := "0:0" } }] do
+      assertEq (Watch.progressLines #[current, stale]).size 0 "Progress leaked from earlier execution"
+    let next := { current with event := { event with location := "0:2" } }
+    assertEq (Watch.progressLines #[current, progress, next]).size 0 "New command kept old progress"
+    let finished := { current with event := { event with activity := "recorded" } }
+    assertEq (Watch.progressLines #[current, progress, finished]).size 1 "Completion lost the last progress view"
+    assertEq (Watch.progressLines #[current, progress] 0).size 0
+    assertEq (Watch.progressLines #[{ current with event := { event with source := none } }, progress]).size 1
+      "An unannotated exec cannot report progress"⟩,
   ⟨"console.watch-reported-worker-identities", do
     let ctx : Context := ⟨"/work", "deployment"⟩
     let steps : Array Trace.Step := #[{

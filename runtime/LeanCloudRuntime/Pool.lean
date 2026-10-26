@@ -99,6 +99,41 @@ private def exchange (config : Config) (message : String → Envelope) : IO (Exc
 def request (config : Config) (command : LeanCloud.Pool.Command) : IO Json := do
   IO.ofExcept (← exchange config (fun replyTo => .event (.request replyTo command)))
 
+/-- Poll ownership independently of user computation. A revoked or disconnected
+attempt signals its local tasks, then fails outside Cloud.exec's error capture.
+No replacement is acknowledged until the action and monitor have both stopped. -/
+def withCancellation (config : Config) (run worker : String) (attempt : Nat)
+    (revoked : IO.Ref Bool) (action : CancellationToken IO → IO Unit → IO α) : IO α :=
+  withHeartbeat config run worker attempt fun healthy => do
+    let stopped ← IO.mkRef false
+    let cancelled ← IO.mkRef false
+    let failure ← IO.mkRef (none : Option IO.Error)
+    let check : IO Unit := do
+      if let some error ← failure.get then throw error
+      if ← revoked.get then throw (IO.userError "Assignment revoked")
+      healthy
+      let allowed : Bool ← IO.ofExcept (fromJson? (← request config (.check run worker attempt)))
+      unless allowed do
+        revoked.set true
+        cancelled.set true
+        throw (IO.userError "Assignment revoked")
+    check
+    let monitor ← IO.asTask (do
+      let mut next := (← IO.monoMsNow) + 1000
+      while !(← stopped.get) do
+        if (← IO.monoMsNow) ≥ next then
+          try check
+          catch error =>
+            cancelled.set true
+            failure.set (some error)
+            return
+          next := (← IO.monoMsNow) + 1000
+        IO.sleep 50) .dedicated
+    try action ⟨cancelled.get⟩ check
+    finally
+      stopped.set true
+      discard (IO.wait monitor)
+
 def control (config : Config) (requestId : String) (command : LeanCloud.Pool.Command) : IO (Except String Unit) := do
   validateRun requestId
   return (← exchange config (fun replyTo => .control replyTo requestId command)).map (fun _ => ())

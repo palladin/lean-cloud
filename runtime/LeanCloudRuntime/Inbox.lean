@@ -1,4 +1,5 @@
 import LeanCloudRuntime.LocalDb
+import LeanCloudRuntime.WorkQueueStore
 import Std.Sync.Mutex
 
 namespace LeanCloudRuntime.Inbox
@@ -79,6 +80,7 @@ def create (conn : Sqlite.Conn) (leaseMs := 15000) : IO Store := do
   LocalDb.ensureVersion conn "inbox"
   conn.createTable messages (primaryKey := [.column "queue", .column "id"])
   conn.createTable counters (primaryKey := [.column "queue"])
+  WorkQueueStore.initializeSchema conn
   -- A service restart abandons temporary exchanges, but preserves actor mail.
   for p in replyPrefixes do erase conn p true
   let random ← IO.Process.output { cmd := "openssl", args := #["rand", "-hex", "16"] }

@@ -1,4 +1,4 @@
-import LeanBuild.Batch
+import LeanBuild.Model
 import LeanCloud.Source
 
 namespace LeanBuild
@@ -6,42 +6,13 @@ open LeanCloud
 
 structure Backend (m : Type → Type) where
   prepare : Environment m → Request → m Preparation
-  build : Environment m → Request → Plan → Array Module → Array BuildResult → m (Array BuildResult)
+  start : Environment m → Plan → m Unit
+  builder : Environment m → Request → Plan → m Unit
+  results : Environment m → Plan → m (Array BuildResult)
   finish : Environment m → Request → Plan → Array BuildResult → m BuildResult
 
-/-- Module progress shown at either boundary of a parallel round. -/
-def progressLabel (completed total : Nat) : String :=
-  let number (n : Nat) := String.ofList <| (toString n).toList.reverse.zipIdx.foldl
-    (fun text (digit, index) => digit :: (if index > 0 && index % 3 == 0 then ',' :: text else text)) []
-  s!"{number completed}/{number total} · {completed * 100 / total}%"
-
-private def batches [Monad m] [MonadCloudExec m] (backend : Backend m) (request : Request) (plan : Plan) :
-    Nat → Array Module → Array BuildResult → Cloud m (Array BuildResult)
-  | 0, pending, done => pure <| done ++ pending.map fun m =>
-      { name := m.name, status := .blocked, message := "Invalid dependency graph" }
-  | rounds + 1, pending, done => cloud {
-      let (pending, done) := skipBlocked pending done
-      if pending.isEmpty then return done
-      let cpus ← Cloud.exec (fun env => pure <|
-        (if env.workers.isEmpty then #[env.currentWorker] else env.workers).map (max 1 ·.cpus)) "plan build round"
-      let jobs := (partition pending done cpus request.modulesPerJob).filter (!·.isEmpty)
-      let afterRound := done.size + jobs.foldl (fun count job => count + job.size) 0
-      let groups ← Cloud.parallel (label := progressLabel done.size plan.modules.size)
-        (completedLabel := progressLabel afterRound plan.modules.size) $
-        jobs.map fun group => cloud {
-          let results ← Cloud.exec (fun executing => backend.build executing request plan group done)
-            s!"build {group.size} modules from {(group[0]?.map (·.name)).getD ""}"
-          if results.map (·.name) != group.map (·.name) then
-            Cloud.fail "Build job returned missing or reordered module results"
-          return results
-        }
-      let results := groups.flatten
-      if results.isEmpty then Cloud.fail "No ready modules in a validated plan"
-      let completed := results.foldl (fun set r => set.insert r.name) ({} : Std.HashSet String)
-      batches backend request plan rounds
-        (pending.filter fun m => !completed.contains m.name) (done ++ results)
-    }
-
+/-- Prepare once, keep builders alive until the DAG is finished, then assemble
+Lake's requested targets. Dependency scheduling is ordinary IO inside builders. -/
 def workflow [Monad m] [MonadCloudExec m] (backend : Backend m) (request : Request) : Cloud m Report := cloud {
   match request.validate with
   | .error reason => Cloud.fail reason
@@ -51,10 +22,15 @@ def workflow [Monad m] [MonadCloudExec m] (backend : Backend m) (request : Reque
   match validateModules plan.modules with
   | .error reason => Cloud.fail reason
   | .ok () => pure ()
-  let modules ← batches backend request plan plan.modules.size plan.modules #[]
-  let byName := modules.foldl (fun map r => map.insert r.name r) ({} : Std.HashMap String BuildResult)
-  let modules := plan.modules.map fun m => byName[m.name]?.getD
-    { name := m.name, status := .blocked, message := "Missing module result" }
+  let count ← Cloud.exec (fun env => do
+    backend.start env plan
+    pure (max 1 env.workers.size)) "start builders"
+  let _ ← Cloud.parallel (label := "Build modules") (completedLabel := "Modules finished") $
+    (Array.range (if plan.modules.isEmpty then 0 else count)).map fun _ =>
+      Cloud.exec (fun env => backend.builder env request plan) "build modules"
+  let modules ← Cloud.exec (fun env => backend.results env plan) "collect module results"
+  if modules.map (·.name) != plan.modules.map (·.name) then
+    Cloud.fail "Build returned missing or reordered module results"
   let report : Report := {
     request, commit := plan.commit, toolchain := plan.toolchain
     platform := plan.platform, source := some plan.source, modules }

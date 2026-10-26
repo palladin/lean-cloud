@@ -12,6 +12,9 @@ private def journalStore (journal : IO.Ref Journal) : ReplayStore IO := {
     | none => (proposed, (key, proposed) :: records) }
 
 private def noBlobs : ExecContext IO := {
+  cancellation := .never
+  progress := .ignore
+  queues := .unsupported
   blobs := {
     putBlob := fun _ => throw ⟨.unsupported, "blob"⟩
     readBlob := fun _ => throw ⟨.unsupported, "blob"⟩
@@ -32,7 +35,7 @@ private def partitioned (_ : Unit) : Cloud IO (Array (String × (String × Nat))
 
 def cases : Array TestCase := #[
   ⟨"environment.exec-captures-typed-errors-and-underlying-io", do
-    let context : ExecContext (ExceptT CloudError IO) := { blobs := {
+    let context : ExecContext (ExceptT CloudError IO) := { cancellation := .never, progress := .ignore, queues := .unsupported, blobs := {
       putBlob := fun _ => throw ⟨.unsupported, "blob"⟩
       readBlob := fun _ => throw ⟨.unsupported, "blob"⟩
       resolveBlob := fun _ => throw ⟨.unsupported, "blob"⟩ } }
@@ -48,7 +51,7 @@ def cases : Array TestCase := #[
     let error : CloudError := ⟨.integrity, "Corrupt blob"⟩
     for recover in [false, true] do
       let calls ← IO.mkRef 0
-      let context : ExecContext (ExceptT CloudError IO) := { blobs := {
+      let context : ExecContext (ExceptT CloudError IO) := { cancellation := .never, progress := .ignore, queues := .unsupported, blobs := {
         putBlob := fun _ => throw ⟨.unsupported, "blob"⟩
         readBlob := fun _ => do
           calls.modify (· + 1)

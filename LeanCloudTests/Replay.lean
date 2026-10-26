@@ -13,6 +13,9 @@ private def memoryStore (saved : IO.Ref Records) : ReplayStore IO where
     | none => (proposed, (key, proposed) :: records)
 
 private def noBlobs : ExecContext IO where
+  cancellation := .never
+  progress := .ignore
+  queues := .unsupported
   blobs := {
     putBlob _ := throw ⟨.unsupported, "Unexpected blob operation"⟩
     readBlob _ := throw ⟨.unsupported, "Unexpected blob operation"⟩

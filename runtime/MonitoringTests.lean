@@ -84,6 +84,23 @@ private def nativeResources : IO Unit := do
 
 def run : IO Unit := IO.FS.withTempFile fun _ path => do
   nativeResources
+  let updates ← Std.Mutex.new (#[] : Array Observations.Step)
+  let sink ← Trace.create "worker1" "progress" (fun step => updates.atomically (modify (·.push step)))
+  sink.assign ⟨2, Location.root⟩
+  sink.visit Location.root (some "builder") none
+  let tasks ← (Array.range 8).mapM fun lane => IO.asTask (do
+    for completed in [:20] do
+      sink.progress.report s!"lane-{lane}" { message := "building", completed, total := some 20 }) .dedicated
+  for task in tasks do IO.ofExcept (← IO.wait task)
+  let reported := (← updates.atomically get).filter (·.progress.isSome)
+  assertEq reported.size 160 "Concurrent progress reports were lost"
+  assertEq (reported.foldl (fun s step => s.insert step.event.seq) ({} : Std.HashSet Nat)).size 160
+    "Concurrent progress reused sequence numbers"
+  let latest := Observations.latest (Observations.merge #[] reported)
+  assertEq latest.size 8 "Progress accumulated history instead of replacing slots"
+  assertTrue (latest.all fun step => step.progress.any (fun p => p.2.completed == 19) &&
+    step.event.source == some "builder" && step.event.attempt == some 2) "Progress lost attempt or source"
+  (← Trace.create "worker1" "ignored" (fun _ => throw (IO.userError "telemetry unavailable"))).progress.report "build" {}
   let captured ← IO.mkRef (#[] : Array Observations.Step)
   let trace ← Trace.create "worker1" "parallel-source" (fun step => captured.modify (·.push step))
   let fork := Location.root.next

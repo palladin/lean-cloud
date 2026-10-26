@@ -15,6 +15,9 @@ private def same [BEq α] : Except CloudError α → Except CloudError α → Bo
   | _, _ => false
 
 private def noBlobs : ExecContext IO where
+  cancellation := .never
+  progress := .ignore
+  queues := .unsupported
   blobs := {
     putBlob _ := throw ⟨.unsupported, "Unexpected blob operation"⟩
     readBlob _ := throw ⟨.unsupported, "Unexpected blob operation"⟩

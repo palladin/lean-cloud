@@ -25,6 +25,7 @@ lean_lib ObjectStoreTests
 lean_lib StorageProviderTests
 lean_lib ReplayCacheTests
 lean_lib CleanupTests
+lean_lib WorkQueueTests
 
 lean_exe cloud_inbox_tests where
   root := `InboxTests

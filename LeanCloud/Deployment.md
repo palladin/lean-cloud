@@ -31,7 +31,9 @@ ownership, and creates always publish to durable storage before caching a value.
 
 ## Planning work and using local resources
 
-`Cloud.exec` receives `Environment IO`: `currentWorker`, `workers`, and `blobs`.
+`Cloud.exec` receives `Environment IO`: worker capacity, `blobs`, `queues`,
+`cancellation`, and `progress`. Each capability is supplied explicitly; pure
+models use no-op cancellation/progress and an unsupported-queue adapter.
 Each worker advertises an `id`, a `cpus` concurrency budget, and optional
 `memoryMiB`. The runtime refreshes capacity once per assignment; these are
 configured budgets, not instantaneous utilization or free memory.
@@ -70,12 +72,44 @@ can repeat the entire body, including blob writes; design those actions to
 support repetition. A committed result is reused without executing the body.
 Replay-journal failures remain outside this user exception boundary.
 
+Long-running bodies can poll `env.cancellation.isRequested` and report an
+absolute last view with `env.progress.report "activity" { message := "…" }`.
+Progress may include `completed` and `total`; it is best-effort telemetry, not
+durable state. Use a small, fixed set of activity names. Pause, kill, or loss of
+assignment ownership signals cancellation. Stop and join local tasks before
+returning; the runtime refuses to journal an outcome after revocation.
+
+`env.queues.open "name"` opens a run-scoped work queue. It provides batched
+`send`/`receive`, `acknowledge`, `renew`, `release`, and `isIdle`. Deliveries have
+renewable leases and may repeat. An empty receive can mean other consumers still
+hold leases; even `isIdle` only means there are currently no pending or leased
+messages, not that future producers are finished. Applications own their
+completion protocol and must make repeated work safe.
+
+Each sent item has a stable `key` and JSON `value`. Sending the same key and
+value again is a no-op, including after acknowledgement; changing its value is
+an error. This lets multiple parents safely announce the same ready task. Keys
+and their deduplication records live until the run is removed.
+
+The runtime hosts these queues in the scheduler's existing HTTP/SQLite service.
+Queue transactions run independently of the Cloud actor loop. Local, Azure and
+AWS use the same adapter, with no additional queue service. Queue transport
+errors inside `exec` are ordinary IO failures, like blob errors.
+
+For resumable application work, `env.blobs.readNamed` and `publishNamed` expose
+immutable, run-scoped result names. Publication atomically selects one blob
+reference; subsequent publications return that reference. These are application
+records, separate from the interpreter's replay locations. Publish artifacts
+before their named result, and enqueue successors before acknowledging work.
+See [LeanBuild](../Applications/LeanBuild/README.md) for a complete example.
+
 See [resource settings](../deploy/README.md#worker-resource-budgets) for deployment
 configuration. Existing unfinished workflows must continue with their original
 image: removing implicit planning and blob records changes replay locations.
 
 Removing a run clears replay records and the last views on every active worker
-and the scheduler. Partial failures are reported; retry `remove` after restoring
+and the scheduler, including run-scoped queues and named result references.
+Partial failures are reported; retry `remove` after restoring
 the unavailable node. Scaled-down workers clear retired-run views on their next
 startup. Shared application blobs are retained.
 

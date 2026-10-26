@@ -23,8 +23,6 @@ structure Request where
   targets : Array String := #[]
   options : Std.TreeMap String String := {}
   cache : CachePolicy := .rebuild
-  /-- Zero balances CPU use and cloud barriers; nonzero also caps job size. -/
-  modulesPerJob : Nat := 0
   limits : Limits := {}
   deriving Repr, ToJson
 
@@ -50,6 +48,8 @@ instance : FromJson Request where
         throw s!"LeanBuild builds Lake targets; independent proof checking was removed. Remove the {old} field"
     if ((← json.getObj?)["modules"]?).isSome then
       throw "Use targets instead of modules"
+    if ((← json.getObj?)["modulesPerJob"]?).isSome then
+      throw "modulesPerJob was removed; persistent builders use the worker CPU budget"
     return {
       repository := ← json.getObjValAs? _ "repository"
       revision := ← json.getObjValAs? _ "revision"
@@ -57,7 +57,6 @@ instance : FromJson Request where
       targets := ← field json "targets" #[]
       options := ← field json "options" {}
       cache := ← field json "cache" .rebuild
-      modulesPerJob := ← field json "modulesPerJob" 0
       limits := ← field json "limits" {} }
 
 def identifier (s : String) : Bool :=
@@ -87,8 +86,6 @@ def Request.validate (r : Request) : Except String Unit := do
     throw "Invalid Lake target"
   unless r.options.toArray.all (fun (key, value) => identifier key && !value.contains '\x00') do
     throw "Invalid Lake configuration option"
-  unless r.modulesPerJob ≤ 100000 do
-    throw "modulesPerJob must be 0 (automatic) or between 1 and 100000"
   unless 0 < r.limits.seconds && r.limits.seconds ≤ 3600 &&
       64 ≤ r.limits.helperMemoryMiB && r.limits.helperMemoryMiB ≤ 65536 &&
       0 < r.limits.bytes && r.limits.bytes ≤ 16 * 1024 * 1024 * 1024 &&
@@ -140,7 +137,7 @@ structure Preparation where
   diagnostics : Option FileRef := none
   deriving Repr, ToJson, FromJson
 
-instance : Codec Request := jsonCodec _ "lean-build/request/v2"
+instance : Codec Request := jsonCodec _ "lean-build/request/v3"
 instance : Codec Preparation := jsonCodec _ "lean-build/preparation/v1"
 instance : Codec BuildResult := jsonCodec _ "lean-build/build-result/v1"
 instance : Codec Report := jsonCodec _ "lean-build/report/v2"

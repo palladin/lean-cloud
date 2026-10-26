@@ -65,6 +65,9 @@ def store : ReplayStore WorkerM where
   create key record := atomic (.create key) (ReplayModel.store.create key record)
 
 def pureContext : ExecContext WorkerM where
+  cancellation := .never
+  progress := .ignore
+  queues := .unsupported
   blobs := {
     putBlob _ := throw ⟨.unsupported, "User blobs are outside the pure replay model"⟩
     readBlob _ := throw ⟨.unsupported, "User blobs are outside the pure replay model"⟩

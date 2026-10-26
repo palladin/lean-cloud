@@ -1,6 +1,7 @@
 import LeanCloudRuntime.HttpMailbox
 import LeanCloudRuntime.Application
 import LeanCloudRuntime.Programs
+import LeanCloudRuntime.Process
 import LeanCloud.MailboxModel
 import LeanCloudTests.Support
 import ApplicationTests
@@ -11,6 +12,7 @@ import ObjectStoreTests
 import StorageProviderTests
 import ReplayCacheTests
 import CleanupTests
+import WorkQueueTests
 
 open Lean LeanCloud LeanCloudRuntime LeanCloudTests
 
@@ -384,12 +386,51 @@ private def poolLeases : IO Unit := IO.FS.withTempFile fun _ inboxPath =>
           LeanCloudRuntime.Pool.withHeartbeat config "lease-test" "worker1" second.attempt fun _ => do
             IO.sleep 2000
             assertTrue (!(← valid third)) "Stale heartbeat renewed replacement work"
+          let fourth ← acquire
+          let revoked ← IO.mkRef false
+          let observedCancellation ← IO.mkRef false
+          let entered ← IO.mkRef false
+          let wrote ← IO.mkRef false
+          rejects (LeanCloudRuntime.Pool.withCancellation config "lease-test" "worker1" fourth.attempt revoked fun token check => do
+            let stopping ← IO.asTask (do
+              let deadline := (← IO.monoMsNow) + 5000
+              while !(← entered.get) do
+                assertTrue ((← IO.monoMsNow) < deadline) "Test exec never started"
+                IO.sleep 10
+              discard <| LeanCloudRuntime.Pool.request config (.pause "lease-test")) .dedicated
+            try
+              let context := { defaults.objects.executionContext with cancellation := ⟨liftM token.isRequested⟩ }
+              let records : ReplayStore IO := {
+                read _ := do check; pure none
+                create _ value := do check; wrote.set true; pure value }
+              let program (_ : Unit) : Cloud IO Nat := Cloud.exec fun env => do
+                entered.set true
+                let deadline := (← IO.monoMsNow) + 5000
+                while !(← env.cancellation.isRequested) do
+                  assertTrue ((← IO.monoMsNow) < deadline) "Cancellation never reached exec"
+                  IO.sleep 10
+                observedCancellation.set true
+                return 7 -- Even a normal return after cancellation must not be journalled.
+              discard <| (ReplayInterpreter.step records context 100 program () fourth).run
+            finally discard (IO.wait stopping)) "Cancelled exec committed an outcome"
+          assertTrue (← observedCancellation.get) "Busy exec did not observe pause"
+          assertTrue (!(← wrote.get)) "Cancellation was recorded as an application outcome"
         finally handle.close
       finally
         try child.kill catch _ => pure ()
         discard child.wait
     finally server.shutdownAndWait.block
   finally conn.close
+
+private def processCancellation : IO Unit := IO.FS.withTempDir fun directory => do
+  let output := directory / "stdout"
+  let start ← IO.monoMsNow
+  let result ← LeanCloudRuntime.Process.runFiles {
+    cmd := "/bin/sh", cwd := directory, args := #["-c", "sleep 30 & echo ready > started; wait"] }
+    5000 output (directory / "stderr") 4096 #[] ((directory / "started").pathExists)
+  assertTrue result.stopped "Cancellation did not stop the subprocess"
+  assertTrue ((← IO.monoMsNow) - start < 4000) "Cancellation waited for the command timeout"
+  -- runFiles joins both pipe readers; the descendant holding stdout must also stop.
 
 private def processSignals : IO Unit := do
   for signal in ["TERM", "INT"] do
@@ -442,6 +483,7 @@ private def processCrash : IO Unit := IO.FS.withTempFile fun _ path => do
     try discard child.wait catch _ => pure ()
 
 def main (args : List String) : IO UInt32 := do
+  if args == ["process-cancellation"] then processCancellation; return 0
   if args == ["reentrant-http"] then reentrantHttp; return 0
   if args == ["node-exit"] then nodeExit; return 0
   if let ["node-exit-worker", path, mode] := args then return ← nodeExitWorker path (mode == "throw")
@@ -457,6 +499,7 @@ def main (args : List String) : IO UInt32 := do
     MonitoringTests.run
     ObjectStoreTests.run
     StorageProviderTests.run
+    WorkQueueTests.run
     schemaVersions
     laws
     for seed in [:32] do differential seed
@@ -464,6 +507,7 @@ def main (args : List String) : IO UInt32 := do
     processCrash
     IO.println "SIGKILL recovery passed"
     processSignals
+    processCancellation
     nodeExit
     IO.println "Node failures exit despite outstanding HTTP callbacks"
     let nested ← IO.Process.output {

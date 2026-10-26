@@ -18,8 +18,17 @@ def main (args : List String) : IO UInt32 := do
       let tools ← Tools.fromEnvironment
       let request : Request ← decode input
       IO.ofExcept request.validate
-      let .ok report ← (LeanCloud.DirectInterpreter.interpret cfg.objects.executionContext
-        (workflow (tools.backend cfg.objects)) request).run
+      let conn ← LeanLinq.Sqlite.connect ":memory:"
+      let outcome ← try
+        WorkQueueStore.initializeSchema conn
+        let scope := s!"direct-{← IO.monoNanosNow}"
+        let context := cfg.objects.executionContextFor scope
+        let queues := WorkQueueStore.provider conn (← Std.Mutex.new ()) scope
+        let context := { context with queues := ⟨fun name =>
+          (queues.open name).map (fun action => LeanCloud.captureIO (liftM action))⟩ }
+        (LeanCloud.DirectInterpreter.interpret context (workflow (tools.backend cfg.objects)) request).run
+      finally conn.close
+      let .ok report := outcome
         | throw (IO.userError "Build workflow failed")
       IO.FS.writeFile output (toJson report).pretty
       return if report.success then 0 else 1

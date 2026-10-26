@@ -137,6 +137,9 @@ private def workload (_ : Unit) : Cloud IO Nat := cloud {
 ownership checks. Caching changes reads only, never results or journal contents. -/
 private def differential : IO Unit := do
   let blobs : ExecContext IO := {
+    cancellation := .never
+    progress := .ignore
+    queues := .unsupported
     blobs := {
       putBlob := fun _ => throw ⟨.unsupported, "unused"⟩
       readBlob := fun _ => throw ⟨.unsupported, "unused"⟩

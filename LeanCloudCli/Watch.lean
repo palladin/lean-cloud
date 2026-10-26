@@ -93,6 +93,30 @@ private def sourceLabel (run : Run) (steps : Array Trace.Step) : String :=
     site.functionInfo.map (fun info => s!"{safe info.descr} · {position}") |>.getD position)
     |>.getD "source unavailable"
 
+/-- Progress belongs to the last executing command, not an earlier command or
+worker incarnation. Keep it when completion freezes that command's last view.
+Never sum worker counters: duplicate execution is not additional build progress. -/
+def progressLines (steps : Array Trace.Step) (limit : Nat := 4) : Array Styled.Line := Id.run do
+  if limit == 0 then return #[]
+  let some current := steps.findSomeRev? (fun step =>
+    if step.progress.isNone && (step.event.source.isSome || step.event.activity == "execute") then
+      some step.event else none)
+    | return #[]
+  let mut seen : Std.HashSet String := {}
+  let mut lines := #[]
+  for step in steps.reverse do
+    unless step.event.worker == current.worker && step.event.session == current.session &&
+        step.event.attempt == current.attempt && step.event.location == current.location do continue
+    if let some (slot, update) := step.progress then
+      if seen.contains slot then continue
+      seen := seen.insert slot
+      let count := match update.total with
+        | some total => s!"{update.completed}/{total} · {if total == 0 then 100 else min 100 (update.completed * 100 / total)}% · "
+        | none => ""
+      lines := lines.push (Styled.text s!"{safe slot}: {count}{safe update.message}" .green)
+      if lines.size ≥ limit then break
+  return lines.reverse
+
 private def beside (left right : Array Styled.Line) (leftWidth : Nat) : Array Styled.Line :=
   (Array.range (max left.size right.size)).map fun row =>
     let content := Styled.slice (left[row]?.getD #[]) 0 leftWidth
@@ -121,6 +145,7 @@ private def workerCard (ctx : Context) (run : Run) (steps : Array Trace.Step)
     lines := lines.push (Styled.text (sourceLabel run code) .muted)
     lines := lines ++ sourceRows run code (if height ≥ 10 then 2 else 1) 0
   else lines := lines.push (Styled.text "No branch executing" .muted)
+  lines := lines ++ progressLines code 2
   return (lines ++ metrics ctx worker steps histories live width).extract 0 height
 
 /-- Use reported node identities, including names chosen by external deployers. -/
@@ -132,7 +157,7 @@ def workerRoster (ctx : Context) (steps : Array Trace.Step) (histories : Array H
 
 private def workerColumns (count width : Nat) := min count (max 1 (min 3 (width / 44)))
 
-private def workerCardHeight (height : Nat) := min 14 (height - 1)
+private def workerCardHeight (height : Nat) := min 16 (height - 1)
 
 private def workerCapacity (count width height : Nat) :=
   max 1 (workerColumns count width * max 1 ((height - 1) / max 1 (workerCardHeight height)))
@@ -177,6 +202,7 @@ private def branchPanel (ctx : Context) (run : Run) (steps : Array Trace.Step)
     lines := lines ++ workerGrid ctx run steps entries histories live nav.workers width (height - lines.size)
   else if let some worker := worker then
     lines := lines ++ #[Styled.text s!"{worker} · {if live then "executing" else "last view"}" .cyan] ++
+      progressLines code ++
       metrics ctx worker (if live then steps else own) histories live width
   else lines := lines.push (Styled.text "No worker executing this branch" .muted)
   return lines.extract 0 height

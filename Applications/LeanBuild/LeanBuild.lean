@@ -6,15 +6,17 @@ namespace LeanBuild
 def program (environment : IO (Tools × LeanCloudRuntime.ObjectStore)) :
     LeanCloud.CloudProgram Request Report := {
   name := "lean-build"
-  version := "v5"
+  version := "v6"
   description := "Build GitHub Lean projects in parallel and publish their artifacts"
   run := fun request => workflow {
     prepare := fun env request => do
       let (tools, store) ← environment
       (tools.backend store).prepare env request
-    build := fun env request plan modules completed => do
+    start := Builders.seed
+    builder := fun env request plan => do
       let (tools, store) ← environment
-      (tools.backend store).build env request plan modules completed
+      (tools.backend store).builder env request plan
+    results := Builders.results
     finish := fun env request plan completed => do
       let (tools, store) ← environment
       (tools.backend store).finish env request plan completed } request }

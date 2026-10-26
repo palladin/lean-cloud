@@ -157,38 +157,33 @@ private def buildTargets (policy : Json) (output : String) : IO Unit := do
   unless names.size ≤ limit do throw (IO.userError "Module limit exceeded after target build")
   IO.FS.writeFile output (toJson names).pretty
 
-/-- One Lake context per cloud job: shared dependency jobs are fetched once and
-Lake runs independent modules concurrently. Keep per-module failures as data;
-the monitor still prints their diagnostics before the helper exits. -/
-private def buildModules (policy : Json) (input output : String) : IO Unit := do
+/-- A local builder asks Lake for one ready module. Only this module's output
+paths are packed; a module completion never rescans the whole source tree. -/
+private def buildModule (policy : Json) (name output root : String) : IO Unit := do
   let ws ← workspace policy
-  let names : Array String ← IO.ofExcept (fromJson? (← readJson input))
-  let outcomes ← IO.mkRef (none : Option (Array (String × Bool)))
-  try
-    ws.runFetchM do
-      let jobs ← names.mapM fun name => do
-        let some m := ws.findTargetModule? name.toName | error s!"Unknown module: {name}"
-        return (name, ← m.leanArts.fetch)
-      let rows ← jobs.mapM fun (name, job) => do
-        let built := (← job.wait?).isSome
-        return (name, built)
-      outcomes.set (some rows)
-  catch error =>
-    -- Lake reports this after monitoring a failed module. Only accept it when
-    -- our complete per-module results already account for that failure.
-    let .userError "build failed" := error | throw error
-    let some rows ← outcomes.get | throw error
-    unless rows.any (fun row => !row.2) do throw error
-  let some rows ← outcomes.get | throw (IO.userError "Missing module outcomes")
-  IO.FS.writeFile output (toJson (rows.map fun (name, built) =>
-    Json.mkObj [("name", toJson name), ("built", toJson built)])).pretty
+  let some m := ws.findTargetModule? name.toName | throw (IO.userError s!"Unknown module: {name}")
+  ws.runFetchM (do discard (← m.leanArts.fetch).await)
+  let root := (← IO.FS.realPath root).toString ++ "/"
+  let files := #[m.oleanFile, m.oleanServerFile, m.oleanPrivateFile, m.ileanFile,
+    m.irFile, m.irSigFile, m.cFile, m.bcFile, m.traceFile, m.setupFile,
+    m.coExportFile, m.coNoExportFile, m.bcoFile, m.dynlibFile]
+  let files := files.flatMap fun path => #[path, path.addExtension "hash", path.addExtension "trace"]
+  let mut paths : Array String := #[]
+  for path in files do
+    if ← path.pathExists then
+      let path := (← IO.FS.realPath path).toString
+      unless path.startsWith root do throw (IO.userError "Module output escaped the workspace")
+      let relative := path.drop root.length |>.toString
+      unless paths.contains relative do paths := paths.push relative
+  unless ← m.oleanFile.pathExists do throw (IO.userError "Lake did not produce the module's olean")
+  IO.FS.writeFile output (toJson paths).compress
 
 def main (args : List String) : IO UInt32 := do
   try
     match args with
     | ["plan", policy, output, root] => plan (← readJson policy) output root
     | ["build", policy, output] => buildTargets (← readJson policy) output
-    | ["modules", policy, input, output] => buildModules (← readJson policy) input output
-    | _ => throw (IO.userError "Expected plan POLICY OUTPUT ROOT | build POLICY OUTPUT | modules POLICY INPUT OUTPUT")
+    | ["module", policy, name, output, root] => buildModule (← readJson policy) name output root
+    | _ => throw (IO.userError "Expected plan POLICY OUTPUT ROOT | build POLICY OUTPUT | module POLICY NAME OUTPUT ROOT")
     return 0
   catch error => IO.eprintln s!"{error}"; return 1

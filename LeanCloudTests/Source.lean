@@ -178,7 +178,7 @@ private def inspectNext (program : Cloud IO α) (context : ExecContext IO)
 private def nextExec (program : Cloud Id α) : Cloud Id α :=
   match program with
   | .impure _ (.command _ _ body) next =>
-    let context : ExecContext Id := { blobs := {
+    let context : ExecContext Id := { cancellation := .never, progress := .ignore, queues := .unsupported, blobs := {
       putBlob := fun _ => throw ⟨.unsupported, "blob"⟩
       readBlob := fun _ => throw ⟨.unsupported, "blob"⟩
       resolveBlob := fun _ => throw ⟨.unsupported, "blob"⟩ } }
@@ -190,6 +190,9 @@ private def nextExec (program : Cloud Id α) : Cloud Id α :=
 private def has (text fragment : String) : Bool := (text.splitOn fragment).length > 1
 
 private def ioBlobs : ExecContext IO where
+  cancellation := .never
+  progress := .ignore
+  queues := .unsupported
   blobs := {
     putBlob _ := throw ⟨.unsupported, "blob"⟩
     readBlob _ := throw ⟨.unsupported, "blob"⟩
@@ -368,6 +371,9 @@ def cases : Array TestCase := #[
     | _ => throw (IO.userError "Expected fork")⟩,
   ⟨"source.control-flow-and-io-thunks", do
     let noBlobs : ExecContext Id := {
+      cancellation := .never
+      progress := .ignore
+      queues := .unsupported
       blobs := {
         putBlob := fun _ => throw ⟨.unsupported, "blob"⟩
         readBlob := fun _ => throw ⟨.unsupported, "blob"⟩
@@ -375,6 +381,9 @@ def cases : Array TestCase := #[
     assertOutcome (DirectInterpreter.interpret noBlobs loopAndReturn 3).run (.ok 3)
     assertOutcome (DirectInterpreter.interpret noBlobs loopAndReturn 9).run (.ok 10)
     let ioBlobs : ExecContext IO := {
+      cancellation := .never
+      progress := .ignore
+      queues := .unsupported
       blobs := {
         putBlob := fun _ => throw ⟨.unsupported, "blob"⟩
         readBlob := fun _ => throw ⟨.unsupported, "blob"⟩

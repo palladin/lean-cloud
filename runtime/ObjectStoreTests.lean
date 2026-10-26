@@ -28,11 +28,23 @@ def contract (store : ObjectStore) (runPrefix : String) : IO Unit := do
   assertEq actual.data bytes.data
   let removed := runPrefix ++ "-remove"
   let retained := removed ++ "-keep"
+  let names := (store.executionContextFor removed).blobs
+  assertOutcome (← (names.readNamed "module").run) (.ok none)
+  let choices ← (Array.range 4).mapM fun i => store.putBytes (toJson i).compress.toUTF8
+  let writers ← choices.mapM fun choice => IO.asTask ((names.publishNamed "module" choice).run) .dedicated
+  let .ok chosen ← IO.ofExcept (← IO.wait writers[0]!)
+    | throw (IO.userError "Named publication failed")
+  for writer in writers do
+    assertOutcome (← IO.ofExcept (← IO.wait writer)) (.ok chosen)
+  assertOutcome (← (names.readNamed "module").run) (.ok (some chosen))
+  assertOutcome (← ((store.executionContextFor retained).blobs.readNamed "module").run) (.ok none)
+  assertEq (← (store.records removed).read "module") none "User name reached a replay location"
   discard <| store.createJson retained "keep" (toJson (99 : Nat))
   -- More than one listing page, plus a neighboring run and shared user blobs.
   for i in [:129] do discard <| store.createJson removed s!"key-{i}" (toJson i)
   store.removeRun removed
   store.removeRun removed
+  assertOutcome (← (names.readNamed "module").run) (.ok none)
   assertTrue (← store.isRemoved removed) "Cleanup lost its durable removal marker"
   for i in [:129] do assertEq (← store.readJson removed s!"key-{i}") none
   assertEq (← store.readJson retained "keep") (some (toJson (99 : Nat)))
@@ -109,6 +121,9 @@ private def executionBoundary (objects : ObjectStore) : IO Unit := do
         IO.sleep 1
       objects.executionContext.blobs.readBlob ref
     let context : ExecContext IO := { objects.executionContext with
+      cancellation := .never
+      progress := .ignore
+      queues := .unsupported
       blobs := { objects.executionContext.blobs with readBlob := read } }
     let program (_ : Unit) : Cloud IO BlobRef := Cloud.exec (fun env => do
       generation.modify (· + 1)

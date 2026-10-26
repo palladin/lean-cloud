@@ -54,6 +54,9 @@ def resolve (store : ObjectStore) (name : String) : ExceptT CloudError IO BlobRe
   | .error _ => throw ⟨.codec, "Invalid blob name record"⟩
 
 def executionContext (store : ObjectStore) : ExecContext IO where
+  cancellation := .never
+  progress := .ignore
+  queues := .unsupported
   blobs := {
     putBlob bytes := captureIO (liftM (store.putBytes bytes))
     readBlob ref := captureIO (store.readBytes ref)
@@ -81,6 +84,17 @@ def readJson (store : ObjectStore) (run key : String) : IO (Option Json) := do
 def createJson (store : ObjectStore) (run key : String) (value : Json) : IO Json := do
   let bytes ← store.create (← recordKey run key) (toJson (key, value)).compress.toUTF8
   decodeRecord key bytes
+
+/-- User names cannot address interpreter or coordination records. They share
+the run's cleanup lifetime, while referenced content-addressed blobs are shared. -/
+def executionContextFor (store : ObjectStore) (run : String) : ExecContext IO :=
+  { store.executionContext with blobs.names := some {
+    read name := captureIO do
+      let value ← store.readJson run ("user/blob/" ++ name)
+      value.mapM fun json => liftM (IO.ofExcept (fromJson? json))
+    publish name ref := captureIO do
+      discard (store.readBytes ref)
+      liftM (IO.ofExcept (fromJson? (← store.createJson run ("user/blob/" ++ name) (toJson ref)))) } }
 
 def records (store : ObjectStore) (run : String) : ReplayStore IO where
   read key := do

@@ -70,7 +70,7 @@ def executionEnvironment (config : Config) (worker : String) : IO (ExecContext I
     if let some bytes := sample.memoryLimit then
       let limit := max 1 (bytes / (1024 * 1024))
       capacity := { capacity with memoryMiB := some (min (capacity.memoryMiB.getD limit) limit) }
-  return { blobs := config.objects.executionContext.blobs, currentWorker := capacity, workers := routes.map fun route =>
+  return { config.objects.executionContext with currentWorker := capacity, workers := routes.map fun route =>
     if route.worker == worker then capacity else route.capacity }
 
 /-- Execute one inbox assignment. User exceptions are already Cloud outcomes.
@@ -83,14 +83,7 @@ private def executeAssignment (registry : Registry) (config : Config) (cache : R
   trace.assign assignment
   let revoked ← IO.mkRef false
   try
-    Pool.withHeartbeat config run id assignment.attempt fun healthy => do
-      let check : IO Unit := do
-        healthy
-        let allowed : Bool ← IO.ofExcept (fromJson? (← Pool.request config (.check run id assignment.attempt)))
-        unless allowed do
-          revoked.set true
-          throw (IO.userError "Assignment revoked")
-      check
+    Pool.withCancellation config run id assignment.attempt revoked fun cancellation check => do
       if finalize.isSome then config.objects.ensureContainer
       let records := trace.records (cache.records run (config.objects.records run) check)
       let observed ← observe records
@@ -102,6 +95,11 @@ private def executeAssignment (registry : Registry) (config : Config) (cache : R
             throw (IO.userError "Worker image does not match the submitted run")
           let program ← IO.ofExcept (registry.find definition.entry)
           let environment ← executionEnvironment config id
+          let environment : Environment IO := { environment.map MonadCloudExec.restore with
+            blobs := (config.objects.executionContextFor run).blobs.map MonadCloudExec.restore
+            cancellation, progress := trace.progress
+            queues := HttpMailbox.workQueues config.mailboxes.scheduler run }
+          let environment := environment.map (fun action => captureIO (liftM action))
           program.execute config.worker definition id observed trace assignment environment
       match report.progress with
       | .ok (.fork location _) => trace.suspend location

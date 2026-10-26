@@ -3,6 +3,7 @@ import LeanCloud.Scheduler
 import LeanCloud.Telemetry
 import LeanCloud.Observations
 import Std.Time.DateTime.Timestamp
+import Std.Sync.Mutex
 
 namespace LeanCloudRuntime.Trace
 open Lean LeanCloud LeanEff
@@ -32,21 +33,39 @@ structure Sink where
   worker : String
   session : String
   started : Nat
-  state : IO.Ref State
+  state : Std.Mutex State
   run : String := ""
   record : Recorder := fun _ => pure ()
 
 def create (worker : String) (run : String := "") (record : Recorder := fun _ => pure ()) : IO Sink := do
   let started ← IO.monoMsNow
-  return ⟨worker, s!"{← IO.Process.getPID}-{← IO.monoNanosNow}", started, ← IO.mkRef {}, run, record⟩
+  return ⟨worker, s!"{← IO.Process.getPID}-{← IO.monoNanosNow}", started, ← Std.Mutex.new {}, run, record⟩
+
+/-- Progress goes only to the coalescing last-view buffer, never the journal or
+stdout. Local tasks share an atomic sequence; reporting failures are harmless. -/
+def Sink.progress (sink : Sink) : ProgressReporter IO := ⟨fun slot update => do
+  try
+    unless !slot.isEmpty && slot.utf8ByteSize ≤ 128 && update.message.utf8ByteSize ≤ 2048 do return
+    let state ← sink.state.atomically do
+      let state ← get
+      set { state with seq := state.seq + 1 }
+      return state
+    let event : ExecutionEvent := ⟨sink.session, state.seq, (← IO.monoMsNow) - sink.started,
+      sink.worker, state.attempt, state.location, "progress", update.message, sink.run, state.source⟩
+    let now := toString (← Std.Time.Timestamp.now).toMillisecondsSinceUnixEpoch.val
+    let timestamp := String.ofList (List.replicate (20 - now.length) '0') ++ now
+    sink.record { timestamp, event, branch := state.branch, progress := some (slot, update) }
+  catch _ => pure ()⟩
 
 /-- Diagnostics never turn a successful operation into a workflow error.
 Docker's bounded log driver retains recent events; gaps are allowed. -/
 def Sink.emit (sink : Sink) (activity operation : String) (job : Option BranchObservation := none)
     (parallel : Option ParallelDisplay := none) : IO Unit := do
   try
-    let state ← sink.state.get
-    sink.state.set { state with seq := state.seq + 1 }
+    let state ← sink.state.atomically do
+      let state ← get
+      set { state with seq := state.seq + 1 }
+      return state
     let event : ExecutionEvent := ⟨sink.session, state.seq, (← IO.monoMsNow) - sink.started,
       sink.worker, state.attempt, state.location, activity, operation, sink.run, state.source⟩
     let resources ← Trace.resources
@@ -61,7 +80,7 @@ def Sink.emit (sink : Sink) (activity operation : String) (job : Option BranchOb
   catch _ => pure ()
 
 def Sink.assign (sink : Sink) (assignment : Assignment) : IO Unit := do
-  sink.state.modify fun state => { state with attempt := some assignment.attempt, location := assignment.branchStart.key, source := none, branch := some assignment.branchStart }
+  sink.state.atomically (modify fun state => { state with attempt := some assignment.attempt, location := assignment.branchStart.key, source := none, branch := some assignment.branchStart })
   sink.emit "assigned" ""
 
 /-- Lease renewal changes no visible branch state. Emit deltas, not the entire
@@ -77,20 +96,20 @@ def Sink.branches (sink : Sink) (before after : Array Scheduler.Job) : IO Unit :
       | .running worker attempt _ => (some attempt, s!"running · {worker}")
       | .waiting children => (none, s!"waiting · {children.size} branches")
       | .done => (none, "completed")
-    sink.state.modify fun state => { state with attempt, location := job.location.key, source := none, branch := some job.branch }
+    sink.state.atomically (modify fun state => { state with attempt, location := job.location.key, source := none, branch := some job.branch })
     sink.emit "branch-state" label (some observation)
 
 /-- Set context before the interpreter touches a record, including replay hits. -/
 def Sink.visit (sink : Sink) (location : Location) (source : Option SourceSiteId)
     (parallel : Option ParallelDisplay) : IO Unit := do
-  sink.state.modify fun state => { state with location := location.key, source }
+  sink.state.atomically (modify fun state => { state with location := location.key, source })
   if let some display := parallel then
     sink.emit "parallel-label" display.label.running (parallel := some display)
 
 /-- Joining probes child returns. Restore the parallel location before retaining
 its source, rather than attributing the suspension to the last child read. -/
 def Sink.suspend (sink : Sink) (location : Location) : IO Unit := do
-  sink.state.modify fun state => { state with location := location.key }
+  sink.state.atomically (modify fun state => { state with location := location.key })
   sink.emit "suspended" "parallel"
 
 private def operation (request : Request) : String :=
@@ -101,14 +120,14 @@ private def recordLocation (key : String) : String :=
 
 def Sink.records (sink : Sink) (store : ReplayStore IO) : ReplayStore IO where
   read key := do
-    sink.state.modify fun state => { state with location := recordLocation key }
+    sink.state.atomically (modify fun state => { state with location := recordLocation key })
     sink.emit "read-record" ""
     let record ← store.read key
     if let some record := record then sink.emit "replay" (operation record.request)
     else sink.emit "missing-record" ""
     return record
   create key record := do
-    sink.state.modify fun state => { state with location := recordLocation key }
+    sink.state.atomically (modify fun state => { state with location := recordLocation key })
     sink.emit "save-record" (operation record.request)
     let recorded ← store.create key record
     sink.emit "recorded" (operation recorded.request)

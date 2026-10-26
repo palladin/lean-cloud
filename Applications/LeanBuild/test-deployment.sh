@@ -23,7 +23,7 @@ cleanup() {
 trap cleanup EXIT
 cli() { LEAN_CLOUD_HOME="$test_dir/client" "$root/.lake/build/bin/lean_cloud" "$@"; }
 compose() { docker compose -p "$name" -f "$deployment/compose.json" "$@"; }
-bash "$root/deploy/local.sh" init "$deployment" "$image" "$name" 3 0 > "$test_dir/deploy.log" 2>&1
+bash "$root/deploy/local.sh" configure "$deployment" "$image" "$name" 3 0 > "$test_dir/deploy.log" 2>&1
 bash "$root/deploy/local.sh" up "$deployment" >> "$test_dir/deploy.log" 2>&1
 address=$(compose port scheduler 8080)
 cli connect build-test "http://$address" --token-file "$deployment/client.token" > "$test_dir/connect.log"
@@ -53,4 +53,4 @@ cli inspect modules > "$test_dir/inspect.log"
 cli watch modules --once > "$test_dir/watch.log"
 cli logs modules > "$test_dir/logs.log"
 [[ $(compose ps -q | sort) == "$before" ]] || { echo 'Submission changed containers' >&2; exit 1; }
-echo 'PASS GitHub source checkout, parallel module jobs, build artifacts and HTTP monitoring'
+echo 'PASS GitHub source checkout, persistent builders, build artifacts and HTTP monitoring'

@@ -267,6 +267,7 @@ private def handle (registry : Registry) (prepare : Config → String → Json �
     unless removed do throw (IO.userError "Run has not been retired; refusing to delete records")
     if let some store := observations then store.remove id
     if let some cache := replayCache then cache.remove id
+    HttpMailbox.retireWorkQueues config.mailboxes.scheduler id
     config.objects.removeRun id
   | .remove config id => do
     discard <| Pool.request config (.remove id)

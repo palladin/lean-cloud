@@ -10,6 +10,9 @@ abbrev M := StateM Journal
 /-- The pure reference model has no user blob effects. Pure evaluation never
 calls these operations; rejecting them also makes accidental use explicit. -/
 def pureContext : ExecContext M where
+  cancellation := .never
+  progress := .ignore
+  queues := .unsupported
   blobs := {
     putBlob _ := throw ⟨.unsupported, "User blobs are outside the pure replay model"⟩
     readBlob _ := throw ⟨.unsupported, "User blobs are outside the pure replay model"⟩

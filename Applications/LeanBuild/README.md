@@ -1,9 +1,10 @@
 # LeanBuild
 
 Build a Lean project from GitHub on lean-cloud. Give it a repository, revision,
-and Lake targets. Independent modules build on different workers; the completed
-workspace, executables, and diagnostics are saved in blob storage.
-Lean's normal elaboration and kernel checking run as part of compilation.
+and Lake targets. Workers compile ready modules using their local CPUs and share
+artifacts through blob storage. The final report links to the completed workspace,
+executables, and diagnostics. Lean's normal elaboration and kernel checking run
+as part of compilation.
 
 ```json
 {
@@ -13,110 +14,62 @@ Lean's normal elaboration and kernel checking run as part of compilation.
 }
 ```
 
-Omit `targets` (or use `[]`) to build the project's default Lake targets.
-Use the same target names as `lake build`: for example `Mathlib`, `my_executable`,
-`+My.Module:olean`, or `@dependency/Library`. Custom targets are supported too.
-A branch or tag is resolved once; the actual commit is recorded in the result.
-Use a commit hash when you want repeatable inputs.
-
-## Request options
-
-| Field | Meaning | Default |
-| --- | --- | --- |
-| `repository`, `revision` | Public GitHub HTTPS URL and Git revision | Required |
-| `targets` | Arguments to `lake build` | Project's default targets |
-| `subdirectory` | Lake project directory within the repository | `"."` |
-| `options` | Lake configuration values, e.g. `{"feature": "enabled"}` passes `-Kfeature=enabled` | `{}` |
-| `cache` | `"rebuild"` clears package build directories during preparation and disables external Lake artifact caches; `"reuse"` allows Lake's cache support | `"rebuild"` |
-| `modulesPerJob` | `0` groups work automatically using dependencies and available CPU capacity; a positive value caps modules per job (up to 100,000) | `0` |
-| `limits` | Per-command and artifact limits | See below |
-
-Native tools and system libraries belong in the deployment image. Jobs use the
-project's exact Lean version and the worker's OS/architecture. The request does
-not install toolchains or select a different execution platform.
+Omit `targets` to build the project's default Lake targets. Use the same names as
+`lake build`: for example `Mathlib`, `my_executable`, `+My.Module:olean`, or
+`@dependency/Library`. Custom targets are supported too. A branch or tag is
+resolved once; the actual commit is recorded in the result.
 
 ## How it runs
 
-1. Fetch the revision, load the Lake project, and resolve its dependencies and
-   declared generated-source prerequisites. Publish the resolved source workspace.
-2. Discover the module dependency graph for ordinary module, library, and
-   executable targets using Lake's APIs.
-3. Plan work in CPU slots, prioritizing long remaining dependency paths.
-   Modules using this round's outputs stay with their producing job; modules
-   whose prerequisites are already published can use any worker. Prefer placing
-   inputs of a future join together while filling the available CPU slots.
-   Before keeping a round boundary, try repacking the combined dependency graph
-   of neighboring rounds. Merge them when the estimated compute time is no
-   greater than their separate times. Otherwise publish the first round's
-   results so the following work can use the whole pool.
-   Each `Cloud.parallel` job uses one Lake context for local module scheduling.
-   Workers cache the full prepared source tree and import missing prerequisite
-   artifacts from shared blob storage. They publish only new or changed outputs.
-4. Restore those artifacts and pass **the original target list** to Lake's own
-   build engine, the same one used by `lake build`.
-   Lake completes native compilation, C FFI, linking, custom targets, and dynamic
-   dependencies. Publish the complete workspace as one file manifest.
+The Cloud workflow has five stages:
 
-In `watch`, each round's module count advances when all its jobs finish, so the
-last round reaches `100%`. The workflow completes after the final Lake target
-build and artifact publication also finish.
+1. Fetch the revision, resolve Lake dependencies and generated-source prerequisites,
+   discover the module DAG, and publish the prepared workspace.
+2. Enqueue modules with no prerequisites. Record the number of builder sessions
+   from `env.workers.size`.
+3. Run the builder sessions in one `Cloud.parallel`. Each is a long-lived `exec`
+   with a local pool bounded by `env.currentWorker.cpus`.
+4. Collect the immutable result for every planned module. Failed modules block
+   their dependents; independent modules can still finish.
+5. Restore the artifacts on one worker and ask Lake to complete the original
+   targets, including native compilation, linking, custom targets and dynamic
+   dependencies. Publish the complete workspace manifest.
 
-For `Base → [Left, Right] → Final`, one job suffices if its worker has two CPUs.
-For `Base → 1,024 independent modules` on four eight-CPU workers, the first job
-publishes `Base`; the next round runs four jobs of 256 modules. Keeping that
-wide fan-out with `Base` would leave the other workers idle.
+Each builder restores the prepared sources once. Its local lanes dequeue ready
+module IDs, restore missing prerequisites, compile, publish artifacts and a named
+result, notify ready dependents, then acknowledge the delivery. The workspace,
+manifest cache and downloaded packs stay on the worker's local filesystem.
+Already installed imports are not copied again.
 
-The module stage is distributed. The final target build runs on one worker;
-Lake retains its own local parallelism. Custom targets and unusual
-facets are delegated to that final build rather than guessing their dependencies.
-Build hooks must work in a relocated workspace and declare their dependencies to
-Lake. Module jobs preserve the prepared inputs and their prerequisites. Differing
-artifacts produced at the same path by parallel jobs are rejected.
+For `Base → [Left, Right] → Final`, publishing `Base` makes `Left` and `Right`
+available immediately. `Final` becomes available when both are committed.
+An unrelated slow module does not hold back this chain. There are no dependency
+rounds or repeated Cloud forks for module scheduling.
 
-Parallel planning records `env.workers` so replay preserves the same grouping.
-Each native job passes its executing worker's `env.currentWorker.cpus` explicitly
-as `lean -jN` to the Lake helper, including after a restart on another worker.
-Child module compilers default to `-j1`, so each does not create another
-hardware-sized thread pool. Project `weakLeanArgs`/`moreLeanArgs` can override
-that default. `LEAN_NUM_THREADS` is also set for compiled Lean tools.
-These settings are concurrency budgets, not CPU affinity or process limits;
-container resource limits remain in force. The pool describes capacity, not
-reservations or placement guarantees.
-Configure budgets in `deployment.json` using `cpuMillis` and `memoryMiB`
-(see [worker resource budgets](../../deploy/README.md#worker-resource-budgets)).
-An unconfigured local worker advertises only one CPU.
+The queue lives in the scheduler's existing HTTP/SQLite service. Its short
+transactions run independently of the Cloud scheduler actor. All deployments
+use the same implementation; no SQS, Service Bus, or separate queue service is
+required. Sources, artifacts and module results move directly between workers
+and blob storage, not through the scheduler.
 
-The same CPU budget bounds artifact hashing, file restoration and blob transfers
-in preparation, module builds and final target builds. Publication
-groups files into packs that can be hashed and uploaded concurrently; a single
-large pack uses concurrent chunk transfers. All started IO tasks stop before
-temporary files are removed, including when an operation fails.
+Module names are idempotent queue keys: several parents can announce the same
+ready module without creating more work, even after its acknowledgement.
+Queue deliveries have renewable leases and may repeat. Artifacts are uploaded
+before publishing an immutable, run-scoped result; notifications precede ACK.
+After interruption, redelivery reuses a committed result and repeats any needed
+notifications. An empty receive is not completion: builders wait until the queue
+has no pending **or leased** messages, and the collection stage still requires
+one result for every module. This relies on seeding all roots before starting
+builders and sending every successor before acknowledging its predecessor.
 
-Workers retain their own published packs in `LEAN_BUILD_CACHE`, so later jobs
-can reuse them without downloading them again. Successful module jobs, final
-builds share a worker-local workspace and manifest cache.
-Every reuse checks committed content; an interrupted or failed job invalidates
-the workspace. Packs remain immutable and independently verified. This cache
-is local to each worker's filesystem, not a shared writable build directory.
+Pause or kill signals `env.cancellation`. Builders stop accepting work, terminate
+active compiler process groups, join local tasks, and release outstanding work.
+The runtime checks assignment ownership before journaling the `exec` outcome.
+Ordinary IO exceptions remain application failures; they are not crash retries.
 
-With four equal workers, 1,024 independent modules need four jobs by default.
-A manual `modulesPerJob: 64` cap instead produces 16 jobs. Long independent
-chains stay local without a cloud round for every module. Cross-worker joins
-require publishing results first.
-
-This deterministic heuristic balances CPU use and fewer rounds. It assumes
-equal module costs and removes barriers without increasing modeled compute time;
-it does not predict compilation times, transfer costs or competing workloads.
-There is no fixed worker count, desired number of rounds or utilization threshold.
-Each round still waits for its slowest job; full CPU utilization and minimum
-build time are not guaranteed. Smaller caps reduce work repeated after a crash.
-The test tool's `--plan PATH` option reports round/job counts and an explicit
-unit-cost compute estimate for a saved module DAG.
-
-Only job inputs and artifact references enter the replay journal. Completed jobs
-are reused after a worker crash. An interrupted job may execute again. A build
-error or ordinary IO exception is a failure outcome, not a
-node-crash retry.
+`watch` shows each builder's active modules and locally known committed count.
+These counts are not added together: workers may know the same results. Progress
+is a best-effort last view, separate from durable build results and replay records.
 
 ## Local deployment and first run
 
@@ -129,7 +82,7 @@ bash deploy/local.sh up .lean-cloud/build
 lake exe lean_cloud
 ```
 
-In the console:
+In the console, enter each command separately:
 
 ```text
 connect build http://127.0.0.1:8080 --token-file .lean-cloud/build/client.token
@@ -140,115 +93,113 @@ watch batteries
 result batteries
 ```
 
-The supplied example builds two modules from a pinned Batteries revision and
-publishes their artifacts. The same image works with the
-[Kubernetes helpers](../../deploy/README.md) and [Azure deployment](../../deploy/Azure.md);
-the console uses the same HTTP connection in each environment.
+The example builds two modules from a pinned Batteries revision. The same image
+works with the [Azure](../../deploy/Azure.md), [AWS](../../deploy/AWS.md), and
+[existing Kubernetes](../../deploy/README.md) deployment helpers; the console
+uses the same HTTP connection in each environment.
 
 The report contains:
 
 - `commit`, `toolchain`, `platform`, and `source`: exact input provenance.
-- `modules`: per-module status in dependency order. Modules in the same job share
-  diagnostics and job duration; successful modules also share an artifact manifest.
-  Do not sum these durations as per-module CPU time. A failed module blocks its
-  dependents; independent modules in the job can still succeed.
-- `build`: final target status, diagnostics, duration, built modules, and an
-  `artifacts` reference to the complete workspace manifest. This includes sources,
-  Lake outputs, executables, and custom outputs outside `.lake/build`.
-- `success`: true when all module jobs and the final target build succeed.
+- `modules`: per-module status, diagnostics, elapsed time and artifact manifest,
+  in dependency order. Durations include prerequisite restoration and compilation;
+  they are not CPU time. Failed prerequisites produce `blocked` results.
+- `build`: final Lake target status, diagnostics, duration and an `artifacts`
+  reference to the complete workspace manifest.
+- `success`: true only when the modules and final target build succeed.
 
-To read diagnostics or a manifest, save its file-reference JSON from the report:
+Save a diagnostics or manifest reference from the report as JSON, then read it:
 
 ```sh
 bash Applications/LeanBuild/local-files.sh .lean-cloud/build ref.json
 ```
 
-Each workspace manifest entry gives a relative path, a packed-file reference
-(pack, byte offset, length, and SHA-256), and an executable flag. Files from one
-snapshot share a bounded number of packs, avoiding a separate remote transfer
-for each small file while allowing concurrent transfers.
-The application's `files download CONFIG FILE_REF OUTPUT` command downloads a
-top-level file reference, such as diagnostics or a workspace manifest;
-`files restore CONFIG MANIFEST_REF DIRECTORY` restores the packed workspace into
-a new directory. Run these inside the deployed image, where the storage
-configuration is available. Transfers verify sizes and SHA-256 hashes.
-Native executables require a compatible platform and runtime libraries.
+Each manifest entry records a relative path, a packed-file reference (pack,
+offset, length, SHA-256), and an executable flag. `files download CONFIG FILE_REF
+OUTPUT` downloads a top-level file reference; `files restore CONFIG MANIFEST_REF
+DIRECTORY` restores a workspace into a new directory. These application commands
+run inside the deployed image, where storage is configured. Transfers verify
+sizes and hashes. Native executables require a compatible platform and libraries.
 
-The workflow is `lean-build/v5`. Start new runs with the updated image;
-existing runs must finish with their original image because the workflow and
-report schema changed. Independent proof checking and its `check` request field
-have been removed. Rename `limits.checkerMemoryMiB` to `limits.helperMemoryMiB`
-in existing request files.
-Packed workspace manifests remain compatible with `v2`; old `v1` manifests
-require the old application image to restore.
-
-Remove this test deployment and its stored data:
+Remove the test deployment and its stored data:
 
 ```sh
 bash deploy/local.sh clean .lean-cloud/build --yes
 ```
 
-## Deployment and limits
+## Configuration and resource use
 
-Source projects need a stable **Lean 4.35.0 or later** release. `source-toolchain`
-selects the default image toolchain (currently 4.35.0). To select an exact release:
+| Request field | Meaning | Default |
+| --- | --- | --- |
+| `repository`, `revision` | Public GitHub HTTPS URL and Git revision | Required |
+| `targets` | Arguments to `lake build` | Project's default targets |
+| `subdirectory` | Lake project directory inside the repository | `"."` |
+| `options` | Lake configuration values, e.g. `{"feature":"enabled"}` passes `-Kfeature=enabled` | `{}` |
+| `cache` | `"rebuild"` clears package build directories and disables external Lake caches; `"reuse"` allows valid prepared cache artifacts | `"rebuild"` |
+| `limits` | Command and artifact limits | Below |
+
+Builder count is recorded once. Each builder uses its executing worker's current
+CPU budget, so a restarted session may have a different local width. These are
+concurrency budgets, not CPU affinity or placement guarantees. Each lane starts
+a Lake helper for one ready module with one Lean thread. Preparation and final
+targets use the worker's full budget. Native tools and project options may create
+additional threads; container limits remain authoritative.
+
+Configure `cpuMillis` and `memoryMiB` in `deployment.json` (see
+[worker resource budgets](../../deploy/README.md#worker-resource-budgets)). An
+unconfigured worker advertises one CPU. The local pool does not dynamically
+estimate module memory use: choose enough memory for the concurrent compilers.
+Artifact hashing, restoration and blob transfers also use bounded local pools.
+
+`limits` defaults to `seconds: 600` per subprocess, `helperMemoryMiB: 4096` per
+Lake helper, `bytes: 2147483648` per workspace, and `modules: 10000`.
+Each module is a separate subprocess; the final Lake invocation has its own
+limit. Diagnostics are capped at 16 MiB per stream. Workspace size is checked at
+preparation, restoration/publication boundaries and after all local compilers
+stop. Container memory and disk limits bound peak usage between these checks.
+
+Workers cache immutable packs in `/data/build-cache` and one reusable workspace
+in `/data/build-cache.workspace`. The workspace key includes prepared sources,
+request, toolchain and helper. Switching builds replaces it. Cache hits are
+verified; an interrupted session leaves no clean marker and is reconstructed
+from committed blob artifacts. Cache directories must be private to each worker
+process. `LEAN_BUILD_CACHE` changes the pack directory and
+`LEAN_BUILD_CACHE_BYTES` bounds packs (default 4 GiB). Without a cache, builders
+use temporary workspaces. Provision extra disk for logs and temporary files.
+
+Prepared inputs and installed artifacts remain immutable during module builds.
+Conflicting artifacts are rejected. Build hooks must declare dependencies to Lake
+and work in relocated workspaces. Custom targets and unusual facets remain the
+final Lake build's responsibility. Dependencies must be inside the snapshot;
+internal file symlinks are materialized, while external links, directory links,
+Git submodules and external dependency directories are rejected.
+
+## Toolchains and compatibility
+
+Source projects need a stable Lean **4.35.0 or later** release. The project's
+`lean-toolchain` must match the deployed toolchain exactly; it is never rewritten.
+To select an exact release:
 
 ```sh
 bash Applications/LeanBuild/build.sh lean-cloud-build:dev 4.35.0
 ```
 
-The project's `lean-toolchain` must match the deployed toolchain exactly; it is
-never rewritten. The image pins the official release's SHA-256 digest. On first
-startup, each worker downloads that release directly from GitHub into
-`/data/toolchains`, verifies its checksum, and type-checks the Lake helper before
-becoming ready. Restarts reuse the installation. The toolchain is not uploaded
-from your laptop as an image layer. First startup needs outbound GitHub access
-and roughly 3.2 GB of persistent space for Lean 4.35.0, plus installation scratch
-space. For Kubernetes, set `startupSeconds: 900` in `deployment.json` to allow
-time for installation. The scheduler does not download a toolchain.
+The image pins the release checksum. Each worker downloads Lean directly from
+GitHub at first startup, verifies it and checks the Lake helper. Restarts reuse
+`/data/toolchains`; the scheduler does not download a toolchain. Lean 4.35.0 needs
+roughly 3.2 GB of persistent space plus installation scratch space. Kubernetes
+can use `startupSeconds: 900` to allow installation time. Alternatively,
+`LEAN_BUILD_TOOLCHAIN` selects an existing installation. `LEAN_BUILD_RELEASE`
+and `LEAN_BUILD_TOOLCHAINS` select the pinned release JSON and download cache.
+4.35.0 is tested; future Lake API changes may need helper updates.
 
-For an existing local installation, set `LEAN_BUILD_TOOLCHAIN` to its directory;
-this bypasses downloading. `LEAN_BUILD_RELEASE` identifies the pinned release
-JSON and `LEAN_BUILD_TOOLCHAINS` selects the installation cache directory.
-**4.35.0 is tested**; future Lake API changes may require helper updates. The
-lean-cloud worker SDK has its own separate, pinned toolchain.
+The workflow is `lean-build/v6`. Start new runs with the new image; unfinished
+older workflows must keep their original image. `modulesPerJob` is removed.
+Packed manifests remain compatible with v2. Independent checking fields are no
+longer accepted; use `limits.helperMemoryMiB` instead of `checkerMemoryMiB`.
 
 Run trusted repositories in dedicated deployments: Lake configuration, build
 hooks, plugins and metaprograms execute code inside the worker container.
-
-`limits` defaults to `seconds: 600` per command, `helperMemoryMiB: 4096` for the
-helper, `bytes: 2147483648` per workspace, and `modules: 10000`.
-The module build command now covers a whole job, not one module. Adjust `seconds`
-or `modulesPerJob` for expensive modules.
-Each command's diagnostics are capped at 16 MiB per stream. Container CPU, memory,
-and disk limits govern native tools and temporary files; the helper's memory
-option is not a container memory limit.
-
-Dependencies must be inside the repository snapshot. Internal file symlinks are
-materialized; external links, directory links, Git submodules, and dependencies
-outside the snapshot are rejected.
-
-The image caches immutable packs in `/data/build-cache` and keeps one reusable
-workspace in `/data/build-cache.workspace`. Switching builds replaces that
-workspace. Its key includes the prepared source, request, toolchain path and
-helper digest. Cache directories must be private to each worker process.
-Calls within a worker are serialized.
-
-Before a job, files are checked against its committed input manifest; unchanged
-files stay in place. Missing or corrupt files are restored, and outputs outside
-those inputs are removed. This also prevents an interrupted replay from treating
-its own outputs as prerequisites. Only successful, published jobs mark a
-workspace reusable. A crash or failed job leaves it dirty; the next attempt
-reconstructs it from blobs. The cache is an optimization, never durable progress.
-
-Set `LEAN_BUILD_CACHE` to choose the pack directory; the workspace uses that path
-with `.workspace` appended. `LEAN_BUILD_CACHE_BYTES` bounds packs (default 4 GiB).
-Without `LEAN_BUILD_CACHE`, jobs use temporary workspaces. `limits.bytes` bounds
-the reusable workspace; provision additional disk for packs, metadata, logs and
-temporary files. Packs larger than the cache budget use temporary storage.
-
-Large Mathlib/FLT performance has not been validated;
-batch barriers and artifact transfer costs still apply.
 
 ## Tests
 
@@ -261,21 +212,21 @@ lake build cloud_app build_local build_tests
 .lake/build/bin/build_tests --native
 ```
 
-Tests compare direct/replay execution on 80 generated module graphs and compare
-native executable output with ordinary Lake. Fixtures cover library/default/module
-and custom targets, generated sources, C FFI, configuration options, subdirectories,
-CPU-weighted batching, local joins, barrier merging, overlapping native builds, replay after a capacity change,
-bounded concurrent IO, producer caches, finish with downloads disabled,
-exact toolchains and durable failures. Invalid Lean modules fail the build and
-block dependent modules; independent modules can still succeed. Ordinary Lean
-warnings, including `sorry`, preserve Lake's normal build behavior.
+Tests compare direct/replay execution on 40 generated DAGs. They cover concurrent
+builder sessions, progress without round barriers, interruption between result
+publication and notification, cancellation, blocked dependencies, durable errors,
+cache reuse and integrity. Native fixtures compare output with ordinary Lake and
+cover libraries, executables, C FFI, generated/custom targets and restored artifacts.
+Runtime tests separately exercise the same HTTP/SQLite queue's leases, reopening,
+stale receipts, concurrent consumers and run removal.
 
-An optional [offline planner benchmark](Benchmarks/README.md) compares the
-heuristic with open-source constraint solvers on saved module graphs.
-
-The optional container test fetches the pinned GitHub example through the normal
-HTTP client and removes its temporary deployment on exit:
+The container test uses the ordinary HTTP client and removes its temporary
+deployment on exit:
 
 ```sh
 bash Applications/LeanBuild/test-deployment.sh lean-cloud-build:dev
 ```
+
+This builder design has not yet been benchmarked on the full Mathlib DAG in a
+cloud deployment. Shared queue throughput, artifact IO, per-module Lake startup,
+module memory use and the final target build can still limit utilization.

@@ -42,6 +42,9 @@ def coordinationCases : Array TestCase := #[
           let accepted := existing.getD proposed
           (accepted, some accepted) }
     let blobs : ExecContext IO := {
+      cancellation := .never
+      progress := .ignore
+      queues := .unsupported
       blobs := {
         putBlob := fun _ => throw ⟨.unsupported, "Unexpected blob operation"⟩
         readBlob := fun _ => throw ⟨.unsupported, "Unexpected blob operation"⟩

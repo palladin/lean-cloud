@@ -46,6 +46,16 @@ tracked source bytes and actual prerequisite artifacts remain protected. -/
 private def gitIndex (path : String) : Bool :=
   path == ".git/index" || path.endsWith "/.git/index"
 
+/-- Validate prepared inputs once after all local compilers have stopped. This
+does not scan or republish the build directory after every module. -/
+def validateInputs (root : System.FilePath) (inputs : Manifest) (concurrency : Nat) : IO Unit := do
+  discard <| Parallel.map concurrency inputs fun entry => do
+    if gitIndex entry.path then return
+    let path := root / entry.path
+    unless (← path.pathExists) && (← path.metadata).type == .file &&
+        (← Files.digest path) == entry.file.sha256 && (← executable path.toString) == entry.executable do
+      throw (IO.userError s!"Build changed a prerequisite artifact: {entry.path}")
+
 /-- File links inside the checkout are captured as ordinary files. Never follow
 directory links or links outside the workspace. Restored manifests contain no links. -/
 private partial def enumerate (root : System.FilePath) (relative : String := "") : IO (Array String) := do

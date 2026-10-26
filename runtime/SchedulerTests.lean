@@ -93,6 +93,9 @@ def run : IO Unit := IO.FS.withTempFile fun _ inboxPath =>
             | some existing => (existing, all)
             | none => (proposed, (key, proposed) :: all) }
         let blobs : ExecContext IO := {
+          cancellation := .never
+          progress := .ignore
+          queues := .unsupported
           blobs := {
             putBlob := fun _ => throw ⟨.unsupported, "No user blobs in this test"⟩
             readBlob := fun _ => throw ⟨.unsupported, "No user blobs in this test"⟩

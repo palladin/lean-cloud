@@ -47,6 +47,9 @@ def workflow [Monad m] (input : Input) : Cloud m Nat :=
 
 /-- Reject any accidental use of external effects in the reference program. -/
 private def noBlobs : ExecContext Id := {
+  cancellation := .never
+  progress := .ignore
+  queues := .unsupported
   blobs := {
     putBlob := fun _ => throw ⟨.unsupported, "Pure chaos workflow used blobs"⟩
     readBlob := fun _ => throw ⟨.unsupported, "Pure chaos workflow used blobs"⟩

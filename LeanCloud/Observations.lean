@@ -1,5 +1,6 @@
 import LeanCloud.Telemetry
 import LeanCloud.ParallelLabel
+import LeanCloud.ExecServices
 
 namespace LeanCloud.Observations
 open Lean
@@ -15,6 +16,7 @@ structure Step where
   job : Option BranchObservation := none
   /-- Optional labels carried by a parallel observation, including its final text. -/
   parallel : Option ParallelDisplay := none
+  progress : Option (String × ProgressUpdate) := none
   deriving ToJson
 
 instance : Inhabited Step := ⟨{ timestamp := "", event := ⟨"", 0, 0, "", none, "", "", "", "", none⟩ }⟩
@@ -28,7 +30,8 @@ instance : FromJson Step where
              resources := (json.getObjValAs? ResourceSample "resources").toOption
              branch := (json.getObjValAs? Location "branch").toOption
              job := (json.getObjValAs? BranchObservation "job").toOption
-             parallel := (json.getObjValAs? ParallelDisplay "parallel").toOption }
+             parallel := (json.getObjValAs? ParallelDisplay "parallel").toOption
+             progress := (json.getObjValAs? (String × ProgressUpdate) "progress").toOption }
 
 def Step.id (step : Step) : String :=
   (toJson (step.timestamp, step.event.worker, step.event.session, step.event.seq)).compress
@@ -53,6 +56,10 @@ def Step.owner (step : Step) : Option Location :=
 appending history; each parallel call retains its source and child count. -/
 def Step.keys (step : Step) : Array String := Id.run do
   let mut keys := #[]
+  if let some (slot, _) := step.progress then
+    if let some owner := step.owner then
+      return #[s!"progress/{owner.key}/{step.event.worker}/{slot}"]
+    return #[]
   if let some job := step.job then
     keys := keys.push ("job/" ++ job.branch.key)
     if let .waiting _ := job.status then keys := keys.push ("group/" ++ job.location.key)

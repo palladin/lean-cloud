@@ -83,6 +83,9 @@ def run : IO Unit := do
       | some existing => return existing
       | none => journal.modify ((key, record) :: ·); return record }
   let blobs : ExecContext IO := {
+    cancellation := .never
+    progress := .ignore
+    queues := .unsupported
     blobs := {
       putBlob := fun _ => throw ⟨.unsupported, "unexpected blob"⟩
       readBlob := fun _ => throw ⟨.unsupported, "unexpected blob"⟩

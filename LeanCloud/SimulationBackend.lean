@@ -61,6 +61,9 @@ def observed (worker : WorkerId) : Worker.ObservedStore (SimM World) where
     "worker.confirmed"
 
 def context : ExecContext (SimM World) where
+  cancellation := .never
+  progress := .ignore
+  queues := .unsupported
   blobs := {
     putBlob bytes := liftM (m := SimM World) <| SimM.atomic (fun world =>
       let key := s!"blob/{modelChecksum bytes}/{bytes.size}"
