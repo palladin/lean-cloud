@@ -88,12 +88,12 @@ def Reader.read (reader : Reader) (offset count : Nat) : IO ByteArray := do
     if reader.ends[mid]! ≤ offset then low := mid + 1 else high := mid
   let mut index := low
   let mut position := offset
-  let mut result := ByteArray.empty
+  let mut result := ByteArray.emptyWithCapacity (stop - offset)
   while position < stop do
     let start := if index == 0 then 0 else reader.ends[index - 1]!
     let bytes ← reader.chunk index
     let finish := min stop reader.ends[index]!
-    result := result ++ bytes.extract (position - start) (finish - start)
+    result := bytes.copySlice (position - start) result result.size (finish - position) false
     position := finish
     index := index + 1
   return result
@@ -106,7 +106,7 @@ def upload (store : ObjectStore) (path : System.FilePath) (limit : Nat)
     (concurrency : Nat := 1) : IO FileRef := do
   let size := (← path.metadata).byteSize.toNat
   unless size ≤ limit do throw (IO.userError "File exceeds configured byte limit")
-  let sha256 ← digest path
+  let hashing ← Digest.start
   let handle ← IO.FS.Handle.mk path .read
   let mut chunks := #[]
   let mut total := 0
@@ -117,9 +117,11 @@ def upload (store : ObjectStore) (path : System.FilePath) (limit : Nat)
       if bytes.isEmpty then break
       total := total + bytes.size
       unless total ≤ limit do throw (IO.userError "File grew beyond configured byte limit")
+      Digest.update hashing bytes
       batch := batch.push bytes
     if batch.isEmpty then break
     chunks := chunks ++ (← Parallel.map concurrency batch store.putBytes)
+  let sha256 ← Digest.finish hashing
   unless total == size && (← digest path) == sha256 do
     throw (IO.userError "File changed during upload")
   let manifest : FileManifest := { chunks, size, sha256 }
@@ -136,33 +138,43 @@ def download (store : ObjectStore) (ref : FileRef) (path : System.FilePath) (lim
     throw (IO.userError "File reference exceeds configured limit")
   let reader ← openReader store ref
   let handle ← IO.FS.Handle.mk path .write
+  let hashing ← Digest.start
   let width := max 1 concurrency
   let mut index := 0
   while index < reader.chunks.size do
     let batch ← Parallel.map width (reader.chunks.extract index (index + width)) (readBlob store)
-    for bytes in batch do handle.write bytes
+    for bytes in batch do
+      handle.write bytes
+      Digest.update hashing bytes
     index := index + width
   handle.flush
-  unless (← digest path) == ref.sha256 do throw (IO.userError "File digest mismatch")
+  unless (← Digest.finish hashing) == ref.sha256 do throw (IO.userError "File digest mismatch")
   -- On failure the caller's private workspace owns any partial file. In
   -- particular, do not remove a file owned by IO.FS.withTempFile's cleanup.
 
 
-def putText (store : ObjectStore) (text : String) : IO FileRef :=
-  IO.FS.withTempFile fun handle path => do
-    handle.putStr text
-    handle.flush
-    upload store path text.utf8ByteSize
+def putText (store : ObjectStore) (text : String) : IO FileRef := do
+  let bytes := text.toUTF8
+  let sha256 ← Digest.bytes bytes
+  let mut chunks := #[]
+  for offset in [:((bytes.size + chunkSize - 1) / chunkSize)] do
+    chunks := chunks.push (← store.putBytes (bytes.extract (offset * chunkSize) ((offset + 1) * chunkSize)))
+  let manifest : FileManifest := { chunks, size := bytes.size, sha256 }
+  let ref ← store.putBytes (toJson manifest).compress.toUTF8
+  return ⟨ref, bytes.size, sha256⟩
 
-def readText (store : ObjectStore) (ref : FileRef) (limit : Nat := 16 * 1024 * 1024) : IO String :=
-  IO.FS.withTempFile fun _ path => do
-    download store ref path limit
-    IO.FS.readFile path
+def readText (store : ObjectStore) (ref : FileRef) (limit : Nat := 16 * 1024 * 1024) : IO String := do
+  unless ref.size ≤ limit do throw (IO.userError "File reference exceeds configured limit")
+  let reader ← openReader store ref
+  let bytes ← reader.read 0 ref.size
+  unless (← Digest.bytes bytes) == ref.sha256 do throw (IO.userError "File digest mismatch")
+  let some text := String.fromUTF8? bytes | throw (IO.userError "Invalid UTF-8 file")
+  return text
 
 def metadataLimit : Nat := 256 * 1024 * 1024
 
 def putJson [ToJson α] (store : ObjectStore) (value : α) : IO FileRef := do
-  let text := (toJson value).pretty
+  let text := (toJson value).compress
   unless text.utf8ByteSize ≤ metadataLimit do throw (IO.userError "Artifact metadata exceeds 256 MiB")
   putText store text
 

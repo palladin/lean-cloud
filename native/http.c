@@ -146,3 +146,102 @@ LEAN_EXPORT lean_obj_res lc_http_post(b_lean_obj_arg handle, b_lean_obj_arg url,
     (void)world;
     return request_http(handle, url, lean_string_cstr(token), body, timeout);
 }
+
+/* Storage uses borrowed request bytes and grows the Lean response buffer
+ * geometrically. No subprocesses, temporary files, or final response copy. */
+struct binary_buffer { lean_object *bytes; size_t capacity; };
+static size_t receive_binary(char *data, size_t size, size_t count, void *context) {
+    struct binary_buffer *b = context;
+    if (count && size > SIZE_MAX / count) return 0;
+    size_t n = size * count, previous = lean_sarray_size(b->bytes);
+    if (n > SIZE_MAX - previous - 1) return 0;
+    size_t needed = previous + n;
+    if (needed > b->capacity) {
+        size_t capacity = b->capacity > SIZE_MAX / 2 ? needed : b->capacity * 2;
+        if (capacity < 16384) capacity = 16384;
+        if (capacity < needed) capacity = needed;
+        lean_object *amount = lean_usize_to_nat(capacity);
+        lean_object *next = lean_mk_empty_byte_array(amount);
+        lean_dec(amount);
+        memcpy(lean_sarray_cptr(next), lean_sarray_cptr(b->bytes), previous);
+        lean_dec(b->bytes);
+        b->bytes = next; b->capacity = capacity;
+    }
+    memcpy(lean_sarray_cptr(b->bytes) + previous, data, n);
+    lean_sarray_set_size(b->bytes, needed);
+    return n;
+}
+
+LEAN_EXPORT lean_obj_res lc_http_storage(b_lean_obj_arg handle, b_lean_obj_arg url,
+        b_lean_obj_arg method, b_lean_obj_arg fields, b_lean_obj_arg body,
+        b_lean_obj_arg signing, uint8_t no_proxy, lean_obj_arg world) {
+    (void)world;
+    CURL *c = lean_get_external_data(handle);
+    struct curl_slist *headers = NULL;
+    struct binary_buffer b = { .bytes = lean_mk_empty_byte_array(lean_box(0)), .capacity = 0 };
+    CURLcode code = CURLE_OK;
+    long status = 0;
+    curl_off_t length = -1;
+    const char *verb = lean_string_cstr(method);
+    p_curl_easy_reset(c);
+#define STORAGE_OPT(option, value) do { code = p_curl_easy_setopt(c, option, value); if (code != CURLE_OK) goto done; } while (0)
+    for (size_t i = 0; i < lean_array_size(fields); ++i) {
+        struct curl_slist *next = p_curl_slist_append(headers, lean_string_cstr(lean_array_get_core(fields, i)));
+        if (!next) { code = CURLE_OUT_OF_MEMORY; goto done; }
+        headers = next;
+    }
+    STORAGE_OPT(CURLOPT_URL, lean_string_cstr(url));
+#if LIBCURL_VERSION_NUM >= 0x075500
+    STORAGE_OPT(CURLOPT_PROTOCOLS_STR, "http,https");
+#else
+    STORAGE_OPT(CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+#endif
+    STORAGE_OPT(CURLOPT_HTTPHEADER, headers);
+    STORAGE_OPT(CURLOPT_FOLLOWLOCATION, 0L);
+    STORAGE_OPT(CURLOPT_NOSIGNAL, 1L);
+    STORAGE_OPT(CURLOPT_CONNECTTIMEOUT_MS, 10000L);
+    STORAGE_OPT(CURLOPT_TIMEOUT_MS, 60000L);
+    STORAGE_OPT(CURLOPT_MAXCONNECTS, 4L);
+    STORAGE_OPT(CURLOPT_NOPROGRESS, 0L);
+    STORAGE_OPT(CURLOPT_XFERINFOFUNCTION, progress);
+    STORAGE_OPT(CURLOPT_WRITEFUNCTION, receive_binary);
+    STORAGE_OPT(CURLOPT_WRITEDATA, &b);
+    if (no_proxy) STORAGE_OPT(CURLOPT_NOPROXY, "*");
+    if (lean_array_size(signing) == 3) {
+        STORAGE_OPT(CURLOPT_AWS_SIGV4, lean_string_cstr(lean_array_get_core(signing, 0)));
+        STORAGE_OPT(CURLOPT_USERNAME, lean_string_cstr(lean_array_get_core(signing, 1)));
+        STORAGE_OPT(CURLOPT_PASSWORD, lean_string_cstr(lean_array_get_core(signing, 2)));
+    }
+    if (!strcmp(verb, "PUT") || !strcmp(verb, "POST")) {
+        STORAGE_OPT(CURLOPT_POSTFIELDS, lean_sarray_cptr(body));
+        STORAGE_OPT(CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)lean_sarray_size(body));
+    }
+    if (!strcmp(verb, "HEAD")) STORAGE_OPT(CURLOPT_NOBODY, 1L);
+    STORAGE_OPT(CURLOPT_CUSTOMREQUEST, verb);
+    code = p_curl_easy_perform(c);
+    if (code == CURLE_OK) code = p_curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
+    if (code == CURLE_OK) code = p_curl_easy_getinfo(c, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &length);
+done:
+    /* Clear credentials and borrowed pointers; reset preserves connections. */
+    p_curl_easy_reset(c);
+    p_curl_slist_free_all(headers);
+    if (code != CURLE_OK) {
+        lean_dec(b.bytes);
+        char message[80];
+        snprintf(message, sizeof(message), "Storage transport failed (curl %d)", (int)code);
+        return fail(message);
+    }
+    lean_object *known = lean_box(0);
+    if (length >= 0) {
+        known = lean_alloc_ctor(1, 1, 0);
+        lean_ctor_set(known, 0, lean_uint64_to_nat((uint64_t)length));
+    }
+    lean_object *payload = lean_alloc_ctor(0, 2, 0);
+    lean_ctor_set(payload, 0, b.bytes);
+    lean_ctor_set(payload, 1, known);
+    lean_object *result = lean_alloc_ctor(0, 2, 0);
+    lean_ctor_set(result, 0, lean_box_uint32((uint32_t)status));
+    lean_ctor_set(result, 1, payload);
+    return lean_io_result_mk_ok(result);
+#undef STORAGE_OPT
+}

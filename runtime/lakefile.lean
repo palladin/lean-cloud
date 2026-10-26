@@ -23,6 +23,7 @@ lean_lib SchedulerTests
 lean_lib MonitoringTests
 lean_lib ObjectStoreTests
 lean_lib StorageProviderTests
+lean_lib StorageHttpTests
 lean_lib ReplayCacheTests
 lean_lib CleanupTests
 lean_lib WorkQueueTests

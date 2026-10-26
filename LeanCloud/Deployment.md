@@ -103,6 +103,15 @@ records, separate from the interpreter's replay locations. Publish artifacts
 before their named result, and enqueue successors before acknowledging work.
 See [LeanBuild](../Applications/LeanBuild/README.md) for a complete example.
 
+Blob bytes use SHA-256 content keys and conditional creation. Duplicate uploads
+check the existing object's length without downloading it; name publication
+also uses metadata only. This relies on SHA-256 collision resistance. Reads
+verify both the content hash and the reference checksum. Small replay and named
+result records still return the canonical value selected by the first writer.
+Storage transfers use pooled libcurl connections, without subprocesses or
+temporary files. Large file transfers retain bounded chunk buffers and hash
+their contents while streaming.
+
 See [resource settings](../deploy/README.md#worker-resource-budgets) for deployment
 configuration. Existing unfinished workflows must continue with their original
 image: removing implicit planning and blob records changes replay locations.

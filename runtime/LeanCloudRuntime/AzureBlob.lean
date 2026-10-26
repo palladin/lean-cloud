@@ -59,6 +59,27 @@ private def read (config : Config) (key : String) : IO (Option ByteArray) := do
   unless status == 200 do throw (IO.userError s!"Azure Blob read failed (HTTP {status})")
   return some bytes
 
+private def size (config : Config) (key : String) : IO (Option Nat) := do
+  IO.ofExcept config.validate
+  let (status, _, length) ← StorageHttp.sendWithLength
+    (requestSpec config (← token config) "HEAD" ("/" ++ key))
+  if status == 404 then return none
+  unless status == 200 do throw (IO.userError s!"Azure Blob metadata read failed (HTTP {status})")
+  let some length := length | throw (IO.userError "Azure Blob response has no content length")
+  return some length
+
+private def putContent (config : Config) (key : String) (bytes : ByteArray) : IO Unit := do
+  for _ in [:8] do
+    let (status, _) ← request config "PUT" ("/" ++ key) bytes true
+    if status == 201 then return
+    unless status == 409 || status == 412 do
+      throw (IO.userError s!"Azure Blob content upload failed (HTTP {status})")
+    if let some length ← size config key then
+      unless length == bytes.size do throw (IO.userError "Content-addressed blob size conflict")
+      return
+    IO.sleep 50
+  throw (IO.userError "Azure Blob conditional upload did not settle")
+
 private def create (config : Config) (key : String) (bytes : ByteArray) : IO ByteArray := do
   for _ in [:8] do
     let (status, _) ← request config "PUT" ("/" ++ key) bytes true
@@ -97,6 +118,8 @@ def objects (config : Config) : ObjectStore where
     unless status == 200 do throw (IO.userError s!"Azure Blob container unavailable (HTTP {status})")
   read := read config
   create := create config
+  putContent := putContent config
+  size := size config
   list keyPrefix := do
     let (status, bytes) ← request config "GET"
       ("?restype=container&comp=list&maxresults=128&prefix=" ++ StorageHttp.component keyPrefix)

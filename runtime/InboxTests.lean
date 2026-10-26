@@ -10,6 +10,7 @@ import SchedulerTests
 import MonitoringTests
 import ObjectStoreTests
 import StorageProviderTests
+import StorageHttpTests
 import ReplayCacheTests
 import CleanupTests
 import WorkQueueTests
@@ -499,6 +500,7 @@ def main (args : List String) : IO UInt32 := do
     MonitoringTests.run
     ObjectStoreTests.run
     StorageProviderTests.run
+    StorageHttpTests.run
     WorkQueueTests.run
     schemaVersions
     laws

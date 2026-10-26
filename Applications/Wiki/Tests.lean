@@ -18,6 +18,9 @@ private def objects (ref : Std.Mutex (Std.HashMap String ByteArray)) : ObjectSto
     if let some old := (← get)[key]? then return old
     modify (·.insert key bytes)
     return bytes
+  putContent key bytes := ref.atomically do
+    unless (← get).contains key do modify (·.insert key bytes)
+  size key := ref.atomically do return (← get)[key]?.map (·.size)
   erase key := ref.atomically do modify (·.erase key)
   list _ := return #[]
 

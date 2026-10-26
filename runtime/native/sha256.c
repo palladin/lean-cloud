@@ -4,6 +4,8 @@
 #include <string.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <stdlib.h>
+#include <pthread.h>
 
 #ifdef __APPLE__
 #include <CommonCrypto/CommonDigest.h>
@@ -16,7 +18,6 @@ static int digest_final(digest_ctx *ctx, unsigned char *hash) { return CC_SHA256
 static void digest_free(digest_ctx *ctx) { (void)ctx; }
 #else
 #include <dlfcn.h>
-#include <pthread.h>
 typedef void *digest_ctx;
 static void *crypto;
 static void *(*ctx_new)(void);
@@ -76,6 +77,76 @@ LEAN_EXPORT lean_obj_res lean_cloud_sha256_bytes(b_lean_obj_arg bytes, lean_obj_
         offset += count;
     }
     return finish(&ctx, ok);
+}
+
+LEAN_EXPORT lean_obj_res lean_cloud_blob_fingerprint(b_lean_obj_arg bytes, lean_obj_arg world) {
+    lean_object *hashed = lean_cloud_sha256_bytes(bytes, world);
+    if (lean_io_result_is_error(hashed)) return hashed;
+    const unsigned char *data = lean_sarray_cptr(bytes);
+    uint64_t checksum = UINT64_C(14695981039346656037);
+    for (size_t i = 0; i < lean_sarray_size(bytes); ++i)
+        checksum = (checksum ^ data[i]) * UINT64_C(1099511628211);
+    lean_object *pair = lean_alloc_ctor(0, 2, 0);
+    lean_object *hash = lean_ctor_get(hashed, 0);
+    lean_inc(hash);
+    lean_ctor_set(pair, 0, hash);
+    lean_ctor_set(pair, 1, lean_uint64_to_nat(checksum));
+    lean_dec(hashed);
+    return lean_io_result_mk_ok(pair);
+}
+
+struct streaming_digest { digest_ctx ctx; int active; pthread_mutex_t lock; };
+static lean_external_class *digest_class;
+static pthread_once_t class_once = PTHREAD_ONCE_INIT;
+static void destroy_digest(void *value) {
+    struct streaming_digest *state = value;
+    if (state->active) digest_free(&state->ctx);
+    pthread_mutex_destroy(&state->lock);
+    free(state);
+}
+static void visit_digest(void *value, b_lean_obj_arg fn) { (void)value; (void)fn; }
+static void register_digest(void) {
+    digest_class = lean_register_external_class(destroy_digest, visit_digest);
+}
+LEAN_EXPORT lean_obj_res lean_cloud_sha256_new(lean_obj_arg world) {
+    (void)world;
+    pthread_once(&class_once, register_digest);
+    struct streaming_digest *state = calloc(1, sizeof(*state));
+    if (!state) return failure();
+    if (!digest_init(&state->ctx)) { digest_free(&state->ctx); free(state); return failure(); }
+    if (pthread_mutex_init(&state->lock, NULL) != 0) {
+        digest_free(&state->ctx); free(state); return failure();
+    }
+    state->active = 1;
+    return lean_io_result_mk_ok(lean_alloc_external(digest_class, state));
+}
+LEAN_EXPORT lean_obj_res lean_cloud_sha256_update(b_lean_obj_arg handle, b_lean_obj_arg bytes,
+        lean_obj_arg world) {
+    (void)world;
+    struct streaming_digest *state = lean_get_external_data(handle);
+    pthread_mutex_lock(&state->lock);
+    if (!state->active) { pthread_mutex_unlock(&state->lock); return failure(); }
+    size_t offset = 0, size = lean_sarray_size(bytes);
+    while (offset < size) {
+        size_t count = size - offset < 65536 ? size - offset : 65536;
+        if (!digest_update(&state->ctx, lean_sarray_cptr(bytes) + offset, count)) {
+            digest_free(&state->ctx); state->active = 0;
+            pthread_mutex_unlock(&state->lock); return failure();
+        }
+        offset += count;
+    }
+    pthread_mutex_unlock(&state->lock);
+    return lean_io_result_mk_ok(lean_box(0));
+}
+LEAN_EXPORT lean_obj_res lean_cloud_sha256_finish(b_lean_obj_arg handle, lean_obj_arg world) {
+    (void)world;
+    struct streaming_digest *state = lean_get_external_data(handle);
+    pthread_mutex_lock(&state->lock);
+    if (!state->active) { pthread_mutex_unlock(&state->lock); return failure(); }
+    state->active = 0;
+    lean_object *result = finish(&state->ctx, 1);
+    pthread_mutex_unlock(&state->lock);
+    return result;
 }
 
 LEAN_EXPORT lean_obj_res lean_cloud_sha256_file(b_lean_obj_arg path, lean_obj_arg world) {

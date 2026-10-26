@@ -30,9 +30,13 @@ private def session (store : ObjectStore) (root : System.FilePath) (key : String
       if let some (_, manifest) := (← manifests.atomically get).find? (fun entry => entry.1 == ref) then
         -- Manifests are published by Files.putJson. Treat cached metadata like
         -- cached files: corruption must never change the committed inputs.
-        let bytes := (toJson manifest).pretty.toUTF8
-        if bytes.size == ref.size && (← Digest.bytes bytes) == ref.sha256 then
-          return manifest
+        let json := toJson manifest
+        -- Accept the original pretty encoding as well as compact uploads.
+        let validEncoding (text : String) : IO Bool := do
+          let bytes := text.toUTF8
+          return bytes.size == ref.size && (← Digest.bytes bytes) == ref.sha256
+        if ← validEncoding json.compress then return manifest
+        if ← validEncoding json.pretty then return manifest
       let manifest ← Files.readJson store ref
       remember ref manifest
       return manifest

@@ -32,6 +32,9 @@ private def objects (ref : Std.Mutex (Std.HashMap String ByteArray)) : ObjectSto
     if let some old := saved[key]? then return old
     set (saved.insert key bytes)
     return bytes
+  putContent key bytes := ref.atomically do
+    unless (← get).contains key do modify (·.insert key bytes)
+  size key := ref.atomically do return (← get)[key]?.map (·.size)
   erase key := ref.atomically (modify (·.erase key))
   list _ := return #[]
 
@@ -310,8 +313,8 @@ private def publicationTests (tools : Tools) (store : ObjectStore) (fixture : Sy
     for artifact in [false, true] do
       let pending ← Std.Mutex.new true
       let preparing ← IO.mkRef true
-      let flaky := { store with create := fun key bytes => do
-        let saved ← store.create key bytes
+      let flaky := { store with putContent := fun key bytes => do
+        store.putContent key bytes
         let target := artifact != (← preparing.get)
         if target then
           let inject ← pending.atomically do
@@ -319,7 +322,7 @@ private def publicationTests (tools : Tools) (store : ObjectStore) (fixture : Sy
             set false
             return old
           if inject then throw (IO.userError "Publication failure")
-        return saved }
+        pure () }
       let backend := { tools.backend flaky with
         prepare := fun _ r => do
           let result ← tools.prepareDirectory flaky r directory "fixture"
@@ -474,15 +477,18 @@ private def workspaceTests (store : ObjectStore) : IO Unit := IO.FS.withTempDir 
   IO.FS.writeFile (source / "input") "prepared source"
   let files ← (← Bundle.snapshot source 10000).publish store
   let ref ← Files.putJson store files
+  let legacyRef ← Files.putText store (toJson files).pretty
   let cache := root / "workspace"
   let use := Workspace.use store (some cache) "build-a"
   use fun session => do
     let manifest ← session.readManifest ref
+    discard <| session.readManifest legacyRef
     Bundle.synchronize store session.directory manifest 10000
     session.commit
   let offline := { store with read := fun _ => throw (IO.userError "Unnecessary blob read") }
   Workspace.use offline (some cache) "build-a" fun session => do
     let manifest ← session.readManifest ref
+    discard <| session.readManifest legacyRef
     check (← (session.directory / "input").pathExists) "Clean workspace was discarded"
     let before ← (session.directory / "input").metadata
     Bundle.synchronize offline session.directory manifest 10000
@@ -573,7 +579,7 @@ private def parallelIOTests (store : ObjectStore) : IO Unit := do
       try IO.sleep 10; action
       finally traffic.atomically do modify fun (active, peak) => (active - 1, peak)
     let remote := { store with
-      create := fun key bytes => observe (store.create key bytes)
+      putContent := fun key bytes => observe (store.putContent key bytes)
       read := fun key => observe (store.read key) }
     let original := root / "original"
     let bytes := ByteArray.mk ((Array.range (Files.chunkSize * 3 + 19)).map fun i => (i % 251).toUInt8)

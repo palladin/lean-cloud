@@ -290,6 +290,9 @@ private def memoryObjects (saved : IO.Ref (Std.HashMap String ByteArray)) : Lean
     match records[key]? with
     | some existing => (existing, records)
     | none => (bytes, records.insert key bytes)
+  putContent key bytes := objectsLock.atomically do
+    unless (← saved.get).contains key do saved.modify (·.insert key bytes)
+  size key := objectsLock.atomically do return (← saved.get)[key]?.map (·.size)
   list _ := return #[]
   erase key := objectsLock.atomically do saved.modify (·.erase key)
 
@@ -310,6 +313,12 @@ private def fileTests : IO Unit := IO.FS.withTempDir fun directory => do
   check (ref.size == 10 * 1048576 && count == 4) "Expected three chunks and a manifest"
   Files.download store ref dest ref.size
   check ((← Files.digest dest) == ref.sha256) "Large artifact round trip failed"
+  let reader ← Files.openReader store ref
+  let original ← IO.FS.readBinFile source
+  for (offset, count) in #[(16, 1), (Files.chunkSize - 1, 3), (ref.size - 2, 10), (ref.size, 1)] do
+    check ((← reader.read offset count) == original.extract offset (offset + count)) "Chunk range read changed bytes"
+  for text in ["", "small UTF-8 λ 🌍\n"] do
+    check ((← Files.readText store (← Files.putText store text)) == text) "In-memory text round trip"
   check ((← Files.upload store source ref.size) == ref && (← saved.get).size == count) "Retry did not reuse artifacts"
   rejects (Files.download store { ref with size := ref.size + 1 } dest (ref.size+1)) "Accepted forged file length"
   rejects (Files.download store { ref with sha256 := "bad" } dest ref.size) "Accepted forged file digest"
@@ -325,10 +334,10 @@ private def fileTests : IO Unit := IO.FS.withTempDir fun directory => do
   saved.set before
   -- No complete file reference is produced if publication fails midway.
   let attempts ← IO.mkRef 0
-  let interrupted := { store with create := fun key bytes => do
+  let interrupted := { store with putContent := fun key bytes => do
     let n ← attempts.modifyGet fun n => (n, n+1)
     if n == 1 then throw (IO.userError "Upload interrupted")
-    store.create key bytes }
+    store.putContent key bytes }
   rejects (Files.upload interrupted source ref.size) "Upload fault did not fire"
   check ((← Files.upload store source ref.size) == ref) "Interrupted upload changed artifact identity"
   IO.println "PASS 10 MiB chunked files, retry, limits, corruption and missing artifacts"

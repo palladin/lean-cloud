@@ -91,6 +91,27 @@ private def read (config : Config) (key : String) : IO (Option ByteArray) := do
   unless status == 200 do throw (IO.userError s!"S3 read failed (HTTP {status})")
   return some bytes
 
+private def size (config : Config) (key : String) : IO (Option Nat) := do
+  IO.ofExcept config.validate
+  let (status, _, length) ← StorageHttp.sendWithLength
+    (requestSpec config (← credentials config) "HEAD" ("/" ++ key))
+  if status == 404 then return none
+  unless status == 200 do throw (IO.userError s!"S3 metadata read failed (HTTP {status})")
+  let some length := length | throw (IO.userError "S3 response has no content length")
+  return some length
+
+private def putContent (config : Config) (key : String) (bytes : ByteArray) : IO Unit := do
+  for _ in [:8] do
+    let (status, _) ← request config "PUT" ("/" ++ key) bytes true
+    if 200 ≤ status && status < 300 then return
+    unless status == 409 || status == 412 do
+      throw (IO.userError s!"S3 content upload failed (HTTP {status})")
+    if let some length ← size config key then
+      unless length == bytes.size do throw (IO.userError "Content-addressed blob size conflict")
+      return
+    IO.sleep 50
+  throw (IO.userError "S3 conditional upload did not settle")
+
 /-- A 409 can precede a visible winner. Retrying never overwrites an object. -/
 private def create (config : Config) (key : String) (bytes : ByteArray) : IO ByteArray := do
   for _ in [:8] do
@@ -127,6 +148,8 @@ def objects (config : Config) : ObjectStore where
       throw (IO.userError s!"S3 bucket initialization failed (HTTP {status})")
   read := read config
   create := create config
+  putContent := putContent config
+  size := size config
   list keyPrefix := do
     let (status, bytes) ← request config "GET"
       ("?list-type=2&encoding-type=url&max-keys=128&prefix=" ++ StorageHttp.component keyPrefix)

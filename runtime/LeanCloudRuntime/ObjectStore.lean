@@ -14,6 +14,10 @@ structure ObjectStore where
   ensureContainer : IO Unit
   read : String → IO (Option ByteArray)
   create : String → ByteArray → IO ByteArray
+  /-- Immutable content-addressed bytes. Existing content is trusted by SHA-256;
+  this path never downloads an existing object to compare its contents. -/
+  putContent : String → ByteArray → IO Unit
+  size : String → IO (Option Nat)
   list : String → IO (Array String)
   erase : String → IO Unit
 
@@ -26,16 +30,23 @@ private def writeImmutable (store : ObjectStore) (key : String) (bytes : ByteArr
     throw (IO.userError "Immutable object conflicts with existing contents")
 
 def putBytes (store : ObjectStore) (bytes : ByteArray) : IO BlobRef := do
-  let key := "objects/" ++ (← digest bytes)
-  writeImmutable store key bytes
-  return ⟨key, bytes.size, modelChecksum bytes⟩
+  let (hash, checksum) ← Digest.fingerprint bytes
+  let key := "objects/" ++ hash
+  store.putContent key bytes
+  return ⟨key, bytes.size, checksum⟩
 
-def readBytes (store : ObjectStore) (ref : BlobRef) : ExceptT CloudError IO ByteArray := do
+private def validateRef (ref : BlobRef) : Except CloudError String := do
   let hash := ref.key.drop 8 |>.toString
   unless ref.key.startsWith "objects/" && hash.length == 64 && hash.toList.all (fun c =>
       c.isDigit || ('a' ≤ c && c ≤ 'f')) do throw ⟨.integrity, "Invalid blob reference"⟩
+  return hash
+
+def readBytes (store : ObjectStore) (ref : BlobRef) : ExceptT CloudError IO ByteArray := do
+  let hash ← ExceptT.mk (pure (validateRef ref))
   let some bytes ← store.read ref.key | throw ⟨.missingBlob, "Blob is missing"⟩
-  unless bytes.size == ref.size && modelChecksum bytes == ref.checksum && (← digest bytes) == hash do
+  unless bytes.size == ref.size do throw ⟨.integrity, "Blob size does not match reference"⟩
+  let (actual, checksum) ← Digest.fingerprint bytes
+  unless checksum == ref.checksum && actual == hash do
     throw ⟨.integrity, "Blob contents do not match reference"⟩
   return bytes
 
@@ -93,7 +104,9 @@ def executionContextFor (store : ObjectStore) (run : String) : ExecContext IO :=
       let value ← store.readJson run ("user/blob/" ++ name)
       value.mapM fun json => liftM (IO.ofExcept (fromJson? json))
     publish name ref := captureIO do
-      discard (store.readBytes ref)
+      discard <| ExceptT.mk (pure (validateRef ref))
+      let some size ← store.size ref.key | throw ⟨.missingBlob, "Blob is missing"⟩
+      unless size == ref.size do throw ⟨.integrity, "Blob size does not match reference"⟩
       liftM (IO.ofExcept (fromJson? (← store.createJson run ("user/blob/" ++ name) (toJson ref)))) } }
 
 def records (store : ObjectStore) (run : String) : ReplayStore IO where

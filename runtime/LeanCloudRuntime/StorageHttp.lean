@@ -1,11 +1,8 @@
 import Lean
+import Std.Sync.Mutex
 
 namespace LeanCloudRuntime.StorageHttp
 open Lean
-
-private def quote (text : String) : String :=
-  "\"" ++ (text.replace "\\" "\\\\" |>.replace "\"" "\\\"" |>.replace "\n" "\\n"
-    |>.replace "\r" "\\r" |>.replace "\t" "\\t") ++ "\""
 
 private def hexDigit (n : Nat) : Char := "0123456789abcdef".toList[n % 16]!
 
@@ -28,32 +25,47 @@ structure Request where
   /-- Node-local credential endpoints must not send tokens through a proxy. -/
   noProxy : Bool := false
 
-/-- Request headers and credentials are sent through stdin. Error messages
-contain only the service and status, never response bodies, tokens, or URLs.
-Redirects are deliberately disabled so credentials stay at the chosen endpoint. -/
-def send (request : Request) : IO (Nat × ByteArray) :=
-  IO.FS.withTempFile fun input inputPath => IO.FS.withTempFile fun _ outputPath => do
-    unless request.url.startsWith "https://" || request.url.startsWith "http://" do
-      throw (IO.userError "Storage requires an HTTP(S) endpoint")
-    input.write request.body
-    input.flush
-    let mut options := "url = " ++ quote request.url ++ "\n"
-    for (name, value) in request.headers do
-      unless !name.isEmpty && !(name ++ value).toList.any (fun c => c == '\r' || c == '\n' || c == '\x00') do
-        throw (IO.userError "Invalid storage request header")
-      options := options ++ "header = " ++ quote (name ++ ": " ++ value) ++ "\n"
-    if let some (service, access, secret) := request.signing then
-      options := options ++ "aws-sigv4 = " ++ quote service ++ "\nuser = " ++ quote (access ++ ":" ++ secret) ++ "\n"
-    let args := #["--disable", "--silent", "--show-error", "--connect-timeout", "10", "--max-time", "60",
-      "--config", "-", "--request", request.method, "--output", outputPath.toString, "--write-out", "%{http_code}"] ++
-      (if request.noProxy then #["--noproxy", "*"] else #[]) ++
-      (if request.method == "PUT" || request.method == "POST" then #["--data-binary", "@" ++ inputPath.toString] else #[])
-    let response ← IO.Process.output { cmd := "curl", args } (some options)
-    unless response.exitCode == 0 do
-      throw (IO.userError s!"{request.service} transport failed (curl {response.exitCode})")
-    let some status := response.stdout.trimAscii.toString.toNat?
-      | throw (IO.userError s!"{request.service} returned an invalid HTTP status")
-    return (status, ← IO.FS.readBinFile outputPath)
+private opaque ClientType : NonemptyType
+private def Client := ClientType.type
+private instance : Nonempty Client := ClientType.property
+@[extern "lc_http_client"] private opaque newClient : IO Client
+@[extern "lc_http_storage"] private opaque transfer (client : @&Client)
+  (url method : @&String) (headers : @&Array String) (body : @&ByteArray)
+  (signing : @&Array String) (noProxy : Bool) : IO (UInt32 × ByteArray × Option Nat)
+
+-- Exclusive checkout permits concurrent transfers without sharing a handle.
+-- Only idle handles are bounded; active work is bounded by the caller's pool.
+initialize idle : Std.Mutex (Array Client) ← Std.Mutex.new #[]
+
+/-- In-process binary HTTP with reusable connections. Credentials are cleared
+after each call; redirects are disabled and errors omit secrets and URLs. -/
+def sendWithLength (request : Request) : IO (Nat × ByteArray × Option Nat) := do
+  unless (request.url.startsWith "https://" || request.url.startsWith "http://") &&
+      !request.url.contains '\x00' do throw (IO.userError "Storage requires an HTTP(S) endpoint")
+  unless ["GET", "HEAD", "PUT", "POST", "DELETE"].contains request.method do
+    throw (IO.userError "Invalid storage HTTP method")
+  let mut headers := #[]
+  for (name, value) in request.headers do
+    unless !name.isEmpty && !name.contains ':' &&
+        !(name ++ value).toList.any (fun c => c == '\r' || c == '\n' || c == '\x00') do
+      throw (IO.userError "Invalid storage request header")
+    headers := headers.push (name ++ ": " ++ value)
+  let signing := request.signing.map (fun (service, access, secret) => #[service, access, secret]) |>.getD #[]
+  unless signing.all (fun value => !value.contains '\x00') do
+    throw (IO.userError "Invalid storage signing configuration")
+  let client ← idle.atomically do
+    let clients ← get
+    if let some client := clients.back? then set clients.pop; return client
+    newClient
+  try
+    let (status, body, length) ← transfer client request.url request.method headers request.body signing request.noProxy
+    return (status.toNat, body, length)
+  finally idle.atomically do
+    if (← get).size < 32 then modify (·.push client)
+
+def send (request : Request) : IO (Nat × ByteArray) := do
+  let (status, body, _) ← sendWithLength request
+  return (status, body)
 
 /-- Credential response fields are simple text, never nested XML. Do not include
 the document or field value in parse failures: both can contain credentials. -/

@@ -68,6 +68,9 @@ private def model : IO ObjectStore := do
       if let some (_, existing) := (← get).find? (·.1 == key) then return existing
       modify (·.push (key, value))
       return value
+    putContent := fun key value => objects.atomically do
+      unless (← get).any (·.1 == key) do modify (·.push (key, value))
+    size := fun key => objects.atomically do return ((← get).find? (·.1 == key)).map (·.2.size)
     list := fun keyPrefix => objects.atomically do
       return ((← get).filter (fun row => row.1.startsWith keyPrefix)).map (·.1) |>.extract 0 17
     erase := fun key => objects.atomically do modify (·.filter (·.1 != key)) }
@@ -77,6 +80,7 @@ private def digestTests : IO Unit := do
       ("", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
       ("abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") ] do
     assertEq (← Digest.bytes text.toUTF8) hash "SHA-256 known vector"
+    assertEq (← Digest.fingerprint text.toUTF8) (hash, modelChecksum text.toUTF8)
   IO.FS.withTempDir fun root => do
     let path := root / "source"
     let bytes := ByteArray.mk ((Array.range 200003).map (fun n => (n % 251).toUInt8))
@@ -85,6 +89,13 @@ private def digestTests : IO Unit := do
     assertEq expected.exitCode 0
     let hash := (expected.stdout.splitOn " ").head!
     assertEq (← Digest.bytes bytes) hash
+    assertEq (← Digest.fingerprint bytes) (hash, modelChecksum bytes) "BlobRef checksum compatibility"
+    let streaming ← Digest.start
+    for start in [:((bytes.size + 8190) / 8191)] do
+      Digest.update streaming (bytes.extract (start * 8191) ((start + 1) * 8191))
+    assertEq (← Digest.finish streaming) hash "Streaming SHA-256"
+    let consumed ← try Digest.update streaming bytes; pure false catch _ => pure true
+    assertTrue consumed "Consumed digest state was reused"
     assertEq (← Digest.file path.toString) hash
     for (offset, count) in #[(0, 0), (0, bytes.size), (13, 131073), (bytes.size, 0)] do
       let output := root / "range"
@@ -172,6 +183,7 @@ def run : IO Unit := do
   -- Raw journal IO must escape; user-facing blob IO must become a recorded failure.
   let unavailable := { store with
     read := fun _ => throw (IO.userError "Offline")
+    putContent := fun _ _ => throw (IO.userError "Offline")
     create := fun _ _ => throw (IO.userError "Offline") }
   let failed ← try discard (unavailable.readBytes ref).run; pure false catch _ => pure true
   assertTrue failed "Raw storage swallowed a transport exception"
