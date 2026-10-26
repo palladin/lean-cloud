@@ -313,12 +313,10 @@ private def fileTests : IO Unit := IO.FS.withTempDir fun directory => do
   check (ref.size == 10 * 1048576 && count == 4) "Expected three chunks and a manifest"
   Files.download store ref dest ref.size
   check ((← Files.digest dest) == ref.sha256) "Large artifact round trip failed"
-  let reader ← Files.openReader store ref
+  let reader ← LeanCloudRuntime.Files.openReader store ref
   let original ← IO.FS.readBinFile source
   for (offset, count) in #[(16, 1), (Files.chunkSize - 1, 3), (ref.size - 2, 10), (ref.size, 1)] do
     check ((← reader.read offset count) == original.extract offset (offset + count)) "Chunk range read changed bytes"
-  for text in ["", "small UTF-8 λ 🌍\n"] do
-    check ((← Files.readText store (← Files.putText store text)) == text) "In-memory text round trip"
   check ((← Files.upload store source ref.size) == ref && (← saved.get).size == count) "Retry did not reuse artifacts"
   rejects (Files.download store { ref with size := ref.size + 1 } dest (ref.size+1)) "Accepted forged file length"
   rejects (Files.download store { ref with sha256 := "bad" } dest ref.size) "Accepted forged file digest"
@@ -340,6 +338,9 @@ private def fileTests : IO Unit := IO.FS.withTempDir fun directory => do
     store.putContent key bytes }
   rejects (Files.upload interrupted source ref.size) "Upload fault did not fire"
   check ((← Files.upload store source ref.size) == ref) "Interrupted upload changed artifact identity"
+  -- Add unrelated text objects after the large-file count and corruption checks.
+  for text in ["", "small UTF-8 λ 🌍\n"] do
+    check ((← Files.readText store (← Files.putText store text)) == text) "In-memory text round trip"
   IO.println "PASS 10 MiB chunked files, retry, limits, corruption and missing artifacts"
 
 private def inputCacheTests : IO Unit := IO.FS.withTempDir fun directory => do
