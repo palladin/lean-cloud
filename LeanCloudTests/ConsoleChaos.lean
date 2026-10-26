@@ -111,7 +111,9 @@ unwrap (Json.parse output.stdout >>= fromJson?)
 private def storageFailures (f : Fixture) : IO (Array Nat) := do
   (#["worker1", "worker2", "worker3"]).mapM fun worker => do
     let output ← IO.Process.output { cmd := "docker", args := #["logs", ← node f worker] }
-    return ((output.stdout ++ output.stderr).splitOn "S3 transport failed (curl ").length - 1
+    -- The pooled transport is shared by S3 and Azure; the service prefix is
+    -- diagnostic text, not part of the failure condition under test.
+    return ((output.stdout ++ output.stderr).splitOn "transport failed (curl ").length - 1
 
 private def blobOutage (f : Fixture) (runs : Array Run) : IO (Array (String × Array (String × Json))) := do
   let (states, _) ← busy f runs 3 true
