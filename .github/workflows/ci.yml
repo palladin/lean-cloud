@@ -175,7 +175,10 @@ jobs:
       # toolchain steps. The external deployment fixtures use the loaded images.
       - name: Build runtime images together
         id: images
-        timeout-minutes: 5
+        # A cold build also installs Ubuntu packages and the Lean toolchain.
+        # Slow archive downloads alone can consume five minutes; allow the
+        # uncached build to finish and export caches for subsequent runs.
+        timeout-minutes: 10
         uses: docker/bake-action@v7
         env:
           LEAN_VERSION: ${{ needs.test.outputs.lean_version }}
