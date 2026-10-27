@@ -90,12 +90,6 @@ def snapshot (root : System.FilePath) (limit : Nat) : IO Snapshot := do
     unless total ≤ limit do throw (IO.userError "Workspace exceeds configured artifact byte limit")
   return { root, limit, paths }
 
-def existing (root : System.FilePath) (manifest : Manifest) : IO Manifest :=
-  manifest.filterM fun entry => do
-    let path := root / entry.path
-    if !(← path.pathExists) then return false
-    return (← path.metadata).type == .file
-
 private def publishPack (snapshot : Snapshot) (store : ObjectStore) (concurrency : Nat)
     (retain : FileRef → System.FilePath → IO Unit) : IO Manifest := do
   if snapshot.paths.isEmpty then return #[]
@@ -125,11 +119,17 @@ private def publishPack (snapshot : Snapshot) (store : ObjectStore) (concurrency
     retain pack packPath
     return entries.map fun entry => { entry with file.pack := pack }
 
+/-- One workspace scan yields both the files to upload and the verified entries
+to retain. Finalization need not stat every file again after publication. -/
+structure Difference where
+  changed : Snapshot
+  retained : Manifest
+
 /-- Capture changed/new files, including custom outputs outside `.lake/build`.
 Parallel module jobs cannot overwrite their immutable prerequisite artifacts.
 The final Lake build may legitimately rebuild artifacts when native facets require it. -/
 def delta (root : System.FilePath) (limit : Nat) (baseline : Manifest)
-    (immutable : Manifest := #[]) (concurrency : Nat := 1) : IO Snapshot := do
+    (immutable : Manifest := #[]) (concurrency : Nat := 1) : IO Difference := do
   let old := baseline.foldl (fun map entry => map.insert entry.path entry) ({} : Std.HashMap String Entry)
   let frozen := immutable.foldl (fun map entry => map.insert entry.path entry) ({} : Std.HashMap String Entry)
   discard <| Parallel.map concurrency immutable fun entry => do
@@ -140,20 +140,29 @@ def delta (root : System.FilePath) (limit : Nat) (baseline : Manifest)
       throw (IO.userError s!"Build replaced a prerequisite artifact: {entry.path}")
   let checked ← Parallel.map concurrency (← enumerate root) fun path => do
     let size := (← (root / path).metadata).byteSize.toNat
-    if !immutable.isEmpty && gitIndex path then return (size, none)
+    if !immutable.isEmpty && gitIndex path then return (size, none, old[path]?)
     if let some entry := old[path]? then
       if size == entry.file.size && (← Files.digest (root / path)) == entry.file.sha256 &&
-          (← executable (root / path).toString) == entry.executable then return (size, none)
+          (← executable (root / path).toString) == entry.executable then return (size, none, some entry)
     if frozen.contains path then
       throw (IO.userError s!"Build changed a prerequisite artifact: {path}")
-    return (size, some path)
+    return (size, some path, none)
   unless checked.foldl (fun total item => total + item.1) 0 ≤ limit do
     throw (IO.userError "Workspace exceeds configured artifact byte limit")
-  let paths := checked.filterMap (·.2)
-  return { root, limit, paths }
+  let paths := checked.filterMap (·.2.1)
+  return { changed := { root, limit, paths }, retained := checked.filterMap (·.2.2) }
+
+/-- Publish a potentially large final manifest with bounded concurrent chunks. -/
+def publishManifest (store : ObjectStore) (manifest : Manifest) (concurrency : Nat) : IO FileRef := do
+  let text := (toJson manifest).compress
+  unless text.utf8ByteSize ≤ Files.metadataLimit do throw (IO.userError "Artifact metadata exceeds 256 MiB")
+  IO.FS.withTempFile fun handle path => do
+    handle.putStr text
+    handle.flush
+    Files.upload store path Files.metadataLimit concurrency
 
 /-- Layer build outputs over their source workspace or earlier products.
-Concurrent module results use the stricter `merge` operation instead. -/
+Concurrent module results use the stricter `mergeMany` operation instead. -/
 def overlay (base updates : Manifest) : Manifest :=
   let paths := updates.foldl (fun paths entry => paths.insert entry.path) ({} : Std.HashSet String)
   base.filter (fun entry => !paths.contains entry.path) ++ updates
@@ -331,16 +340,17 @@ def synchronize (store : ObjectStore) (root : System.FilePath) (desired : Manife
 
 /-- Separate modules may produce the same auxiliary build artifact. Identical
 content is shared; differing content is an error, never last-writer-wins. -/
-def merge (left right : Manifest) : Except String Manifest := do
-  let mut result := left
-  let mut known := left.foldl (fun map entry => map.insert entry.path entry) ({} : Std.HashMap String Entry)
-  for entry in right do
-    if let some old := known[entry.path]? then
-      unless old.file.sha256 == entry.file.sha256 && old.executable == entry.executable do
-        throw s!"Conflicting artifacts: {entry.path}"
-    else
-      result := result.push entry
-      known := known.insert entry.path entry
+def mergeMany (manifests : Array Manifest) : Except String Manifest := do
+  let mut result := #[]
+  let mut known : Std.HashMap String Entry := {}
+  for manifest in manifests do
+    for entry in manifest do
+      if let some old := known[entry.path]? then
+        unless old.file.sha256 == entry.file.sha256 && old.executable == entry.executable do
+          throw s!"Conflicting artifacts: {entry.path}"
+      else
+        result := result.push entry
+        known := known.insert entry.path entry
   return result
 
 end LeanBuild.Bundle

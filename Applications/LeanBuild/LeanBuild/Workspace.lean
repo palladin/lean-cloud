@@ -8,6 +8,11 @@ private structure Saved where
   manifests : Array (FileRef × Bundle.Manifest)
   deriving ToJson, FromJson
 
+private structure Cached where
+  ref : FileRef
+  manifest : Bundle.Manifest
+  validated : Bool := false
+
 /-- A worker-local cache, never a source of durable build progress. -/
 structure Session where
   directory : System.FilePath
@@ -21,13 +26,17 @@ initialize lock : Std.Mutex Unit ← Std.Mutex.new ()
 private def session (store : ObjectStore) (root : System.FilePath) (key : String)
     (saved : Option Saved) (persistent : Bool) (action : Session → IO α) : IO α := do
   IO.FS.createDirAll (root / "project")
-  let manifests ← Std.Mutex.new (saved.map (·.manifests) |>.getD #[])
+  let entries := saved.map (·.manifests) |>.getD #[]
+  let manifests ← Std.Mutex.new (entries.foldl (fun map (ref, manifest) =>
+    map.insert ref.sha256 { ref, manifest : Cached }) ({} : Std.HashMap String Cached))
   let remember := fun ref manifest => manifests.atomically do
-    modify fun entries => (entries.filter (·.1 != ref)).push (ref, manifest)
+    modify (·.insert ref.sha256 { ref, manifest, validated := true })
   action {
     directory := root / "project"
     readManifest := fun ref => do
-      if let some (_, manifest) := (← manifests.atomically get).find? (fun entry => entry.1 == ref) then
+      if let some entry := (← manifests.atomically get)[ref.sha256]? then
+        let manifest := entry.manifest
+        if entry.ref == ref && entry.validated then return manifest
         -- Manifests are published by Files.putJson. Treat cached metadata like
         -- cached files: corruption must never change the committed inputs.
         let json := toJson manifest
@@ -35,15 +44,16 @@ private def session (store : ObjectStore) (root : System.FilePath) (key : String
         let validEncoding (text : String) : IO Bool := do
           let bytes := text.toUTF8
           return bytes.size == ref.size && (← Digest.bytes bytes) == ref.sha256
-        if ← validEncoding json.compress then return manifest
-        if ← validEncoding json.pretty then return manifest
+        if (← validEncoding json.compress) || (← validEncoding json.pretty) then
+          remember ref manifest
+          return manifest
       let manifest ← Files.readJson store ref
       remember ref manifest
       return manifest
     rememberManifest := remember
     commit := do
       if persistent then
-        let value : Saved := { key, manifests := ← manifests.atomically get }
+        let value : Saved := { key, manifests := (← manifests.atomically get).toArray.map fun (_, e) => (e.ref, e.manifest) }
         IO.FS.writeFile (root / "ready.pending") (toJson value).compress
         IO.FS.rename (root / "ready.pending") (root / "ready.json") }
 

@@ -157,12 +157,9 @@ private def buildTargets (policy : Json) (output : String) : IO Unit := do
   unless names.size ≤ limit do throw (IO.userError "Module limit exceeded after target build")
   IO.FS.writeFile output (toJson names).pretty
 
-/-- A local builder asks Lake for one ready module. Only this module's output
-paths are packed; a module completion never rescans the whole source tree. -/
-private def buildModule (policy : Json) (name output root : String) : IO Unit := do
-  let ws ← workspace policy
-  let some m := ws.findTargetModule? name.toName | throw (IO.userError s!"Unknown module: {name}")
-  ws.runFetchM (do discard (← m.leanArts.fetch).await)
+/-- Only this module's output paths are packed; completion never rescans the
+whole source tree. Lake has finished writing these files before we report them. -/
+private def modulePaths (m : Lake.Module) (root : String) : IO (Array String) := do
   let root := (← IO.FS.realPath root).toString ++ "/"
   let files := #[m.oleanFile, m.oleanServerFile, m.oleanPrivateFile, m.ileanFile,
     m.irFile, m.irSigFile, m.cFile, m.bcFile, m.traceFile, m.setupFile,
@@ -176,14 +173,54 @@ private def buildModule (policy : Json) (name output root : String) : IO Unit :=
       let relative := path.drop root.length |>.toString
       unless paths.contains relative do paths := paths.push relative
   unless ← m.oleanFile.pathExists do throw (IO.userError "Lake did not produce the module's olean")
-  IO.FS.writeFile output (toJson paths).compress
+  return paths
+
+/-- Load the workspace once and let Lake schedule a batch of ready modules.
+Report each finished job independently, so artifact uploads and downstream work
+can overlap the remaining compilation. Rename makes each report atomic. -/
+private def buildModules (policy : Json) (input output root : String) : IO Unit := do
+  let names : Array String ← IO.ofExcept ((← readJson input) |> fromJson?)
+  unless !names.isEmpty && names.size ≤ 100 && names.toList.eraseDups.length == names.size do
+    throw (IO.userError "Expected 1–100 distinct ready modules")
+  let ws ← workspace policy
+  let modules ← names.mapM fun name => do
+    let some m := ws.findTargetModule? name.toName | throw (IO.userError s!"Unknown module: {name}")
+    return m
+  IO.FS.createDirAll output
+  ws.runFetchM do
+    let jobs ← modules.mapM fun m => m.leanArts.fetch
+    -- Poll outside the compiler pool: even a one-CPU worker must make progress.
+    let reporter ← IO.asTask (do
+      let mut pending := Array.range jobs.size
+      while !pending.isEmpty do
+        let mut waiting := #[]
+        for i in pending do
+          let job := jobs[i]!
+          if !(← IO.hasFinished job.task) then
+            waiting := waiting.push i
+            continue
+          let (success, diagnostics) ← match ← job.wait with
+            | .ok _ state => pure (true, state.log.toString)
+            | .error _ state => pure (false, state.log.toString)
+          let some m := modules[i]? | throw (IO.userError "Missing module for Lake job")
+          let paths ← if success then modulePaths m root else pure #[]
+          let value := Json.mkObj [
+            ("name", toJson names[i]!), ("success", toJson success),
+            ("paths", toJson paths), ("diagnostics", toJson diagnostics)]
+          let destination := FilePath.mk output / s!"{i}.json"
+          let temporary := destination.addExtension "pending"
+          IO.FS.writeFile temporary value.compress
+          IO.FS.rename temporary destination
+        pending := waiting
+        unless pending.isEmpty do IO.sleep 10) .dedicated
+    IO.ofExcept (← IO.wait reporter)
 
 def main (args : List String) : IO UInt32 := do
   try
     match args with
     | ["plan", policy, output, root] => plan (← readJson policy) output root
     | ["build", policy, output] => buildTargets (← readJson policy) output
-    | ["module", policy, name, output, root] => buildModule (← readJson policy) name output root
-    | _ => throw (IO.userError "Expected plan POLICY OUTPUT ROOT | build POLICY OUTPUT | module POLICY NAME OUTPUT ROOT")
+    | ["modules", policy, input, output, root] => buildModules (← readJson policy) input output root
+    | _ => throw (IO.userError "Expected plan POLICY OUTPUT ROOT | build POLICY OUTPUT | modules POLICY INPUT OUTPUT ROOT")
     return 0
   catch error => IO.eprintln s!"{error}"; return 1

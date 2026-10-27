@@ -143,10 +143,10 @@ instance : Codec BuildResult := jsonCodec _ "lean-build/build-result/v1"
 instance : Codec Report := jsonCodec _ "lean-build/report/v2"
 
 def validateModules (modules : Array Module) : Except String Unit := do
-  let mut seen : Array String := #[]
+  let mut seen : Std.HashSet String := {}
   for m in modules do
     unless identifier m.name && !seen.contains m.name do throw "Duplicate or invalid module"
     unless m.imports.all seen.contains do throw s!"Plan is not topological at {m.name}"
-    seen := seen.push m.name
+    seen := seen.insert m.name
 
 end LeanBuild

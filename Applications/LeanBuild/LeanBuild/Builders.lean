@@ -35,7 +35,6 @@ def results (env : Environment IO) (plan : Plan) : IO (Array BuildResult) :=
 
 private structure State where
   results : Std.HashMap String BuildResult := {}
-  active : Std.HashSet String := {}
 
 /-- Only committed successes/failures are cached. Missing results may become
 available at any time, so a negative lookup is never retained. -/
@@ -46,108 +45,138 @@ private def read (env : Environment IO) (state : Std.Mutex State) (name : String
     state.atomically (modify fun s => { s with results := s.results.insert name result })
   return result
 
-private def dependencies (modules : Array Module) (target : Module) : Array Module := Id.run do
-  let mut needed := target.imports.foldl (·.insert ·) ({} : Std.HashSet String)
+/-- Union of transitive prerequisites, in the plan's topological order. -/
+private def dependencies (modules targets : Array Module) : Array Module := Id.run do
+  let mut needed := targets.foldl (fun set m => m.imports.foldl (·.insert ·) set) ({} : Std.HashSet String)
   for m in modules.reverse do
     if needed.contains m.name then needed := m.imports.foldl (·.insert ·) needed
   return modules.filter (needed.contains ·.name)
 
-/-- One cloud command owns a persistent local pool. Artifacts precede the
-immutable result; dependent notifications precede ACK, including on redelivery.
-Thus a crash in any gap repeats harmless publication instead of losing work. -/
+/-- A few modules per CPU amortize Lake startup without hoarding the ready queue.
+Receive returns immediately with whatever is available; it never waits to fill. -/
+def batchSize (cpus : Nat) : Nat := min 100 (4 * max 1 cpus)
+
+private structure Claim where
+  delivery : WorkDelivery
+  -- Serialize renewal with settlement, independently for each receipt.
+  settled : Std.Mutex Bool
+
+private def Claim.acknowledge (claim : Claim) (queue : WorkQueue IO) : IO Unit :=
+  claim.settled.atomically do
+    unless ← get do
+      queue.acknowledge claim.delivery.receipt
+      set true
+
+private def Claim.release (claim : Claim) (queue : WorkQueue IO) : IO Unit :=
+  claim.settled.atomically do
+    unless ← get do
+      queue.release claim.delivery.receipt
+      set true
+
+/-- One Lake batch at a time per worker, with bounded concurrent artifact IO.
+The callback reports individual module completions while Lake keeps compiling.
+Artifacts precede the immutable result; notifications precede ACK. Redelivery
+therefore repairs an interrupted notification without rebuilding the module. -/
 def run (env : Environment IO) (plan : Plan)
-    (build : Nat → CancellationToken IO → Module → Array BuildResult → IO BuildResult) : IO Unit := do
+    (build : CancellationToken IO → Array Module → Array BuildResult →
+      (BuildResult → IO Unit) → IO Unit) : IO Unit := do
   IO.ofExcept (validateModules plan.modules)
   let queue := env.queues.open queueName
   let state ← Std.Mutex.new ({} : State)
-  let abort ← IO.mkRef false
+  let width := max 1 env.currentWorker.cpus
   let byName := plan.modules.foldl (fun map m => map.insert m.name m) ({} : Std.HashMap String Module)
   let dependents := plan.modules.foldl (fun map m => m.imports.foldl (fun map dep =>
     map.insert dep ((map[dep]?.getD #[]).push m)) map) ({} : Std.HashMap String (Array Module))
-  let cancelled : IO Bool := do return (← abort.get) || (← env.cancellation.isRequested)
-  let isReady (m : Module) : IO Bool := do
-    for parent in m.imports do
-      if (← read env state parent).isNone then return false
-    return true
   let notify (name : String) : IO Unit := do
     let mut ready := #[]
     for m in dependents[name]?.getD #[] do
-      if ← isReady m then ready := ready.push ⟨m.name, toJson m.name⟩
+      let mut available := true
+      for parent in m.imports do
+        if (← read env state parent).isNone then available := false; break
+      if available then ready := ready.push ⟨m.name, toJson m.name⟩
     for offset in [:((ready.size + 99) / 100)] do
       queue.send (ready.extract (offset * 100) ((offset + 1) * 100))
-  discard <| Parallel.map env.currentWorker.cpus (Array.range (max 1 env.currentWorker.cpus)) fun lane => do
-    try
-      repeat
-        if ← cancelled then return ()
-        let batch ← queue.receive 1
-        if batch.isEmpty then
-          -- Roots were seeded before builders started. Every notification is
-          -- sent before ACK, so an empty queue INCLUDING leases is quiescent.
-          -- The final collection still requires every planned module result.
-          if ← queue.isIdle then
-            env.progress.report s!"builder-{lane + 1}" { message := "Finished" }
-            return ()
-          env.progress.report s!"builder-{lane + 1}" { message := "Waiting for dependencies" }
-          IO.sleep 250
-          continue
-        for delivery in batch do
-          let name : String ← IO.ofExcept (fromJson? delivery.value)
-          let some m := byName[name]? | throw (IO.userError "Unknown queued module")
-          let acquired ← state.atomically do
-            let s ← get
-            if s.active.contains name then return false
-            set { s with active := s.active.insert name }
-            return true
-          unless acquired do
-            queue.release delivery.receipt
-            IO.sleep 50
-            continue
-          let settled ← IO.mkRef false
-          let finished ← IO.mkRef false
-          let leaseLost ← IO.mkRef false
-          let renewal ← IO.asTask (do
-            let mut next := (← IO.monoMsNow) + 10000
-            while !(← finished.get) do
-              if (← IO.monoMsNow) ≥ next then
-                try queue.renew delivery.receipt
-                catch error => leaseLost.set true; throw error
-                next := (← IO.monoMsNow) + 10000
-              IO.sleep 50) .dedicated
-          let stop : CancellationToken IO := ⟨do return (← cancelled) || (← leaseLost.get)⟩
+  repeat
+    if ← env.cancellation.isRequested then break
+    let deliveries ← queue.receive (batchSize width)
+    if deliveries.isEmpty then
+      -- Notifications precede ACK: empty INCLUDING leases means quiescence.
+      if ← queue.isIdle then break
+      env.progress.report "lake" { message := "Waiting for dependencies" }
+      IO.sleep 250
+      continue
+    let claims ← deliveries.mapM fun delivery => return { delivery, settled := ← Std.Mutex.new false : Claim }
+    let finished ← IO.mkRef false
+    let leaseLost ← IO.mkRef false
+    let renewal ← IO.asTask (do
+      let mut next := (← IO.monoMsNow) + 10000
+      while !(← finished.get) do
+        if (← IO.monoMsNow) ≥ next then
           try
-            let existing ← read env state name
-            if existing.isNone then
-              let parents ← m.imports.mapM (read env state)
-              if parents.any Option.isNone then continue
-              env.progress.report s!"builder-{lane + 1}" { message := name }
-              let outcome ← if parents.any (fun r => r.any (·.status != .built)) then
-                pure { name, status := .blocked, message := "A prerequisite failed" }
-              else do
-                let inputs ← (dependencies plan.modules m).mapM fun dep => do
-                  let some result ← read env state dep.name | throw (IO.userError "Missing transitive prerequisite")
-                  return result
-                build lane stop m inputs
-              if ← stop.isRequested then continue
-              unless outcome.name == name do throw (IO.userError "Builder returned a different module")
-              let result ← publishResult env outcome
-              state.atomically (modify fun s => { s with results := s.results.insert name result })
-            if ← stop.isRequested then continue
-            notify name
-            queue.acknowledge delivery.receipt
-            settled.set true
-            let count ← state.atomically do return (← get).results.size
-            env.progress.report "build" { message := "Committed modules known to this builder", completed := count, total := some plan.modules.size }
-          finally
-            finished.set true
-            let renewed ← IO.wait renewal
-            state.atomically (modify fun s => { s with active := s.active.erase name })
-            unless ← settled.get do
-              try queue.release delivery.receipt catch _ => pure ()
-              -- A transport failure is an ordinary exec failure, not an
-              -- implicit retry. After ACK, a racing renewal may see no lease.
-              IO.ofExcept renewed
-      return ()
-    catch error => abort.set true; throw error
-  env.progress.report "build" { message := if ← cancelled then "Stopped" else "Builder finished" }
+            discard <| Parallel.map width claims fun claim => claim.settled.atomically do
+              unless ← get do queue.renew claim.delivery.receipt
+          catch error => leaseLost.set true; throw error
+          next := (← IO.monoMsNow) + 10000
+        IO.sleep 50) .dedicated
+    let stop : CancellationToken IO := ⟨do return (← env.cancellation.isRequested) || (← leaseLost.get)⟩
+    try
+      -- A queue may deliver the same key more than once. Build it once, then
+      -- settle every receipt, including duplicates, after durable publication.
+      let mut grouped : Std.HashMap String (Array Claim) := {}
+      let mut queued := #[]
+      for claim in claims do
+        let name : String ← IO.ofExcept (fromJson? claim.delivery.value)
+        let some m := byName[name]? | throw (IO.userError "Unknown queued module")
+        unless grouped.contains name do queued := queued.push m
+        grouped := grouped.insert name ((grouped[name]?.getD #[]).push claim)
+      let settle (name : String) : IO Unit := do
+        if ← stop.isRequested then return
+        notify name
+        for claim in grouped[name]?.getD #[] do claim.acknowledge queue
+      let existing ← Parallel.map width queued fun m => do
+        if (← read env state m.name).isSome then settle m.name; return none
+        return some m
+      let targets := existing.filterMap id
+      let parents := targets.foldl (fun set m => m.imports.foldl (·.insert ·) set) ({} : Std.HashSet String)
+      discard <| Parallel.map width parents.toArray (read env state)
+      let outcomes ← Parallel.map width targets fun m => do
+        let parents ← m.imports.mapM (read env state)
+        if parents.any Option.isNone then return none
+        if parents.any (fun r => r.any (·.status != .built)) then
+          unless ← stop.isRequested do
+            let result ← publishResult env { name := m.name, status := .blocked, message := "A prerequisite failed" }
+            state.atomically (modify fun s => { s with results := s.results.insert m.name result })
+            settle m.name
+          return none
+        return some m
+      let targets := outcomes.filterMap id
+      unless targets.isEmpty || (← stop.isRequested) do
+        let inputs ← Parallel.map width (dependencies plan.modules targets) fun dep => do
+          let some result ← read env state dep.name | throw (IO.userError "Missing transitive prerequisite")
+          return result
+        let requested := targets.foldl (fun set m => set.insert m.name) ({} : Std.HashSet String)
+        let reported ← Std.Mutex.new ({} : Std.HashSet String)
+        build stop targets inputs fun outcome => do
+          unless requested.contains outcome.name do throw (IO.userError "Builder returned an unrequested module")
+          reported.atomically do
+            if (← get).contains outcome.name then throw (IO.userError "Builder returned a module twice")
+            modify (·.insert outcome.name)
+          if ← stop.isRequested then return
+          let result ← publishResult env outcome
+          state.atomically (modify fun s => { s with results := s.results.insert outcome.name result })
+          settle outcome.name
+          let count ← state.atomically do return (← get).results.size
+          env.progress.report "build" { message := "Committed modules known to this worker", completed := count, total := some plan.modules.size }
+        unless ← stop.isRequested do
+          unless (← reported.atomically get).size == targets.size do
+            throw (IO.userError "Builder omitted module results")
+    finally
+      finished.set true
+      let renewed ← IO.wait renewal
+      discard <| Parallel.map width claims fun claim => do
+        try claim.release queue catch _ => pure ()
+      -- Renewal transport errors are ordinary exec failures, not implicit retries.
+      IO.ofExcept renewed
+  env.progress.report "lake" { message := if ← env.cancellation.isRequested then "Stopped" else "Finished" }
 
 end LeanBuild.Builders
