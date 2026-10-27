@@ -26,8 +26,9 @@ def workflow [Monad m] [MonadCloudExec m] (backend : Backend m) (request : Reque
     backend.start env plan
     pure (max 1 env.workers.size)) "start builders"
   let _ ← Cloud.parallel (label := "Build modules") (completedLabel := "Modules finished") $
-    (Array.range (if plan.modules.isEmpty then 0 else count)).map fun _ =>
+    (Array.range (if plan.modules.isEmpty then 0 else count)).map fun _ => cloud {
       Cloud.exec (fun env => backend.builder env request plan) "build modules"
+    }
   let modules ← Cloud.exec (fun env => backend.results env plan) "collect module results"
   if modules.map (·.name) != plan.modules.map (·.name) then
     Cloud.fail "Build returned missing or reordered module results"

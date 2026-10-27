@@ -153,6 +153,28 @@ public def cases : Array TestCase := #[
       "New attempt showed revoked execution as current"
     for removed in ["HISTORY", "Step ", "report worker", "mapped step", "[/]"] do
       assertTrue (!has group removed) s!"Removed timeline remains: {removed}"⟩,
+  ⟨"console.tree.all-builder-messages-fit-with-metrics", do
+    let ctx : Context := ⟨"/work", "test"⟩
+    let builders := (Array.range 7).map fun i =>
+      { workerStep (i + 6) child child with
+        event := { (workerStep (i + 6) child child).event with activity := "progress" }
+        progress := some (s!"builder-{i + 1}", { message := s!"Module{i + 1}" }) }
+    let total := { workerStep 5 child child with
+      event := { (workerStep 5 child child).event with activity := "progress" }
+      progress := some ("build", { completed := 5170, total := some 9031, message := "Committed modules known" }) }
+    let trace := (steps.extract 0 5) ++ #[total] ++ builders
+    let histories : Array History := (Array.range 4).map fun i => ⟨ctx.node s!"worker{i+1}", #[{
+      incarnation := "boot", timeNs := 1, nodeName := some s!"machine-{i+1}",
+      cpuCores := some 8, memoryCapacity := some 34359738368 }], true⟩
+    for selection in ["branch/0:2/0:0", "parallel/0:2"] do
+      let lines := Watch.frame ctx run trace histories
+        { tree := { expandedTree with selected := some selection } } 207 55 "result pending"
+      let view := String.intercalate "\n" lines.toList
+      assertTrue (has view "build: 5170/9031 · 57%") "Total progress was clipped"
+      for i in [:7] do
+        assertTrue (has view s!"builder-{i + 1}: Module{i + 1}") s!"Builder {i + 1} was clipped"
+      assertTrue (has view "I/O W") "Builder rows displaced the resource graphs"
+      assertTrue (lines.size < 55 && lines.all (·.length < 207)) "Progress exceeded the terminal bounds"⟩,
   ⟨"console.tree.nested-forks-and-latest-state", do
     let early := LeanCloudCli.BranchTree.current (steps.extract 0 1)
     assertEq early.size 3 "A fork must expose children that have not reached a worker"

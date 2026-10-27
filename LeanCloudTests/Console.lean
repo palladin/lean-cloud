@@ -26,6 +26,25 @@ def consoleCases : Array TestCase := #[
     assertEq (Watch.progressLines #[current, progress] 0).size 0
     assertEq (Watch.progressLines #[{ current with event := { event with source := none } }, progress]).size 1
       "An unannotated exec cannot report progress"⟩,
+  ⟨"console.watch-one-latest-message-per-builder", do
+    let event : ExecutionEvent := ⟨"boot", 0, 0, "worker1", some 2, "0:1", "execute", "build", "run", none⟩
+    let current : Trace.Step := { timestamp := "0", event }
+    let update (seq : Nat) (slot : String) (value : ProgressUpdate) : Trace.Step := {
+      timestamp := toString seq
+      event := { event with seq, activity := "progress" }
+      progress := some (slot, value) }
+    let builders := (Array.range 10).reverse.map fun i =>
+      update (i + 1) s!"builder-{i + 1}" { message := s!"Module{i + 1}" }
+    let steps := #[current] ++ builders ++ #[
+      update 11 "build" { completed := 5170, total := some 9031, message := "Committed modules known" },
+      update 12 "builder-2" { message := "NextModule" }]
+    let expected := #["build: 5170/9031 · 57% · Committed modules known"] ++
+      (Array.range 10).map fun i => s!"builder-{i + 1}: {if i == 1 then "NextModule" else s!"Module{i + 1}"}"
+    assertEq ((Watch.progressLines steps).map Styled.plain) expected
+      "Progress must show the counter first and every builder's latest message in numeric order"
+    let refreshed := steps.push (update 13 "builder-1" { message := "AnotherModule" })
+    assertEq ((Watch.progressLines refreshed).map Styled.plain) (expected.set! 1 "builder-1: AnotherModule")
+      "A builder update moved other rows or kept an old message"⟩,
   ⟨"console.watch-reported-worker-identities", do
     let ctx : Context := ⟨"/work", "deployment"⟩
     let steps : Array Trace.Step := #[{

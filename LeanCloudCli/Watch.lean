@@ -96,26 +96,40 @@ private def sourceLabel (run : Run) (steps : Array Trace.Step) : String :=
 /-- Progress belongs to the last executing command, not an earlier command or
 worker incarnation. Keep it when completion freezes that command's last view.
 Never sum worker counters: duplicate execution is not additional build progress. -/
-def progressLines (steps : Array Trace.Step) (limit : Nat := 4) : Array Styled.Line := Id.run do
-  if limit == 0 then return #[]
+private def progressUpdates (steps : Array Trace.Step) : Array (String × ProgressUpdate) := Id.run do
   let some current := steps.findSomeRev? (fun step =>
     if step.progress.isNone && (step.event.source.isSome || step.event.activity == "execute") then
       some step.event else none)
     | return #[]
   let mut seen : Std.HashSet String := {}
-  let mut lines := #[]
+  let mut updates := #[]
   for step in steps.reverse do
     unless step.event.worker == current.worker && step.event.session == current.session &&
         step.event.attempt == current.attempt && step.event.location == current.location do continue
     if let some (slot, update) := step.progress then
       if seen.contains slot then continue
       seen := seen.insert slot
-      let count := match update.total with
-        | some total => s!"{update.completed}/{total} · {if total == 0 then 100 else min 100 (update.completed * 100 / total)}% · "
-        | none => ""
-      lines := lines.push (Styled.text s!"{safe slot}: {count}{safe update.message}" .green)
-      if lines.size ≥ limit then break
-  return lines.reverse
+      updates := updates.push (slot, update)
+  -- Numeric suffixes keep builder-2 before builder-10. Arrival order never
+  -- changes a slot's row; a later report only replaces that slot's message.
+  let key (slot : String) :=
+    let digits := slot.toList.reverse.takeWhile Char.isDigit
+    ((slot.dropEnd digits.length).toString, (String.ofList digits.reverse).toNat?.getD 0, slot)
+  return updates.qsort fun a b =>
+    if a.2.total.isSome != b.2.total.isSome then a.2.total.isSome
+    else
+      let (prefixA, numberA, nameA) := key a.1
+      let (prefixB, numberB, nameB) := key b.1
+      if prefixA != prefixB then prefixA < prefixB
+      else if numberA != numberB then numberA < numberB
+      else nameA < nameB
+
+def progressLines (steps : Array Trace.Step) (limit : Nat := steps.size) : Array Styled.Line :=
+  ((progressUpdates steps).extract 0 limit).map fun (slot, update) =>
+    let count := match update.total with
+      | some total => s!"{update.completed}/{total} · {if total == 0 then 100 else min 100 (update.completed * 100 / total)}% · "
+      | none => ""
+    Styled.text s!"{safe slot}: {count}{safe update.message}" .green
 
 private def beside (left right : Array Styled.Line) (leftWidth : Nat) : Array Styled.Line :=
   (Array.range (max left.size right.size)).map fun row =>
@@ -133,11 +147,15 @@ def executing (steps : Array Trace.Step) (entries : Array BranchTree.Entry)
   | some (branch, attempt) => (BranchTree.observations steps branch).filter fun step =>
       step.event.worker == worker && step.event.attempt == some attempt
 
+private def workerCode (steps : Array Trace.Step) (entries : Array BranchTree.Entry)
+    (worker : String) (live : Bool) : Array Trace.Step :=
+  if live then executing steps entries worker else steps.filter (·.event.worker == worker)
+
 private def workerCard (ctx : Context) (run : Run) (steps : Array Trace.Step)
     (entries : Array BranchTree.Entry) (worker : String) (histories : Array History)
     (live : Bool) (width height : Nat) : Array Styled.Line := Id.run do
   let current := entries.find? (fun entry => (assignment entry).map (·.1) == some worker)
-  let code := if live then executing steps entries worker else steps.filter (·.event.worker == worker)
+  let code := workerCode steps entries worker live
   let label := if live then current.map (fun entry => s!"branch {entry.branch.key}") |>.getD "idle for this workflow"
     else "last view"
   let mut lines := #[Styled.text (pad width s!" {worker} · {label}") .selected]
@@ -145,7 +163,7 @@ private def workerCard (ctx : Context) (run : Run) (steps : Array Trace.Step)
     lines := lines.push (Styled.text (sourceLabel run code) .muted)
     lines := lines ++ sourceRows run code (if height ≥ 10 then 2 else 1) 0
   else lines := lines.push (Styled.text "No branch executing" .muted)
-  lines := lines ++ progressLines code 2
+  lines := lines ++ progressLines code
   return (lines ++ metrics ctx worker steps histories live width).extract 0 height
 
 /-- Use reported node identities, including names chosen by external deployers. -/
@@ -157,10 +175,17 @@ def workerRoster (ctx : Context) (steps : Array Trace.Step) (histories : Array H
 
 private def workerColumns (count width : Nat) := min count (max 1 (min 3 (width / 44)))
 
-private def workerCardHeight (height : Nat) := min 16 (height - 1)
+private def workerCardHeight (steps : Array Trace.Step) (entries : Array BranchTree.Entry)
+    (workers : Array String) (live : Bool) (height : Nat) : Nat :=
+  let progress := workers.foldl (fun count worker =>
+    max count (progressUpdates (workerCode steps entries worker live)).size) 0
+  -- Header, source label, two code lines, progress, and nine metric lines.
+  min (max 16 (13 + progress)) (height - 1)
 
-private def workerCapacity (count width height : Nat) :=
-  max 1 (workerColumns count width * max 1 ((height - 1) / max 1 (workerCardHeight height)))
+private def workerCapacity (count width height cellHeight : Nat) :=
+  max 1 (workerColumns count width * max 1 ((height - 1) / max 1 cellHeight))
+
+private def groupCodeRows (height : Nat) := min 3 (max 2 (height / 5))
 
 private def workerGrid (ctx : Context) (run : Run) (steps : Array Trace.Step)
     (entries : Array BranchTree.Entry) (histories : Array History)
@@ -170,8 +195,8 @@ private def workerGrid (ctx : Context) (run : Run) (steps : Array Trace.Step)
   if count == 0 then return #[Styled.text "No workers" .muted]
   let columns := workerColumns count width
   let cellWidth := (width - (columns - 1) * 3) / columns
-  let cellHeight := workerCardHeight height
-  let perPage := workerCapacity count width height
+  let cellHeight := workerCardHeight steps entries roster live height
+  let perPage := workerCapacity count width height cellHeight
   let pages := max 1 ((count + perPage - 1) / perPage)
   let page := min page (pages - 1)
   let workers := roster.extract (page * perPage) ((page + 1) * perPage)
@@ -194,7 +219,9 @@ private def branchPanel (ctx : Context) (run : Run) (steps : Array Trace.Step)
   let code := if live && assigned.isSome && row.fork.isNone then
     executing steps entries (assigned.get!.1) else branchCode steps row
   let title := if row.fork.isSome then s!" {row.title}" else s!" Branch {row.branch.key}"
-  let codeRows := if row.fork.isSome then min 5 (max 2 (height / 5)) else min 12 (max 2 (height - 16))
+  let progress := progressLines code
+  let codeRows := if row.fork.isSome then groupCodeRows height
+    else min 12 (max 2 (height - 13 - progress.size))
   let mut lines := #[Styled.text (pad width title) .header,
     Styled.text row.status .cyan, Styled.text s!"Source: {sourceLabel run code}" .muted]
   lines := lines ++ sourceRows run code codeRows nav.offset
@@ -202,7 +229,7 @@ private def branchPanel (ctx : Context) (run : Run) (steps : Array Trace.Step)
     lines := lines ++ workerGrid ctx run steps entries histories live nav.workers width (height - lines.size)
   else if let some worker := worker then
     lines := lines ++ #[Styled.text s!"{worker} · {if live then "executing" else "last view"}" .cyan] ++
-      progressLines code ++
+      progress ++
       metrics ctx worker (if live then steps else own) histories live width
   else lines := lines.push (Styled.text "No worker executing this branch" .muted)
   return lines.extract 0 height
@@ -329,8 +356,12 @@ private def lastPage (ctx : Context) (view : View) (width height : Nat) : Nat :=
   let sidebar := width ≥ 100
   let bodyWidth := if sidebar then width - min 52 (max 38 (width / 4)) - 3 else width
   let bodyHeight := height - 5 - (if sidebar then 0 else 5)
-  let count := (workerRoster ctx view.snapshot.steps view.history).size
-  let capacity := workerCapacity count bodyWidth (bodyHeight - 3 - min 5 (max 2 (bodyHeight / 5)))
+  let roster := workerRoster ctx view.snapshot.steps view.history
+  let count := roster.size
+  let height := bodyHeight - 3 - groupCodeRows bodyHeight
+  let entries := BranchTree.current view.snapshot.steps view.jobs
+  let cellHeight := workerCardHeight view.snapshot.steps entries roster (view.status == "result pending") height
+  let capacity := workerCapacity count bodyWidth height cellHeight
   (count + capacity - 1) / capacity - 1
 
 private partial def loop (ctx : Context) (run : Run) (interactive color : Bool)

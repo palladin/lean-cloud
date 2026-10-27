@@ -83,6 +83,35 @@ private def withEnvironment (store : ObjectStore) (base : ExecContext IO)
       queues := WorkQueueStore.provider conn (← Std.Mutex.new ()) scope }
   finally conn.close
 
+private def builderSourceTest : IO Unit := do
+  let sources : Array ProgramSource := cloud_sources%
+  let current ← IO.mkRef (none : Option SourceSiteId)
+  let calls ← IO.mkRef (0 : Nat)
+  let line : IO String := do
+    let some id ← current.get | throw (IO.userError "Builder has no source position")
+    let some text := sources.findSome? fun source => do
+      let site ← source.sites.find? (·.id == id)
+      (source.text.splitOn "\n").toArray[site.line - 1]?
+      | throw (IO.userError "Builder source is not bundled")
+    return text
+  let backend := { stub with builder := fun _ _ _ => do
+    let text ← line
+    check ((text.splitOn "Cloud.exec").length > 1 && (text.splitOn "backend.builder").length > 1)
+      s!"Builder highlights its parent instead of its exec call: {text}"
+    calls.modify (· + 1) }
+  let saved ← IO.mkRef []
+  let visit : ReplayInterpreter.Observer IO := fun _ source _ => current.set source
+  let step := fun branch => (ReplayInterpreter.step (journal saved) (pool #[2, 2]) 100
+    (workflow backend) request ⟨0, branch⟩ (some visit)).run
+  let .ok (.fork location count) ← step Location.root
+    | throw (IO.userError "Workflow did not suspend at parallel builders")
+  check (((← line).splitOn "Cloud.parallel").length > 1) "Fork lost its own source position"
+  for index in [:count] do
+    let .ok .done ← step (location.child index)
+      | throw (IO.userError "Builder branch did not complete")
+  check ((← calls.get) == 2) "Did not inspect both builder branches"
+  IO.println "PASS builder exec source locations through replay"
+
 private def generatedTests : IO Unit := do
   for version in ["4.35.0", "4.35.1", "4.36.0", "5.0.0"] do
     check ((Tools.sourceRelease s!"leanprover/lean4:v{version}").toOption == some version) "Supported release rejected"
@@ -898,6 +927,7 @@ private def nativeTests : IO Unit := IO.FS.withTempDir fun cacheRoot => do
   IO.println "PASS native Lake builds, executable/FFI/generated/custom targets, restored artifacts and build failures"
 
 def main (args : List String) : IO Unit := do
+  builderSourceTest
   generatedTests
   if args.contains "--io" then parallelIOTests (objects (← Std.Mutex.new {}))
   if args.contains "--native" then nativeTests
