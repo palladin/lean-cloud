@@ -1,4 +1,5 @@
 import LeanCloudRuntime.Storage
+import LeanCloudCli.Http
 import LeanCloudTests.Support
 import Std.Http
 
@@ -15,9 +16,18 @@ private instance : Server.Handler Service where
     let path := toString request.line.uri.path
     let verb := toString request.line.method
     service.requests.atomically (modify (·.push (verb, path)))
+    let attempts ← service.requests.atomically do return ((← get).filter (·.2 == path)).size
     if let some peer := request.extensions.get Server.RemoteAddr then
       service.peers.atomically (modify (·.push (toString peer)))
     let bytes : ByteArray ← request.body.readAll (maximumSize := some (8 * 1024 * 1024))
+    if path == "/retry" || path == "/client-retry" then
+      if attempts < 3 then
+        return ← Response.new |>.status (if attempts == 1 then .serviceUnavailable else .tooManyRequests) |>.text "temporary"
+      if path == "/client-retry" then
+        let request ← IO.ofExcept (Json.parse (String.fromUTF8! bytes))
+        return ← Response.ok |>.text (LeanCloud.Version.response request (toJson (42 : Nat))).compress
+      return ← Response.ok |>.text "recovered"
+    if path == "/denied" then return ← Response.new |>.status .unauthorized |>.text "denied"
     if path == "/auth" then
       return ← Response.ok |>.text ((request.line.headers.get? (.mk "authorization")).map toString |>.getD "")
     if path == "/redirect" then
@@ -31,6 +41,9 @@ private instance : Server.Handler Service where
         if (← get).any (·.1 == path) then return false
         modify (·.push (path, bytes))
         return true
+      -- The first write committed, but its successful response was lost.
+      if path == "/bucket/lost-response" && inserted then
+        return ← Response.new |>.status .serviceUnavailable |>.text "temporary"
       return ← Response.new |>.status (if inserted then .created else .preconditionFailed) |>.text ""
     let value ← service.objects.atomically do return ((← get).find? (·.1 == path)).map (·.2)
     let some value := value | return ← Response.notFound |>.text ""
@@ -45,6 +58,17 @@ def run : IO Unit := do
     let url := s!"http://127.0.0.1:{bound.port}"
     let config : S3.Config := ⟨url, "bucket", "us-east-1", .keys "test-key" "test-secret" "", true⟩
     let store := S3.objects config
+    let (_, recovered) ← StorageHttp.send { service := "test", url := url ++ "/retry" }
+    assertEq (String.fromUTF8! recovered) "recovered"
+    assertEq (← LeanCloudCli.Http.post (url ++ "/client-retry") "token" "{}") "42"
+    let (denied, _) ← StorageHttp.send { service := "test", url := url ++ "/denied" }
+    assertEq denied 401
+    assertEq (← service.requests.atomically do return ((← get).filter (·.2 == "/denied")).size) 1
+      "Authentication failure was retried"
+    assertEq (← store.create "lost-response" "winner".toUTF8).data "winner".toUTF8.data
+      "Retry after a committed write lost the canonical value"
+    service.requests.atomically (set (#[] : Array (String × String)))
+    service.peers.atomically (set (#[] : Array String))
     let bytes := ByteArray.mk ((Array.range 200003).map fun i => (i % 256).toUInt8)
     let ref ← store.putBytes bytes
     assertEq (← store.size ref.key) (some bytes.size)

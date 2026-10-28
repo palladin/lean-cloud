@@ -8,6 +8,9 @@ open Lean LeanCloud LeanCloudRuntime
 def queueName := "lean-build/v7/modules"
 def resultName (module : String) := "lean-build/v7/results/" ++ module
 
+/-- Network latency can be overlapped without consuming a compiler CPU slot. -/
+def ioConcurrency (cpus : Nat) : Nat := max 4 (min 32 (4 * cpus))
+
 def readResult (env : Environment IO) (name : String) : IO (Option BuildResult) := do
   let some ref ← env.blobs.readNamed (resultName name) | return none
   let result : BuildResult ← IO.ofExcept (Json.parse (← env.blobs.readText ref) >>= fromJson?)
@@ -30,7 +33,7 @@ def seed (env : Environment IO) (plan : Plan) : IO Unit := do
     queue.send ((roots.extract (offset * 100) ((offset + 1) * 100)).map fun m => ⟨m.name, toJson m.name⟩)
 
 def results (env : Environment IO) (plan : Plan) : IO (Array BuildResult) :=
-  Parallel.map (max 1 env.currentWorker.cpus) plan.modules fun m => do
+  Parallel.map (ioConcurrency env.currentWorker.cpus) plan.modules fun m => do
     let some result ← readResult env m.name | throw (IO.userError s!"Missing module result: {m.name}")
     return result
 
@@ -61,6 +64,7 @@ def compilerSlots (cpus : Nat) := max 1 (cpus - 1)
 /-- One persistent compiler session. Only the coordinator calls submit/poll.
 Preparation and publication run in separate bounded pools. -/
 structure Engine (α : Type) where
+  prefetch : CancellationToken IO → Array BuildResult → IO Unit := fun _ _ => pure ()
   prepare : CancellationToken IO → Module → Array BuildResult → IO Unit
   submit : Module → IO Unit
   poll : IO (Array (String × α))
@@ -118,6 +122,8 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
   IO.ofExcept (validateModules plan.modules)
   let queue := env.queues.open queueName
   let cache ← Std.Mutex.new ({} : State)
+  let reads ← Parallel.Limit.new (ioConcurrency env.currentWorker.cpus)
+  let read := fun name => reads.run (read env cache name)
   let control ← Std.Mutex.new ({} : Control)
   let stop : CancellationToken IO := ⟨do
     return (← env.cancellation.isRequested) || (← control.atomically do return (← get).stopped)⟩
@@ -138,12 +144,14 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
   let settle (work : Work) (result : BuildResult) : IO Unit := do
     if ← stop.isRequested then return
     cache.atomically (modify fun s => { s with results := s.results.insert result.name result })
-    let mut ready := #[]
-    for m in dependents[result.name]?.getD #[] do
-      let mut available := true
-      for parent in m.imports do
-        if (← read env cache parent).isNone then available := false; break
-      if available then ready := ready.push ⟨m.name, toJson m.name⟩
+    let candidates := dependents[result.name]?.getD #[]
+    -- Stop checking a candidate as soon as one prerequisite is missing. Eagerly
+    -- reading every parent of every dependent adds IO on the publication path.
+    let ready ← Parallel.map (ioConcurrency env.currentWorker.cpus) candidates fun m => do
+      if ← m.imports.allM (fun name => return (← read name).isSome) then
+        return some (⟨m.name, toJson m.name⟩ : WorkItem)
+      return none
+    let ready := ready.filterMap id
     for offset in [:((ready.size + 99) / 100)] do
       queue.send (ready.extract (offset * 100) ((offset + 1) * 100))
     work.claims.atomically do
@@ -151,10 +159,10 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
     events.sync.send (.settled work.mod.name)
   let prepare (work : Work) : IO Unit := do
     if ← stop.isRequested then return
-    if let some result ← read env cache work.mod.name then
+    if let some result ← read work.mod.name then
       settle work result
       return
-    let parents ← work.mod.imports.mapM (read env cache)
+    let parents ← Parallel.map (ioConcurrency env.currentWorker.cpus) work.mod.imports read
     if parents.any Option.isNone then
       -- An early delivery remains eligible for a later attempt.
       work.claims.atomically do
@@ -165,8 +173,9 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
       settle work (← publishResult env {
         name := work.mod.name, status := .blocked, message := "A prerequisite failed" })
     else
-      let inputs ← (dependencies plan.modules #[work.mod]).mapM fun dep => do
-        let some result ← read env cache dep.name | throw (IO.userError "Missing transitive prerequisite")
+      let inputs ← Parallel.map (ioConcurrency env.currentWorker.cpus)
+          (dependencies plan.modules #[work.mod]) fun dep => do
+        let some result ← read dep.name | throw (IO.userError "Missing transitive prerequisite")
         return result
       engine.prepare stop work.mod inputs
       unless ← stop.isRequested do events.sync.send (.prepared work.mod.name)
@@ -190,6 +199,23 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
         report env queue plan.modules.size (← activity.atomically get)
         next := (← IO.monoMsNow) + 1000
       IO.sleep 50) .dedicated
+  -- Every worker follows the same append-only completion feed with its own
+  -- cursor. Artifact IO overlaps compilation and never consumes a work lease.
+  let prefetcher ← IO.asTask (do
+    try
+      let mut cursor := 0
+      while !(← stop.isRequested) do
+        let completed ← queue.completions cursor 100
+        if completed.isEmpty then IO.sleep 200
+        else
+          let results ← Parallel.map (ioConcurrency env.currentWorker.cpus) completed fun item => do
+            let name ← IO.ofExcept (fromJson? (α := String) item.value)
+            let some result ← read name | throw (IO.userError "Completion has no published module result")
+            return result
+          engine.prefetch stop (results.filter (·.status == .built))
+          cursor := completed.back!.cursor
+    catch error =>
+      control.atomically (modify fun s => { s with stopped := true, error := s.error.orElse (fun _ => some error) })) .dedicated
   try
     let mut work : Std.HashMap String Work := {}
     let mut waiting : Array String := #[]
@@ -282,6 +308,8 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
     unless ← env.cancellation.isRequested do
       engine.finish
       control.atomically (modify fun s => { s with stopped := true })
+      discard <| IO.wait prefetcher
+      if let some error ← control.atomically do return (← get).error then throw error
       discard <| IO.wait reporter
       report env queue plan.modules.size "Finished"
   finally
@@ -290,6 +318,7 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
     for task in ← tasks.get do discard <| IO.wait task
     discard <| IO.wait renewer
     discard <| IO.wait reporter
+    discard <| IO.wait prefetcher
     let claims ← control.atomically do return (← get).claims
     discard <| Parallel.map ioSlots claims fun claim => do
       try claim.release queue catch _ => pure ()

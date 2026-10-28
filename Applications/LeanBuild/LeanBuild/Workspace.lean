@@ -24,7 +24,7 @@ structure Session where
 initialize lock : Std.Mutex Unit ← Std.Mutex.new ()
 
 private def session (store : ObjectStore) (root : System.FilePath) (key : String)
-    (saved : Option Saved) (persistent : Bool) (action : Session → IO α) : IO α := do
+    (saved : Option Saved) (persistent : Bool) (concurrency : Nat) (action : Session → IO α) : IO α := do
   IO.FS.createDirAll (root / "project")
   let entries := saved.map (·.manifests) |>.getD #[]
   let manifests ← Std.Mutex.new (entries.foldl (fun map (ref, manifest) =>
@@ -47,7 +47,7 @@ private def session (store : ObjectStore) (root : System.FilePath) (key : String
         if (← validEncoding json.compress) || (← validEncoding json.pretty) then
           remember ref manifest
           return manifest
-      let manifest ← Files.readJson store ref
+      let manifest ← Files.readJson store ref concurrency
       remember ref manifest
       return manifest
     rememberManifest := remember
@@ -62,9 +62,9 @@ limit. A different build replaces it. Remove the clean marker before any work:
 a crash, exception, or unsuccessful job leaves no reusable checkpoint. The next
 attempt discards it and restores committed blob artifacts. -/
 def use (store : ObjectStore) (cache : Option System.FilePath) (key : String)
-    (action : Session → IO α) : IO α :=
+    (action : Session → IO α) (concurrency : Nat := 1) : IO α :=
   match cache with
-  | none => IO.FS.withTempDir fun root => session store root key none false action
+  | none => IO.FS.withTempDir fun root => session store root key none false concurrency action
   | some root => lock.atomically do
     let saved : Option Saved ← try
       let value ← IO.ofExcept (Json.parse (← IO.FS.readFile (root / "ready.json")) >>= fromJson?)
@@ -78,6 +78,6 @@ def use (store : ObjectStore) (cache : Option System.FilePath) (key : String)
       if entry.fileName != "project" then
         if (← entry.path.symlinkMetadata).type == .dir then IO.FS.removeDirAll entry.path
         else IO.FS.removeFile entry.path
-    session store root key saved true action
+    session store root key saved true concurrency action
 
 end LeanBuild.Workspace

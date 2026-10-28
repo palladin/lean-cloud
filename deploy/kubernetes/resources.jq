@@ -7,7 +7,8 @@ def resource($api;$kind;$name;$role): {apiVersion:$api,kind:$kind,metadata:meta(
 def claim: {accessModes:["ReadWriteOnce"],storageClassName:$c.storageClass,resources:{requests:{storage:(($c.diskGiB|tostring)+"Gi")}}};
 def probe: {httpGet:{path:"/health",port:"http"},timeoutSeconds:3,periodSeconds:5};
 def resources($role): ($c + (if $role=="scheduler" then ($c.schedulerResources//{}) else {} end)) as $r |
-  {requests:{cpu:(($r.cpuMillis|tostring)+"m"),memory:(($r.memoryMiB|tostring)+"Mi")},limits:{memory:(($r.memoryMiB|tostring)+"Mi")}};
+  (if $role=="scheduler" then $r.cpuMillis else ($c.cpuRequestMillis//$r.cpuMillis) end) as $request |
+  {requests:{cpu:(($request|tostring)+"m"),memory:(($r.memoryMiB|tostring)+"Mi")},limits:{memory:(($r.memoryMiB|tostring)+"Mi")}};
 def service($role): resource("v1";"Service";$role;$role) + {spec:{type:"ClusterIP",publishNotReadyAddresses:true,selector:labels($role),ports:[{name:"http",port:8080,targetPort:"http"}]}};
 def node($role): resource("apps/v1";"StatefulSet";$role;$role) + {spec:{
   serviceName:$role,replicas:0,selector:{matchLabels:labels($role)},updateStrategy:{type:"OnDelete"},

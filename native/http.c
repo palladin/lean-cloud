@@ -1,5 +1,5 @@
 /* Synchronous libcurl transport. Lean owns endpoint routing and exclusive
- * handle access. No retries: a failed response may follow a committed send. */
+ * handle access. Typed transport failures are retried by Lean's shared policy. */
 #include <lean/lean.h>
 #include <curl/curl.h>
 #include <pthread.h>
@@ -58,6 +58,11 @@ static void initialize(void) {
 static lean_obj_res fail(const char *message) {
     return lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(message)));
 }
+static lean_obj_res transfer_result(CURLcode code, lean_object *value) {
+    lean_object *result = lean_alloc_ctor(code == CURLE_OK ? 1 : 0, 1, 0);
+    lean_ctor_set(result, 0, code == CURLE_OK ? value : lean_box_uint32((uint32_t)code));
+    return lean_io_result_mk_ok(result);
+}
 LEAN_EXPORT lean_obj_res lc_http_client(lean_obj_arg world) {
     (void)world;
     pthread_once(&once, initialize);
@@ -100,7 +105,6 @@ static lean_obj_res request_http(b_lean_obj_arg handle, b_lean_obj_arg url,
         free(auth);
     }
     struct buffer b = { .limit = 16 * 1024 * 1024 };
-    char error[CURL_ERROR_SIZE] = {0};
     p_curl_easy_reset(c);
     p_curl_easy_setopt(c, CURLOPT_URL, lean_string_cstr(url));
 #if LIBCURL_VERSION_NUM >= 0x075500
@@ -115,11 +119,10 @@ static lean_obj_res request_http(b_lean_obj_arg handle, b_lean_obj_arg url,
     }
     p_curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, receive);
     p_curl_easy_setopt(c, CURLOPT_WRITEDATA, &b);
-    p_curl_easy_setopt(c, CURLOPT_ERRORBUFFER, error);
     p_curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
     p_curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
     p_curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, progress);
-    p_curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT_MS, 2000L);
+    p_curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT_MS, 10000L);
     p_curl_easy_setopt(c, CURLOPT_TIMEOUT_MS, (long)timeout);
     /* A restarted/reconnected node may have a different IP. easy_reset keeps
      * libcurl's DNS cache, whose default 60s lifetime outlasts our work leases.
@@ -130,15 +133,17 @@ static lean_obj_res request_http(b_lean_obj_arg handle, b_lean_obj_arg url,
     long status = 0;
     p_curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
     p_curl_slist_free_all(headers);
+    /* Clear borrowed pointers/credentials while retaining connection reuse. */
+    p_curl_easy_reset(c);
     if (code != CURLE_OK) {
         free(b.data);
-        return fail(error[0] ? error : p_curl_easy_strerror(code));
+        return transfer_result(code, NULL);
     }
     lean_object *result = lean_alloc_ctor(0, 2, 0);
     lean_ctor_set(result, 0, lean_box_uint32((uint32_t)status));
     lean_ctor_set(result, 1, lean_mk_string_from_bytes(b.data ? b.data : "", b.size));
     free(b.data);
-    return lean_io_result_mk_ok(result);
+    return transfer_result(CURLE_OK, result);
 }
 
 LEAN_EXPORT lean_obj_res lc_http_post(b_lean_obj_arg handle, b_lean_obj_arg url,
@@ -227,9 +232,7 @@ done:
     p_curl_slist_free_all(headers);
     if (code != CURLE_OK) {
         lean_dec(b.bytes);
-        char message[80];
-        snprintf(message, sizeof(message), "Storage transport failed (curl %d)", (int)code);
-        return fail(message);
+        return transfer_result(code, NULL);
     }
     lean_object *known = lean_box(0);
     if (length >= 0) {
@@ -242,6 +245,6 @@ done:
     lean_object *result = lean_alloc_ctor(0, 2, 0);
     lean_ctor_set(result, 0, lean_box_uint32((uint32_t)status));
     lean_ctor_set(result, 1, payload);
-    return lean_io_result_mk_ok(result);
+    return transfer_result(CURLE_OK, result);
 #undef STORAGE_OPT
 }

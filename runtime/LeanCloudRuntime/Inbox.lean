@@ -129,6 +129,8 @@ def apply (store : Store) (now : Nat) (request : Request) : IO Json := store.sta
   match operation with
   | .openReply =>
     unless !session.isEmpty && session.length ≤ 128 do throw (IO.userError "Invalid consumer session")
+    if let some consumer := consumers.find? (fun c => isReply c.queue && c.session == session) then
+      return toJson (consumer.queue, store.leaseMs)
     let queue := s!"$reply/{store.replyEpoch}/{state.nextReply}"
     let consumer : Consumer := { queue, session, expires := now + store.leaseMs }
     set ({ consumers := consumers.push consumer, nextReply := state.nextReply + 1 } : State)

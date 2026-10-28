@@ -61,10 +61,12 @@ def run : IO Unit := do
       assertEq (← WorkQueueStore.apply conn 101 (request "run" .idle)) (toJson false)
         "Stale ACK deleted a newer lease"
       rejects (WorkQueueStore.apply conn 101 (request "run" (.renew receipt)))
-      rejects (WorkQueueStore.apply conn 101 (request "run" (.release receipt)))
+      discard <| WorkQueueStore.apply conn 101 (request "run" (.release receipt))
+      assertTrue (← receive conn 101).isEmpty "Stale release disturbed a newer lease"
       let receipt := batch[0]!.receipt
       discard <| WorkQueueStore.apply conn 150 (request "run" (.renew receipt)) 100
       assertTrue (← receive conn 200).isEmpty "Renewal did not extend the lease"
+      discard <| WorkQueueStore.apply conn 201 (request "run" (.release receipt))
       discard <| WorkQueueStore.apply conn 201 (request "run" (.release receipt))
       let next ← receive conn 201
       assertEq next.size 1 "Released work was lost"
@@ -73,6 +75,13 @@ def run : IO Unit := do
       discard <| WorkQueueStore.apply conn 202 (request "run" (.complete receipt true))
       let progress : WorkQueueProgress ← IO.ofExcept (fromJson? (← WorkQueueStore.apply conn 202 (request "run" .progress)))
       assertEq progress ⟨2, 1⟩ "Duplicate/expired completion inflated progress"
+      let page : Array WorkCompletion ← IO.ofExcept (fromJson?
+        (← WorkQueueStore.apply conn 202 (request "run" (.completions 0 1))))
+      assertEq (page.map fun item => (item.cursor, item.value, item.failed)) #[(1, toJson "A", false)]
+      let page : Array WorkCompletion ← IO.ofExcept (fromJson?
+        (← WorkQueueStore.apply conn 202 (request "run" (.completions 1 100))))
+      assertEq (page.map fun item => (item.cursor, item.value, item.failed)) #[(2, toJson "B", true)]
+        "Completion feed lost ordering, restart durability, or deduplication"
       assertEq (← WorkQueueStore.apply conn 202 (request "run" .idle)) (toJson true)
       discard <| WorkQueueStore.apply conn 203 (request "run" (.send #[⟨"B", toJson "B"⟩]))
       assertEq (← WorkQueueStore.apply conn 203 (request "run" .idle)) (toJson true)
@@ -107,6 +116,12 @@ def run : IO Unit := do
       "Competing HTTP consumers lost or duplicated work"
     assertTrue (← queue.isIdle) "Acknowledged work remained queued"
     assertEq (← queue.progress) ⟨100, 50⟩ "Concurrent HTTP progress is not deduplicated"
+    let page ← queue.completions 0 100
+    assertEq (page.map (·.cursor)) ((Array.range 100).map (· + 1))
+    assertEq ((page.map (·.value.compress)).qsort (· < ·)) ((items.map (·.value.compress)).qsort (· < ·))
+    assertTrue (← queue.completions 100 100).isEmpty "Completion cursor replayed earlier entries"
+    assertEq (← queue.completions 0 100 |>.map (·.map (·.cursor))) (page.map (·.cursor))
+      "Reading the feed consumed another observer's entries"
     HttpMailbox.retireWorkQueues endpoints[0]! "concurrent"
     rejects (queue.send #[⟨"late", Json.null⟩])
   IO.println "Work queues: idempotent sends, leases, restart, stale receipts, retirement, concurrent HTTP consumers passed"

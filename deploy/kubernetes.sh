@@ -44,6 +44,8 @@ startup=$(jq -er '.startupSeconds // 300' "$spec"); number "$startup"
 (( startup >= 5 && startup <= 3600 )) || fail 'startupSeconds must be between 5 and 3600'
 jq -e '.image|test("@sha256:[a-f0-9]{64}$")' "$spec" >/dev/null || fail 'Use an immutable registry image digest'
 jq -e '[.diskGiB,.cpuMillis,.memoryMiB]|all(type=="number" and .>0 and floor==.)' "$spec" >/dev/null || fail 'Invalid resource sizes'
+jq -e 'if has("cpuRequestMillis") then .cpuMillis as $budget | .cpuRequestMillis |
+  type=="number" and .>0 and floor==. and .<=$budget else true end' "$spec" >/dev/null || fail 'cpuRequestMillis must be a positive integer no greater than cpuMillis'
 jq -e '(.schedulerResources // {}) | type=="object" and (keys|all(.=="cpuMillis" or .=="memoryMiB")) and (values|all(type=="number" and .>0 and floor==.))' "$spec" >/dev/null || fail 'Invalid scheduler resources'
 kube() { kubectl "${kube_options[@]}" --request-timeout=30s "$@"; }
 roles() { printf 'scheduler\n'; for ((i=1;i<=workers;i++)); do printf 'worker%s\n' "$i"; done; }
@@ -102,7 +104,7 @@ fi
 kube create configmap cloud-operation --from-literal="operation=$command" >/dev/null || fail 'Deployment operation is locked; verify the previous operator has stopped before removing cloud-operation.'
 trap 'kube delete configmap cloud-operation --ignore-not-found --wait=true >/dev/null' EXIT
 storage_hash=$(jq -Sc . "$directory/storage.json" | shasum -a 256 | cut -d " " -f 1)
-identity_filter='del(.workers,.cpuMillis,.memoryMiB,.schedulerResources,.startupSeconds,.kubeconfig)'
+identity_filter='del(.workers,.cpuMillis,.cpuRequestMillis,.memoryMiB,.schedulerResources,.startupSeconds,.kubeconfig)'
 identity=$(jq -Sc "$identity_filter" "$spec")
 record=$(kube get configmap cloud-deployment --ignore-not-found -o json)
 if [[ -n "$record" ]]; then

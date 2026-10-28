@@ -67,6 +67,8 @@ def Step.keys (step : Step) : Array String := Id.run do
     if ["paused", "resumed", "sealed", "killed", "failed"].contains step.event.activity then
       keys := keys.push "control"
   else if let some owner := step.owner then
+    if ["branch-failed", "branch-succeeded", "branch-cancelled"].contains step.event.activity then
+      keys := keys.push ("outcome/" ++ owner.key)
     if step.event.activity == "parallel-label" then
       keys := keys.push ("label/" ++ step.event.location)
     keys := keys.push ("branch/" ++ owner.key)

@@ -1,4 +1,5 @@
 import Lean
+import LeanCloud.Retry
 import Std.Sync.Mutex
 
 namespace LeanCloudRuntime.StorageHttp
@@ -31,7 +32,7 @@ private instance : Nonempty Client := ClientType.property
 @[extern "lc_http_client"] private opaque newClient : IO Client
 @[extern "lc_http_storage"] private opaque transfer (client : @&Client)
   (url method : @&String) (headers : @&Array String) (body : @&ByteArray)
-  (signing : @&Array String) (noProxy : Bool) : IO (UInt32 × ByteArray × Option Nat)
+  (signing : @&Array String) (noProxy : Bool) : IO (Except UInt32 (UInt32 × ByteArray × Option Nat))
 
 -- Exclusive checkout permits concurrent transfers without sharing a handle.
 -- Only idle handles are bounded; active work is bounded by the caller's pool.
@@ -58,7 +59,8 @@ def sendWithLength (request : Request) : IO (Nat × ByteArray × Option Nat) := 
     if let some client := clients.back? then set clients.pop; return client
     newClient
   try
-    let (status, body, length) ← transfer client request.url request.method headers request.body signing request.noProxy
+    let (status, body, length) ← LeanCloud.Retry.http
+      (transfer client request.url request.method headers request.body signing request.noProxy) (·.1.toNat)
     return (status.toNat, body, length)
   finally idle.atomically do
     if (← get).size < 32 then modify (·.push client)

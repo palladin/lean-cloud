@@ -12,6 +12,7 @@ structure Entry where
   job : Option BranchObservation := none
   control : String := ""
   labels : Std.HashMap String ParallelDisplay := {}
+  outcome : Option String := none
   deriving Inhabited
 
 private def ensure (entries : Array Entry) (known : Std.HashMap String Nat)
@@ -41,7 +42,16 @@ def current (observed : Array Trace.Step) (jobs : Array BranchObservation := #[]
   let mut known : Std.HashMap String Nat := {}
   let mut control := ""
   let mut labels : Std.HashMap String (Std.HashMap String ParallelDisplay) := {}
+  let mut failures : Std.HashMap String String := {}
   for step in observed do
+    if step.event.worker != "scheduler" then
+      if let some owner := step.owner then
+        if step.event.activity == "branch-failed" then
+          failures := failures.insert owner.key ("failed: " ++ safe step.event.operation)
+        else if step.event.activity == "branch-cancelled" then
+          failures := failures.insert owner.key ("cancelled: " ++ safe step.event.operation)
+        else if ["branch-succeeded", "assigned"].contains step.event.activity then
+          failures := failures.erase owner.key
     if step.event.worker != "scheduler" && step.event.activity == "parallel-label" then
       if let some fork := Trace.location? step.event.location then
         let parent := (branch fork).key
@@ -61,7 +71,9 @@ def current (observed : Array Trace.Step) (jobs : Array BranchObservation := #[]
       (entries, known) := observeJob entries known job
   for job in jobs do
     (entries, known) := observeJob entries known job
-  return entries.map fun entry => { entry with control, labels := labels[entry.branch.key]?.getD {} }
+  return entries.map fun entry => { entry with
+    control, labels := labels[entry.branch.key]?.getD {}
+    outcome := failures[entry.branch.key]? }
 
 /-- Replay may visit an ancestor's code while executing a child assignment.
 Use assignment ownership, not the current record's location, to select code. -/
@@ -124,7 +136,7 @@ private def label (index : Index) (entry : Entry) : String :=
     | .waiting count =>
       let done := (children index job.location).filter (fun e => e.job.any (·.status == .done))
       s!"waiting {done.size}/{count}"
-    | .done => "completed"
+    | .done => entry.outcome.getD "completed"
 
 private def descend (index : Index) (nav : Navigation) :
     Nat → Entry → Nat → Option String → Array Row
@@ -140,7 +152,8 @@ private def descend (index : Index) (nav : Navigation) :
         let children := children index fork
         let done := children.filter (fun e => e.job.any (·.status == .done))
         let display := entry.labels[fork.key]?.getD default
-        let completed := display.count > 0 && done.size == display.count && children.size == display.count
+        let completed := display.count > 0 && done.size == display.count && children.size == display.count &&
+          children.all (·.outcome.isNone)
         let title := if completed && !display.label.completed.isEmpty then display.label.completed else display.label.running
         let title := if title.isEmpty then "parallel" else title
         rows := rows.push { key, parent := some (branchKey entry.branch), branch := entry.branch, fork := some fork, depth := depth + 1, title, status := s!"{done.size}/{children.size}", expandable := true }

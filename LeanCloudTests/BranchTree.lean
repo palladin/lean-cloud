@@ -50,6 +50,19 @@ private def text (nav : Watch.Navigation) (width := 180) (height := 40) (trace :
 private def has (text fragment : String) : Bool := (text.splitOn fragment).length > 1
 
 public def cases : Array TestCase := #[
+  ⟨"console.tree.durable-failure-survives-idle-and-compaction", do
+    let failed := workerStep 11 child child
+    let failed := { failed with event := { failed.event with
+      activity := "branch-failed", operation := "DNS timeout" } }
+    let idle := { workerStep 12 child child with event := { failed.event with seq := 12, activity := "idle", operation := "" } }
+    let compact := Trace.latest (Trace.merge steps #[failed, idle])
+    let cached ← unwrap (fromJson? (α := Array Trace.Step) (toJson compact))
+    let entries := LeanCloudCli.BranchTree.current cached
+    let rows := LeanCloudCli.BranchTree.rows entries expandedTree
+    assertEq ((rows.find? (fun row => row.branch == child && row.fork.isNone)).map (·.status))
+      (some "failed: DNS timeout")
+    assertTrue (has (text { tree := { expandedTree with selected := some "branch/0:2/0:0" } } (trace := cached)) "DNS timeout")
+      "Selected failed branch hid its cause"⟩,
   ⟨"console.tree.progress-changes-only-after-all-children-finish", do
     let start := "9,030/9,031 · 99%"
     let finish := "9,031/9,031 · 100%"

@@ -39,6 +39,8 @@ private def inboxes : IO Unit := IO.FS.withTempFile fun _ path => do
     for i in [:240] do
       let now := i * 1000
       let (queue, lease) : String × Nat ← IO.ofExcept (fromJson? (← Inbox.apply store now ⟨"", "client", .openReply⟩))
+      let repeated : String × Nat ← IO.ofExcept (fromJson? (← Inbox.apply store now ⟨"", "client", .openReply⟩))
+      assertEq repeated (queue, lease) "Lost open response allocated another temporary inbox"
       assertEq lease 100
       let reply (store : Inbox.Store) (time : Nat) : IO Bool := do
         IO.ofExcept (fromJson? (← Inbox.apply store time ⟨queue, "", .reply "result"⟩))

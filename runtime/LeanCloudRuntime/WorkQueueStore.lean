@@ -12,13 +12,16 @@ private abbrev Counter : Schema := [("queue", .string), ("next", .int)]
 private abbrev Submission : Schema := [("queue", .string), ("key", .string), ("payload", .string)]
 private abbrev Retired : Schema := [("run", .string)]
 private abbrev Totals : Schema := [("queue", .string), ("completed", .int), ("failed", .int)]
+private abbrev Completed : Schema := [("queue", .string), ("cursor", .int), ("payload", .string), ("failed", .bool)]
 private abbrev Context : Ctx := { tables := [("work_messages", Row), ("work_counters", Counter),
-  ("work_submissions", Submission), ("work_retired", Retired), ("work_totals", Totals)] }
+  ("work_submissions", Submission), ("work_retired", Retired), ("work_totals", Totals),
+  ("work_completed", Completed)] }
 private def messages : Table "work_messages" Row := ⟨⟩
 private def counters : Table "work_counters" Counter := ⟨⟩
 private def submissions : Table "work_submissions" Submission := ⟨⟩
 private def retired : Table "work_retired" Retired := ⟨⟩
 private def totals : Table "work_totals" Totals := ⟨⟩
+private def completed : Table "work_completed" Completed := ⟨⟩
 
 inductive Operation where
   | send (values : Array WorkItem)
@@ -27,6 +30,7 @@ inductive Operation where
   | acknowledge (receipt : String)
   | complete (receipt : String) (failed : Bool)
   | progress
+  | completions (after count : Nat)
   | renew (receipt : String)
   | release (receipt : String)
   | retire
@@ -43,6 +47,7 @@ def initializeSchema (conn : Sqlite.Conn) : IO Unit := do
   conn.createTable submissions (primaryKey := [.column "queue", .column "key"])
   conn.createTable retired (primaryKey := [.column "run"])
   conn.createTable totals (primaryKey := [.column "queue"])
+  conn.createTable completed (primaryKey := [.column "queue", .column "cursor"])
 
 private def progress (conn : Sqlite.Conn) (queue : String) : IO WorkQueueProgress := do
   let query : Query Context Totals := Query.from' (ts := Context) totals
@@ -64,11 +69,20 @@ private def progress (conn : Sqlite.Conn) (queue : String) : IO WorkQueueProgres
 private def settle (conn : Sqlite.Conn) (now : Nat) (queue receipt : String) (failed : Bool) : IO Unit := do
   unless !receipt.isEmpty do throw (IO.userError "Empty receipt")
   let previous ← progress conn queue
+  let query : Query Context Row := Query.from' (ts := Context) messages
+    |>.where' (fun r => (r["queue"] ==. SqlExpr.str queue) &&.
+      (r["receipt"] ==. SqlExpr.str receipt) &&. (r["available"] >. SqlExpr.int now))
+  let [.cons _ (.cons _ (.cons payload (.cons _ (.cons _ .nil))))] ← conn.query query
+    | return
   let delete : DeleteStmt Context _ _ := messages.delete
     |>.where' (fun r => (r["queue"] ==. SqlExpr.str queue) &&.
       (r["receipt"] ==. SqlExpr.str receipt) &&. (r["available"] >. SqlExpr.int now))
   -- Redelivery, repeated ACKs and expired receipts cannot increment progress.
   if (← conn.execDelete delete) == 0 then return
+  let insert : InsertStmt Context _ _ := completed.insert
+    |>.value "queue" (SqlExpr.str queue) |>.value "cursor" (SqlExpr.int (previous.completed + 1))
+    |>.value "payload" (SqlExpr.str payload) |>.value "failed" (SqlExpr.bool failed)
+  discard (conn.execInsert insert)
   let update : UpdateStmt Context _ _ := totals.update
     |>.set "completed" (SqlExpr.int (previous.completed + 1))
     |>.set "failed" (SqlExpr.int (previous.failed + if failed then 1 else 0))
@@ -94,6 +108,9 @@ private def retire (conn : Sqlite.Conn) (run : String) : IO Unit := do
       |>.where' (fun r => r["queue"] ==. SqlExpr.str name)
     discard (conn.execDelete delete)
     let delete : DeleteStmt Context _ _ := totals.delete
+      |>.where' (fun r => r["queue"] ==. SqlExpr.str name)
+    discard (conn.execDelete delete)
+    let delete : DeleteStmt Context _ _ := completed.delete
       |>.where' (fun r => r["queue"] ==. SqlExpr.str name)
     discard (conn.execDelete delete)
     let delete : DeleteStmt Context _ _ := submissions.delete
@@ -136,6 +153,15 @@ def apply (conn : Sqlite.Conn) (now : Nat) (request : Request)
   match operation with
   | .retire => return Json.null
   | .progress => return toJson (← progress conn queue)
+  | .completions after count =>
+    unless count > 0 && count ≤ 100 do throw (IO.userError "Completion count must be between 1 and 100")
+    let query : Query Context Completed := Query.from' (ts := Context) completed
+      |>.where' (fun r => (r["queue"] ==. SqlExpr.str queue) &&. (r["cursor"] >. SqlExpr.int after))
+      |>.orderBy (fun r => [r["cursor"].asc]) |>.limit count
+    let values ← (← conn.query query).toArray.mapM fun
+      | .cons _ (.cons cursor (.cons payload (.cons failed .nil))) => do
+        return (⟨cursor.toNat, ← IO.ofExcept (Json.parse payload), failed⟩ : WorkCompletion)
+    return toJson values
   | .idle =>
     let query : Query Context Row := Query.from' (ts := Context) messages
       |>.where' (fun r => r["queue"] ==. SqlExpr.str queue) |>.limit 1
@@ -197,7 +223,11 @@ def apply (conn : Sqlite.Conn) (now : Nat) (request : Request)
       |>.set "receipt" (SqlExpr.str (if available == 0 then "" else receipt))
       |>.where' (fun r => (r["queue"] ==. SqlExpr.str queue) &&.
         (r["receipt"] ==. SqlExpr.str receipt) &&. (r["available"] >. SqlExpr.int now))
-    unless (← conn.execUpdate update) == 1 do throw (IO.userError "Work queue lease expired")
+    let changed ← conn.execUpdate update
+    -- Release can be repeated after a lost response, including after another
+    -- consumer acquires the item. Its receipt can never change that newer lease.
+    if let .renew _ := operation then
+      unless changed == 1 do throw (IO.userError "Work queue lease expired")
     return Json.null
 
 /-- In-process adapter for direct execution and differential tests. Uses exactly
@@ -213,6 +243,7 @@ def provider (conn : Sqlite.Conn) (lock : Std.Mutex Unit) (scope : String) : Que
       acknowledge receipt := do discard (call (.acknowledge receipt))
       complete receipt failed := do discard (call (.complete receipt failed))
       progress := do IO.ofExcept (fromJson? (← call .progress))
+      completions after count := do IO.ofExcept (fromJson? (← call (.completions after count)))
       renew receipt := do discard (call (.renew receipt))
       release receipt := do discard (call (.release receipt)) }⟩
 

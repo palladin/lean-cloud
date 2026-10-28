@@ -1,6 +1,18 @@
 import Std.Sync.Mutex
+import Std.Sync.Semaphore
 
 namespace LeanCloudRuntime.Parallel
+
+/-- One shared limit for leaf IO, including callers in nested parallel maps.
+Never hold a permit while waiting for another action using the same limit. -/
+abbrev Limit := Std.Semaphore
+
+def Limit.new (concurrency : Nat) : IO Limit := Std.Semaphore.new (max 1 concurrency)
+
+def Limit.run (limit : Limit) (action : IO α) : IO α := do
+  let permit ← limit.acquire
+  discard <| IO.wait permit.result!
+  try action finally limit.release
 
 /-- A bounded pool for blocking IO and file processing. Results retain input
 order. All started tasks are joined, including on failure, before the caller

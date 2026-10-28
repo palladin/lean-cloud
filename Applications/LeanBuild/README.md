@@ -41,8 +41,17 @@ and publishes their artifacts concurrently. Small queue receives fill available
 capacity immediately; they do not define execution batches. Shared prerequisite
 files are transferred once, and concurrent preparations await the same transfer.
 
+Every worker also follows a durable completion feed with its own cursor and
+prefetches new artifacts while Lake is busy. Dequeuing a module waits only for
+prerequisites still in flight. The feed announces module names; artifact bytes
+travel directly from blob storage. Read and upload pools each allow up to
+`min 32 (max 4 (4 × CPUs))` concurrent transfers, shared across nested operations.
+Compilation still uses `max 1 (CPUs − 1)` slots.
+
 As each module finishes, a bounded IO pool packs and uploads its artifacts, publishes
 its immutable result, notifies ready dependents, and acknowledges its delivery.
+Each module stays in one pack; parallel transfers do not split its small files
+into separate objects. Large packs upload chunks concurrently.
 Uploads overlap both other uploads and ongoing compilation. All claims are renewed
 until settled. The workspace, manifest cache and downloaded packs stay on the
 worker's local filesystem; already installed imports are not copied again.
@@ -74,6 +83,8 @@ Pause or kill signals `env.cancellation`. Builders stop accepting work, terminat
 active compiler process groups, join local tasks, and release outstanding work.
 The runtime checks assignment ownership before journaling the `exec` outcome.
 Ordinary IO exceptions remain application failures; they are not crash retries.
+HTTP clients retry transient connection failures and temporary service responses
+with bounded backoff and jitter before reporting an exhausted operation as an error.
 
 `watch` shows one shared module completion counter and each worker's compiling,
 restoring, ready and publishing counts. Failed/blocked modules are included in

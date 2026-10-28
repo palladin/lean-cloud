@@ -48,6 +48,14 @@ structure WorkItem where
   value : Json
   deriving ToJson, FromJson
 
+/-- A durable completion announcement. Every observer has its own cursor;
+reading this feed neither dequeues work nor changes another observer's position. -/
+structure WorkCompletion where
+  cursor : Nat
+  value : Json
+  failed : Bool
+  deriving Repr, ToJson, FromJson, Inhabited
+
 /-- Competing consumers with renewable leases. Duplicate deliveries are allowed.
 Receipts fence expired deliveries; settlement never deletes a newer lease.
 Broker waiting is bounded; an empty batch is not completion.
@@ -62,6 +70,7 @@ structure WorkQueue (m : Type → Type u) where
   /-- Settle with an application outcome, atomically updating queue progress. -/
   complete : String → Bool → m Unit
   progress : m WorkQueueProgress
+  completions : Nat → Nat → m (Array WorkCompletion)
   renew : String → m Unit
   release : String → m Unit
 
@@ -72,6 +81,7 @@ def WorkQueue.map (f : {α : Type} → m α → n α) (queue : WorkQueue m) : Wo
   acknowledge receipt := f (queue.acknowledge receipt)
   complete receipt failed := f (queue.complete receipt failed)
   progress := f queue.progress
+  completions after count := f (queue.completions after count)
   renew receipt := f (queue.renew receipt)
   release receipt := f (queue.release receipt)
 
@@ -91,6 +101,7 @@ def QueueProvider.unsupported [Monad m] [MonadExceptOf CloudError m] : QueueProv
     acknowledge _ := unavailable
     complete _ _ := unavailable
     progress := unavailable
+    completions _ _ := unavailable
     renew _ := unavailable
     release _ := unavailable }⟩
 

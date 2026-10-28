@@ -138,6 +138,12 @@ mv "$work/kube/next.json" "$work/kube/deployment.json"
 bash deploy/kubernetes.sh render "$work/kube"
 jq -e '.items[]|select(.kind=="StatefulSet" and .metadata.name=="scheduler")|.spec.template.spec.containers[0].resources|.requests.cpu=="250m" and .limits.memory=="512Mi"' "$work/kube/resources.json" >/dev/null
 jq -e --arg memory "$(jq -r '.memoryMiB|tostring' "$work/kube/deployment.json")Mi" '[.items[]|select(.kind=="StatefulSet" and .metadata.name!="scheduler")|.spec.template.spec.containers[0].resources.limits.memory]|all(.==$memory)' "$work/kube/resources.json" >/dev/null
+cp "$work/kube/deployment.json" "$work/kube/valid.json"
+for request in 'null' 'false' '0' '-1' '1.5' '"100"' '999999'; do
+  jq --argjson request "$request" '.cpuRequestMillis=$request' "$work/kube/valid.json" > "$work/kube/deployment.json"
+  if bash deploy/kubernetes.sh render "$work/kube" 2>/dev/null; then echo "Accepted invalid CPU request: $request"; exit 1; fi
+done
+cp "$work/kube/valid.json" "$work/kube/deployment.json"
 jq '.image="mutable:tag"' "$work/kube/deployment.json" > "$work/kube/next.json"
 mv "$work/kube/next.json" "$work/kube/deployment.json"
 if bash deploy/kubernetes.sh render "$work/kube" 2>/dev/null; then echo 'Accepted mutable registry image'; exit 1; fi

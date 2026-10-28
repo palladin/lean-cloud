@@ -140,6 +140,15 @@ Local defaults leave Docker resources unrestricted and advertise a conservative
 one-job CPU budget. The runtime uses any visible memory limit when no budget is
 configured.
 
+On Kubernetes, optional `cpuRequestMillis` sets the worker's placement request
+separately from its `cpuMillis` execution budget; it defaults to `cpuMillis`.
+For one worker on an 8-vCPU node, use `cpuMillis: 8000` and
+`cpuRequestMillis: 7000`. LeanBuild then runs seven compilers, leaving the remaining
+CPU capacity for coordination, artifact IO and node services. The request allows
+the pod to fit beside Kubernetes services; it is not a second execution limit.
+Kubernetes workers have no CPU quota, so this assumes dedicated capacity and is
+not CPU pinning or an eight-core guarantee on an oversubscribed node.
+
 The same settings reach the workflow through `env.currentWorker` and
 `env.workers`; `cpus` is `floor(cpuMillis / 1000)`, with a minimum of one job.
 This is a concurrency budget, not CPU pinning or a count of idle cores. See the

@@ -237,17 +237,18 @@ private def retainPack (cache : Cache) (ref : FileRef) (source : System.FilePath
   finally
     if ← pending.pathExists then IO.FS.removeFile pending
 
-/-- Pack, hash and upload independent groups within one CPU/IO budget. Large
-single files instead use parallel chunk transfers. No manifest is returned until
-all packs are durable; temporary files remain alive until every task stops. -/
+/-- Choose packing independently of transfer concurrency. Small module artifacts
+can share one pack while its chunks upload concurrently. No manifest is returned
+until all packs are durable; temporary files outlive every transfer. -/
 def Snapshot.publish (snapshot : Snapshot) (store : ObjectStore)
-    (cache : Option Cache := none) (concurrency : Nat := 1) : IO Manifest := do
+    (cache : Option Cache := none) (concurrency : Nat := 1)
+    (packCount : Nat := concurrency) : IO Manifest := do
   if snapshot.paths.isEmpty then return #[]
   let sizes ← Parallel.map concurrency snapshot.paths fun path => do
     return (path, (← (snapshot.root / path).metadata).byteSize.toNat)
   let total := sizes.foldl (fun total item => total + item.2) 0
   unless total ≤ snapshot.limit do throw (IO.userError "Pack exceeds configured byte limit")
-  let count := min (max 1 concurrency) sizes.size
+  let count := min (max 1 packCount) sizes.size
   -- Assign large files first to the currently smallest pack. This only groups
   -- immutable file bytes; it does not change build dependencies or scheduling.
   let groups := (sizes.qsort (fun a b => a.2 > b.2)).foldl (fun groups item =>

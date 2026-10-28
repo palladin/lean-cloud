@@ -122,8 +122,9 @@ def Tools.prepareDirectory (tools : Tools) (store : ObjectStore) (request : Requ
   | .error reason => return { error := reason, diagnostics := ← logs store directory }
   | .ok (toolchain, platform, modules, snapshot) =>
     -- Publication exceptions propagate to Cloud.exec and are durable failures.
-    let source ← snapshot.publish store tools.cache tools.threads
-    return { plan := some { commit, toolchain, platform, modules, source := ← Files.putJson store source } }
+    let source ← snapshot.publish store tools.cache (Builders.ioConcurrency tools.threads)
+    let reference ← Files.putJson store source (Builders.ioConcurrency tools.threads)
+    return { plan := some { commit, toolchain, platform, modules, source := reference } }
 
 def Tools.prepare (tools : Tools) (store : ObjectStore) (request : Request) : IO Preparation :=
   withWorkspace fun directory => do
@@ -149,7 +150,7 @@ private def restore (tools : Tools) (store : ObjectStore) (directory : System.Fi
   unless (← platform) == plan.platform do throw (IO.userError "Build worker platform changed")
   let source ← session.readManifest plan.source
   let workspace := Bundle.overlay source artifacts
-  Bundle.synchronize store directory workspace request.limits.bytes tools.cache tools.threads
+  Bundle.synchronize store directory workspace request.limits.bytes tools.cache (Builders.ioConcurrency tools.threads)
   unless (← verifyToolchain tools (project directory request)) == plan.toolchain do
     throw (IO.userError "Toolchain changed since preparation")
   return workspace
@@ -163,14 +164,14 @@ private def finishTargets (tools : Tools) (store : ObjectStore) (request : Reque
     (plan : Plan) (completed : Array BuildResult) (progress : ProgressReporter IO) : IO BuildResult := do
   let key ← workspaceKey tools request plan
   let cache := tools.cache.map fun cache => cache.directory.addExtension "workspace"
-  Workspace.use store cache key fun session => do
+  Workspace.use store cache key (concurrency := Builders.ioConcurrency tools.threads) fun session => do
     let directory := session.directory
     let start ← IO.monoMsNow
     progress.report "finalize" { message := "Collecting artifact manifests" }
     let references ← completed.mapM fun result => do
       let some ref := result.artifacts | throw (IO.userError "Missing prerequisite artifacts")
       return ref
-    let downloaded ← Parallel.map tools.threads references session.readManifest
+    let downloaded ← Parallel.map (Builders.ioConcurrency tools.threads) references session.readManifest
     let imports ← IO.ofExcept (Bundle.mergeMany downloaded)
     progress.report "finalize" { message := "Restoring and verifying cached artifacts" }
     let baseline ← restore tools store directory request plan imports session
@@ -189,9 +190,9 @@ private def finishTargets (tools : Tools) (store : ObjectStore) (request : Reque
     | .error message => return { name := "targets", status := .failed, diagnostics, milliseconds, message }
     | .ok (builtModules, difference) =>
       progress.report "finalize" { message := "Publishing final workspace" }
-      let changes ← difference.changed.publish store tools.cache tools.threads
+      let changes ← difference.changed.publish store tools.cache (Builders.ioConcurrency tools.threads)
       let artifacts := difference.retained ++ changes
-      let reference ← Bundle.publishManifest store artifacts tools.threads
+      let reference ← Bundle.publishManifest store artifacts (Builders.ioConcurrency tools.threads)
       session.rememberManifest reference artifacts
       session.commit
       progress.report "finalize" { message := "Finished" }
@@ -222,11 +223,11 @@ private structure ModuleCompletion where
 same transfer; conflicting bytes fail before installation. No lock spans IO. -/
 private def install (tools : Tools) (store : ObjectStore) (directory : System.FilePath)
     (request : Request) (session : Workspace.Session) (installed : Std.Mutex Installed)
-    (stop : CancellationToken IO) (inputs : Array BuildResult) : IO Unit := do
-  for input in inputs do
+    (limit : Parallel.Limit) (stop : CancellationToken IO) (inputs : Array BuildResult) : IO Unit := do
+  discard <| Parallel.map (Builders.ioConcurrency tools.threads) inputs fun input => limit.run do
     if ← stop.isRequested then return
     let some ref := input.artifacts | throw (IO.userError "Missing prerequisite artifacts")
-    if (← installed.atomically do return (← get).modules[input.name]?) == some ref then continue
+    if (← installed.atomically do return (← get).modules[input.name]?) == some ref then return
     let manifest ← session.readManifest ref
     let transfers ← installed.atomically do
       let previous ← get
@@ -242,7 +243,10 @@ private def install (tools : Tools) (store : ObjectStore) (directory : System.Fi
         waiting := waiting.push task
       set state
       return waiting
-    for task in transfers do IO.ofExcept (← IO.wait task)
+    try
+      for task in transfers do IO.ofExcept (← IO.wait task)
+    finally
+      for task in transfers do discard <| IO.wait task
     installed.atomically (modify fun s => { s with modules := s.modules.insert input.name ref })
 
 private def publishModule (tools : Tools) (store : ObjectStore) (directory : System.FilePath)
@@ -255,9 +259,10 @@ private def publishModule (tools : Tools) (store : ObjectStore) (directory : Sys
   unless !value.paths.isEmpty && value.paths.all Bundle.safePath do
     throw (IO.userError "Invalid module artifact paths")
   let snapshot : Bundle.Snapshot := { root := directory, limit := request.limits.bytes, paths := value.paths }
-  -- Publication concurrency is bounded by Builders; avoid nested full pools.
-  let manifest ← snapshot.publish store tools.cache 1
-  let artifacts ← Files.putJson store manifest
+  -- Keep a module's small files together. Parallelize modules and large pack
+  -- chunks, without multiplying blob objects and cache scans for every file.
+  let manifest ← snapshot.publish store tools.cache (Builders.ioConcurrency tools.threads) (packCount := 1)
+  let artifacts ← Files.putJson store manifest (Builders.ioConcurrency tools.threads)
   installed.atomically do
     let state ← IO.ofExcept ((← get).remember manifest)
     set { state with modules := state.modules.insert mod.name artifacts }
@@ -269,13 +274,15 @@ renamed requests carry module names; independent completion files carry results.
 This protocol crosses the project toolchain boundary without serializing jobs. -/
 def Tools.builder (tools : Tools) (store : ObjectStore) (env : Environment IO)
     (request : Request) (plan : Plan) : IO Unit := do
+  let store ← store.concurrent (Builders.ioConcurrency env.currentWorker.cpus)
   let key ← workspaceKey tools request plan
   let cache := tools.cache.map fun cache => cache.directory.addExtension "workspace"
-  Workspace.use store cache key fun session => do
+  Workspace.use store cache key (concurrency := Builders.ioConcurrency tools.threads) fun session => do
     let directory := session.directory
     env.progress.report "worker" { message := "Restoring sources" }
     let baseline ← restore tools store directory request plan #[] session
     let installed ← Std.Mutex.new (← IO.ofExcept (({} : Installed).remember baseline))
+    let installing ← Parallel.Limit.new (Builders.ioConcurrency tools.threads)
     let policy ← policyFile directory request
     let protocol := directory / ".." / "lake-session"
     if ← protocol.pathExists then IO.FS.removeDirAll protocol
@@ -298,7 +305,8 @@ def Tools.builder (tools : Tools) (store : ObjectStore) (env : Environment IO)
       abort.atomically (set true)
       discard <| IO.wait task
     let engine : Builders.Engine (ModuleCompletion × Nat) := {
-      prepare := fun stop _ inputs => install tools store directory request session installed stop inputs
+      prefetch := fun stop inputs => install tools store directory request session installed installing stop inputs
+      prepare := fun stop _ inputs => install tools store directory request session installed installing stop inputs
       submit := fun mod => do
         let id ← next.get
         let path := input / s!"{id}.json"

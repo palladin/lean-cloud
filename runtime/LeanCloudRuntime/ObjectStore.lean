@@ -1,5 +1,6 @@
 import LeanCloud.Worker
 import LeanCloudRuntime.Digest
+import LeanCloudRuntime.Parallel
 
 namespace LeanCloudRuntime
 open Lean LeanCloud
@@ -22,6 +23,20 @@ structure ObjectStore where
   erase : String → IO Unit
 
 namespace ObjectStore
+
+/-- Independent read/write budgets shared by all nested artifact operations.
+Permits cover a provider request (including its retries), never user work. -/
+def concurrent (store : ObjectStore) (concurrency : Nat) : IO ObjectStore := do
+  let reads ← Parallel.Limit.new concurrency
+  let writes ← Parallel.Limit.new concurrency
+  return { store with
+    ensureContainer := reads.run store.ensureContainer
+    read := fun key => reads.run (store.read key)
+    size := fun key => reads.run (store.size key)
+    list := fun keyPrefix => reads.run (store.list keyPrefix)
+    create := fun key bytes => writes.run (store.create key bytes)
+    putContent := fun key bytes => writes.run (store.putContent key bytes)
+    erase := fun key => writes.run (store.erase key) }
 
 private abbrev digest := Digest.bytes
 

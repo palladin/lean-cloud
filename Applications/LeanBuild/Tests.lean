@@ -85,10 +85,12 @@ private def withEnvironment (store : ObjectStore) (base : ExecContext IO)
 
 /-- The same rolling coordinator, with task-backed compiler jobs for model tests. -/
 private def runBuilders (env : Environment IO) (plan : Plan)
-    (build : CancellationToken IO → LeanBuild.Module → Array BuildResult → IO BuildResult) : IO Unit := do
+    (build : CancellationToken IO → LeanBuild.Module → Array BuildResult → IO BuildResult)
+    (prefetch : CancellationToken IO → Array BuildResult → IO Unit := fun _ _ => pure ()) : IO Unit := do
   let prepared ← Std.Mutex.new ({} : Std.HashMap String (CancellationToken IO × Array BuildResult))
   let running ← IO.mkRef (#[] : Array (String × Task (Except IO.Error BuildResult)))
   let engine : Builders.Engine BuildResult := {
+    prefetch
     prepare := fun stop m inputs => prepared.atomically (modify (·.insert m.name (stop, inputs)))
     submit := fun m => do
       let some (stop, inputs) ← prepared.atomically do return (← get)[m.name]?
@@ -198,7 +200,47 @@ private def generatedTests : IO Unit := do
       if m.name == "Child" then child.set true
       return { name := m.name, status := .built }
     check (← child.get) "Dependent module was never built"
+  -- Other workers hold Gate/Far. Finishing Root must stop probing Target at
+  -- missing Gate, rather than reading all of Target's unfinished prerequisites.
+  withEnvironment store (pool #[2]) fun env => do
+    let plan := { fixturePlan with modules := #[⟨"Gate", #[]⟩, ⟨"Far", #[]⟩,
+      ⟨"Root", #[]⟩, ⟨"Target", #["Root", "Gate", "Far"]⟩] }
+    Builders.seed env plan
+    let queue := env.queues.open Builders.queueName
+    discard (queue.receive 2)
+    let stopped ← IO.mkRef false
+    let probes ← IO.mkRef (#[] : Array String)
+    let some names := env.blobs.names | throw (IO.userError "Missing result names")
+    let env := { env with
+      cancellation := ⟨stopped.get⟩
+      queues := ⟨fun _ => { queue with complete := fun receipt failed => do
+        queue.complete receipt failed
+        stopped.set true }⟩
+      blobs.names := some { names with read := fun name => do
+        probes.modify (·.push name)
+        names.read name } }
+    runBuilders env plan fun _ m _ => pure { name := m.name, status := .built }
+    check (!(← probes.get).contains (Builders.resultName "Far"))
+      "Publication fetched prerequisites after a known missing dependency"
   -- Slots are replenished without claiming an unbounded ready frontier.
+  -- A worker with a busy compiler must observe/download another worker's
+  -- artifact before dequeuing its next job. Cursor catch-up must work too.
+  withEnvironment store (pool #[2]) fun env => do
+    let plan := { fixturePlan with modules := #[⟨"Published", #[]⟩, ⟨"Busy", #[]⟩] }
+    Builders.seed env plan
+    let queue := env.queues.open Builders.queueName
+    let claimed ← queue.receive 1
+    discard <| Builders.publishResult env { name := "Published", status := .built }
+    queue.complete claimed[0]!.receipt false
+    let prefetched ← IO.mkRef false
+    runBuilders env plan (fun _ m _ => do
+      let deadline := (← IO.monoMsNow) + 3000
+      while !(← prefetched.get) do
+        check ((← IO.monoMsNow) < deadline) "Busy worker did not prefetch the completion feed"
+        IO.sleep 10
+      return { name := m.name, status := .built })
+      (fun _ results => if results.any (·.name == "Published") then prefetched.set true else pure ())
+    check (← prefetched.get) "Completion catch-up skipped a committed artifact"
   withEnvironment store (pool #[3]) fun env => do
     let modules := (Array.range 33).map fun i => ⟨s!"M{i}", #[]⟩
     let plan := { fixturePlan with modules }
@@ -723,6 +765,11 @@ private def parallelIOTests (store : ObjectStore) : IO Unit := do
     let remote := { store with
       putContent := fun key bytes => observe (store.putContent key bytes)
       read := fun key => observe (store.read key) }
+    let bounded ← remote.concurrent 3
+    traffic.atomically (set (0, 0))
+    discard <| Parallel.map 4 (Array.range 4) fun i =>
+      Parallel.map 4 (Array.range 4) fun j => bounded.putBytes s!"{i}/{j}".toUTF8
+    check ((← traffic.atomically get) == (0, 3)) "Nested upload pools escaped the shared transfer budget"
     let original := root / "original"
     let bytes := ByteArray.mk ((Array.range (Files.chunkSize * 3 + 19)).map fun i => (i % 251).toUInt8)
     IO.FS.writeBinFile original bytes
@@ -741,6 +788,23 @@ private def parallelIOTests (store : ObjectStore) : IO Unit := do
     let manifest ← (← Bundle.snapshot source 10000).publish remote (some cache) 3
     let packs := manifest.foldl (fun set entry => set.insert entry.file.pack.sha256) ({} : Std.HashSet String)
     check (packs.size == 3) "Publication did not distribute files across packs"
+    -- Raising transfer concurrency must not turn one module into many tiny
+    -- blob objects. Large chunks still overlap inside its single pack.
+    let moduleSource := root / "module"
+    IO.FS.createDir moduleSource
+    IO.FS.writeBinFile (moduleSource / "large") bytes
+    for i in [:16] do IO.FS.writeFile (moduleSource / s!"small-{i}") s!"content-{i}"
+    let puts ← Std.Mutex.new (0 : Nat)
+    let measured := { remote with putContent := fun key bytes => do
+      puts.atomically (modify (· + 1))
+      remote.putContent key bytes }
+    traffic.atomically (set (0, 0))
+    let packed ← (← Bundle.snapshot moduleSource (bytes.size + 10000)).publish measured none 3 (packCount := 1)
+    let some entry := packed[0]? | throw (IO.userError "Missing packed module")
+    check (packed.size == 17 && packed.all (·.file.pack == entry.file.pack))
+      "Transfer concurrency fragmented module artifacts"
+    check ((← puts.atomically get) == 5 && (← traffic.atomically get).2 > 1)
+      "Single-pack publication lost parallel chunk IO or multiplied requests"
     -- Each first read waits for the other packs. Holding the cache lock over
     -- downloads would deadlock this rendezvous even with three restore tasks.
     let arrivals ← Std.Mutex.new (0 : Nat)
@@ -908,6 +972,12 @@ private def nativeTests : IO Unit := IO.FS.withTempDir fun cacheRoot => do
   let built ← nativeTest tools store fixture (environment := pool #[2, 2])
   requireSuccess store built
   check (built.modules.size == 4 && built.build.status == .built) "Build report is incorrect"
+  for result in built.modules do
+    let some ref := result.artifacts | throw (IO.userError "Module artifacts missing")
+    let entries : Bundle.Manifest ← Files.readJson store ref
+    let some entry := entries[0]? | throw (IO.userError "Empty module artifacts")
+    check (entries.all (·.file.pack == entry.file.pack))
+      "Module publication split its artifacts into separate packs"
   let split ← nativeTest tools store fixture
   requireSuccess store split
   let [base, left, right, final] := split.modules.toList | throw (IO.userError "Missing split results")

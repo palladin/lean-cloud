@@ -118,12 +118,22 @@ private def operation (request : Request) : String :=
 private def recordLocation (key : String) : String :=
   ((key.splitOn "/value").head!).splitOn "/return" |>.head!
 
+private def Sink.completion (sink : Sink) (key : String) (record : ReplayRecord) : IO Unit := do
+  let owner ← sink.state.atomically do return (← get).branch
+  unless owner.any (fun branch => key == ReplayStore.returnKey branch) do return
+  match record.outcome with
+  | .success _ => sink.emit "branch-succeeded" ""
+  | .failure error => sink.emit "branch-failed" error.message
+  | .cancelled reason => sink.emit "branch-cancelled" reason
+
 def Sink.records (sink : Sink) (store : ReplayStore IO) : ReplayStore IO where
   read key := do
     sink.state.atomically (modify fun state => { state with location := recordLocation key })
     sink.emit "read-record" ""
     let record ← store.read key
-    if let some record := record then sink.emit "replay" (operation record.request)
+    if let some record := record then
+      sink.emit "replay" (operation record.request)
+      sink.completion key record
     else sink.emit "missing-record" ""
     return record
   create key record := do
@@ -131,6 +141,7 @@ def Sink.records (sink : Sink) (store : ReplayStore IO) : ReplayStore IO where
     sink.emit "save-record" (operation record.request)
     let recorded ← store.create key record
     sink.emit "recorded" (operation recorded.request)
+    sink.completion key recorded
     return recorded
 
 /-- Wrap only IO bodies, preserving the effect tree, requests, and record keys.

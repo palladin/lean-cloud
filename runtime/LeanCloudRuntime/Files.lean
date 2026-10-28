@@ -153,33 +153,34 @@ def download (store : ObjectStore) (ref : FileRef) (path : System.FilePath) (lim
   -- particular, do not remove a file owned by IO.FS.withTempFile's cleanup.
 
 
-def putText (store : ObjectStore) (text : String) : IO FileRef := do
+def putText (store : ObjectStore) (text : String) (concurrency : Nat := 1) : IO FileRef := do
   let bytes := text.toUTF8
   let sha256 ← Digest.bytes bytes
-  let mut chunks := #[]
-  for offset in [:((bytes.size + chunkSize - 1) / chunkSize)] do
-    chunks := chunks.push (← store.putBytes (bytes.extract (offset * chunkSize) ((offset + 1) * chunkSize)))
+  let chunks ← Parallel.map concurrency (Array.range ((bytes.size + chunkSize - 1) / chunkSize)) fun offset =>
+    store.putBytes (bytes.extract (offset * chunkSize) ((offset + 1) * chunkSize))
   let manifest : FileManifest := { chunks, size := bytes.size, sha256 }
   let ref ← store.putBytes (toJson manifest).compress.toUTF8
   return ⟨ref, bytes.size, sha256⟩
 
-def readText (store : ObjectStore) (ref : FileRef) (limit : Nat := 16 * 1024 * 1024) : IO String := do
+def readText (store : ObjectStore) (ref : FileRef) (limit : Nat := 16 * 1024 * 1024)
+    (concurrency : Nat := 1) : IO String := do
   unless ref.size ≤ limit do throw (IO.userError "File reference exceeds configured limit")
   let reader ← openReader store ref
-  let bytes ← reader.read 0 ref.size
+  let chunks ← Parallel.map concurrency reader.chunks (readBlob store)
+  let bytes := chunks.foldl (· ++ ·) (ByteArray.emptyWithCapacity ref.size)
   unless (← Digest.bytes bytes) == ref.sha256 do throw (IO.userError "File digest mismatch")
   let some text := String.fromUTF8? bytes | throw (IO.userError "Invalid UTF-8 file")
   return text
 
 def metadataLimit : Nat := 256 * 1024 * 1024
 
-def putJson [ToJson α] (store : ObjectStore) (value : α) : IO FileRef := do
+def putJson [ToJson α] (store : ObjectStore) (value : α) (concurrency : Nat := 1) : IO FileRef := do
   let text := (toJson value).compress
   unless text.utf8ByteSize ≤ metadataLimit do throw (IO.userError "Artifact metadata exceeds 256 MiB")
-  putText store text
+  putText store text concurrency
 
-def readJson [FromJson α] (store : ObjectStore) (ref : FileRef) : IO α := do
-  IO.ofExcept (Json.parse (← readText store ref metadataLimit) >>= fromJson?)
+def readJson [FromJson α] (store : ObjectStore) (ref : FileRef) (concurrency : Nat := 1) : IO α := do
+  IO.ofExcept (Json.parse (← readText store ref metadataLimit concurrency) >>= fromJson?)
 
 end Files
 end LeanCloudRuntime
