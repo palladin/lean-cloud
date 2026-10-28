@@ -1,11 +1,12 @@
 import LeanBuild.Model
 import LeanCloudRuntime.Parallel
+import Std.Sync.Channel
 
 namespace LeanBuild.Builders
 open Lean LeanCloud LeanCloudRuntime
 
-def queueName := "lean-build/v6/modules"
-def resultName (module : String) := "lean-build/v6/results/" ++ module
+def queueName := "lean-build/v7/modules"
+def resultName (module : String) := "lean-build/v7/results/" ++ module
 
 def readResult (env : Environment IO) (name : String) : IO (Option BuildResult) := do
   let some ref ← env.blobs.readNamed (resultName name) | return none
@@ -52,19 +53,29 @@ private def dependencies (modules targets : Array Module) : Array Module := Id.r
     if needed.contains m.name then needed := m.imports.foldl (·.insert ·) needed
   return modules.filter (needed.contains ·.name)
 
-/-- A few modules per CPU amortize Lake startup without hoarding the ready queue.
-Receive returns immediately with whatever is available; it never waits to fill. -/
-def batchSize (cpus : Nat) : Nat := min 100 (4 * max 1 cpus)
+
+/-- Reserve headroom for scheduling, hashing and compression. This is a budget,
+not CPU affinity. A single-CPU worker still has one compilation slot. -/
+def compilerSlots (cpus : Nat) := max 1 (cpus - 1)
+
+/-- One persistent compiler session. Only the coordinator calls submit/poll.
+Preparation and publication run in separate bounded pools. -/
+structure Engine (α : Type) where
+  prepare : CancellationToken IO → Module → Array BuildResult → IO Unit
+  submit : Module → IO Unit
+  poll : IO (Array (String × α))
+  publish : CancellationToken IO → Module → α → IO BuildResult
+  finish : IO Unit
+  cancel : IO Unit
 
 private structure Claim where
   delivery : WorkDelivery
-  -- Serialize renewal with settlement, independently for each receipt.
   settled : Std.Mutex Bool
 
-private def Claim.acknowledge (claim : Claim) (queue : WorkQueue IO) : IO Unit :=
+private def Claim.settle (claim : Claim) (queue : WorkQueue IO) (failed : Bool) : IO Unit :=
   claim.settled.atomically do
     unless ← get do
-      queue.acknowledge claim.delivery.receipt
+      queue.complete claim.delivery.receipt failed
       set true
 
 private def Claim.release (claim : Claim) (queue : WorkQueue IO) : IO Unit :=
@@ -73,110 +84,214 @@ private def Claim.release (claim : Claim) (queue : WorkQueue IO) : IO Unit :=
       queue.release claim.delivery.receipt
       set true
 
-/-- One Lake batch at a time per worker, with bounded concurrent artifact IO.
-The callback reports individual module completions while Lake keeps compiling.
-Artifacts precede the immutable result; notifications precede ACK. Redelivery
-therefore repairs an interrupted notification without rebuilding the module. -/
-def run (env : Environment IO) (plan : Plan)
-    (build : CancellationToken IO → Array Module → Array BuildResult →
-      (BuildResult → IO Unit) → IO Unit) : IO Unit := do
+private structure Work where
+  mod : Module
+  claims : Std.Mutex (Array Claim)
+
+private inductive Event where
+  | received (claims : Array Claim) (idle : Bool)
+  | prepared (name : String)
+  | settled (name : String)
+
+private structure Control where
+  stopped : Bool := false
+  error : Option IO.Error := none
+  claims : Array Claim := #[]
+
+/-- Replicas carry the service's monotone revision. Watch displays one shared
+counter, never adds overlapping worker knowledge. Telemetry cannot fail a build. -/
+private def report (env : Environment IO) (queue : WorkQueue IO) (total : Nat)
+    (activity : String) : IO Unit := do
+  try
+    let stats ← queue.progress
+    env.progress.report "build" {
+      completed := stats.completed, total := some total
+      message := if stats.failed == 0 then "Modules finished" else s!"Modules finished · {stats.failed} failed/blocked"
+      shared := some queueName, revision := stats.completed }
+    env.progress.report "worker" { message := activity }
+  catch _ => pure ()
+
+/-- A rolling pipeline: receiving, restoring, compiling and publishing overlap.
+A compilation completion frees its slot BEFORE publication. Leases remain live
+through publication and successor notification. No group barrier exists. -/
+def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := do
   IO.ofExcept (validateModules plan.modules)
   let queue := env.queues.open queueName
-  let state ← Std.Mutex.new ({} : State)
-  let width := max 1 env.currentWorker.cpus
+  let cache ← Std.Mutex.new ({} : State)
+  let control ← Std.Mutex.new ({} : Control)
+  let stop : CancellationToken IO := ⟨do
+    return (← env.cancellation.isRequested) || (← control.atomically do return (← get).stopped)⟩
+  let events ← Std.Channel.new (α := Event)
+  let tasks ← IO.mkRef (#[] : Array (Task (Except IO.Error Unit)))
+  let spawn (action : IO Unit) : IO Unit := do
+    let task ← IO.asTask (do
+      try action catch error =>
+        control.atomically (modify fun s => { s with stopped := true, error := s.error.orElse (fun _ => some error) })) .dedicated
+    tasks.modify (·.push task)
+  let slots := compilerSlots env.currentWorker.cpus
+  let ioSlots := max 2 (min 8 env.currentWorker.cpus)
+  let capacity := 3 * slots + ioSlots
+  let activity ← Std.Mutex.new "Starting Lake"
   let byName := plan.modules.foldl (fun map m => map.insert m.name m) ({} : Std.HashMap String Module)
   let dependents := plan.modules.foldl (fun map m => m.imports.foldl (fun map dep =>
     map.insert dep ((map[dep]?.getD #[]).push m)) map) ({} : Std.HashMap String (Array Module))
-  let notify (name : String) : IO Unit := do
+  let settle (work : Work) (result : BuildResult) : IO Unit := do
+    if ← stop.isRequested then return
+    cache.atomically (modify fun s => { s with results := s.results.insert result.name result })
     let mut ready := #[]
-    for m in dependents[name]?.getD #[] do
+    for m in dependents[result.name]?.getD #[] do
       let mut available := true
       for parent in m.imports do
-        if (← read env state parent).isNone then available := false; break
+        if (← read env cache parent).isNone then available := false; break
       if available then ready := ready.push ⟨m.name, toJson m.name⟩
     for offset in [:((ready.size + 99) / 100)] do
       queue.send (ready.extract (offset * 100) ((offset + 1) * 100))
-  repeat
-    if ← env.cancellation.isRequested then break
-    let deliveries ← queue.receive (batchSize width)
-    if deliveries.isEmpty then
-      -- Notifications precede ACK: empty INCLUDING leases means quiescence.
-      if ← queue.isIdle then break
-      env.progress.report "lake" { message := "Waiting for dependencies" }
-      IO.sleep 250
-      continue
-    let claims ← deliveries.mapM fun delivery => return { delivery, settled := ← Std.Mutex.new false : Claim }
-    let finished ← IO.mkRef false
-    let leaseLost ← IO.mkRef false
-    let renewal ← IO.asTask (do
-      let mut next := (← IO.monoMsNow) + 10000
-      while !(← finished.get) do
-        if (← IO.monoMsNow) ≥ next then
-          try
-            discard <| Parallel.map width claims fun claim => claim.settled.atomically do
-              unless ← get do queue.renew claim.delivery.receipt
-          catch error => leaseLost.set true; throw error
-          next := (← IO.monoMsNow) + 10000
-        IO.sleep 50) .dedicated
-    let stop : CancellationToken IO := ⟨do return (← env.cancellation.isRequested) || (← leaseLost.get)⟩
+    work.claims.atomically do
+      for claim in ← get do claim.settle queue (result.status != .built)
+    events.sync.send (.settled work.mod.name)
+  let prepare (work : Work) : IO Unit := do
+    if ← stop.isRequested then return
+    if let some result ← read env cache work.mod.name then
+      settle work result
+      return
+    let parents ← work.mod.imports.mapM (read env cache)
+    if parents.any Option.isNone then
+      -- An early delivery remains eligible for a later attempt.
+      work.claims.atomically do
+        for claim in ← get do claim.release queue
+      events.sync.send (.settled work.mod.name)
+    else if parents.any (fun r => r.any (·.status != .built)) then
+      if ← stop.isRequested then return
+      settle work (← publishResult env {
+        name := work.mod.name, status := .blocked, message := "A prerequisite failed" })
+    else
+      let inputs ← (dependencies plan.modules #[work.mod]).mapM fun dep => do
+        let some result ← read env cache dep.name | throw (IO.userError "Missing transitive prerequisite")
+        return result
+      engine.prepare stop work.mod inputs
+      unless ← stop.isRequested do events.sync.send (.prepared work.mod.name)
+  -- Renewal is independent of telemetry and compiler activity.
+  let renewer ← IO.asTask (do
     try
-      -- A queue may deliver the same key more than once. Build it once, then
-      -- settle every receipt, including duplicates, after durable publication.
-      let mut grouped : Std.HashMap String (Array Claim) := {}
-      let mut queued := #[]
-      for claim in claims do
-        let name : String ← IO.ofExcept (fromJson? claim.delivery.value)
-        let some m := byName[name]? | throw (IO.userError "Unknown queued module")
-        unless grouped.contains name do queued := queued.push m
-        grouped := grouped.insert name ((grouped[name]?.getD #[]).push claim)
-      let settle (name : String) : IO Unit := do
-        if ← stop.isRequested then return
-        notify name
-        for claim in grouped[name]?.getD #[] do claim.acknowledge queue
-      let existing ← Parallel.map width queued fun m => do
-        if (← read env state m.name).isSome then settle m.name; return none
-        return some m
-      let targets := existing.filterMap id
-      let parents := targets.foldl (fun set m => m.imports.foldl (·.insert ·) set) ({} : Std.HashSet String)
-      discard <| Parallel.map width parents.toArray (read env state)
-      let outcomes ← Parallel.map width targets fun m => do
-        let parents ← m.imports.mapM (read env state)
-        if parents.any Option.isNone then return none
-        if parents.any (fun r => r.any (·.status != .built)) then
-          unless ← stop.isRequested do
-            let result ← publishResult env { name := m.name, status := .blocked, message := "A prerequisite failed" }
-            state.atomically (modify fun s => { s with results := s.results.insert m.name result })
-            settle m.name
-          return none
-        return some m
-      let targets := outcomes.filterMap id
-      unless targets.isEmpty || (← stop.isRequested) do
-        let inputs ← Parallel.map width (dependencies plan.modules targets) fun dep => do
-          let some result ← read env state dep.name | throw (IO.userError "Missing transitive prerequisite")
-          return result
-        let requested := targets.foldl (fun set m => set.insert m.name) ({} : Std.HashSet String)
-        let reported ← Std.Mutex.new ({} : Std.HashSet String)
-        build stop targets inputs fun outcome => do
-          unless requested.contains outcome.name do throw (IO.userError "Builder returned an unrequested module")
-          reported.atomically do
-            if (← get).contains outcome.name then throw (IO.userError "Builder returned a module twice")
-            modify (·.insert outcome.name)
-          if ← stop.isRequested then return
-          let result ← publishResult env outcome
-          state.atomically (modify fun s => { s with results := s.results.insert outcome.name result })
-          settle outcome.name
-          let count ← state.atomically do return (← get).results.size
-          env.progress.report "build" { message := "Committed modules known to this worker", completed := count, total := some plan.modules.size }
-        unless ← stop.isRequested do
-          unless (← reported.atomically get).size == targets.size do
-            throw (IO.userError "Builder omitted module results")
-    finally
-      finished.set true
-      let renewed ← IO.wait renewal
-      discard <| Parallel.map width claims fun claim => do
-        try claim.release queue catch _ => pure ()
-      -- Renewal transport errors are ordinary exec failures, not implicit retries.
-      IO.ofExcept renewed
-  env.progress.report "lake" { message := if ← env.cancellation.isRequested then "Stopped" else "Finished" }
+      let mut next := (← IO.monoMsNow) + 10000
+      while !(← stop.isRequested) do
+        if (← IO.monoMsNow) ≥ next then
+          let claims ← control.atomically do return (← get).claims
+          discard <| Parallel.map ioSlots claims fun claim => claim.settled.atomically do
+            unless ← get do queue.renew claim.delivery.receipt
+          next := (← IO.monoMsNow) + 10000
+        IO.sleep 50
+    catch error =>
+      control.atomically (modify fun s => { s with stopped := true, error := s.error.orElse (fun _ => some error) })) .dedicated
+  let reporter ← IO.asTask (do
+    let mut next := 0
+    while !(← stop.isRequested) do
+      if (← IO.monoMsNow) ≥ next then
+        report env queue plan.modules.size (← activity.atomically get)
+        next := (← IO.monoMsNow) + 1000
+      IO.sleep 50) .dedicated
+  try
+    let mut work : Std.HashMap String Work := {}
+    let mut waiting : Array String := #[]
+    let mut restoring : Std.HashSet String := {}
+    let mut ready : Array String := #[]
+    let mut compiling : Std.HashSet String := {}
+    let mut completed : Array (String × α) := #[]
+    let mut publishing : Std.HashSet String := {}
+    let mut receiving := false
+    let mut idle := false
+    let mut nextReceive := 0
+    repeat
+      if ← stop.isRequested then break
+      -- Finished tasks have already delivered their events (or recorded errors).
+      tasks.set (← (← tasks.get).filterM fun task => return !(← IO.hasFinished task))
+      -- Bound the registry to outstanding receipts, even on very large DAGs.
+      control.atomically do
+        let s ← get
+        let claims ← s.claims.filterM fun c => return !(← c.settled.atomically get)
+        set { s with claims }
+      while let some event ← events.tryRecv do
+        match event with
+        | .received claims empty =>
+          receiving := false
+          idle := empty
+          if claims.isEmpty then nextReceive := (← IO.monoMsNow) + 100
+          for claim in claims do
+            let name : String ← IO.ofExcept (fromJson? claim.delivery.value)
+            let some m := byName[name]? | throw (IO.userError "Unknown queued module")
+            if let some existing := work[name]? then
+              existing.claims.atomically (modify (·.push claim))
+            else
+              work := work.insert name ⟨m, ← Std.Mutex.new #[claim]⟩
+              waiting := waiting.push name
+        | .prepared name =>
+          unless restoring.contains name do throw (IO.userError "Unexpected preparation")
+          restoring := restoring.erase name
+          ready := ready.push name
+        | .settled name =>
+          -- A duplicate receipt can arrive during settlement. Settle any late
+          -- receipts using the same committed result on the next pass.
+          if let some w := work[name]? then
+            let unfinished ← w.claims.atomically do
+              (← get).anyM fun c => return !(← c.settled.atomically get)
+            if unfinished then
+              spawn (prepare w)
+              continue
+          work := work.erase name
+          restoring := restoring.erase name
+          publishing := publishing.erase name
+      for (name, result) in ← engine.poll do
+        unless compiling.contains name do throw (IO.userError "Unknown or duplicate Lake completion")
+        compiling := compiling.erase name
+        completed := completed.push (name, result)
+      while compiling.size < slots && !ready.isEmpty do
+        let name := ready[0]!
+        ready := ready.extract 1 ready.size
+        let some w := work[name]? | throw (IO.userError "Missing prepared work")
+        engine.submit w.mod
+        compiling := compiling.insert name
+      while publishing.size < ioSlots && !completed.isEmpty do
+        let some (name, value) := completed[0]? | break
+        completed := completed.extract 1 completed.size
+        let some w := work[name]? | throw (IO.userError "Missing compiled work")
+        publishing := publishing.insert name
+        spawn do
+          let result ← engine.publish stop w.mod value
+          unless result.name == name do throw (IO.userError "Builder returned an unrequested module")
+          unless ← stop.isRequested do settle w (← publishResult env result)
+      while restoring.size < ioSlots && !waiting.isEmpty do
+        let name := waiting[0]!
+        waiting := waiting.extract 1 waiting.size
+        let some w := work[name]? | throw (IO.userError "Missing received work")
+        restoring := restoring.insert name
+        spawn (prepare w)
+      if idle && work.isEmpty && !receiving then break
+      let admission := 2 * slots - (waiting.size + restoring.size + ready.size + compiling.size)
+      if !receiving && admission > 0 && work.size < capacity && (← IO.monoMsNow) ≥ nextReceive then
+        receiving := true
+        let count := min 100 (min admission (capacity - work.size))
+        spawn do
+          let deliveries ← queue.receive count
+          let claims ← deliveries.mapM fun d => return (⟨d, ← Std.Mutex.new false⟩ : Claim)
+          control.atomically (modify fun s => { s with claims := s.claims ++ claims })
+          let idle ← if claims.isEmpty then queue.isIdle else pure false
+          events.sync.send (.received claims idle)
+      activity.atomically (set s!"compiling {compiling.size}/{slots} · restoring {restoring.size} · ready {ready.size} · publishing {publishing.size + completed.size}")
+      IO.sleep 10
+    if let some error ← control.atomically do return (← get).error then throw error
+    unless ← env.cancellation.isRequested do
+      engine.finish
+      control.atomically (modify fun s => { s with stopped := true })
+      discard <| IO.wait reporter
+      report env queue plan.modules.size "Finished"
+  finally
+    control.atomically (modify fun s => { s with stopped := true })
+    engine.cancel
+    for task in ← tasks.get do discard <| IO.wait task
+    discard <| IO.wait renewer
+    discard <| IO.wait reporter
+    let claims ← control.atomically do return (← get).claims
+    discard <| Parallel.map ioSlots claims fun claim => do
+      try claim.release queue catch _ => pure ()
 
 end LeanBuild.Builders

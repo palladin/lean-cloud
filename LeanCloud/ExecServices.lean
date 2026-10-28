@@ -11,6 +11,24 @@ structure ProgressUpdate where
   message : String := ""
   completed : Nat := 0
   total : Option Nat := none
+  /-- A shared counter is a replicated snapshot, never a sum of worker counters.
+  Its revision orders snapshots independently of worker clocks. -/
+  shared : Option String := none
+  revision : Nat := 0
+  deriving Repr, BEq, ToJson
+
+instance : FromJson ProgressUpdate where
+  fromJson? json := do
+    return { message := ← json.getObjValAs? String "message"
+             completed := ← json.getObjValAs? Nat "completed"
+             total := ← json.getObjValAs? (Option Nat) "total"
+             shared := (json.getObjValAs? String "shared").toOption
+             revision := (json.getObjValAs? Nat "revision").toOption.getD 0 }
+
+/-- Durable, deduplicated settlements. Failed work is included in completed. -/
+structure WorkQueueProgress where
+  completed : Nat := 0
+  failed : Nat := 0
   deriving Repr, BEq, ToJson, FromJson
 
 /-- Absolute, best-effort last views. A slot identifies a local activity, not a
@@ -41,6 +59,9 @@ structure WorkQueue (m : Type → Type u) where
   guarantee unless the application has finished producing work. -/
   isIdle : m Bool
   acknowledge : String → m Unit
+  /-- Settle with an application outcome, atomically updating queue progress. -/
+  complete : String → Bool → m Unit
+  progress : m WorkQueueProgress
   renew : String → m Unit
   release : String → m Unit
 
@@ -49,6 +70,8 @@ def WorkQueue.map (f : {α : Type} → m α → n α) (queue : WorkQueue m) : Wo
   receive count := f (queue.receive count)
   isIdle := f queue.isIdle
   acknowledge receipt := f (queue.acknowledge receipt)
+  complete receipt failed := f (queue.complete receipt failed)
+  progress := f queue.progress
   renew receipt := f (queue.renew receipt)
   release receipt := f (queue.release receipt)
 
@@ -66,6 +89,8 @@ def QueueProvider.unsupported [Monad m] [MonadExceptOf CloudError m] : QueueProv
     receive _ := unavailable
     isIdle := unavailable
     acknowledge _ := unavailable
+    complete _ _ := unavailable
+    progress := unavailable
     renew _ := unavailable
     release _ := unavailable }⟩
 

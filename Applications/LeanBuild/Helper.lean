@@ -175,52 +175,58 @@ private def modulePaths (m : Lake.Module) (root : String) : IO (Array String) :=
   unless ← m.oleanFile.pathExists do throw (IO.userError "Lake did not produce the module's olean")
   return paths
 
-/-- Load the workspace once and let Lake schedule a batch of ready modules.
-Report each finished job independently, so artifact uploads and downstream work
-can overlap the remaining compilation. Rename makes each report atomic. -/
-private def buildModules (policy : Json) (input output root : String) : IO Unit := do
-  let names : Array String ← IO.ofExcept ((← readJson input) |> fromJson?)
-  unless !names.isEmpty && names.size ≤ 100 && names.toList.eraseDups.length == names.size do
-    throw (IO.userError "Expected 1–100 distinct ready modules")
+
+/-- One workspace and one BuildStore for the worker's lifetime. Requests and
+completions are atomically renamed local files, so the helper can use the source
+project's exact Lean version without sharing Lean values across processes.
+Only this loop owns FetchM; jobs execute concurrently in Lake's task pool. -/
+private def serveModules (policy : Json) (input output root : String) : IO Unit := do
   let ws ← workspace policy
-  let modules ← names.mapM fun name => do
-    let some m := ws.findTargetModule? name.toName | throw (IO.userError s!"Unknown module: {name}")
-    return m
   IO.FS.createDirAll output
   ws.runFetchM do
-    let jobs ← modules.mapM fun m => m.leanArts.fetch
-    -- Poll outside the compiler pool: even a one-CPU worker must make progress.
-    let reporter ← IO.asTask (do
-      let mut pending := Array.range jobs.size
-      while !pending.isEmpty do
-        let mut waiting := #[]
-        for i in pending do
-          let job := jobs[i]!
-          if !(← IO.hasFinished job.task) then
-            waiting := waiting.push i
-            continue
-          let (success, diagnostics) ← match ← job.wait with
-            | .ok _ state => pure (true, state.log.toString)
-            | .error _ state => pure (false, state.log.toString)
-          let some m := modules[i]? | throw (IO.userError "Missing module for Lake job")
-          let paths ← if success then modulePaths m root else pure #[]
-          let value := Json.mkObj [
-            ("name", toJson names[i]!), ("success", toJson success),
-            ("paths", toJson paths), ("diagnostics", toJson diagnostics)]
-          let destination := FilePath.mk output / s!"{i}.json"
+    let mut next := 0
+    let mut seen : Std.HashSet String := {}
+    let mut pending : Array (Nat × IO (Option Json)) := #[]
+    repeat
+      let mut waiting := #[]
+      for (id, inspect) in pending do
+        match ← inspect with
+        | none => waiting := waiting.push (id, inspect)
+        | some value =>
+          let destination := FilePath.mk output / s!"{id}.json"
           let temporary := destination.addExtension "pending"
           IO.FS.writeFile temporary value.compress
           IO.FS.rename temporary destination
-        pending := waiting
-        unless pending.isEmpty do IO.sleep 10) .dedicated
-    IO.ofExcept (← IO.wait reporter)
+      pending := waiting
+      let path := FilePath.mk input / s!"{next}.json"
+      if ← path.pathExists then
+        let name : String ← IO.ofExcept ((← readJson path.toString) |> fromJson?)
+        unless !seen.contains name do error s!"Repeated module submission: {name}"
+        let some m := ws.findTargetModule? name.toName | error s!"Unknown module: {name}"
+        seen := seen.insert name
+        let job ← m.leanArts.fetch
+        let inspect : IO (Option Json) := do
+          unless ← IO.hasFinished job.task do return none
+          let (success, diagnostics) ← match ← job.wait with
+            | .ok _ state => pure (true, state.log.toString)
+            | .error _ state => pure (false, state.log.toString)
+          let paths ← if success then modulePaths m root else pure #[]
+          return some (Json.mkObj [
+            ("name", toJson name), ("success", toJson success),
+            ("paths", toJson paths), ("diagnostics", toJson diagnostics)])
+        pending := pending.push (next, inspect)
+        IO.FS.removeFile path
+        next := next + 1
+      else
+        if pending.isEmpty && (← (FilePath.mk input / "finish").pathExists) then break
+        IO.sleep 10
 
 def main (args : List String) : IO UInt32 := do
   try
     match args with
     | ["plan", policy, output, root] => plan (← readJson policy) output root
     | ["build", policy, output] => buildTargets (← readJson policy) output
-    | ["modules", policy, input, output, root] => buildModules (← readJson policy) input output root
-    | _ => throw (IO.userError "Expected plan POLICY OUTPUT ROOT | build POLICY OUTPUT | modules POLICY INPUT OUTPUT ROOT")
+    | ["serve", policy, input, output, root] => serveModules (← readJson policy) input output root
+    | _ => throw (IO.userError "Expected plan POLICY OUTPUT ROOT | build POLICY OUTPUT | serve POLICY INPUT OUTPUT ROOT")
     return 0
   catch error => IO.eprintln s!"{error}"; return 1

@@ -25,9 +25,16 @@ structure Cache where
   directory : System.FilePath
   bytes : Nat := 4 * 1024 * 1024 * 1024
 
--- One worker normally runs one job. Serialize cache access as well for callers
--- that execute jobs concurrently, so eviction never removes a pack being copied.
+-- The lock protects reservations/eviction, never network transfers.
 initialize cacheLock : Std.Mutex Unit ← Std.Mutex.new ()
+
+private structure Pin where
+  ref : FileRef
+  users : Nat
+  ready : Task (Except IO.Error System.FilePath)
+
+-- Access only under cacheLock. Canonical directories also cover path aliases.
+private initialize pins : IO.Ref (Std.HashMap String (Std.HashMap String Pin)) ← IO.mkRef {}
 
 @[extern "lean_cloud_file_executable"]
 opaque executable (path : @& String) : IO Bool
@@ -194,11 +201,14 @@ private def makeRoom (cache : Cache) (reserved : Array FileRef) : IO Unit := do
   let mut files : Array (System.FilePath × Nat) := #[]
   let mut total := 0
   for entry in ← cache.directory.readDir do
+    -- A pinned download may rename .pending concurrently; do not stat it.
+    if reserved.any (fun ref => entry.fileName == ref.sha256 ||
+        entry.fileName == ref.sha256 ++ ".pending") then continue
     let metadata ← entry.path.symlinkMetadata
     unless metadata.type == .file do throw (IO.userError "Invalid pack cache entry")
     if entry.fileName.endsWith ".pending" then
       IO.FS.removeFile entry.path
-    else if !reserved.any (fun ref => ref.sha256 == entry.fileName) then
+    else
       let size := metadata.byteSize.toNat
       files := files.push (entry.path, size)
       total := total + size
@@ -212,7 +222,13 @@ private def makeRoom (cache : Cache) (reserved : Array FileRef) : IO Unit := do
 download bytes this worker just uploaded. Called under the cache lock. -/
 private def retainPack (cache : Cache) (ref : FileRef) (source : System.FilePath) : IO Unit := do
   if ref.size > cache.bytes then return
-  makeRoom cache #[ref]
+  IO.FS.createDirAll cache.directory
+  let key := (← IO.FS.realPath cache.directory).toString
+  let held := (← pins.get)[key]?.getD {}
+  if held.contains ref.sha256 then return
+  let reserved := held.toArray.map (·.2.ref)
+  if reserved.foldl (fun n ref => n + ref.size) ref.size > cache.bytes then return
+  makeRoom cache (reserved.push ref)
   let pending := cache.directory / (ref.sha256 ++ ".pending")
   try
     let hash ← Digest.copyRange source.toString pending.toString 0 ref.size.toUInt64
@@ -266,57 +282,62 @@ private def validate (manifest : Manifest) (limit : Nat) : IO Unit := do
       ancestor := if ancestor.isEmpty then component else ancestor ++ "/" ++ component
       if seen.contains ancestor then throw (IO.userError "Artifact file is also a directory")
 
+/-- Pin a verified pack until the copy completes. Concurrent readers of the
+same pack share one transfer/verification; unrelated packs never wait for it.
+If active pins exhaust the cache budget, use private scratch space. -/
+private def withPack (store : ObjectStore) (cache : Option Cache) (ref : FileRef)
+    (limit concurrency : Nat) (action : System.FilePath → IO Unit) : IO Unit := do
+  let privateCopy : IO Unit := IO.FS.withTempDir fun temporary => do
+    action (← materialize store temporary ref limit concurrency)
+  let some cache := cache | privateCopy
+  let lease ← cacheLock.atomically do
+    IO.FS.createDirAll cache.directory
+    let key := (← IO.FS.realPath cache.directory).toString
+    let held := (← pins.get)[key]?.getD {}
+    if let some pin := held[ref.sha256]? then
+      unless pin.ref.size == ref.size do throw (IO.userError "Conflicting pack size")
+      pins.modify (·.insert key (held.insert ref.sha256 { pin with users := pin.users + 1 }))
+      return some (key, pin.ready)
+    let reserved := held.toArray.map (·.2.ref)
+    if reserved.foldl (fun n ref => n + ref.size) ref.size > cache.bytes then
+      makeRoom cache reserved
+      return none
+    makeRoom cache (reserved.push ref)
+    let task ← IO.asTask (materialize store cache.directory ref limit concurrency) .dedicated
+    pins.modify (·.insert key (held.insert ref.sha256 ⟨ref, 1, task⟩))
+    return some (key, task)
+  let some (key, task) := lease | privateCopy
+  try
+    action (← IO.ofExcept (← IO.wait task))
+  finally
+    cacheLock.atomically do
+      let held := (← pins.get)[key]?.getD {}
+      if let some pin := held[ref.sha256]? then
+        let held := if pin.users ≤ 1 then held.erase ref.sha256
+          else held.insert ref.sha256 { pin with users := pin.users - 1 }
+        pins.modify fun state => if held.isEmpty then state.erase key else state.insert key held
+
 def restore (store : ObjectStore) (root : System.FilePath) (manifest : Manifest)
     (limit : Nat) (cache : Option Cache := none) (concurrency : Nat := 1) : IO Unit := do
   validate manifest limit
-  IO.FS.withTempDir fun temporary => do
-    let groups := manifest.foldl (fun groups entry =>
-      groups.insert entry.file.pack.sha256
-        ((groups[entry.file.pack.sha256]?).getD #[] |>.push entry))
-      ({} : Std.HashMap String (Array Entry))
-    let groups := groups.toArray.map (·.2)
-    let restoreAll : IO Unit := do
-      if let some cache := cache then makeRoom cache #[]
-      let width := max 1 concurrency
-      let mut index := 0
-      while index < groups.size do
-        let batch := groups.extract index (index + width)
-        -- Pin this batch before starting its tasks. Entries that do not fit use
-        -- private scratch files. No eviction or .pending cleanup runs mid-batch.
-        let mut reserved : Array FileRef := #[]
-        let mut bytes := 0
-        if let some cache := cache then
-          for entries in batch do
-            if let some entry := entries[0]? then
-              let ref := entry.file.pack
-              if bytes + ref.size ≤ cache.bytes then
-                reserved := reserved.push ref
-                bytes := bytes + ref.size
-          makeRoom cache reserved
-        let perPack := max 1 (width / batch.size)
-        discard <| Parallel.map width batch fun entries => do
-          let some first := entries[0]? | return
-          let ref := first.file.pack
-          unless entries.all (·.file.pack == ref) do
-            throw (IO.userError "Inconsistent pack references")
-          let cached := reserved.contains ref
-          let directory := match cache with
-            | some cache => if cached then cache.directory else temporary
-            | none => temporary
-          let pack ← materialize store directory ref limit perPack
-          discard <| Parallel.map perPack entries fun entry => do
-            let path := root / entry.path
-            if let some parent := path.parent then IO.FS.createDirAll parent
-            let hash ← Digest.copyRange pack.toString path.toString
-              entry.file.offset.toUInt64 entry.file.size.toUInt64 entry.executable
-            unless hash == entry.file.sha256 do throw (IO.userError "Packed file digest mismatch")
-          unless cached do IO.FS.removeFile pack
-        index := index + width
-    -- Serialize cache users, while each user processes its pinned packs/files
-    -- concurrently. The caller's workspace is private and never shared.
-    match cache with
-    | some _ => cacheLock.atomically do restoreAll
-    | none => restoreAll
+  let groups := manifest.foldl (fun groups entry =>
+    groups.insert entry.file.pack.sha256
+      ((groups[entry.file.pack.sha256]?).getD #[] |>.push entry))
+    ({} : Std.HashMap String (Array Entry))
+  let groups := groups.toArray.map (·.2)
+  let perPack := max 1 (concurrency / max 1 groups.size)
+  discard <| Parallel.map concurrency groups fun entries => do
+    let some first := entries[0]? | return
+    let ref := first.file.pack
+    unless entries.all (·.file.pack == ref) do
+      throw (IO.userError "Inconsistent pack references")
+    withPack store cache ref limit perPack fun pack =>
+      discard <| Parallel.map perPack entries fun entry => do
+        let path := root / entry.path
+        if let some parent := path.parent then IO.FS.createDirAll parent
+        let hash ← Digest.copyRange pack.toString path.toString
+          entry.file.offset.toUInt64 entry.file.size.toUInt64 entry.executable
+        unless hash == entry.file.sha256 do throw (IO.userError "Packed file digest mismatch")
 
 /-- Reconcile a clean cached workspace with exactly this job's committed inputs.
 Keep verified files in place; fetch only missing/changed files. Outputs not in

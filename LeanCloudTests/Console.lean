@@ -6,6 +6,21 @@ namespace LeanCloudTests
 open Lean LeanCloud LeanCloudCli
 
 def consoleCases : Array TestCase := #[
+  ⟨"console.watch-shared-progress-is-one-versioned-counter", do
+    let update (worker : String) (count : Nat) : Trace.Step := {
+      timestamp := "1"
+      event := ⟨"boot", count, 0, worker, some 0, "0:1", "progress", "", "run", none⟩
+      progress := some ("build", {
+        completed := count, total := some 100
+        message := "Modules finished", shared := some "modules", revision := count }) }
+    let steps := #[update "w1" 51, update "w2" 60, update "w1" 55]
+    assertEq ((Watch.sharedProgressLines steps).map Styled.plain)
+      #["60/100 · 60% · Modules finished"]
+      "Shared progress regressed or added overlapping snapshots"
+    assertTrue (Watch.progressLines steps).isEmpty "Shared progress was repeated inside worker cards"
+    let old := Json.mkObj [("message", toJson "old"), ("completed", toJson (1 : Nat)), ("total", toJson (some (2 : Nat)))]
+    let decoded : ProgressUpdate ← IO.ofExcept (fromJson? old)
+    assertEq decoded.shared none "Old progress stopped decoding"⟩,
   ⟨"console.watch-progress-command-and-attempt", do
     let event : ExecutionEvent := ⟨"boot", 1, 0, "worker1", some 2, "0:1", "execute", "build", "run", some "site"⟩
     let current : Trace.Step := { timestamp := "1", event }

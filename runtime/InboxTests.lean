@@ -484,6 +484,7 @@ private def processCrash : IO Unit := IO.FS.withTempFile fun _ path => do
     try discard child.wait catch _ => pure ()
 
 def main (args : List String) : IO UInt32 := do
+  if args == ["work-queues"] then WorkQueueTests.run; return 0
   if args == ["process-cancellation"] then processCancellation; return 0
   if args == ["reentrant-http"] then reentrantHttp; return 0
   if args == ["node-exit"] then nodeExit; return 0

@@ -28,17 +28,18 @@ The Cloud workflow has five stages:
 2. Enqueue modules with no prerequisites. Record the number of builder sessions
    from `env.workers.size`.
 3. Run the builder sessions in one `Cloud.parallel`. Each is a long-lived `exec`
-   that hands batches of ready modules to Lake, using `env.currentWorker.cpus`.
+   that continuously feeds ready modules to one persistent Lake session.
 4. Collect the immutable result for every planned module. Failed modules block
    their dependents; independent modules can still finish.
 5. Restore the artifacts on one worker and ask Lake to complete the original
    targets, including native compilation, linking, custom targets and dynamic
    dependencies. Publish the complete workspace manifest.
 
-Each builder restores the prepared sources once. It dequeues up to four ready
-modules per CPU (capped at 100), without waiting to fill a batch. Shared prerequisites
-are collected once and missing artifacts are restored concurrently. One Lake helper
-loads the project and builds the batch using the worker's full CPU budget.
+Each builder restores the prepared sources once and loads Lake once. A bounded
+pipeline receives ready work, restores missing prerequisites, compiles modules
+and publishes their artifacts concurrently. Small queue receives fill available
+capacity immediately; they do not define execution batches. Shared prerequisite
+files are transferred once, and concurrent preparations await the same transfer.
 
 As each module finishes, a bounded IO pool packs and uploads its artifacts, publishes
 its immutable result, notifies ready dependents, and acknowledges its delivery.
@@ -48,9 +49,10 @@ worker's local filesystem; already installed imports are not copied again.
 
 For `Base → [Left, Right] → Final`, publishing `Base` makes `Left` and `Right`
 available immediately. `Final` becomes available when both are committed.
-Another worker can pick up these dependents while the first worker's batch is
-still running. Each worker finishes its own batch before claiming more work;
-there are no global dependency rounds or repeated Cloud forks for module scheduling.
+Any worker, including the one compiling `Left`, can start newly ready work while
+its other modules are still compiling or uploading. A compilation completion
+immediately frees a slot. There are no batch barriers, global dependency rounds
+or repeated Cloud forks for module scheduling.
 
 The queue lives in the scheduler's existing HTTP/SQLite service. Its short
 transactions run independently of the Cloud scheduler actor. All deployments
@@ -73,11 +75,16 @@ active compiler process groups, join local tasks, and release outstanding work.
 The runtime checks assignment ownership before journaling the `exec` outcome.
 Ordinary IO exceptions remain application failures; they are not crash retries.
 
-`watch` shows each worker's Lake batch and locally known committed count. Finalization
+`watch` shows one shared module completion counter and each worker's compiling,
+restoring, ready and publishing counts. Failed/blocked modules are included in
+completed work and displayed separately. The service updates the durable counter
+atomically with settlement; repeated acknowledgements cannot inflate it. Workers
+report snapshots approximately once per second independently of compilation.
+Watch selects the newest counter revision and marks stalled activity updates stale.
+Finalization
 reports its current phase: gathering manifests, restoring artifacts, completing
 Lake targets, verifying the workspace, or publishing the result.
-These counts are not added together: workers may know the same results. Progress
-is a best-effort last view, separate from durable build results and replay records.
+Displayed progress is a best-effort last view, separate from replay records.
 
 ## Local deployment and first run
 
@@ -110,8 +117,8 @@ The report contains:
 
 - `commit`, `toolchain`, `platform`, and `source`: exact input provenance.
 - `modules`: per-module status, diagnostics, elapsed time and artifact manifest,
-  in dependency order. Module durations run from the start of their Lake batch
-  through publication preparation; they include waiting for other jobs and are not
+  in dependency order. Module durations run from their submission to Lake
+  through compilation completion; they include waiting for Lake jobs and are not
   CPU time. Failed prerequisites produce `blocked` results.
 - `build`: final Lake target status, diagnostics, duration and an `artifacts`
   reference to the complete workspace manifest. Its duration includes final
@@ -150,9 +157,10 @@ bash deploy/local.sh clean .lean-cloud/build --yes
 
 Builder count is recorded once. Each builder uses its executing worker's current
 CPU budget, so a restarted session may have a different local width. These are
-concurrency budgets, not CPU affinity or placement guarantees. Lake runs one
-helper per batch with the full budget; individual module compilers default to one
-thread so they do not each create a hardware-sized pool. Preparation and final
+concurrency budgets, not CPU affinity or placement guarantees. An N-CPU worker
+uses `max 1 (N - 1)` compilation slots, leaving headroom for coordination and
+artifact processing. Individual module compilers default to one thread so they
+do not each create a hardware-sized pool. Preparation and final
 targets also use the full budget. Native tools and project options may create
 additional threads; container limits remain authoritative.
 
@@ -164,7 +172,7 @@ Artifact hashing, restoration and blob transfers also use bounded local pools.
 
 `limits` defaults to `seconds: 600` per subprocess, `helperMemoryMiB: 4096` per
 Lake helper, `bytes: 2147483648` per workspace, and `modules: 10000`.
-The time limit covers a whole Lake batch, not each module individually; the final
+The time limit covers the persistent Lake session, not each module individually; the final
 Lake invocation has its own limit. Diagnostics are capped at 16 MiB per stream. Workspace size is checked at
 preparation, restoration/publication boundaries and after all local compilers
 stop. Container memory and disk limits bound peak usage between these checks.
@@ -177,6 +185,9 @@ from committed blob artifacts. Cache directories must be private to each worker
 process. `LEAN_BUILD_CACHE` changes the pack directory and
 `LEAN_BUILD_CACHE_BYTES` bounds packs (default 4 GiB). Without a cache, builders
 use temporary workspaces. Provision extra disk for logs and temporary files.
+Concurrent readers share a pack download; independent packs download in parallel.
+Packs stay pinned while being copied. When active packs fill the cache, additional
+downloads use temporary space rather than evicting a pack still in use.
 
 Prepared inputs and installed artifacts remain immutable during module builds.
 Conflicting artifacts are rejected. Build hooks must declare dependencies to Lake
@@ -227,7 +238,9 @@ Tests compare direct/replay execution on 40 generated DAGs. They cover concurren
 builder sessions, progress without round barriers, interruption between result
 publication and notification, cancellation, blocked dependencies, durable errors,
 cache reuse and integrity. A native rendezvous verifies concurrent publications
-while another compiler in the same batch is still running. Native fixtures compare output with ordinary Lake and
+while another compiler in the same session is still running. A single-worker
+rendezvous checks that newly ready dependencies advance before an unrelated slow
+compiler completes. Native fixtures compare output with ordinary Lake and
 cover libraries, executables, C FFI, generated/custom targets and restored artifacts.
 Runtime tests separately exercise the same HTTP/SQLite queue's leases, reopening,
 stale receipts, concurrent consumers and run removal.
@@ -239,7 +252,7 @@ deployment on exit:
 bash Applications/LeanBuild/test-deployment.sh lean-cloud-build:dev
 ```
 
-The batched builder has not yet been benchmarked on the full Mathlib DAG in a
+The continuous builder has not yet been benchmarked on the full Mathlib DAG in a
 cloud deployment. Shared queue throughput, artifact IO, module memory use and the
 final target build can still limit utilization. Finalization merges manifests in
 one pass, verifies files concurrently, retains existing entries from that scan,

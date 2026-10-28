@@ -83,12 +83,30 @@ private def withEnvironment (store : ObjectStore) (base : ExecContext IO)
       queues := WorkQueueStore.provider conn (← Std.Mutex.new ()) scope }
   finally conn.close
 
-/-- A lightweight stand-in for Lake's concurrent jobs; production uses one Lake
-process for the entire batch. Results stream through the same callback. -/
+/-- The same rolling coordinator, with task-backed compiler jobs for model tests. -/
 private def runBuilders (env : Environment IO) (plan : Plan)
-    (build : CancellationToken IO → LeanBuild.Module → Array BuildResult → IO BuildResult) : IO Unit :=
-  Builders.run env plan fun stop modules inputs publish => do
-    discard <| Parallel.map env.currentWorker.cpus modules fun m => do publish (← build stop m inputs)
+    (build : CancellationToken IO → LeanBuild.Module → Array BuildResult → IO BuildResult) : IO Unit := do
+  let prepared ← Std.Mutex.new ({} : Std.HashMap String (CancellationToken IO × Array BuildResult))
+  let running ← IO.mkRef (#[] : Array (String × Task (Except IO.Error BuildResult)))
+  let engine : Builders.Engine BuildResult := {
+    prepare := fun stop m inputs => prepared.atomically (modify (·.insert m.name (stop, inputs)))
+    submit := fun m => do
+      let some (stop, inputs) ← prepared.atomically do return (← get)[m.name]?
+        | throw (IO.userError "Submitted before preparation")
+      let task ← IO.asTask (build stop m inputs) .dedicated
+      running.modify (·.push (m.name, task))
+    poll := do
+      let mut waiting := #[]
+      let mut done := #[]
+      for (name, task) in ← running.get do
+        if ← IO.hasFinished task then done := done.push (name, ← IO.ofExcept (← IO.wait task))
+        else waiting := waiting.push (name, task)
+      running.set waiting
+      return done
+    publish := fun _ _ result => pure result
+    finish := check (← running.get).isEmpty "Finished with active compilers"
+    cancel := do for (_, task) in ← running.get do discard <| IO.wait task }
+  Builders.run env plan engine
 
 private def builderSourceTest : IO Unit := do
   let sources : Array ProgramSource := cloud_sources%
@@ -150,6 +168,9 @@ private def generatedTests : IO Unit := do
       let context := env.map (fun action => captureIO (liftM action))
       let .ok direct ← (DirectInterpreter.interpret context (workflow backend) request).run
         | throw (IO.userError "Direct build failed")
+      let stats ← (env.queues.open Builders.queueName).progress
+      check (stats.completed == modules.size && stats.failed == (expected.filter (·.2 != .built)).size)
+        "Shared progress lost or double-counted successful/failed modules"
       pure direct
     check (direct.modules.map (fun r => (r.name, r.status)) == expected) "Queue build differs from dependency evaluation"
     -- A fresh run namespace ensures replay really builds its own results.
@@ -162,46 +183,43 @@ private def generatedTests : IO Unit := do
       let before ← seen.atomically get
       discard <| (replayReport (journal saved) (workflow backend request) context).run
       check ((← seen.atomically get) == before) "Replay reran completed modules"
-  -- Early publication lets ANOTHER worker advance a short chain before the
-  -- first worker's Lake batch finishes its unrelated slow module.
-  withEnvironment store (pool #[2, 2]) fun env => do
+  -- A SINGLE worker must advance a short chain while its unrelated long
+  -- compiler is still running. A finite Lake batch cannot pass this rendezvous.
+  withEnvironment store (pool #[3]) fun env => do
     let plan := { fixturePlan with modules := #[⟨"Slow", #[]⟩, ⟨"Fast", #[]⟩, ⟨"Child", #["Fast"]⟩] }
     let child ← IO.mkRef false
     Builders.seed env plan
-    discard <| Parallel.map 2 (Array.range 2) fun _ =>
-      runBuilders env plan fun _ m _ => do
-        if m.name == "Slow" then
-          let deadline := (← IO.monoMsNow) + 3000
-          while !(← child.get) do
-            check ((← IO.monoMsNow) < deadline) "A batch barrier blocked another worker's short chain"
-            IO.sleep 10
-        if m.name == "Child" then child.set true
-        return { name := m.name, status := .built }
+    runBuilders env plan fun _ m _ => do
+      if m.name == "Slow" then
+        let deadline := (← IO.monoMsNow) + 3000
+        while !(← child.get) do
+          check ((← IO.monoMsNow) < deadline) "A batch barrier blocked the same worker's short chain"
+          IO.sleep 10
+      if m.name == "Child" then child.set true
+      return { name := m.name, status := .built }
     check (← child.get) "Dependent module was never built"
-  -- A wide ready frontier is handed to Lake in bounded CPU-sized batches.
-  withEnvironment store (pool #[2]) fun env => do
+  -- Slots are replenished without claiming an unbounded ready frontier.
+  withEnvironment store (pool #[3]) fun env => do
     let modules := (Array.range 33).map fun i => ⟨s!"M{i}", #[]⟩
     let plan := { fixturePlan with modules }
-    let batches ← IO.mkRef (#[] : Array Nat)
+    let active ← Std.Mutex.new ((0, 0) : Nat × Nat)
     Builders.seed env plan
-    Builders.run env plan fun _ ready inputs publish => do
+    runBuilders env plan fun _ m inputs => do
       check inputs.isEmpty "Independent modules acquired prerequisites"
-      batches.modify (·.push ready.size)
-      for m in ready do publish { name := m.name, status := .built }
-    check ((← batches.get) == #[8, 8, 8, 8, 1]) "Ready work was not batched or waited to fill the last batch"
-    check ((← Builders.results env plan).size == 33) "Batch dropped modules"
-  for mistake in ["missing", "duplicate", "unknown"] do
-    withEnvironment store (pool #[2]) fun env => do
-      Builders.seed env fixturePlan
-      let rejected ← try
-        Builders.run env fixturePlan fun _ ready _ publish => do
-          if mistake != "missing" then
-            let name := if mistake == "unknown" then "Other" else ready[0]?.map (·.name) |>.getD ""
-            publish { name, status := .built }
-            if mistake == "duplicate" then publish { name, status := .built }
-        pure false
-      catch _ => pure true
-      check rejected s!"Accepted {mistake} batch completion"
+      active.atomically (modify fun (n, peak) => (n + 1, max peak (n + 1)))
+      IO.sleep 40
+      active.atomically (modify fun (n, peak) => (n - 1, peak))
+      return { name := m.name, status := .built }
+    check ((← active.atomically get) == (0, 2)) "Compilation budget was not respected/utilized"
+    check ((← Builders.results env plan).size == 33) "Pipeline dropped modules"
+    check ((← (env.queues.open Builders.queueName).progress) == ⟨33, 0⟩) "Wrong global progress"
+  withEnvironment store (pool #[2]) fun env => do
+    Builders.seed env fixturePlan
+    let rejected ← try
+      runBuilders env fixturePlan fun _ _ _ => pure { name := "Other", status := .built }
+      pure false
+    catch _ => pure true
+    check rejected "Accepted an unrequested module result"
   -- Independent builder sessions share only the queue and immutable results.
   withEnvironment store (pool #[2, 2, 2]) fun env => do
     let seen ← Std.Mutex.new (#[] : Array String)
@@ -307,7 +325,7 @@ private def copyFixture (source destination : System.FilePath) : IO Unit := do
 private def nativeTest (tools : Tools) (store : ObjectStore) (fixture : System.FilePath)
     (change : System.FilePath → IO Unit := fun _ => pure ())
     (req : LeanBuild.Request := request)
-    (environment : ExecContext IO := pool #[2]) : IO LeanBuild.Report :=
+    (environment : ExecContext IO := pool #[3]) : IO LeanBuild.Report :=
   IO.FS.withTempDir fun root => do
     let directory := root / "project"
     IO.FS.createDir directory
@@ -335,17 +353,19 @@ private def helperFailureTests (tools : Tools) (fixture : System.FilePath) : IO 
     copyFixture fixture directory
     let policy := root / "policy.json"
     let output := root / "results"
-    let input := root / "input.json"
+    let input := root / "requests"
+    IO.FS.createDir input
+    IO.FS.writeFile (input / "finish") ""
     IO.FS.writeFile policy (toJson request).pretty
     let library := tools.toolchain / "lib/lean" /
       (if System.Platform.isOSX then "libLake_shared.dylib" else "libLake_shared.so")
     let run (name : String) := do
-      IO.FS.writeFile input (toJson #[name]).compress
+      IO.FS.writeFile (input / "0.json") (toJson name).compress
       IO.Process.output {
       cmd := (tools.toolchain / "bin/lake").toString, cwd := directory
       env := #[("LEAN_NUM_THREADS", some "2")]
       args := #["--no-cache", "env", "lean", "--load-dynlib", library.toString, "--run",
-        tools.helper.toString, "modules", policy.toString, input.toString, output.toString, directory.toString] }
+        tools.helper.toString, "serve", policy.toString, input.toString, output.toString, directory.toString] }
     IO.FS.writeFile output "[]"
     check ((← run "Missing.Module").exitCode != 0) "A stale result file hid a Lake fetch failure"
     IO.FS.removeFile output
@@ -376,11 +396,11 @@ private def failedJobTests (tools : Tools) (store : ObjectStore) (fixture : Syst
     check (!mixed.success && mixed.modules.any (fun r => r.name == "Fixture.Left" && r.status == .failed) &&
       mixed.modules.any (fun r => r.name == "Fixture.Right" && r.status == .built) &&
       mixed.modules.any (fun r => r.name == "Fixture.Final" && r.status == .blocked))
-      "A failed module lost independent successes in the same Lake batch"
+      "A failed module lost independent successes in the same Lake session"
 
 /-- Two publications rendezvous while a third compiler waits for them. This
-proves both concurrent publication and publication before the batch exits. -/
-private def batchPublicationTest (tools : Tools) (store : ObjectStore) (fixture : System.FilePath) : IO Unit :=
+proves both concurrent publication and continued dependency admission. -/
+private def streamingPublicationTest (tools : Tools) (store : ObjectStore) (fixture : System.FilePath) : IO Unit :=
   IO.FS.withTempDir fun root => do
     let directory := root / "project"
     IO.FS.createDir directory
@@ -393,11 +413,11 @@ private def batchPublicationTest (tools : Tools) (store : ObjectStore) (fixture 
       s!"  while !(← System.FilePath.pathExists {reprStr signal.toString}) do",
       "    if (← IO.monoMsNow) > deadline then throw (IO.userError \"Publication waited for the Lake batch\")",
       "    IO.sleep 20", ""])
-    let req := { request with targets := #["+Fixture.Slow", "+Fixture.Left", "+Fixture.Right"] }
-    let tools := { tools with threads := 2 }
+    let req := { request with targets := #["+Fixture.Slow", "+Fixture.Left", "+Fixture.Right", "+Fixture.Final"] }
+    let tools := { tools with threads := 3 }
     let prepared ← tools.prepareDirectory store req directory "fixture"
-    let some plan := prepared.plan | throw (IO.userError "Cannot prepare batch publication fixture")
-    withEnvironment store (pool #[2]) fun env => do
+    let some plan := prepared.plan | throw (IO.userError "Cannot prepare streaming publication fixture")
+    withEnvironment store (pool #[3]) fun env => do
       let some names := env.blobs.names | throw (IO.userError "Missing named blobs")
       let published ← Std.Mutex.new (0 : Nat)
       let names : BlobNames IO := { names with publish := fun name ref => do
@@ -412,7 +432,7 @@ private def batchPublicationTest (tools : Tools) (store : ObjectStore) (fixture 
           while (← published.atomically get) < 2 do
             check ((← IO.monoMsNow) < deadline) "Module publications did not overlap"
             IO.sleep 10
-          IO.FS.writeFile signal "ready"
+        if name == Builders.resultName "Fixture.Final" then IO.FS.writeFile signal "ready"
         return selected }
       let env := { env with blobs := { env.blobs with names := some names } }
       Builders.seed env plan
@@ -420,7 +440,7 @@ private def batchPublicationTest (tools : Tools) (store : ObjectStore) (fixture 
       let results ← Builders.results env plan
       check (results.all (·.status == .built)) "Early publication fixture failed"
       check ((← published.atomically get) == 2) "Concurrent publications were not exercised"
-    IO.println "PASS real Lake batch: independent publications overlap a still-running compiler"
+    IO.println "PASS persistent Lake: publications overlap and the same worker feeds a newly ready dependent while another compiler is running"
 
 private def publicationTests (tools : Tools) (store : ObjectStore) (fixture : System.FilePath) : IO Unit :=
   IO.FS.withTempDir fun root => do
@@ -721,6 +741,31 @@ private def parallelIOTests (store : ObjectStore) : IO Unit := do
     let manifest ← (← Bundle.snapshot source 10000).publish remote (some cache) 3
     let packs := manifest.foldl (fun set entry => set.insert entry.file.pack.sha256) ({} : Std.HashSet String)
     check (packs.size == 3) "Publication did not distribute files across packs"
+    -- Each first read waits for the other packs. Holding the cache lock over
+    -- downloads would deadlock this rendezvous even with three restore tasks.
+    let arrivals ← Std.Mutex.new (0 : Nat)
+    let rendezvous := { store with read := fun key => do
+      arrivals.atomically (modify (· + 1))
+      let deadline := (← IO.monoMsNow) + 3000
+      while (← arrivals.atomically get) < 3 do
+        if (← IO.monoMsNow) > deadline then
+          throw (IO.userError "Pack cache serialized independent downloads")
+        IO.sleep 1
+      store.read key }
+    Bundle.restore rendezvous (root / "concurrent-downloads") manifest 10000
+      (some { directory := root / "shared-cache", bytes := 10000 }) 3
+    let some firstPack := manifest[0]? | throw (IO.userError "Missing parallel pack entry")
+    let samePack := manifest.filter (·.file.pack == firstPack.file.pack)
+    let reads ← Std.Mutex.new (0 : Nat)
+    let counting := { store with read := fun key => do
+      reads.atomically (modify (· + 1))
+      IO.sleep 10
+      store.read key }
+    discard <| Parallel.map 3 (Array.range 3) fun i =>
+      Bundle.restore counting (root / s!"shared-pack-{i}") samePack 10000
+        (some { directory := root / "shared-pack-cache", bytes := 10000 })
+    check ((← reads.atomically get) == 2)
+      "Concurrent readers downloaded the same cached pack more than once"
     let offline := { store with read := fun _ => throw (IO.userError "Producer downloaded its own artifacts") }
     let restored := root / "restored"
     Bundle.restore offline restored manifest 10000 (some cache) 3
@@ -854,7 +899,7 @@ private def nativeTests : IO Unit := IO.FS.withTempDir fun cacheRoot => do
   helperFailureTests tools fixture
   let store := objects (← Std.Mutex.new {})
   failedJobTests tools store fixture
-  batchPublicationTest tools store fixture
+  streamingPublicationTest tools store fixture
   bundleTests store
   packCacheTests store
   workspaceTests store
@@ -880,7 +925,7 @@ private def nativeTests : IO Unit := IO.FS.withTempDir fun cacheRoot => do
       let source ← IO.FS.readFile path
       let command := String.intercalate "\n" [
         "run_cmd Lean.Elab.Command.liftIO do",
-        "  unless (← IO.getEnv \"LEAN_NUM_THREADS\") == some \"2\" do",
+        "  unless (← IO.getEnv \"LEAN_NUM_THREADS\") == some \"3\" do",
         "    throw (IO.userError \"Wrong worker CPU budget\")",
         s!"  IO.FS.writeFile \"{name}.started\" \"started\"",
         "  let started ← IO.monoMsNow",
@@ -1030,6 +1075,7 @@ private def nativeTests : IO Unit := IO.FS.withTempDir fun cacheRoot => do
   IO.println "PASS native Lake builds, executable/FFI/generated/custom targets, restored artifacts and build failures"
 
 def main (args : List String) : IO Unit := do
+  if args == ["--native-only"] then nativeTests; return
   builderSourceTest
   generatedTests
   if args.contains "--io" then parallelIOTests (objects (← Std.Mutex.new {}))

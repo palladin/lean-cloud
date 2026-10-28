@@ -200,6 +200,7 @@ private def finishTargets (tools : Tools) (store : ObjectStore) (request : Reque
 private structure Installed where
   modules : Std.HashMap String FileRef := {}
   files : Std.HashMap String Bundle.Entry := {}
+  transfers : Std.HashMap String (Task (Except IO.Error Unit)) := {}
 
 private def Installed.remember (state : Installed) (entries : Bundle.Manifest) : Except String Installed := do
   let mut files := state.files
@@ -217,128 +218,131 @@ private structure ModuleCompletion where
   diagnostics : String
   deriving FromJson
 
-/-- Drain atomic completion files without waiting for the first/slowest module.
-Lake compiles while a bounded IO pool packs and uploads completed artifacts.
-On any publication error, stop and join Lake before releasing the workspace. -/
-private def buildBatch (tools : Tools) (store : ObjectStore) (env : Environment IO)
-    (directory : System.FilePath) (request : Request) (policy : System.FilePath)
-    (session : Workspace.Session) (installed : Std.Mutex Installed)
-    (cancellation : CancellationToken IO) (modules : Array Module)
-    (publish : BuildResult → IO Unit) : IO Unit := do
-  let output := directory / ".." / "module-results"
-  if ← output.pathExists then IO.FS.removeDirAll output
-  IO.FS.createDir output
-  let input := directory / ".." / "module-batch.json"
-  IO.FS.writeFile input (toJson (modules.map (·.name))).compress
-  let abort ← IO.mkRef false
-  let localTools := { tools with cancelled := do return (← abort.get) || (← cancellation.isRequested) }
-  let start ← IO.monoMsNow
-  env.progress.report "lake" { message := s!"Building {modules.size} modules · {tools.threads} CPUs", total := some modules.size }
-  let task ← IO.asTask (runHelper localTools directory request "modules"
-    #["modules", policy.toString, input.toString, output.toString, directory.toString]) .dedicated
-  try
-    let pending ← Std.Mutex.new (Array.range modules.size)
-    let completed ← Std.Mutex.new (0 : Nat)
-    let failures ← IO.mkRef false
-    -- Publishers claim whichever completion is ready. One slow upload must not
-    -- prevent another slot from noticing and publishing later completions.
-    discard <| Parallel.map tools.threads (Array.range (max 1 tools.threads)) fun _ => do
-      try
-        repeat
-          if ← localTools.cancelled then break
-          let (index?, done) ← pending.atomically do
-            let indices ← get
-            -- Check process completion before scanning its atomic reports.
-            let finished ← IO.hasFinished task
-            for position in [:indices.size] do
-              let index := indices[position]!
-              if ← (output / s!"{index}.json").pathExists then
-                set (indices.eraseIdxIfInBounds position)
-                return (some index, false)
-            return (none, finished || indices.isEmpty)
-          let some index := index? | do
-            if done then break
-            IO.sleep 20
-            continue
-          let some m := modules[index]? | throw (IO.userError "Invalid module result index")
-          let value : ModuleCompletion ← readJson (output / s!"{index}.json")
-          unless value.name == m.name do throw (IO.userError "Module completion name mismatch")
-          if ← localTools.cancelled then break
-          let diagnostics ← Files.putText store s!"{m.name}\n{value.diagnostics}"
-          if !value.success then
-            failures.set true
-            publish { name := m.name, status := .failed, diagnostics, milliseconds := (← IO.monoMsNow) - start, message := "Lake module compilation failed" }
-          else
-            unless !value.paths.isEmpty && value.paths.all Bundle.safePath do
-              throw (IO.userError "Invalid module artifact paths")
-            let snapshot : Bundle.Snapshot := { root := directory, limit := request.limits.bytes, paths := value.paths }
-            -- Parallelize across completed modules, not nested full-sized pools.
-            let manifest ← snapshot.publish store tools.cache 1
-            let artifacts ← Files.putJson store manifest
-            installed.atomically do
-              let state ← IO.ofExcept ((← get).remember manifest)
-              set { state with modules := state.modules.insert m.name artifacts }
-            session.rememberManifest artifacts manifest
-            publish { name := m.name, status := .built, artifacts, diagnostics, milliseconds := (← IO.monoMsNow) - start, builtModules := #[m.name] }
-          completed.atomically do
-            modify (· + 1)
-            env.progress.report "lake" { message := s!"Building {modules.size} modules · {tools.threads} CPUs", completed := ← get, total := some modules.size }
-      catch error => abort.set true; throw error
-    let outcome ← IO.ofExcept (← IO.wait task)
-    unless ← cancellation.isRequested do
-      let pending ← pending.atomically get
-      match outcome with
-      | .ok () =>
-        unless pending.isEmpty do throw (IO.userError "Lake omitted module completions")
-      | .error message =>
-        -- A compiler/helper failure is a durable application result. Completed
-        -- successes remain valid; missing modules carry the process diagnostics.
-        if pending.isEmpty && !(← failures.get) then throw (IO.userError message)
-        let diagnostics ← logs store directory
-        for index in pending do
-          let some m := modules[index]? | throw (IO.userError "Invalid pending module")
-          publish { name := m.name, status := .failed, diagnostics, milliseconds := (← IO.monoMsNow) - start, message }
-  finally
-    abort.set true
-    discard <| IO.wait task
+/-- Reserve each immutable prerequisite path once. Other preparations await the
+same transfer; conflicting bytes fail before installation. No lock spans IO. -/
+private def install (tools : Tools) (store : ObjectStore) (directory : System.FilePath)
+    (request : Request) (session : Workspace.Session) (installed : Std.Mutex Installed)
+    (stop : CancellationToken IO) (inputs : Array BuildResult) : IO Unit := do
+  for input in inputs do
+    if ← stop.isRequested then return
+    let some ref := input.artifacts | throw (IO.userError "Missing prerequisite artifacts")
+    if (← installed.atomically do return (← get).modules[input.name]?) == some ref then continue
+    let manifest ← session.readManifest ref
+    let transfers ← installed.atomically do
+      let previous ← get
+      let mut state ← IO.ofExcept (previous.remember manifest)
+      let mut waiting := manifest.filterMap fun entry => previous.transfers[entry.path]?
+      let missing := manifest.filter fun entry => !previous.files.contains entry.path
+      unless missing.isEmpty do
+        -- Restore a module's pack together, rather than re-reading the whole
+        -- pack for each file. All overlapping preparations await this task.
+        let task ← IO.asTask (Bundle.restore store directory missing
+          request.limits.bytes tools.cache 1) .dedicated
+        state := { state with transfers := missing.foldl (fun tasks entry => tasks.insert entry.path task) state.transfers }
+        waiting := waiting.push task
+      set state
+      return waiting
+    for task in transfers do IO.ofExcept (← IO.wait task)
+    installed.atomically (modify fun s => { s with modules := s.modules.insert input.name ref })
 
-/-- Keep all sources and installed artifacts in one worker-local workspace.
-Restore the batch's shared prerequisite set once, in parallel; Lake uses the
-worker's CPU budget and publications stream out as individual jobs finish. -/
+private def publishModule (tools : Tools) (store : ObjectStore) (directory : System.FilePath)
+    (request : Request) (session : Workspace.Session) (installed : Std.Mutex Installed)
+    (mod : Module) (value : ModuleCompletion) (milliseconds : Nat) : IO BuildResult := do
+  unless value.name == mod.name do throw (IO.userError "Module completion name mismatch")
+  let diagnostics ← Files.putText store s!"{mod.name}\n{value.diagnostics}"
+  if !value.success then
+    return { name := mod.name, status := .failed, diagnostics, milliseconds, message := "Lake module compilation failed" }
+  unless !value.paths.isEmpty && value.paths.all Bundle.safePath do
+    throw (IO.userError "Invalid module artifact paths")
+  let snapshot : Bundle.Snapshot := { root := directory, limit := request.limits.bytes, paths := value.paths }
+  -- Publication concurrency is bounded by Builders; avoid nested full pools.
+  let manifest ← snapshot.publish store tools.cache 1
+  let artifacts ← Files.putJson store manifest
+  installed.atomically do
+    let state ← IO.ofExcept ((← get).remember manifest)
+    set { state with modules := state.modules.insert mod.name artifacts }
+  session.rememberManifest artifacts manifest
+  return { name := mod.name, status := .built, artifacts, diagnostics, milliseconds, builtModules := #[mod.name] }
+
+/-- The helper and workspace live for the whole builder. Numbered, atomically
+renamed requests carry module names; independent completion files carry results.
+This protocol crosses the project toolchain boundary without serializing jobs. -/
 def Tools.builder (tools : Tools) (store : ObjectStore) (env : Environment IO)
     (request : Request) (plan : Plan) : IO Unit := do
   let key ← workspaceKey tools request plan
   let cache := tools.cache.map fun cache => cache.directory.addExtension "workspace"
   Workspace.use store cache key fun session => do
     let directory := session.directory
-    env.progress.report "build" { message := "Restoring sources", total := some plan.modules.size }
+    env.progress.report "worker" { message := "Restoring sources" }
     let baseline ← restore tools store directory request plan #[] session
     let installed ← Std.Mutex.new (← IO.ofExcept (({} : Installed).remember baseline))
     let policy ← policyFile directory request
-    Builders.run env plan fun cancellation modules inputs publish => do
-      env.progress.report "lake" { message := s!"Restoring prerequisites for {modules.size} modules" }
-      let previous ← installed.atomically get
-      let missing ← inputs.filterM fun input => do
-        let some ref := input.artifacts | throw (IO.userError "Missing prerequisite artifacts")
-        return previous.modules[input.name]? != some ref
-      let manifests ← Parallel.map tools.threads missing fun input => do
-        let some ref := input.artifacts | throw (IO.userError "Missing prerequisite artifacts")
-        session.readManifest ref
-      let entries ← IO.ofExcept (Bundle.mergeMany manifests)
-      let state ← IO.ofExcept (previous.remember entries)
-      -- Identical artifacts can be packed differently on redelivery. Compare
-      -- contents; never overwrite conflicting prerequisite bytes.
-      Bundle.restore store directory (entries.filter fun e => !previous.files.contains e.path)
-        request.limits.bytes tools.cache tools.threads
-      installed.atomically (set { state with modules := missing.foldl (fun names (input : BuildResult) =>
-        input.artifacts.map (names.insert input.name) |>.getD names) state.modules })
-      unless ← cancellation.isRequested do
-        buildBatch tools store env directory request policy session installed cancellation modules publish
-    unless ← env.cancellation.isRequested do
-      let inputs ← installed.atomically do return (← get).files.toArray.map (·.2)
-      Bundle.validateInputs directory inputs tools.threads
-      discard (Bundle.snapshot directory request.limits.bytes)
-      session.commit
+    let protocol := directory / ".." / "lake-session"
+    if ← protocol.pathExists then IO.FS.removeDirAll protocol
+    let input := protocol / "requests"
+    let output := protocol / "results"
+    IO.FS.createDirAll input
+    IO.FS.createDirAll output
+    let abort ← Std.Mutex.new false
+    -- One helper thread can be occupied by the admission loop even on a
+    -- single-CPU worker. The coordinator separately bounds compiler slots.
+    let localTools := { tools with
+      threads := max 2 env.currentWorker.cpus
+      cancelled := do return (← abort.atomically get) || (← env.cancellation.isRequested) }
+    let task ← IO.asTask (runHelper localTools directory request "modules"
+      #["serve", policy.toString, input.toString, output.toString, directory.toString]) .dedicated
+    let pending ← IO.mkRef (#[] : Array (Nat × Module × Nat))
+    let next ← IO.mkRef (0 : Nat)
+    let failed ← IO.mkRef false
+    let cancel : IO Unit := do
+      abort.atomically (set true)
+      discard <| IO.wait task
+    let engine : Builders.Engine (ModuleCompletion × Nat) := {
+      prepare := fun stop _ inputs => install tools store directory request session installed stop inputs
+      submit := fun mod => do
+        let id ← next.get
+        let path := input / s!"{id}.json"
+        let temporary := path.addExtension "pending"
+        IO.FS.writeFile temporary (toJson mod.name).compress
+        IO.FS.rename temporary path
+        let start ← IO.monoMsNow
+        pending.modify (·.push (id, mod, start))
+        next.set (id + 1)
+      poll := do
+        -- Unexpected helper termination is an exec error, not a node crash.
+        let exited ← IO.hasFinished task
+        let mut waiting := #[]
+        let mut results := #[]
+        for (id, mod, start) in ← pending.get do
+          let path := output / s!"{id}.json"
+          if !(← path.pathExists) then waiting := waiting.push (id, mod, start); continue
+          let value : ModuleCompletion ← readJson path
+          unless value.name == mod.name do throw (IO.userError "Module completion name mismatch")
+          if !value.success then failed.set true
+          results := results.push (mod.name, (value, (← IO.monoMsNow) - start))
+          IO.FS.removeFile path
+        pending.set waiting
+        if exited then
+          match ← IO.ofExcept (← IO.wait task) with
+          | .error message => throw (IO.userError message)
+          | .ok () => throw (IO.userError "Lake session exited before finish")
+        return results
+      publish := fun _ mod (value, elapsed) => publishModule tools store directory request session installed mod value elapsed
+      finish := do
+        unless (← pending.get).isEmpty do throw (IO.userError "Lake session has unfinished modules")
+        IO.FS.writeFile (input / "finish") ""
+        let result ← IO.ofExcept (← IO.wait task)
+        if let .error message := result then
+          unless ← failed.get do throw (IO.userError message)
+      cancel }
+    try
+      Builders.run env plan engine
+      unless ← env.cancellation.isRequested do
+        let inputs ← installed.atomically do return (← get).files.toArray.map (·.2)
+        Bundle.validateInputs directory inputs tools.threads
+        discard (Bundle.snapshot directory request.limits.bytes)
+        session.commit
+    finally cancel
 
 /-- Lake completes exactly the requested targets: native compilation, linking,
 custom targets and any dynamic dependencies remain Lake's responsibility. -/

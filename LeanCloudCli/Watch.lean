@@ -125,11 +125,25 @@ private def progressUpdates (steps : Array Trace.Step) : Array (String × Progre
       else nameA < nameB
 
 def progressLines (steps : Array Trace.Step) (limit : Nat := steps.size) : Array Styled.Line :=
-  ((progressUpdates steps).extract 0 limit).map fun (slot, update) =>
+  (((progressUpdates steps).filter (fun (_, update) => update.shared.isNone)).extract 0 limit).map fun (slot, update) =>
     let count := match update.total with
       | some total => s!"{update.completed}/{total} · {if total == 0 then 100 else min 100 (update.completed * 100 / total)}% · "
       | none => ""
     Styled.text s!"{safe slot}: {count}{safe update.message}" .green
+
+/-- Shared progress is a versioned snapshot, not a per-worker contribution.
+Keep the highest durable revision even if a slower worker reports later. -/
+def sharedProgressLines (steps : Array Trace.Step) : Array Styled.Line := Id.run do
+  let mut latest : Std.TreeMap String ProgressUpdate := {}
+  for step in steps do
+    if let some (_, update) := step.progress then
+      if let some scope := update.shared then
+        if (latest[scope]?).all (fun old => old.revision ≤ update.revision) then
+          latest := latest.insert scope update
+  return latest.toArray.map fun (_, update) =>
+    let count := update.total.map (fun total =>
+      s!"{update.completed}/{total} · {if total == 0 then 100 else min 100 (update.completed * 100 / total)}% · ") |>.getD ""
+    Styled.text s!"{count}{safe update.message}" .green
 
 private def beside (left right : Array Styled.Line) (leftWidth : Nat) : Array Styled.Line :=
   (Array.range (max left.size right.size)).map fun row =>
@@ -153,12 +167,13 @@ private def workerCode (steps : Array Trace.Step) (entries : Array BranchTree.En
 
 private def workerCard (ctx : Context) (run : Run) (steps : Array Trace.Step)
     (entries : Array BranchTree.Entry) (worker : String) (histories : Array History)
-    (live : Bool) (width height : Nat) : Array Styled.Line := Id.run do
+    (live : Bool) (width height : Nat) (stale : Array String := #[]) : Array Styled.Line := Id.run do
   let current := entries.find? (fun entry => (assignment entry).map (·.1) == some worker)
   let code := workerCode steps entries worker live
   let label := if live then current.map (fun entry => s!"branch {entry.branch.key}") |>.getD "idle for this workflow"
     else "last view"
-  let mut lines := #[Styled.text (pad width s!" {worker} · {label}") .selected]
+  let warning := if live && current.isSome && stale.contains worker then " · progress stale" else ""
+  let mut lines := #[Styled.text (pad width s!" {worker} · {label}{warning}") .selected]
   if !live || current.isSome then
     lines := lines.push (Styled.text (sourceLabel run code) .muted)
     lines := lines ++ sourceRows run code (if height ≥ 10 then 2 else 1) 0
@@ -178,7 +193,7 @@ private def workerColumns (count width : Nat) := min count (max 1 (min 3 (width 
 private def workerCardHeight (steps : Array Trace.Step) (entries : Array BranchTree.Entry)
     (workers : Array String) (live : Bool) (height : Nat) : Nat :=
   let progress := workers.foldl (fun count worker =>
-    max count (progressUpdates (workerCode steps entries worker live)).size) 0
+    max count (progressLines (workerCode steps entries worker live)).size) 0
   -- Header, source label, two code lines, progress, and nine metric lines.
   min (max 16 (13 + progress)) (height - 1)
 
@@ -189,7 +204,7 @@ private def groupCodeRows (height : Nat) := min 3 (max 2 (height / 5))
 
 private def workerGrid (ctx : Context) (run : Run) (steps : Array Trace.Step)
     (entries : Array BranchTree.Entry) (histories : Array History)
-    (live : Bool) (page width height : Nat) : Array Styled.Line := Id.run do
+    (live : Bool) (page width height : Nat) (stale : Array String := #[]) : Array Styled.Line := Id.run do
   let roster := workerRoster ctx steps histories
   let count := roster.size
   if count == 0 then return #[Styled.text "No workers" .muted]
@@ -200,7 +215,7 @@ private def workerGrid (ctx : Context) (run : Run) (steps : Array Trace.Step)
   let pages := max 1 ((count + perPage - 1) / perPage)
   let page := min page (pages - 1)
   let workers := roster.extract (page * perPage) ((page + 1) * perPage)
-  let cards := workers.map fun worker => workerCard ctx run steps entries worker histories live cellWidth cellHeight
+  let cards := workers.map fun worker => workerCard ctx run steps entries worker histories live cellWidth cellHeight stale
   let mut lines := #[Styled.text s!"Workers · {count} total · {page + 1}/{pages} · PgUp/PgDn" .cyan]
   for row in [:((cards.size + columns - 1) / columns)] do
     let mut combined := cards[row * columns]?.getD #[]
@@ -212,7 +227,7 @@ private def workerGrid (ctx : Context) (run : Run) (steps : Array Trace.Step)
 private def branchPanel (ctx : Context) (run : Run) (steps : Array Trace.Step)
     (entries : Array BranchTree.Entry) (row : BranchTree.Row)
     (histories : Array History)
-    (live : Bool) (width height : Nat) (nav : Navigation) : Array Styled.Line := Id.run do
+    (live : Bool) (width height : Nat) (nav : Navigation) (stale : Array String := #[]) : Array Styled.Line := Id.run do
   let own := BranchTree.observations steps row.branch
   let assigned := (entries.find? (·.branch == row.branch)) >>= assignment
   let worker := if live then assigned.map (·.1) else own.back?.map (·.event.worker)
@@ -226,9 +241,10 @@ private def branchPanel (ctx : Context) (run : Run) (steps : Array Trace.Step)
     Styled.text row.status .cyan, Styled.text s!"Source: {sourceLabel run code}" .muted]
   lines := lines ++ sourceRows run code codeRows nav.offset
   if row.fork.isSome then
-    lines := lines ++ workerGrid ctx run steps entries histories live nav.workers width (height - lines.size)
+    lines := lines ++ workerGrid ctx run steps entries histories live nav.workers width (height - lines.size) stale
   else if let some worker := worker then
-    lines := lines ++ #[Styled.text s!"{worker} · {if live then "executing" else "last view"}" .cyan] ++
+    let label := if live && stale.contains worker then "progress stale" else if live then "executing" else "last view"
+    lines := lines ++ #[Styled.text s!"{worker} · {label}" .cyan] ++
       progress ++
       metrics ctx worker (if live then steps else own) histories live width
   else lines := lines.push (Styled.text "No worker executing this branch" .muted)
@@ -240,6 +256,7 @@ def frame (ctx : Context) (run : Run) (steps : Array Trace.Step)
     (status := "") (color := false) (warning := "")
     (timing : Option Timing.Run := none)
     (jobs : Array BranchObservation := #[])
+    (stale : Array String := #[])
     : Array String := Id.run do
   let width := width - 1
   let control := if status.startsWith "paused" then some "paused"
@@ -251,21 +268,22 @@ def frame (ctx : Context) (run : Run) (steps : Array Trace.Step)
   let entries := (BranchTree.current steps jobs).map fun entry =>
     { entry with control := control.getD entry.control }
   let live := status == "result pending"
+  let shared := sharedProgressLines steps
   let mut lines := #[
     Styled.text (pad width s!" {run.id} · {status} · {run.program.entry} / {ctx.project}") .header,
     Styled.text "↑↓: branch (wrap) · ←→: fold · PgUp/PgDn: workers · j/k: code · a: follow source · q: back" .cyan,
-    Styled.text (if live then "LIVE" else "LAST VIEW") .muted]
+    Styled.text (if live then "LIVE" else "LAST VIEW") .muted] ++ shared
   if width < 39 || height < 16 then
     lines := lines.push (Styled.text "Enlarge terminal to at least 40 × 16." .yellow)
   else
     let sidebar := width ≥ 100
     let treeWidth := if sidebar then min 52 (max 38 (width / 4)) else width
     let bodyWidth := if sidebar then width - treeWidth - 3 else width
-    let bodyHeight := height - 5 - (if sidebar then 0 else 5)
+    let bodyHeight := height - 5 - shared.size - (if sidebar then 0 else 5)
     let body := match BranchTree.selected entries nav.tree with
-      | some row => branchPanel ctx run steps entries row histories live bodyWidth bodyHeight nav
+      | some row => branchPanel ctx run steps entries row histories live bodyWidth bodyHeight nav stale
       | none => #[Styled.text "Source: waiting for branch observations" .muted]
-    let tree := BranchTree.lines entries nav.tree (if sidebar then height - 5 else 5) treeWidth timing
+    let tree := BranchTree.lines entries nav.tree (if sidebar then height - 5 - shared.size else 5) treeWidth timing
     lines := lines ++ (if sidebar then beside tree body treeWidth else tree ++ body)
     if !warning.isEmpty then lines := lines.push (Styled.text warning .yellow)
   return (lines.extract 0 (height - 1)).map (fun line => Styled.render line width color)
@@ -324,6 +342,8 @@ private structure View where
   timing : Option Timing.Run := none
   timingAvailable : Bool := false
   jobs : Array BranchObservation := #[]
+  /-- Local monotone receipt times avoid comparing clocks on different nodes. -/
+  progressSeen : Array (String × String × Nat) := #[]
 
 private def loadView (ctx : Context) (run : Run) (previous : View) (interactive : Bool) : Cli View := do
   let status ← status ctx run
@@ -341,12 +361,22 @@ private def loadView (ctx : Context) (run : Run) (previous : View) (interactive 
     (snapshot.nodes.filter (·.id != "scheduler")).map fun node =>
       { name := ctx.node node.id, resources := node.samples, fresh := node.online : History }
     else previous.history
-  return { snapshot, status, timing, timingAvailable, history, jobs }
+  let now ← request .now
+  let mut latest : Std.HashMap String String := {}
+  for step in snapshot.steps do
+    if step.progress.isSome then latest := latest.insert step.event.worker step.id
+  let progressSeen := latest.toArray.map fun (worker, id) =>
+    let previous := previous.progressSeen.find? (fun (w, old, _) => w == worker && old == id)
+    (worker, id, previous.map (·.2.2) |>.getD now)
+  return { snapshot, status, timing, timingAvailable, history, jobs, progressSeen }
 
 private def drawView (ctx : Context) (run : Run) (view : View) (interactive color : Bool)
     (nav : Navigation) (width height : Nat) : Cli Unit := do
+  let now ← request .now
+  let stale := view.progressSeen.filterMap fun (worker, _, time) =>
+    if now - time > 5000 then some worker else none
   let lines := frame ctx run view.snapshot.steps view.history nav width height
-    view.status color view.snapshot.warning view.timing view.jobs
+    view.status color view.snapshot.warning view.timing view.jobs stale
   if interactive then request (.write "\x1b[H\x1b[2J")
   request (.write (String.intercalate "\n" lines.toList ++ "\n"))
   request .flush
@@ -355,7 +385,7 @@ private def lastPage (ctx : Context) (view : View) (width height : Nat) : Nat :=
   let width := width - 1
   let sidebar := width ≥ 100
   let bodyWidth := if sidebar then width - min 52 (max 38 (width / 4)) - 3 else width
-  let bodyHeight := height - 5 - (if sidebar then 0 else 5)
+  let bodyHeight := height - 5 - (sharedProgressLines view.snapshot.steps).size - (if sidebar then 0 else 5)
   let roster := workerRoster ctx view.snapshot.steps view.history
   let count := roster.size
   let height := bodyHeight - 3 - groupCodeRows bodyHeight

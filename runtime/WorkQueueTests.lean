@@ -17,6 +17,24 @@ private def rejects (action : IO α) : IO Unit := do
   assertTrue rejected "Invalid queue operation succeeded"
 
 def run : IO Unit := do
+  -- Adopt queues written before durable progress counters were introduced.
+  IO.FS.withTempFile fun _ path => do
+    let conn ← LeanLinq.Sqlite.connect path.toString
+    try
+      WorkQueueStore.initializeSchema conn
+      discard <| WorkQueueStore.apply conn 0 (request "legacy" (.send #[⟨"A", Json.null⟩]))
+      let batch ← receive conn 0 "legacy"
+      discard <| WorkQueueStore.apply conn 1 (request "legacy" (.acknowledge batch[0]!.receipt))
+      conn.execRaw "DROP TABLE work_totals"
+      WorkQueueStore.initializeSchema conn
+      let stats : WorkQueueProgress ← IO.ofExcept (fromJson? (← WorkQueueStore.apply conn 2 (request "legacy" .progress)))
+      assertEq stats ⟨1, 0⟩ "Legacy acknowledgements were forgotten"
+      discard <| WorkQueueStore.apply conn 3 (request "legacy" (.send #[⟨"B", Json.null⟩]))
+      let batch ← receive conn 3 "legacy"
+      discard <| WorkQueueStore.apply conn 4 (request "legacy" (.complete batch[0]!.receipt true))
+      let stats : WorkQueueProgress ← IO.ofExcept (fromJson? (← WorkQueueStore.apply conn 5 (request "legacy" .progress)))
+      assertEq stats ⟨2, 1⟩ "First new completion double-counted legacy progress"
+    finally conn.close
   IO.FS.withTempFile fun _ path => do
     let conn ← LeanLinq.Sqlite.connect path.toString
     let receipt ← try
@@ -34,6 +52,8 @@ def run : IO Unit := do
     let conn ← LeanLinq.Sqlite.connect path.toString
     try
       WorkQueueStore.initializeSchema conn
+      let progress : WorkQueueProgress ← IO.ofExcept (fromJson? (← WorkQueueStore.apply conn 100 (request "run" .progress)))
+      assertEq progress ⟨1, 0⟩ "Restart lost durable progress"
       let batch ← receive conn 100
       assertEq (batch.map (·.value)) #[toJson "B"] "Restart lost leased work"
       assertTrue (batch[0]!.receipt != receipt) "Redelivery reused the receipt"
@@ -48,7 +68,11 @@ def run : IO Unit := do
       discard <| WorkQueueStore.apply conn 201 (request "run" (.release receipt))
       let next ← receive conn 201
       assertEq next.size 1 "Released work was lost"
-      discard <| WorkQueueStore.apply conn 202 (request "run" (.acknowledge next[0]!.receipt))
+      discard <| WorkQueueStore.apply conn 202 (request "run" (.complete next[0]!.receipt true))
+      discard <| WorkQueueStore.apply conn 202 (request "run" (.complete next[0]!.receipt true))
+      discard <| WorkQueueStore.apply conn 202 (request "run" (.complete receipt true))
+      let progress : WorkQueueProgress ← IO.ofExcept (fromJson? (← WorkQueueStore.apply conn 202 (request "run" .progress)))
+      assertEq progress ⟨2, 1⟩ "Duplicate/expired completion inflated progress"
       assertEq (← WorkQueueStore.apply conn 202 (request "run" .idle)) (toJson true)
       discard <| WorkQueueStore.apply conn 203 (request "run" (.send #[⟨"B", toJson "B"⟩]))
       assertEq (← WorkQueueStore.apply conn 203 (request "run" .idle)) (toJson true)
@@ -78,10 +102,11 @@ def run : IO Unit := do
           let value : Nat ← IO.ofExcept (fromJson? message.value)
           seen.atomically (modify (·.push value))
           queue.renew message.receipt
-          queue.acknowledge message.receipt
+          queue.complete message.receipt (value % 2 == 0)
     assertEq ((← seen.atomically get).qsort (· < ·)) (Array.range 100)
       "Competing HTTP consumers lost or duplicated work"
     assertTrue (← queue.isIdle) "Acknowledged work remained queued"
+    assertEq (← queue.progress) ⟨100, 50⟩ "Concurrent HTTP progress is not deduplicated"
     HttpMailbox.retireWorkQueues endpoints[0]! "concurrent"
     rejects (queue.send #[⟨"late", Json.null⟩])
   IO.println "Work queues: idempotent sends, leases, restart, stale receipts, retirement, concurrent HTTP consumers passed"
