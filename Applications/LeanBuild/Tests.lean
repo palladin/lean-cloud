@@ -139,6 +139,37 @@ private def builderSourceTest : IO Unit := do
   check ((← calls.get) == 2) "Did not inspect both builder branches"
   IO.println "PASS builder exec source locations through replay"
 
+/-- Busy compilers must leave unstarted work available to another worker.
+The slow worker cannot finish until the second worker compiles both fast jobs. -/
+private def admissionTest : IO Unit := do
+  let store := objects (← Std.Mutex.new {})
+  withEnvironment store (pool #[3, 2]) fun env => do
+    let modules : Array LeanBuild.Module := (Array.range 4).map fun i => ⟨s!"Module{i}", #[]⟩
+    let plan := { fixturePlan with modules }
+    let started ← Std.Mutex.new (0 : Nat)
+    let finished ← Std.Mutex.new (0 : Nat)
+    Builders.seed env plan
+    discard <| Parallel.map 2 #[0, 1] fun worker => do
+      let deadline := (← IO.monoMsNow) + 5000
+      if worker == 1 then
+        while (← started.atomically get) < 2 do
+          check ((← IO.monoMsNow) < deadline) "First worker did not fill its compiler slots"
+          IO.sleep 10
+      let capacity := env.workers[worker]!
+      runBuilders { env with currentWorker := capacity } plan fun _ m _ => do
+        if worker == 0 then
+          started.atomically (modify (· + 1))
+          while (← finished.atomically get) < 2 do
+            check ((← IO.monoMsNow) < deadline)
+              "Busy worker reserved unstarted modules needed by an idle worker"
+            IO.sleep 10
+        else
+          finished.atomically (modify (· + 1))
+        return { name := m.name, status := .built }
+    check ((← Builders.results env plan).all (·.status == .built)) "Admission lost module results"
+    check ((← (env.queues.open Builders.queueName).progress) == ⟨4, 0⟩) "Admission lost queue completions"
+  IO.println "PASS busy compilers leave unstarted work available to idle workers"
+
 private def generatedTests : IO Unit := do
   for version in ["4.35.0", "4.35.1", "4.36.0", "5.0.0"] do
     check ((Tools.sourceRelease s!"leanprover/lean4:v{version}").toOption == some version) "Supported release rejected"
@@ -1147,6 +1178,7 @@ private def nativeTests : IO Unit := IO.FS.withTempDir fun cacheRoot => do
 def main (args : List String) : IO Unit := do
   if args == ["--native-only"] then nativeTests; return
   builderSourceTest
+  admissionTest
   generatedTests
   if args.contains "--io" then parallelIOTests (objects (← Std.Mutex.new {}))
   if args.contains "--native" then nativeTests

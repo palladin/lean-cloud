@@ -292,7 +292,10 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
         restoring := restoring.insert name
         spawn (prepare w)
       if idle && work.isEmpty && !receiving then break
-      let admission := 2 * slots - (waiting.size + restoring.size + ready.size + compiling.size)
+      -- Preparation reserves a compiler slot; do not lease an extra local
+      -- backlog while other workers could run it. Artifact prefetching is
+      -- independent, and publication does not occupy a compiler slot.
+      let admission := slots - (waiting.size + restoring.size + ready.size + compiling.size)
       if !receiving && admission > 0 && work.size < capacity && (← IO.monoMsNow) ≥ nextReceive then
         receiving := true
         let count := min 100 (min admission (capacity - work.size))

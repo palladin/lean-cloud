@@ -37,9 +37,11 @@ The Cloud workflow has five stages:
 
 Each builder restores the prepared sources once and loads Lake once. A bounded
 pipeline receives ready work, restores missing prerequisites, compiles modules
-and publishes their artifacts concurrently. Small queue receives fill available
-capacity immediately; they do not define execution batches. Shared prerequisite
-files are transferred once, and concurrent preparations await the same transfer.
+and publishes their artifacts concurrently. Queue receives claim only enough
+modules to fill free compiler slots, counting preparation against that budget.
+A busy worker leaves additional modules available to other workers. Receives do
+not define execution batches. Shared prerequisite files are transferred once,
+and concurrent preparations await the same transfer.
 
 Every worker also follows a durable completion feed with its own cursor and
 prefetches new artifacts while Lake is busy. Dequeuing a module waits only for
@@ -246,7 +248,8 @@ lake build cloud_app build_local build_tests
 ```
 
 Tests compare direct/replay execution on 40 generated DAGs. They cover concurrent
-builder sessions, progress without round barriers, interruption between result
+builder sessions, admission that leaves work available to idle workers, progress
+without round barriers, interruption between result
 publication and notification, cancellation, blocked dependencies, durable errors,
 cache reuse and integrity. A native rendezvous verifies concurrent publications
 while another compiler in the same session is still running. A single-worker
