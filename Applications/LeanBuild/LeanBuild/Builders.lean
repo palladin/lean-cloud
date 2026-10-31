@@ -1,4 +1,5 @@
 import LeanBuild.Model
+import LeanBuild.Dependencies
 import LeanBuild.Prefetch
 import LeanCloudRuntime.Parallel
 import Std.Sync.Channel
@@ -52,23 +53,36 @@ def results (env : Environment IO) (plan : Plan) : IO (Array BuildResult) :=
 
 private structure State where
   results : Std.HashMap String BuildResult := {}
+  reading : Std.HashMap String (IO.Promise (Except IO.Error (Option BuildResult))) := {}
+  /-- Artifacts and their full ancestry have finished preparation on this worker. -/
+  prepared : Std.HashSet String := {}
 
 /-- Only committed successes/failures are cached. Missing results may become
 available at any time, so a negative lookup is never retained. -/
-private def read (env : Environment IO) (state : Std.Mutex State) (name : String) : IO (Option BuildResult) := do
-  if let some result ← state.atomically do return (← get).results[name]? then return some result
-  let result ← readResult env name
-  if let some result := result then
-    state.atomically (modify fun s => { s with results := s.results.insert name result })
-  return result
-
-/-- Union of transitive prerequisites, in the plan's topological order. -/
-private def dependencies (modules targets : Array Module) : Array Module := Id.run do
-  let mut needed := targets.foldl (fun set m => m.imports.foldl (·.insert ·) set) ({} : Std.HashSet String)
-  for m in modules.reverse do
-    if needed.contains m.name then needed := m.imports.foldl (·.insert ·) needed
-  return modules.filter (needed.contains ·.name)
-
+private def read (env : Environment IO) (state : Std.Mutex State)
+    (limit : Parallel.Limit) (name : String) : IO (Option BuildResult) := do
+  let entry : BuildResult ⊕ (IO.Promise (Except IO.Error (Option BuildResult)) × Bool) ← state.atomically do
+    let s ← get
+    if let some result := s.results[name]? then return .inl result
+    if let some pending := s.reading[name]? then return .inr (pending, false)
+    let pending ← IO.Promise.new
+    set { s with reading := s.reading.insert name pending }
+    return .inr (pending, true)
+  match entry with
+  | .inl result => return some result
+  | .inr (pending, owner) =>
+    if owner then
+      -- Only the owner consumes IO capacity. Concurrent lookups share its
+      -- result, including absence/errors; later lookups retry those outcomes.
+      let outcome ← (limit.run (readResult env name)).toBaseIO
+      state.atomically do
+        modify fun s => { s with
+          reading := s.reading.erase name
+          results := match outcome with
+            | .ok (some result) => s.results.insert name result
+            | _ => s.results }
+      pending.resolve outcome
+    IO.ofExcept (← IO.wait pending.result!)
 
 /-- Reserve headroom for scheduling, hashing and compression. This is a budget,
 not CPU affinity. A single-CPU worker still has one compilation slot. -/
@@ -83,6 +97,8 @@ compilation concurrency. Only the coordinator calls submit/poll. Preparation
 and publication run in separate bounded pools. -/
 structure Engine (α : Type) where
   prefetch : CancellationToken IO → Array BuildResult → IO Unit := fun _ _ => pure ()
+  /-- Direct parents plus ancestors not already prepared by this session.
+  Successful preparation/prefetch must retain their installed artifacts. -/
   prepare : CancellationToken IO → Module → Array BuildResult → IO Unit
   submit : Module → IO Unit
   poll : IO (Array (String × α))
@@ -141,7 +157,7 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
   let queue := env.queues.open queueName
   let cache ← Std.Mutex.new ({} : State)
   let reads ← Parallel.Limit.new (ioConcurrency env.currentWorker.cpus)
-  let read := fun name => reads.run (read env cache name)
+  let read := read env cache reads
   let control ← Std.Mutex.new ({} : Control)
   let stop : CancellationToken IO := ⟨do
     return (← env.cancellation.isRequested) || (← control.atomically do return (← get).stopped)⟩
@@ -157,12 +173,15 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
   let ioSlots := max 2 (min 8 env.currentWorker.cpus)
   let capacity := 3 * slots + ioSlots
   let activity ← Std.Mutex.new "Starting Lake"
-  let byName := plan.modules.foldl (fun map m => map.insert m.name m) ({} : Std.HashMap String Module)
+  let byName := Dependencies.index plan.modules
   let scores := priorities plan.modules
-  let inputs (m : Module) : IO (Array BuildResult) :=
-    Parallel.map (ioConcurrency env.currentWorker.cpus) (dependencies plan.modules #[m]) fun dep => do
+  let inputs (m : Module) : IO (Array BuildResult) := do
+    let missing ← IO.ofExcept (Dependencies.missing byName (← cache.atomically do return (← get).prepared) m.imports)
+    Parallel.map (ioConcurrency env.currentWorker.cpus) missing fun dep => do
       let some result ← read dep.name | throw (IO.userError "Missing transitive prerequisite")
       return result
+  let prepared (inputs : Array BuildResult) : IO Unit := cache.atomically do
+    modify fun s => { s with prepared := inputs.foldl (fun names r => names.insert r.name) s.prepared }
   let dependents := plan.modules.foldl (fun map m => m.imports.foldl (fun map dep =>
     map.insert dep ((map[dep]?.getD #[]).push m)) map) ({} : Std.HashMap String (Array Module))
   let settle (work : Work) (result : BuildResult) : IO Unit := do
@@ -197,8 +216,12 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
       settle work (← publishResult env {
         name := work.mod.name, status := .blocked, message := "A prerequisite failed" })
     else
-      engine.prepare stop work.mod (← inputs work.mod)
-      unless ← stop.isRequested do events.sync.send (.prepared work.mod.name)
+      let missing ← inputs work.mod
+      let direct := parents.filterMap id
+      engine.prepare stop work.mod (direct ++ missing.filter (fun r => !work.mod.imports.contains r.name))
+      unless ← stop.isRequested do
+        prepared missing
+        events.sync.send (.prepared work.mod.name)
   -- Renewal is independent of telemetry and compiler activity.
   let renewer ← IO.asTask (do
     try
@@ -232,7 +255,10 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
         -- Failed/early deliveries are handled by the owning builder; there are
         -- no valid artifacts to warm until every prerequisite has succeeded.
         unless parents.all (fun result => result.any (·.status == .built)) do return
-        engine.prefetch stop (← inputs m)
+        let missing ← inputs m
+        unless missing.isEmpty do
+          engine.prefetch stop missing
+          unless ← stop.isRequested do prepared missing
     catch error =>
       control.atomically (modify fun s => { s with stopped := true, error := s.error.orElse (fun _ => some error) })) .dedicated
   try

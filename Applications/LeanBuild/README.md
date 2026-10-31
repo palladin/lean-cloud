@@ -60,6 +60,10 @@ new high-priority modules overtake unstarted downloads. Free download slots refi
 without waiting for a whole page. It does not download unrelated completed
 modules. Dequeuing a module waits only for prerequisites still missing or in
 flight; preparation and prefetch share transfers and the local cache.
+Dependency lookup follows the requested ancestry and stops at subtrees already
+prepared on that worker. It does not scan the full DAG or pass every historical
+prerequisite through the download pool again. Concurrent lookups share result
+reads and module installations; cache hits and waiters consume no transfer slots.
 Artifact bytes travel directly from blob storage. Read and upload pools each allow up to
 `min 32 (max 4 (4 × CPUs))` concurrent transfers, shared across nested operations.
 Compilation still uses `max 1 (CPUs − 1)` slots.
@@ -271,6 +275,8 @@ rendezvous checks that newly ready dependencies advance before an unrelated slow
 compiler completes. Native compiler processes also verify that Lake queues
 replacements while all slots are occupied, starts them without another request,
 and keeps the compiler limit, including on a single-CPU worker.
+Incremental prerequisite lookup is compared with full DAG traversal, and shared
+installation tests cover concurrent reads, failures and retry from a cold workspace.
 Native fixtures compare output with ordinary Lake and
 cover libraries, executables, C FFI, generated/custom targets and restored artifacts.
 Runtime tests separately exercise the same HTTP/SQLite queue's leases, reopening,

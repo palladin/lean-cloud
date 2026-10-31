@@ -179,6 +179,33 @@ private def admissionTest : IO Unit := do
     check ((← (env.queues.open Builders.queueName).progress) == ⟨12, 0⟩) "Admission lost queue completions"
   IO.println "PASS queued replacements, bounded compilation and work sharing between workers"
 
+private def dependencyTests : IO Unit := do
+  for seed in [:40] do
+    let modules := (Array.range 80).map fun i => {
+      name := s!"M{i}", imports := ((Array.range i).filter fun j =>
+        (i * 37 + j * 7 + seed) % 11 == 0).map (s!"M{·}") : LeanBuild.Module }
+    let index := Dependencies.index modules
+    for m in modules do
+      -- A topological prefix is closed under ancestry, just like successfully
+      -- prepared artifacts. Compare against the original whole-plan walk.
+      let prepared := (modules.extract 0 (seed % 30)).foldl (fun s m => s.insert m.name) ({} : Std.HashSet String)
+      let mut expected := m.imports.foldl (·.insert ·) ({} : Std.HashSet String)
+      for dep in modules.reverse do
+        if expected.contains dep.name then expected := dep.imports.foldl (·.insert ·) expected
+      let required := modules.filter fun m => expected.contains m.name && !prepared.contains m.name
+      let missing ← IO.ofExcept (Dependencies.missing index prepared m.imports)
+      check (missing.size == required.size && missing.all (fun m => required.any (·.name == m.name)))
+        "Pruning prepared ancestry changed the required inputs"
+      let mut ready := prepared
+      for dep in missing do
+        check (dep.imports.all ready.contains) "Missing inputs were not in dependency order"
+        ready := ready.insert dep.name
+  let chain := (Array.range 20000).map fun i =>
+    ⟨s!"M{i}", if i == 0 then #[] else #[s!"M{i - 1}"]⟩
+  let missing ← IO.ofExcept (Dependencies.missing (Dependencies.index chain) {} #["M19999"])
+  check (missing.size == 20000) "Long dependency chain was truncated"
+  IO.println "PASS incremental prerequisites against 40 full DAG walks and a 20,000-module chain"
+
 private def priorityTests : IO Unit := do
   let modules : Array LeanBuild.Module := #[⟨"A", #[]⟩, ⟨"B", #[]⟩,
     ⟨"C", #[]⟩, ⟨"D", #["C"]⟩, ⟨"E", #["D"]⟩, ⟨"F", #["E"]⟩]
@@ -305,6 +332,40 @@ private def generatedTests : IO Unit := do
   check ((fromJson? (α := LeanBuild.Limits) ((toJson request.limits).setObjVal! "unknown" Json.null)).toOption.isNone)
     "Unknown limit was silently ignored"
   let store := objects (← Std.Mutex.new {})
+  -- Concurrent preparations/prefetches share one slow result lookup, then keep
+  -- using its positive cache entry without consuming transfer capacity.
+  withEnvironment store (pool #[3]) fun env => do
+    let modules := #[⟨"Root", #[]⟩] ++ (Array.range 16).map (fun i => ⟨s!"Child{i}", #["Root"]⟩)
+    let plan := { fixturePlan with modules }
+    discard <| Builders.publishResult env { name := "Root", status := .built }
+    let queue := env.queues.open Builders.queueName
+    queue.send ((modules.extract 1 modules.size).map fun m => ⟨m.name, toJson m.name, 0⟩)
+    let some names := env.blobs.names | throw (IO.userError "Missing result names")
+    let reads ← Std.Mutex.new (0 : Nat)
+    let env := { env with blobs.names := some { names with read := fun name => do
+      if name == Builders.resultName "Root" then
+        reads.atomically (modify (· + 1))
+        IO.sleep 100
+      names.read name } }
+    runBuilders env plan fun _ m _ => pure { name := m.name, status := .built }
+    check ((← reads.atomically get) == 1) "Concurrent consumers repeated the same result lookup"
+  -- A later build gets its direct parent, but not that parent's already
+  -- installed ancestry. Disable speculative work to observe foreground reuse.
+  withEnvironment store (pool #[2]) fun env => do
+    let plan := { fixturePlan with modules := #[⟨"Base", #[]⟩, ⟨"Shared", #["Base"]⟩,
+      ⟨"First", #["Shared"]⟩, ⟨"Next", #["First"]⟩] }
+    for name in ["Base", "Shared"] do
+      discard <| Builders.publishResult env { name, status := .built }
+    let queue := env.queues.open Builders.queueName
+    queue.send #[⟨"First", toJson "First", 0⟩]
+    let env := { env with queues := ⟨fun _ => { queue with peek := fun _ _ => pure #[] }⟩ }
+    runBuilders env plan fun _ m inputs => do
+      if m.name == "First" then
+        check (inputs.size == 2) "Cold preparation omitted a transitive prerequisite"
+      else
+        check (m.name == "Next" && inputs.map (·.name) == #["First"])
+          "Warm preparation repeated already installed ancestry"
+      return { name := m.name, status := .built }
   for seed in [:40] do
     let modules := (Array.range (4 + seed % 12)).map fun i => {
       name := s!"M{i}", imports := ((Array.range i).filter fun j =>
@@ -1130,6 +1191,44 @@ private def backendCacheTests (tools : Tools) (store : ObjectStore) (fixture : S
     check (again.status == .built) s!"Repeated finish lost its cache: {again.message}"
     IO.println "PASS prepare/build producer cache and finish with all artifact downloads disabled"
 
+/-- A cold worker's concurrent children/prefetches share their parent's manifest
+and transfer. An owner failure wakes waiters and releases claims for a retry. -/
+private def sharedInstallationTest (tools : Tools) (store : ObjectStore) (fixture : System.FilePath) : IO Unit :=
+  IO.FS.withTempDir fun root => do
+    let directory := root / "project"
+    IO.FS.createDir directory
+    copyFixture fixture directory
+    let tools := { tools with threads := 3, cache := none }
+    let prepared ← tools.prepareDirectory store request directory "fixture"
+    let some plan := prepared.plan | throw (IO.userError "Cannot prepare shared installation fixture")
+    let basePlan := { plan with modules := plan.modules.filter (·.name == "Fixture.Base") }
+    withEnvironment store (pool #[3]) fun env => do
+      Builders.seed env basePlan
+      tools.builder store env request basePlan
+      let some base ← Builders.readResult env "Fixture.Base" | throw (IO.userError "Missing Base result")
+      let some artifacts := base.artifacts | throw (IO.userError "Missing Base artifacts")
+      (env.queues.open Builders.queueName).send #[
+        ⟨"Fixture.Left", toJson "Fixture.Left", 0⟩, ⟨"Fixture.Right", toJson "Fixture.Right", 0⟩]
+      let broken := { store with read := fun key => do
+        if key == artifacts.manifest.key then
+          IO.sleep 100
+          throw (IO.userError "Shared installation failed")
+        store.read key }
+      let failed ← try tools.builder broken env request plan; pure false
+        catch error => pure (error.toString == "Shared installation failed")
+      check failed "Shared installation swallowed its owner's failure"
+      let reads ← Std.Mutex.new (0 : Nat)
+      let measured := { store with read := fun key => do
+        if key == artifacts.manifest.key then
+          reads.atomically (modify (· + 1))
+          IO.sleep 100
+        store.read key }
+      tools.builder measured env request plan
+      check ((← reads.atomically get) == 1) "Concurrent installations repeated the shared manifest download"
+      check ((← Builders.results env plan).all (·.status == .built))
+        "Shared installation lost work after failure"
+    IO.println "PASS shared artifact installation, failure joins, retry and one manifest download"
+
 private def toolchainTests : IO Unit :=
   IO.FS.withTempDir fun root => do
     let source := root / "release/bin"
@@ -1199,6 +1298,7 @@ private def nativeTests : IO Unit := IO.FS.withTempDir fun cacheRoot => do
   workspaceTests store
   parallelIOTests store
   backendCacheTests tools store fixture
+  sharedInstallationTest tools store fixture
   let built ← nativeTest tools store fixture (environment := pool #[2, 2])
   requireSuccess store built
   check (built.modules.size == 4 && built.build.status == .built) "Build report is incorrect"
@@ -1378,6 +1478,7 @@ def main (args : List String) : IO Unit := do
   if args == ["--native-only"] then nativeTests; return
   builderSourceTest
   admissionTest
+  dependencyTests
   priorityTests
   prefetchTests
   generatedTests

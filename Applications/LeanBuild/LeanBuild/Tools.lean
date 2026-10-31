@@ -200,6 +200,7 @@ private def finishTargets (tools : Tools) (store : ObjectStore) (request : Reque
 
 private structure Installed where
   modules : Std.HashMap String FileRef := {}
+  installing : Std.HashMap String (FileRef × IO.Promise (Except IO.Error Unit)) := {}
   files : Std.HashMap String Bundle.Entry := {}
   transfers : Std.HashMap String (Task (Except IO.Error Unit)) := {}
 
@@ -221,33 +222,58 @@ private structure ModuleCompletion where
 
 /-- Reserve each immutable prerequisite path once. Other preparations await the
 same transfer; conflicting bytes fail before installation. No lock spans IO. -/
+private def installModule (tools : Tools) (store : ObjectStore) (directory : System.FilePath)
+    (request : Request) (session : Workspace.Session) (installed : Std.Mutex Installed)
+    (stop : CancellationToken IO) (input : BuildResult) (ref : FileRef) : IO Unit := do
+  if ← stop.isRequested then return
+  let manifest ← session.readManifest ref
+  let transfers ← installed.atomically do
+    let previous ← get
+    let mut state ← IO.ofExcept (previous.remember manifest)
+    let mut waiting := manifest.filterMap fun entry => previous.transfers[entry.path]?
+    let missing := manifest.filter fun entry => !previous.files.contains entry.path
+    unless missing.isEmpty do
+      -- Restore a module's pack together, rather than re-reading the whole
+      -- pack for each file. All overlapping preparations await this task.
+      let task ← IO.asTask (Bundle.restore store directory missing
+        request.limits.bytes tools.cache 1) .dedicated
+      state := { state with transfers := missing.foldl (fun tasks entry => tasks.insert entry.path task) state.transfers }
+      waiting := waiting.push task
+    set state
+    return waiting
+  try
+    for task in transfers do IO.ofExcept (← IO.wait task)
+  finally
+    for task in transfers do discard <| IO.wait task
+  installed.atomically (modify fun s => { s with modules := s.modules.insert input.name ref })
+
+/-- Share manifest reads and installation, not just pack transfers. Waiters do
+not consume an IO permit, leaving capacity for other missing prerequisites. -/
 private def install (tools : Tools) (store : ObjectStore) (directory : System.FilePath)
     (request : Request) (session : Workspace.Session) (installed : Std.Mutex Installed)
     (limit : Parallel.Limit) (stop : CancellationToken IO) (inputs : Array BuildResult) : IO Unit := do
-  discard <| Parallel.map (Builders.ioConcurrency tools.threads) inputs fun input => limit.run do
+  -- Filter cache hits before allocating a task pool.
+  let missing ← installed.atomically do
+    let state ← get
+    return inputs.filter fun input => input.artifacts.isNone || state.modules[input.name]? != input.artifacts
+  discard <| Parallel.map (Builders.ioConcurrency tools.threads) missing fun input => do
     if ← stop.isRequested then return
     let some ref := input.artifacts | throw (IO.userError "Missing prerequisite artifacts")
-    if (← installed.atomically do return (← get).modules[input.name]?) == some ref then return
-    let manifest ← session.readManifest ref
-    let transfers ← installed.atomically do
-      let previous ← get
-      let mut state ← IO.ofExcept (previous.remember manifest)
-      let mut waiting := manifest.filterMap fun entry => previous.transfers[entry.path]?
-      let missing := manifest.filter fun entry => !previous.files.contains entry.path
-      unless missing.isEmpty do
-        -- Restore a module's pack together, rather than re-reading the whole
-        -- pack for each file. All overlapping preparations await this task.
-        let task ← IO.asTask (Bundle.restore store directory missing
-          request.limits.bytes tools.cache 1) .dedicated
-        state := { state with transfers := missing.foldl (fun tasks entry => tasks.insert entry.path task) state.transfers }
-        waiting := waiting.push task
-      set state
-      return waiting
-    try
-      for task in transfers do IO.ofExcept (← IO.wait task)
-    finally
-      for task in transfers do discard <| IO.wait task
-    installed.atomically (modify fun s => { s with modules := s.modules.insert input.name ref })
+    let entry ← installed.atomically do
+      let s ← get
+      if s.modules[input.name]? == some ref then return none
+      if let some (other, pending) := s.installing[input.name]? then
+        unless other == ref do throw (IO.userError "Conflicting module artifacts")
+        return some (pending, false)
+      let pending ← IO.Promise.new
+      set { s with installing := s.installing.insert input.name (ref, pending) }
+      return some (pending, true)
+    if let some (pending, owner) := entry then
+      if owner then
+        let outcome ← (limit.run (installModule tools store directory request session installed stop input ref)).toBaseIO
+        installed.atomically (modify fun s => { s with installing := s.installing.erase input.name })
+        pending.resolve outcome
+      IO.ofExcept (← IO.wait pending.result!)
 
 private def publishModule (tools : Tools) (store : ObjectStore) (directory : System.FilePath)
     (request : Request) (session : Workspace.Session) (installed : Std.Mutex Installed)
