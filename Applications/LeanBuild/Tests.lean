@@ -115,6 +115,62 @@ private def runBuilders (env : Environment IO) (plan : Plan)
     cancel := do for (_, task) in ← running.get do discard <| IO.wait task }
   Builders.run env plan engine
 
+/-- A ready successor runs while a wide successor is still checking parents.
+The predecessor stays leased until both notifications have succeeded. -/
+private def successorTests : IO Unit := do
+  let store := objects (← Std.Mutex.new {})
+  withEnvironment store (pool #[2]) fun env => do
+    let parents := (Array.range 8).map (s!"Parent{·}")
+    let plan := { fixturePlan with modules := parents.map (fun name => ⟨name, #[]⟩) ++
+      #[⟨"Root", #[]⟩, ⟨"Wide", #["Root"] ++ parents⟩, ⟨"Child", #["Root"]⟩] }
+    for name in parents do
+      discard <| Builders.publishResult env { name, status := .built }
+    let queue := env.queues.open Builders.queueName
+    queue.send #[⟨"Root", toJson "Root", 1⟩]
+    let child ← IO.mkRef false
+    let visible ← IO.mkRef false
+    let notified ← IO.mkRef false
+    let rootReceipt ← IO.mkRef ""
+    let reads ← Std.Mutex.new ((0, 0) : Nat × Nat)
+    let some names := env.blobs.names | throw (IO.userError "Missing result names")
+    let env := { env with
+      progress := ⟨fun slot update => do
+        if slot == "worker" && (update.message.splitOn "uploading 0").length > 1 &&
+            (update.message.splitOn "unlocking 1").length > 1 then visible.set true⟩
+      queues := ⟨fun _ => { queue with
+        receive := fun count => do
+          let values ← queue.receive count
+          for value in values do
+            if value.value == toJson "Root" then rootReceipt.set value.receipt
+          return values
+        send := fun values => do
+          queue.send values
+          if values.any (·.key == "Wide") then notified.set true
+        complete := fun receipt failed => do
+          if receipt == (← rootReceipt.get) then
+            check (← notified.get) "Predecessor acknowledged before every successor notification"
+          queue.complete receipt failed }⟩
+      blobs.names := some { names with read := fun name => do
+        if (parents.map Builders.resultName).contains name then
+          reads.atomically (modify fun (active, peak) => (active + 1, max peak (active + 1)))
+          try
+            let deadline := (← IO.monoMsNow) + 5000
+            while !(← child.get) || !(← visible.get) || (← reads.atomically get).2 < 2 do
+              check ((← IO.monoMsNow) < deadline)
+                "A wide successor blocked ready work, parallel parent reads, or accurate progress"
+              IO.sleep 10
+            names.read name
+          finally reads.atomically (modify fun (active, peak) => (active - 1, peak))
+        else names.read name } }
+    runBuilders env plan fun _ m _ => do
+      if m.name == "Child" then child.set true
+      pure { name := m.name, status := .built }
+    let (active, peak) ← reads.atomically get
+    check (active == 0 && peak ≥ 2 && peak ≤ 4 && (← visible.get))
+      "Successor checks lost their IO bound or uploaded/unlocking distinction"
+    check ((← queue.progress).completed == 3) "Successor notification lost work"
+  IO.println "PASS independent successor delivery, concurrent parent checks, unlocking progress and acknowledgement order"
+
 private def builderSourceTest : IO Unit := do
   let sources : Array ProgramSource := cloud_sources%
   let current ← IO.mkRef (none : Option SourceSiteId)
@@ -418,16 +474,17 @@ private def generatedTests : IO Unit := do
       if m.name == "Child" then child.set true
       return { name := m.name, status := .built }
     check (← child.get) "Dependent module was never built"
-  -- Other workers hold Gate/Far. Finishing Root must stop probing Target at
-  -- missing Gate, rather than reading all of Target's unfinished prerequisites.
+  -- Other workers hold the parents. A missing dependency stops new probes;
+  -- only the bounded set of checks already in flight may finish.
   withEnvironment store (pool #[2]) fun env => do
-    let plan := { fixturePlan with modules := #[⟨"Gate", #[]⟩, ⟨"Far", #[]⟩,
-      ⟨"Root", #[]⟩, ⟨"Target", #["Root", "Gate", "Far"]⟩] }
+    let parents := (Array.range 64).map (s!"Parent{·}")
+    let plan := { fixturePlan with modules := parents.map (fun name => ⟨name, #[]⟩) ++
+      #[⟨"Root", #[]⟩, ⟨"Target", #["Root"] ++ parents⟩] }
     Builders.seed env plan
     let queue := env.queues.open Builders.queueName
-    discard (queue.receive 2)
+    discard (queue.receive 64)
     let stopped ← IO.mkRef false
-    let probes ← IO.mkRef (#[] : Array String)
+    let probes ← Std.Mutex.new (#[] : Array String)
     let some names := env.blobs.names | throw (IO.userError "Missing result names")
     let env := { env with
       cancellation := ⟨stopped.get⟩
@@ -435,11 +492,12 @@ private def generatedTests : IO Unit := do
         queue.complete receipt failed
         stopped.set true }⟩
       blobs.names := some { names with read := fun name => do
-        probes.modify (·.push name)
+        probes.atomically (modify (·.push name))
         names.read name } }
     runBuilders env plan fun _ m _ => pure { name := m.name, status := .built }
-    check (!(← probes.get).contains (Builders.resultName "Far"))
-      "Publication fetched prerequisites after a known missing dependency"
+    let fetched := (← probes.atomically get).filter (fun name => (parents.map Builders.resultName).contains name)
+    check (!fetched.isEmpty && fetched.size ≤ Builders.ioConcurrency 2)
+      "A missing dependency did not stop new parallel readiness checks"
   -- A busy compiler must warm the next queued module's prerequisites, without
   -- downloading unrelated completed artifacts or reserving the next module.
   withEnvironment store (pool #[2]) fun env => do
@@ -1012,6 +1070,27 @@ private def workspaceTests (store : ObjectStore) : IO Unit := IO.FS.withTempDir 
   IO.println "PASS reusable workspaces: no redundant transfers, replay isolation, corruption repair, interrupted/failed attempts"
 
 private def parallelIOTests (store : ObjectStore) : IO Unit := do
+  -- Short-circuiting joins in-flight checks, including on exceptions.
+  for outcome in [true, false] do
+    let active ← Std.Mutex.new ((0, 0, 0) : Nat × Nat × Nat)
+    let result ← (Parallel.all 3 (Array.range 12) fun i => do
+      active.atomically (modify fun (n, peak, calls) => (n + 1, max peak (n + 1), calls + 1))
+      try
+        let deadline := (← IO.monoMsNow) + 3000
+        while (← active.atomically get).2.1 < 3 do
+          check ((← IO.monoMsNow) < deadline) "Parallel checks did not overlap"
+          IO.sleep 1
+        if i == 0 then
+          if outcome then return false else throw (IO.userError "Expected check failure")
+        IO.sleep 40
+        return true
+      finally active.atomically (modify fun (n, peak, calls) => (n - 1, peak, calls))).toBaseIO
+    check (match result with | .ok value => outcome && !value | .error _ => !outcome)
+      "Parallel checks lost false/exception result"
+    check ((← active.atomically get) == (0, 3, 3))
+      "Parallel checks did not short-circuit or join in-flight IO"
+  check (← Parallel.all 3 (Array.range 12) (fun _ => pure true)) "All-true check failed"
+  check (← Parallel.all 3 (#[] : Array Nat) (fun _ => pure false)) "Empty check failed"
   -- A rendezvous proves actual overlap, without relying on elapsed speedup.
   let counts ← Std.Mutex.new ((0, 0) : Nat × Nat)
   let values ← Parallel.map 3 (Array.range 12) fun i => do
@@ -1481,6 +1560,7 @@ def main (args : List String) : IO Unit := do
   dependencyTests
   priorityTests
   prefetchTests
+  successorTests
   generatedTests
   if args.contains "--io" then parallelIOTests (objects (← Std.Mutex.new {}))
   if args.contains "--native" then nativeTests

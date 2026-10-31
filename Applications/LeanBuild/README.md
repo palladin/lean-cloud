@@ -91,6 +91,8 @@ and blob storage, not through the scheduler.
 
 Module names are idempotent queue keys: several parents can announce the same
 ready module without creating more work, even after its acknowledgement.
+Each ready successor is enqueued immediately. Other successors check uncached
+parents with bounded parallel IO and stop when a missing parent is found.
 Queue deliveries have renewable leases and may repeat. Artifacts are uploaded
 before publishing an immutable, run-scoped result; notifications precede ACK.
 After interruption, redelivery reuses a committed result and repeats any needed
@@ -107,8 +109,10 @@ HTTP clients retry transient connection failures and temporary service responses
 with bounded backoff and jitter before reporting an exhausted operation as an error.
 
 `watch` shows one shared module completion counter and each worker's submitted
-Lake jobs (running plus queued), compiler-slot budget, restoring, ready and
-publishing counts. Queued jobs do not imply extra active compilers.
+Lake jobs (running plus queued), compiler-slot budget, restoring, ready, uploading,
+awaiting-upload and unlocking counts. Unlocking checks dependent work after the
+result is durable; it does not occupy an upload slot. Queued jobs do not imply
+extra active compilers.
 Failed/blocked modules are included in
 completed work and displayed separately. The service updates the durable counter
 atomically with settlement; repeated acknowledgements cannot inflate it. Workers

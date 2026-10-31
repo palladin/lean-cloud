@@ -47,4 +47,28 @@ def map (concurrency : Nat) (items : Array α) (action : α → IO β) : IO (Arr
   finally
     for task in ← tasks.get do discard <| IO.wait task
 
+/-- Check concurrently, stopping new checks after the first false result or
+exception. Already started checks are joined before returning. -/
+def all (concurrency : Nat) (items : Array α) (check : α → IO Bool) : IO Bool := do
+  let count := min (max 1 concurrency) items.size
+  if count ≤ 1 then return ← items.allM check
+  let next ← Std.Mutex.new (0 : Nat)
+  let passed ← Std.Mutex.new true
+  discard <| map count (Array.range count) fun _ => do
+    try
+      repeat
+        let index ← next.atomically do
+          let index ← get
+          set (index + 1)
+          return index
+        let some item := items[index]? | break
+        unless ← check item do
+          next.atomically (set items.size)
+          passed.atomically (set false)
+          break
+    catch error =>
+      next.atomically (set items.size)
+      throw error
+  passed.atomically get
+
 end LeanCloudRuntime.Parallel

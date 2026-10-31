@@ -129,6 +129,7 @@ private structure Work where
 private inductive Event where
   | received (claims : Array Claim) (idle : Bool)
   | prepared (name : String)
+  | unlocking (name : String)
   | settled (name : String)
 
 private structure Control where
@@ -187,16 +188,22 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
   let settle (work : Work) (result : BuildResult) : IO Unit := do
     if ← stop.isRequested then return
     cache.atomically (modify fun s => { s with results := s.results.insert result.name result })
+    events.sync.send (.unlocking work.mod.name)
     let candidates := dependents[result.name]?.getD #[]
-    -- Stop checking a candidate as soon as one prerequisite is missing. Eagerly
-    -- reading every parent of every dependent adds IO on the publication path.
-    let ready ← Parallel.map (ioConcurrency env.currentWorker.cpus) candidates fun m => do
-      if ← m.imports.allM (fun name => return (← read name).isSome) then
-        return some (item scores m)
-      return none
-    let ready := ready.filterMap id
-    for offset in [:((ready.size + 99) / 100)] do
-      queue.send (ready.extract (offset * 100) ((offset + 1) * 100))
+    let concurrency := ioConcurrency env.currentWorker.cpus
+    let checks := max 1 (min concurrency candidates.size)
+    -- Share the IO budget between candidates and their uncached parents.
+    -- A large join can check parents concurrently without delaying delivery
+    -- of another successor that is already ready.
+    discard <| Parallel.map checks candidates fun m => do
+      let missing ← cache.atomically do
+        let known := (← get).results
+        return m.imports.filter fun name => !known.contains name
+      if ← Parallel.all (concurrency / checks) missing (fun name => return (← read name).isSome) then
+        unless ← stop.isRequested do queue.send #[item scores m]
+    -- Keep the receipt live until EVERY notification succeeds. A crash retries
+    -- notifications from the committed result without recompiling the module.
+    if ← stop.isRequested then return
     work.claims.atomically do
       for claim in ← get do claim.settle queue (result.status != .built)
     events.sync.send (.settled work.mod.name)
@@ -268,7 +275,8 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
     let mut ready : Array String := #[]
     let mut submitted : Std.HashSet String := {}
     let mut completed : Array (String × α) := #[]
-    let mut publishing : Std.HashSet String := {}
+    let mut uploading : Std.HashSet String := {}
+    let mut unlocking : Std.HashSet String := {}
     let mut receiving := false
     let mut idle := false
     let mut nextReceive := 0
@@ -299,6 +307,10 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
           unless restoring.contains name do throw (IO.userError "Unexpected preparation")
           restoring := restoring.erase name
           ready := ready.push name
+        | .unlocking name =>
+          restoring := restoring.erase name
+          uploading := uploading.erase name
+          unlocking := unlocking.insert name
         | .settled name =>
           -- A duplicate receipt can arrive during settlement. Settle any late
           -- receipts using the same committed result on the next pass.
@@ -310,7 +322,8 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
               continue
           work := work.erase name
           restoring := restoring.erase name
-          publishing := publishing.erase name
+          uploading := uploading.erase name
+          unlocking := unlocking.erase name
       for (name, result) in ← engine.poll do
         unless submitted.contains name do throw (IO.userError "Unknown or duplicate Lake completion")
         submitted := submitted.erase name
@@ -321,11 +334,11 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
         let some w := work[name]? | throw (IO.userError "Missing prepared work")
         engine.submit w.mod
         submitted := submitted.insert name
-      while publishing.size < ioSlots && !completed.isEmpty do
+      while uploading.size < ioSlots && !completed.isEmpty do
         let some (name, value) := completed[0]? | break
         completed := completed.extract 1 completed.size
         let some w := work[name]? | throw (IO.userError "Missing compiled work")
-        publishing := publishing.insert name
+        uploading := uploading.insert name
         spawn do
           let result ← engine.publish stop w.mod value
           unless result.name == name do throw (IO.userError "Builder returned an unrequested module")
@@ -350,7 +363,7 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
           control.atomically (modify fun s => { s with claims := s.claims ++ claims })
           let idle ← if claims.isEmpty then queue.isIdle else pure false
           events.sync.send (.received claims idle)
-      activity.atomically (set s!"Lake jobs {submitted.size} running/queued · slots {slots} · restoring {restoring.size} · ready {ready.size} · publishing {publishing.size + completed.size}")
+      activity.atomically (set s!"Lake jobs {submitted.size} running/queued · slots {slots} · restoring {restoring.size} · ready {ready.size} · uploading {uploading.size} · awaiting upload {completed.size} · unlocking {unlocking.size}")
       IO.sleep 10
     if let some error ← control.atomically do return (← get).error then throw error
     unless ← env.cancellation.isRequested do
