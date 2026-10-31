@@ -11,8 +11,7 @@ structure SchedulerConfig where
   assignmentMs : Nat := 30000
   deriving FromJson, ToJson
 
-/-- Public deployment access is separate from private mailbox credentials.
-Cloud provisioners inject these values; old local configurations omit them. -/
+/-- Public deployment access is separate from private mailbox credentials. -/
 abbrev ClientConfig := DeploymentApi.Access
 
 structure Config where
@@ -41,18 +40,12 @@ instance : ToJson Config where
 instance : FromJson Config where
   fromJson? json := do
     Version.check "formatVersion" "runtime configuration" json
-    let object ← json.getObj?
-    let worker ← match object["worker"]? with
-      | none => pure ({} : ExecutionConfig)
-      | some value => fromJson? value
     return {
       mailboxes := ← json.getObjValAs? _ "mailboxes"
       scheduler := ← json.getObjValAs? _ "scheduler"
       blobs := ← json.getObjValAs? _ "blobs"
-      worker
-      client := ← match object["client"]? with
-        | none => pure none
-        | some value => fromJson? value }
+      worker := ← json.getObjValAs? _ "worker"
+      client := ← json.getObjValAs? _ "client" }
 
 def Config.validate (config : Config) : Except String Unit := do
   config.mailboxes.validate
@@ -79,24 +72,12 @@ structure RunDefinition where
   resultSchema : String
   image : Option String := none
   program : Option ProgramInfo := none
-  deriving ToJson
+  deriving ToJson, FromJson
 
-instance : FromJson RunDefinition where
-  fromJson? json := do
-    return {
-      entry := ← json.getObjValAs? _ "entry"
-      input := ← json.getObjVal? "input"
-      resultSchema := ← json.getObjValAs? _ "resultSchema"
-      image := ← match json.getObjVal? "image" with
-        | .error _ => pure none | .ok value => fromJson? value
-      program := ← match json.getObjVal? "program" with
-        | .error _ => pure none | .ok value => fromJson? value }
-
-/-- Metadata is immutable once saved. Legacy definitions remain readable without
-inventing a release identity or substituting today's source for the old code. -/
+/-- Submission identity is immutable once saved. -/
 def RunDefinition.sameSubmission (saved proposed : RunDefinition) : Bool :=
   saved.entry == proposed.entry && saved.input == proposed.input && saved.resultSchema == proposed.resultSchema &&
-    saved.image.all (fun image => proposed.image == some image)
+    saved.image == proposed.image
 
 def validateRun (run : String) : IO Unit :=
   unless !run.isEmpty && run.length ≤ 100 && run.toList.all (fun c =>

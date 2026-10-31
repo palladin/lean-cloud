@@ -236,10 +236,8 @@ can use `startupSeconds: 900` to allow installation time. Alternatively,
 and `LEAN_BUILD_TOOLCHAINS` select the pinned release JSON and download cache.
 4.35.0 is tested; future Lake API changes may need helper updates.
 
-The workflow is `lean-build/v6`. Start new runs with the new image; unfinished
-older workflows must keep their original image. `modulesPerJob` is removed.
-Packed manifests remain compatible with v2. Independent checking fields are no
-longer accepted; use `limits.helperMemoryMiB` instead of `checkerMemoryMiB`.
+The workflow is `lean-build/v6`. Use the same application image for a run's
+entire lifetime, including recovery.
 
 Run trusted repositories in dedicated deployments: Lake configuration, build
 hooks, plugins and metaprograms execute code inside the worker container.

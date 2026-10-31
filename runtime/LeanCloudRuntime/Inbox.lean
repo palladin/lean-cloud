@@ -46,11 +46,10 @@ structure State where
   consumers : Array Consumer := #[]
   nextReply : Nat := 0
 
-/-- Reply addresses are allocated by the service, never reopened by a caller.
-The second prefix is reserved for reply queues from older deployments. -/
-private def replyPrefixes := #["$reply/", "[\"pool-v1\",\"reply-"]
+/-- Reply addresses are allocated by the service, never reopened by a caller. -/
+private def replyPrefix := "$reply/"
 
-private def isReply (queue : String) : Bool := replyPrefixes.any (fun p => queue.startsWith p)
+private def isReply (queue : String) : Bool := queue.startsWith replyPrefix
 
 private def erase (conn : Sqlite.Conn) (pattern : String) (matchPrefix := false) : IO Unit :=
   conn.withTransaction do
@@ -82,7 +81,7 @@ def create (conn : Sqlite.Conn) (leaseMs := 15000) : IO Store := do
   conn.createTable counters (primaryKey := [.column "queue"])
   WorkQueueStore.initializeSchema conn
   -- A service restart abandons temporary exchanges, but preserves actor mail.
-  for p in replyPrefixes do erase conn p true
+  erase conn replyPrefix true
   let random ← IO.Process.output { cmd := "openssl", args := #["rand", "-hex", "16"] }
   unless random.exitCode == 0 do throw (IO.userError "Cannot allocate reply epoch")
   return ⟨conn, ← Std.Mutex.new {}, leaseMs, random.stdout.trimAscii.toString⟩

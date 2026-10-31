@@ -15,10 +15,7 @@ instance : ToJson Config where
 
 instance : FromJson Config where
   fromJson? json := do
-    let provider ← match (← json.getObj?)["provider"]? with
-      | none => pure "s3"
-      | some value => fromJson? (α := String) value
-    match provider with
+    match ← json.getObjValAs? String "provider" with
     | "s3" => Config.s3 <$> fromJson? json
     | "azure" => Config.azure <$> fromJson? json
     | _ => throw "Unknown blob storage provider"

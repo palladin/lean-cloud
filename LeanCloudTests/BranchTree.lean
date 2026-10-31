@@ -89,10 +89,10 @@ public def cases : Array TestCase := #[
     let stopped := running.push { jobStep 2 ⟨Location.root, fork, false, .waiting #[child]⟩ with
       event := { (jobStep 2 ⟨Location.root, fork, false, .waiting #[child]⟩).event with activity := "killed" } }
     assertEq (title stopped) (some start) "Killing a running group fabricated completed progress"
-    -- Old observations have only a string; do not guess a progress count from it.
-    let legacy := toJson labeled |>.setObjVal! "parallel" Json.null
-    let legacy ← unwrap (fromJson? (α := Trace.Step) legacy)
-    assertEq (title (done.set! 0 legacy)) (some start)⟩,
+    -- A free-form label carries no completion count; do not infer one from text.
+    let unlabelled := toJson labeled |>.setObjVal! "parallel" Json.null
+    let unlabelled ← unwrap (fromJson? (α := Trace.Step) unlabelled)
+    assertEq (title (done.set! 0 unlabelled)) (some start)⟩,
   ⟨"console.tree.parallel-labels-survive-replay-and-completion", do
     let labeled (seq : Nat) (owner location : Location) (label : String) :=
       { workerStep seq owner location with event := {
@@ -277,8 +277,8 @@ public def cases : Array TestCase := #[
     assertEq (LeanCloudCli.BranchTree.rows entries folded.tree).size 2
     let expanded := Watch.navigate active 1 folded .right
     assertEq (LeanCloudCli.BranchTree.rows entries expanded.tree).size 4
-    assertTrue ((Watch.navigate active 1 expanded (.text "[")).tree == expanded.tree) "Removed timeline keys changed selection"⟩,
-  ⟨"console.tree.controls-and-legacy-traces", do
+    assertTrue ((Watch.navigate active 1 expanded (.text "[")).tree == expanded.tree) "Unbound key changed selection"⟩,
+  ⟨"console.tree.controls-and-unlabelled-observations", do
     let control (name : String) := { steps[0]! with event := { steps[0]!.event with activity := name }, branch := none, job := none }
     let frame (status : String) (trace : Array Trace.Step) := String.intercalate "\n"
       (Watch.frame ⟨"/work", "test"⟩ run trace #[] {} 180 40 status).toList
@@ -295,9 +295,9 @@ public def cases : Array TestCase := #[
     let killed := LeanCloudCli.BranchTree.current (steps.push (control "sealed"))
     assertTrue ((LeanCloudCli.BranchTree.rows killed {}).filter (·.fork.isNone) |>.all (·.status == "completed"))
       "A later kill overwrote completed branches"
-    let legacy := { steps[4]! with branch := none, job := none }
-    assertEq legacy.owner (some child)
-    assertTrue ((LeanCloudCli.BranchTree.current #[legacy]).all (·.job.isNone)) "Legacy logs fabricated states"
+    let unlabelled := { steps[4]! with branch := none, job := none }
+    assertEq unlabelled.owner (some child)
+    assertTrue ((LeanCloudCli.BranchTree.current #[unlabelled]).all (·.job.isNone)) "Unlabelled observations fabricated states"
     assertTrue (Trace.location? "0:nope").isNone "Invalid location accepted"⟩,
   ⟨"console.tree.metadata-roundtrip", do
     let sample := steps[1]!

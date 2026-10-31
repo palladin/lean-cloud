@@ -37,9 +37,8 @@ each article once. Compressed XML is still split at bzip2 stream boundaries.
 Only summaries and immutable references enter the journal. Partial count tables
 are stored in blobs and merged in pairs throughout the tree; grep output stays in ordered blob
 parts. Per-file article totals and grep output limits are checked across all
-ranges. The `v3` workflow versions reflect the tree execution structure; dataset,
-request, and result formats remain compatible with earlier artifacts. Finish
-existing `v2` runs with their original image before upgrading.
+ranges. Use the same application image for a run's entire lifetime, including
+recovery.
 
 ## First example, locally
 

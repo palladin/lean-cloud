@@ -31,10 +31,13 @@ private def field [FromJson α] (json : Json) (name : String) (fallback : α) : 
   | none => pure fallback
   | some value => fromJson? value
 
+private def fields (json : Json) (allowed : List String) : Except String Unit := do
+  for (name, _) in (← json.getObj?).toList do
+    unless allowed.contains name do throw s!"Unknown field: {name}"
+
 instance : FromJson Limits where
   fromJson? json := do
-    if ((← json.getObj?)["checkerMemoryMiB"]?).isSome then
-      throw "Use limits.helperMemoryMiB instead of limits.checkerMemoryMiB"
+    fields json ["seconds", "helperMemoryMiB", "bytes", "modules"]
     return {
       seconds := ← field json "seconds" 600
       helperMemoryMiB := ← field json "helperMemoryMiB" 4096
@@ -43,13 +46,7 @@ instance : FromJson Limits where
 
 instance : FromJson Request where
   fromJson? json := do
-    for old in ["check", "theorems", "allowedAxioms", "paranoid"] do
-      if ((← json.getObj?)[old]?).isSome then
-        throw s!"LeanBuild builds Lake targets; independent proof checking was removed. Remove the {old} field"
-    if ((← json.getObj?)["modules"]?).isSome then
-      throw "Use targets instead of modules"
-    if ((← json.getObj?)["modulesPerJob"]?).isSome then
-      throw "modulesPerJob was removed; persistent builders use the worker CPU budget"
+    fields json ["repository", "revision", "subdirectory", "targets", "options", "cache", "limits"]
     return {
       repository := ← json.getObjValAs? _ "repository"
       revision := ← json.getObjValAs? _ "revision"

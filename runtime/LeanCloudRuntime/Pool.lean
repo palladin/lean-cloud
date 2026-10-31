@@ -32,17 +32,11 @@ instance : ToJson Saved where
 instance : FromJson Saved where
   fromJson? json := do
     Version.check "formatVersion" "scheduler catalog" json
-    let routes ← match json.getObjVal? "routes" with
-      | .ok value => fromJson? value
-      | .error _ => pure none
-    let timings ← match json.getObjVal? "timings" with
-      | .ok value => fromJson? value
-      | .error _ => pure #[]
-    let receipts ← match json.getObjVal? "receipts" with
-      | .ok value => fromJson? value
-      | .error _ => pure #[]
-    return { state := (← json.getObjValAs? LeanCloud.Pool.Catalog "state").restore, routes
-             replies := ← json.getObjValAs? _ "replies", timings, receipts }
+    return { state := (← json.getObjValAs? LeanCloud.Pool.Catalog "state").restore
+             routes := ← json.getObjValAs? _ "routes"
+             replies := ← json.getObjValAs? _ "replies"
+             timings := ← json.getObjValAs? _ "timings"
+             receipts := ← json.getObjValAs? _ "receipts" }
 
 private def wallTime : IO Nat := do
   return (← Std.Time.Timestamp.now).toMillisecondsSinceUnixEpoch.val.toNat

@@ -11,17 +11,7 @@ structure Connection where
   deployment : String
   tokenEnv : String
   tokenFile : Option String := none
-  deriving ToJson, BEq, Repr
-
-instance : FromJson Connection where
-  fromJson? json := do
-    return {
-      url := ← json.getObjValAs? _ "url"
-      deployment := ← json.getObjValAs? _ "deployment"
-      tokenEnv := ← json.getObjValAs? _ "tokenEnv"
-      tokenFile := ← match json.getObjVal? "tokenFile" with
-        | .error _ => pure none
-        | .ok value => fromJson? value }
+  deriving ToJson, FromJson, BEq, Repr
 
 def validateUrl (url : String) : Except String Unit := do
   unless !url.toList.any (fun c => c.toNat ≤ 32 || c.toNat == 127 || c == '\\') &&

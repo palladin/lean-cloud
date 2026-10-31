@@ -3,30 +3,22 @@ import Lean
 namespace LeanCloud.Version
 open Lean
 
-/-- Version 0 is the unversioned HTTP/SQLite format. Version 1 adds explicit
-version markers and optional operational fields; existing payloads keep their
-meaning. Broker-era storage is not part of this compatibility contract. -/
+/-- The current wire and persistence format. Only this version is supported. -/
 def current : Nat := 1
 
 def check (field context : String) (json : Json) : Except String Unit := do
-  let fields ← json.getObj?
-  let version : Nat ← match fields[field]? with
-    | none => pure 0
-    | some value => fromJson? value
-  unless version ≤ current do
-    throw s!"Unsupported {context} version {version}; this binary supports up to {current}. Use a compatible binary; data was not migrated."
+  let version ← json.getObjValAs? Nat field
+  unless version == current do
+    throw s!"Unsupported {context} version {version}; expected {current}."
 
 def stamp (field : String) (json : Json) : Json := json.setObjVal! field (toJson current)
 
-/-- Keep the tagged result intact. Legacy callers receive the legacy shape. -/
-def response (request result : Json) : Json :=
-  if (request.getObjVal? "protocolVersion").isOk then
-    stamp "protocolVersion" (Json.mkObj [("result", result)])
-  else result
+/-- All responses use the same versioned envelope, including errors. -/
+def response (result : Json) : Json :=
+  stamp "protocolVersion" (Json.mkObj [("result", result)])
 
 def responsePayload (json : Json) : Except String Json := do
   check "protocolVersion" "HTTP protocol" json
-  if (json.getObjVal? "protocolVersion").isOk then json.getObjVal? "result"
-  else pure json
+  json.getObjVal? "result"
 
 end LeanCloud.Version

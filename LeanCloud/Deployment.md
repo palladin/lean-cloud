@@ -86,9 +86,9 @@ hold leases; even `isIdle` only means there are currently no pending or leased
 messages, not that future producers are finished. Applications own their
 completion protocol and must make repeated work safe.
 
-Each sent item has a stable `key`, JSON `value`, and optional `priority` (default
-zero). Receive selects the highest priority first, using FIFO for ties. Sending
-the same key, value and priority again is a no-op, including after acknowledgement;
+Each sent item has a stable `key`, JSON `value`, and `priority` (default zero when
+constructing a `WorkItem`). Receive selects the highest priority first, using FIFO
+for ties. Sending the same key, value and priority again is a no-op, including after acknowledgement;
 changing its value or priority is an error. This lets multiple parents safely
 announce the same ready task. Keys
 and their deduplication records live until the run is removed.

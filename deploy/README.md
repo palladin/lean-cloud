@@ -9,6 +9,8 @@ Start with [local Docker](#local-docker), or follow the separate
 
 All follow **check tools → build → configure → up → connect → run**.
 Azure and AWS add explicit login, infrastructure provisioning, and image publishing.
+During development, only the current wire and storage formats are supported;
+there are no automatic migrations between versions.
 Once configured, the deployment commands have the same shape:
 
 | Action | Local Docker | Azure / AWS / Kubernetes |
@@ -62,7 +64,7 @@ Continue with [the log-processing example](#run-the-log-processing-example)
 to submit and watch your first workflow.
 
 `configure` only prepares files and pins the local image ID; `up` starts the
-containers. The old `init` spelling remains an alias for `configure`.
+containers.
 `show` displays deployment settings without printing authentication tokens.
 
 Each node hosts its HTTP inbox and embedded SQLite database. Submitting a run
@@ -241,8 +243,10 @@ For Azure workload identity, use:
 Set `serviceAccountAnnotations` to
 `azure.workload.identity/client-id` and `azure.workload.identity/tenant-id`, and
 `podLabels` to `{"azure.workload.identity/use":"true"}` in deployment.json.
-An S3-compatible service can instead use `accessKey` and `secretKey` in the
-private storage.json file. The bucket/container must already exist when marked
+An S3-compatible service can instead use
+`"authentication":{"kind":"keys","accessKey":"...","secretKey":"..."}` in
+the private storage.json file, with `"provider":"s3"`.
+The bucket/container must already exist when marked
 provisioned. With Azure workload identity, nodes obtain credentials themselves;
 no storage key is needed in the configuration.
 

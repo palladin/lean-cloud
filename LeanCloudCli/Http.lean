@@ -18,7 +18,6 @@ initialize clients : Std.Mutex (Array Client) ← Std.Mutex.new #[]
 
 def post (url token body : String) (timeoutMs : UInt32 := 30000) : IO String := do
   let request ← IO.ofExcept (Lean.Json.parse body)
-  IO.ofExcept (LeanCloud.Version.check "protocolVersion" "HTTP protocol" request)
   let body := (LeanCloud.Version.stamp "protocolVersion" request).compress
   let client ← clients.atomically do
     let idle ← get

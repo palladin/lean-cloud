@@ -15,7 +15,7 @@ Usage: deploy/local.sh COMMAND ...
   scale DIR WORKERS
   clean DIR --yes
 
-configure writes files only; review them before up. init is an alias for configure.
+configure writes files only; review them before up.
 down retains data. clean permanently removes workflows and locally hosted blobs.
 USAGE
 }
@@ -31,7 +31,6 @@ if [[ "$command" == doctor ]]; then
   printf 'Docker engine, Compose, Buildx, jq, openssl, and shasum are available.\n'
   exit
 fi
-[[ "$command" != init ]] || command=configure
 case "$command" in
   configure) [[ $# -ge 3 && $# -le 6 ]] || fail 'Usage: local.sh configure DIR IMAGE [NAME [WORKERS [PORT]]]' ;;
   up|down|status|connect|show) [[ $# == 2 ]] || fail "Usage: local.sh $command DIR" ;;
@@ -55,7 +54,7 @@ if [[ "$command" == configure ]]; then
     --arg nodeName "$node_name" --argjson workers "$workers" --argjson port "$port" \
     '{name:$name,image:$image,directory:$directory,nodeName:$nodeName,workers:$workers,retainedWorkers:$workers,port:$port}' > "$directory/deployment.json"
   jq --rawfile access "$directory/blob-access.token" --rawfile secret "$directory/blob-secret.token" '
-    .blobs.accessKey=($access|rtrimstr("\n")) | .blobs.secretKey=($secret|rtrimstr("\n"))
+    .blobs.authentication.accessKey=($access|rtrimstr("\n")) | .blobs.authentication.secretKey=($secret|rtrimstr("\n"))
     ' "$assets/config.json" > "$directory/config.json"
   jq --rawfile access "$directory/blob-access.token" --rawfile secret "$directory/blob-secret.token" '
     .identities[0].credentials=[{accessKey:($access|rtrimstr("\n")),secretKey:($secret|rtrimstr("\n"))}]

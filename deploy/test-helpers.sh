@@ -50,9 +50,7 @@ assert_mode() {
 }
 for count in 0 1 6; do
   dir="$work/local-$count"
-  operation=configure
-  [[ $count != 0 ]] || operation=init  # Keep the original spelling compatible.
-  bash deploy/local.sh "$operation" "$dir" app:test "test-$count" "$count" 8080
+  bash deploy/local.sh configure "$dir" app:test "test-$count" "$count" 8080
   bash deploy/local.sh show "$dir" > "$work/shown.json"
   cmp "$dir/deployment.json" "$work/shown.json"
   bash deploy/local.sh status "$dir"
@@ -67,21 +65,22 @@ for count in 0 1 6; do
   jq -e --argjson count "$count" '.services|length==$count+2' "$dir/compose.json" >/dev/null
   jq -e '[.services|to_entries[]|select(.key!="blobs")|.value.environment.CLOUD_NODE_NAME]|all(.=="test-machine")' "$dir/compose.json" >/dev/null
   jq -e --argjson count "$count" '.mailboxes.workers|length==$count' "$dir/config.json" >/dev/null
+  jq -e '.formatVersion==1 and (.worker|type)=="object" and .blobs.provider=="s3"' "$dir/config.json" >/dev/null
   jq -e '.mailboxes.workers|all(.cpus==1 and .memoryMiB==null)' "$dir/config.json" >/dev/null
   jq -e '.client.token!=.mailboxes.scheduler.token and (.client.token|length)==64' "$dir/config.json" >/dev/null
   jq -e --slurpfile s3 "$dir/s3.json" '
-    (.blobs.accessKey|length)==32 and (.blobs.secretKey|length)==64 and
-    .blobs.secretKey!=.client.token and .blobs.secretKey!=.mailboxes.scheduler.token and
-    .blobs.accessKey==$s3[0].identities[0].credentials[0].accessKey and
-    .blobs.secretKey==$s3[0].identities[0].credentials[0].secretKey
+    (.blobs.authentication.accessKey|length)==32 and (.blobs.authentication.secretKey|length)==64 and
+    .blobs.authentication.secretKey!=.client.token and .blobs.authentication.secretKey!=.mailboxes.scheduler.token and
+    .blobs.authentication.accessKey==$s3[0].identities[0].credentials[0].accessKey and
+    .blobs.authentication.secretKey==$s3[0].identities[0].credentials[0].secretKey
     ' "$dir/config.json" >/dev/null
   grep -Fxq '*' "$dir/.gitignore"
   jq -e '.services.scheduler.ports==["127.0.0.1:8080:8080"] and .services.scheduler.image=="sha256:0000000000000000000000000000000000000000000000000000000000000001"' "$dir/compose.json" >/dev/null
   jq -e '[.services|to_entries[]|select(.key!="blobs")|.value.volumes[0]] | length==(unique|length)' "$dir/compose.json" >/dev/null
-  if bash deploy/local.sh init "$dir" other:image test 9 8080 2>/dev/null; then echo 'Overwrote existing deployment'; exit 1; fi
+  if bash deploy/local.sh configure "$dir" other:image test 9 8080 2>/dev/null; then echo 'Overwrote existing deployment'; exit 1; fi
   if bash deploy/local.sh clean "$dir" 2>/dev/null; then echo 'Clean did not require --yes'; exit 1; fi
 done
-[[ $(jq -r .blobs.secretKey "$work/local-0/config.json") != "$(jq -r .blobs.secretKey "$work/local-1/config.json")" ]]
+[[ $(jq -r .blobs.authentication.secretKey "$work/local-0/config.json") != "$(jq -r .blobs.authentication.secretKey "$work/local-1/config.json")" ]]
 # A recorded missing durable volume must stop recovery before any container starts.
 printf '["test-0_scheduler-data"]' > "$work/local-0/volumes.json"
 if bash deploy/local.sh up "$work/local-0" 2>/dev/null; then echo 'Started with lost durable state'; exit 1; fi

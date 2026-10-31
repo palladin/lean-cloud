@@ -10,8 +10,12 @@
     "endpoint": "http://blobs:8333",
     "bucket": "lean-cloud",
     "region": "us-east-1",
-    "accessKey": "local-cloud",
-    "secretKey": "local-cloud-secret"
+    "provider": "s3",
+    "authentication": {
+      "kind": "keys",
+      "accessKey": "local-cloud",
+      "secretKey": "local-cloud-secret"
+    }
   },
   "mailboxes": {
     "scheduler": {
@@ -26,7 +30,9 @@
           "host": "worker1-mailbox",
           "port": 8080,
           "token": "local-cloud"
-        }
+        },
+        "cpus": 1,
+        "memoryMiB": null
       },
       {
         "worker": "worker2",
@@ -34,7 +40,9 @@
           "host": "worker2-mailbox",
           "port": 8080,
           "token": "local-cloud"
-        }
+        },
+        "cpus": 1,
+        "memoryMiB": null
       },
       {
         "worker": "worker3",
@@ -42,8 +50,12 @@
           "host": "worker3-mailbox",
           "port": 8080,
           "token": "local-cloud"
-        }
+        },
+        "cpus": 1,
+        "memoryMiB": null
       }
     ]
-  }
+  },
+  "formatVersion": 1,
+  "client": null
 }

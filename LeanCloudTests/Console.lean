@@ -18,9 +18,9 @@ def consoleCases : Array TestCase := #[
       #["60/100 · 60% · Modules finished"]
       "Shared progress regressed or added overlapping snapshots"
     assertTrue (Watch.progressLines steps).isEmpty "Shared progress was repeated inside worker cards"
-    let old := Json.mkObj [("message", toJson "old"), ("completed", toJson (1 : Nat)), ("total", toJson (some (2 : Nat)))]
-    let decoded : ProgressUpdate ← IO.ofExcept (fromJson? old)
-    assertEq decoded.shared none "Old progress stopped decoding"⟩,
+    let progress : ProgressUpdate := { message := "Building", completed := 1, total := some 2 }
+    let decoded : ProgressUpdate ← IO.ofExcept (fromJson? (toJson progress))
+    assertEq decoded progress⟩,
   ⟨"console.watch-progress-command-and-attempt", do
     let event : ExecutionEvent := ⟨"boot", 1, 0, "worker1", some 2, "0:1", "execute", "build", "run", some "site"⟩
     let current : Trace.Step := { timestamp := "1", event }
@@ -158,15 +158,8 @@ def consoleCases : Array TestCase := #[
     assertEq latest.size 30 "The last view grew into an execution history"
     assertEq (latest.back?.map (·.event.seq)) (some 499)
     assertEq ((Trace.latest latest).map (·.id)) (latest.map (·.id)) "Compacting a snapshot changed it"⟩,
-  ⟨"console.trace-legacy-cache-and-resource-roundtrip", do
+  ⟨"console.trace-resource-roundtrip", do
     let event : ExecutionEvent := ⟨"boot", 1, 10, "worker1", some 0, "0:0", "execute", "work", "run", some "work"⟩
-    let legacy := Json.mkObj [("timestamp", toJson "stamp"), ("event", toJson event)]
-    let old ← unwrap (fromJson? (α := LeanCloudCli.Trace.Step) legacy)
-    assertTrue old.resources.isNone "Legacy trace fabricated a sample"
-    let oldSample ← unwrap (fromJson? (α := ResourceSample)
-      (Json.mkObj [("incarnation", toJson "old"), ("timeNs", toJson (1 : Nat))]))
-    assertTrue (oldSample.nodeName.isNone && oldSample.hostname.isNone && oldSample.cpuCores.isNone &&
-      oldSample.memoryCapacity.isNone && oldSample.cpuCapacityMillis.isNone) "Legacy API fabricated host information"
     let sample : ResourceSample := {
       incarnation := "boot", timeNs := 1000, memory := some 1234,
       nodeName := some "node", hostname := some "pod", cpuCores := some 4,

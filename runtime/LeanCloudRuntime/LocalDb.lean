@@ -12,8 +12,8 @@ private abbrev FormatSchema : Schema := [("scope", .string), ("version", .int)]
 private abbrev FormatContext : Ctx := { tables := [("cloud_format", FormatSchema)] }
 private def formats : Table "cloud_format" FormatSchema := ⟨⟩
 
-/-- Check before changing domain tables or reclaiming reply rows. An absent
-marker denotes the supported legacy schema; adoption only adds the marker. -/
+/-- Initialize the format marker for a new database and require the current
+version before changing domain tables or reclaiming reply rows. -/
 def ensureVersion (conn : Sqlite.Conn) (scope : String) : IO Unit := conn.withTransaction do
   conn.createTable formats (primaryKey := [.column "scope"])
   let query : Query FormatContext FormatSchema := Query.from' (ts := FormatContext) formats
@@ -25,8 +25,8 @@ def ensureVersion (conn : Sqlite.Conn) (scope : String) : IO Unit := conn.withTr
       |>.value "version" (SqlExpr.int LeanCloud.Version.current)
     discard (conn.execInsert insert)
   | [.cons _ (.cons version .nil)] =>
-    unless version ≥ 0 && version ≤ LeanCloud.Version.current do
-      throw (IO.userError s!"Unsupported {scope} SQLite version {version}; use a compatible binary. Data was not migrated.")
+    unless version == LeanCloud.Version.current do
+      throw (IO.userError s!"Unsupported {scope} SQLite version {version}; expected {LeanCloud.Version.current}.")
   | _ => throw (IO.userError "Invalid SQLite format metadata")
 
 /-- This database belongs exclusively to one scheduler process and its persistent

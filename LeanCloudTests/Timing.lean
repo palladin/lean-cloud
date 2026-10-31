@@ -59,12 +59,10 @@ def cases : Array TestCase := #[
       assertEq (done.span.bind (·.finishedMs)) (some 5000)
       assertTrue (done.branches.all (·.2.finishedMs == some 5000)) "Branch clock still running"
       assertTrue (done.groups.all (·.2.finishedMs == some 5000)) "Group clock still running"⟩,
-  ⟨"timing.legacy-state-stays-unknown-status-roundtrips", do
+  ⟨"timing.repeated-observation-and-status-roundtrip", do
     let timing := LeanCloud.Timing.observe {} (some waiting) waiting 9000
     assertTrue (timing.span.isNone && timing.branches.isEmpty && timing.groups.isEmpty)
       "Recovery fabricated old start times"
-    let legacy ← unwrap (fromJson? (α := LeanCloud.Timing.Status) (toJson initial.scheduler))
-    assertTrue legacy.timing.isNone "Legacy status acquired a timing"
     let status : LeanCloud.Timing.Status := { toSnapshot := waiting.scheduler.toSnapshot, timing := some timing }
     let restored ← unwrap (fromJson? (α := LeanCloud.Timing.Status) (toJson status))
     assertEq restored.toSnapshot waiting.scheduler.toSnapshot

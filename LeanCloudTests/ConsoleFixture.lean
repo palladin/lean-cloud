@@ -55,7 +55,7 @@ def withFixture (suite image : String) (action : Fixture → IO Unit) : IO Unit 
   -- Assign a fixed port for this fixture. Docker may change an ephemeral port
   -- on an automatic node restart, stranding the client during crash recovery.
   let port ← availablePort
-  discard <| external "bash" #["deploy/local.sh", "init", directory.toString, image, name, "3", toString port]
+  discard <| external "bash" #["deploy/local.sh", "configure", directory.toString, image, name, "3", toString port]
   let ctx : Context := ⟨directory / "client", name⟩
   let f : Fixture := ⟨directory, ctx, ""⟩
   try

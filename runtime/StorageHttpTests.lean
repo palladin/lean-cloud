@@ -25,7 +25,8 @@ private instance : Server.Handler Service where
         return ← Response.new |>.status (if attempts == 1 then .serviceUnavailable else .tooManyRequests) |>.text "temporary"
       if path == "/client-retry" then
         let request ← IO.ofExcept (Json.parse (String.fromUTF8! bytes))
-        return ← Response.ok |>.text (LeanCloud.Version.response request (toJson (42 : Nat))).compress
+        IO.ofExcept (LeanCloud.Version.check "protocolVersion" "test request" request)
+        return ← Response.ok |>.text (LeanCloud.Version.response (toJson (42 : Nat))).compress
       return ← Response.ok |>.text "recovered"
     if path == "/denied" then return ← Response.new |>.status .unauthorized |>.text "denied"
     if path == "/auth" then

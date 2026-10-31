@@ -53,9 +53,9 @@ private def configuration : IO Unit := do
   assertEq (toJson (← unwrap (worker.mailboxes.worker "worker2")))
     (toJson (← unwrap (runtime.mailboxes.worker "worker2")))
   let json ← unwrap (Json.parse (include_str "../deploy/config.json"))
-  let legacy : Config ← unwrap (fromJson? json)
-  discard <| unwrap legacy.validate
-  let .s3 s3 := legacy.blobs | throw (IO.userError "Legacy config changed provider")
+  let current : Config ← unwrap (fromJson? json)
+  discard <| unwrap current.validate
+  let .s3 s3 := current.blobs | throw (IO.userError "Local config changed provider")
   let aws : Storage.Config := .s3 { s3 with authentication := .workload, endpoint := "https://s3.eu-north-1.amazonaws.com", provisioned := true }
   let roundtrip : Storage.Config ← unwrap (fromJson? (toJson aws))
   assertEq (toJson roundtrip) (toJson aws)

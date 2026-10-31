@@ -108,7 +108,7 @@ identity_filter='del(.workers,.cpuMillis,.cpuRequestMillis,.memoryMiB,.scheduler
 identity=$(jq -Sc "$identity_filter" "$spec")
 record=$(kube get configmap cloud-deployment --ignore-not-found -o json)
 if [[ -n "$record" ]]; then
-  recorded_identity=$(jq -r '.data.identity' <<< "$record" | jq -Sc "$identity_filter")
+  recorded_identity=$(jq -r '.data.identity' <<< "$record")
   [[ "$recorded_identity" == "$identity" ]] || fail 'Deployment image, storage settings or identity changed. Use a new namespace.'
   [[ $(jq -r '.data.storage' <<< "$record") == "${storage_hash}" ]] || fail 'Blob storage changed; use a new deployment.'
   while IFS= read -r claim; do
@@ -148,7 +148,7 @@ for token in client internal; do
 done
 jq -n --slurpfile spec "$spec" --slurpfile storage "$directory/storage.json" \
   --rawfile client "$directory/client.token" --rawfile internal "$directory/internal.token" '
-  $spec[0] as $c | {client:{deployment:$c.name,image:$c.image,token:($client|rtrimstr("\n"))},
+  $spec[0] as $c | {formatVersion:1,worker:{},client:{deployment:$c.name,image:$c.image,token:($client|rtrimstr("\n"))},
   scheduler:{database:"/data/scheduler.sqlite",assignmentMs:30000},blobs:$storage[0],
   mailboxes:{scheduler:{host:"scheduler",port:8080,token:($internal|rtrimstr("\n"))},workers:[range(1;$c.workers+1)|{worker:"worker\(.)",cpus:([1,($c.cpuMillis/1000|floor)]|max),memoryMiB:$c.memoryMiB,endpoint:{host:"worker\(.)",port:8080,token:($internal|rtrimstr("\n"))}}]}}
   ' > "$directory/config.json"

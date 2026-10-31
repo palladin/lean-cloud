@@ -23,19 +23,6 @@ private def inboxes : IO Unit := IO.FS.withTempFile fun _ path => do
   try
     let mut store ← Inbox.create conn 100
     discard <| Inbox.apply store 0 ⟨"actor", "", .send "durable work"⟩
-    -- Upgrade from the old, indefinitely durable request/reply implementation.
-    let legacy := (toJson ("pool-v1", "reply-before-upgrade")).compress
-    let messages : Table "inbox_messages" Inbox.MessageSchema := ⟨⟩
-    let counters : Table "inbox_counters" Inbox.CounterSchema := ⟨⟩
-    let message : InsertStmt Inbox.Context _ _ := messages.insert
-      |>.value "queue" (SqlExpr.str legacy) |>.value "id" (SqlExpr.int 1)
-      |>.value "payload" (SqlExpr.str "abandoned")
-    let counter : InsertStmt Inbox.Context _ _ := counters.insert
-      |>.value "queue" (SqlExpr.str legacy) |>.value "next" (SqlExpr.int 2)
-    discard (conn.execInsert message)
-    discard (conn.execInsert counter)
-    store ← Inbox.create conn 100
-    assertEq (← contents conn) (1, 1) "Legacy reply inbox was not reclaimed"
     for i in [:240] do
       let now := i * 1000
       let (queue, lease) : String × Nat ← IO.ofExcept (fromJson? (← Inbox.apply store now ⟨"", "client", .openReply⟩))

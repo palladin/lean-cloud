@@ -97,16 +97,12 @@ private def reverseCompletion (fails : Bool) : TestCase :=
     assertOutcome (ReplayInterpreter.result (m := Id) outcome).run expected⟩
 
 def replayCases : Array TestCase := invalidReplayCases ++ #[
-  ⟨"replay/assignment-wire-format-and-legacy-inbox", do
+  ⟨"replay/assignment-wire-format", do
     let child := Location.root.next.child 1
     let assignment : Assignment := ⟨7, child⟩
     assertEq (toJson assignment) (Json.mkObj [("attempt", toJson (7 : Nat)), ("branchStart", toJson child)])
     let decoded : Assignment ← unwrap (fromJson? (toJson assignment))
-    assertEq decoded assignment
-    let legacy : Assignment ← unwrap (fromJson? (Json.mkObj [
-      ("attempt", toJson (7 : Nat)), ("branch", toJson child),
-      ("location", toJson child.next), ("joining", toJson true)]))
-    assertEq legacy assignment "Legacy cursor changed the assigned branch"⟩,
+    assertEq decoded assignment⟩,
   ⟨"replay/partial-group-suspends-until-all-children-return", do
     let saved ← IO.mkRef ([] : Records)
     let store := memoryStore saved

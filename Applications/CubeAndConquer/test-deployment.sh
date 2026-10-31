@@ -34,7 +34,7 @@ wait_result() {
   compose logs --no-color > "$test_dir/containers.log" 2>&1
   return 1
 }
-bash "$root/deploy/local.sh" init "$deployment" "$image" "$name" 3 0 > "$test_dir/deploy.log" 2>&1
+bash "$root/deploy/local.sh" configure "$deployment" "$image" "$name" 3 0 > "$test_dir/deploy.log" 2>&1
 jq '.cpuMillis=2000' "$deployment/deployment.json" > "$deployment/deployment.next"
 mv "$deployment/deployment.next" "$deployment/deployment.json"
 # scale re-renders the edited resource policy before starting the three nodes.

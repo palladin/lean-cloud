@@ -42,16 +42,12 @@ structure Config where
 instance : FromJson Config where
   fromJson? json := do
     let object ← json.getObj?
-    let authentication : Authentication ← match object["authentication"]? with
-      | some value => fromJson? value
-      | none => Authentication.keys <$> json.getObjValAs? String "accessKey" <*>
-          json.getObjValAs? String "secretKey" <*> pure ""
     return {
       endpoint := ← json.getObjValAs? _ "endpoint"
       bucket := ← json.getObjValAs? _ "bucket"
       region := ← match object["region"]? with | none => pure "us-east-1" | some value => fromJson? value
       provisioned := ← match object["provisioned"]? with | none => pure false | some value => fromJson? value
-      authentication }
+      authentication := ← json.getObjValAs? _ "authentication" }
 
 def Config.validate (config : Config) : Except String Unit := do
   unless (config.endpoint.startsWith "http://" || config.endpoint.startsWith "https://") &&

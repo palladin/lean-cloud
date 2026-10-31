@@ -137,15 +137,6 @@ def poolCases : Array TestCase := #[
     let finished := Pool.report state id report
     assertEq (finished.runs[0]?.map (·.finalization)) (some .done)
     assertEq (toJson (Pool.acquire 100 finished "worker1").2) (toJson Pool.Reply.idle)⟩,
-  ⟨"pool.legacy-run-defaults-to-pending-finalization", do
-    let catalog : Pool.RunCatalog ← unwrap (fromJson? (Json.mkObj [
-      ("id", toJson "old"), ("mode", toJson Pool.Mode.killed),
-      ("scheduler", toJson ({} : Scheduler.State))]))
-    let some run := ({ runs := #[catalog] } : Pool.Catalog).restore.runs[0]?
-      | throw (IO.userError "Missing restored run")
-    assertEq run.finalization Scheduler.Status.pending
-    let (_, reply) := Pool.acquire 100 { runs := #[run] } "worker1"
-    assertTrue (match reply with | .finalize .. => true | _ => false) "Saved terminal intent was lost"⟩,
   ⟨"pool.failure-in-child-revokes-siblings-and-survives-recovery", do
     let source := lower (.parallel [.value 7, .value 9]) (m := SimM SimulationBackend.World)
     let runJob (world : SimulationBackend.World) (worker : String) (fuel : Nat) (job : Assignment) :=
@@ -204,12 +195,6 @@ def poolCases : Array TestCase := #[
     let killed ← change state (.kill id)
     assertEq (toJson (Pool.report killed id stale)) (toJson killed)
     assertEq (killed.runs[0]?.bind Pool.Run.terminalOutcome) (some (.cancelled "Killed by user"))⟩,
-  ⟨"pool.legacy-state-defaults-to-unconfigured-membership", do
-    let catalog : Pool.Catalog ← unwrap (fromJson? (Json.mkObj [
-      ("runs", toJson initial.runs), ("cursor", toJson initial.cursor)]))
-    let state := catalog.restore
-    assertTrue state.membership.active.isNone "Legacy state acquired an empty pool"
-    discard (takeJob state "worker1")⟩,
   ⟨"pool.elastic-drain-preserves-running-work", do
     let state ← change initial (.configureWorkers #["worker1", "worker2"])
     let (state, id, job) ← takeJob state "worker2"

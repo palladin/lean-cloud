@@ -30,7 +30,7 @@ result() {
   compose logs --no-color > "$test_dir/containers.log" 2>&1
   echo "Timed out waiting for $1" >&2; return 1
 }
-bash "$root/deploy/local.sh" init "$deployment" "$1" "$name" 3 0 > "$test_dir/deploy.log" 2>&1
+bash "$root/deploy/local.sh" configure "$deployment" "$1" "$name" 3 0 > "$test_dir/deploy.log" 2>&1
 bash "$root/deploy/local.sh" up "$deployment" >> "$test_dir/deploy.log" 2>&1
 address=$(compose port scheduler 8080)
 cli connect wiki-test "http://$address" --token-file "$deployment/client.token" > "$test_dir/connect.log"

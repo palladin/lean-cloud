@@ -21,8 +21,6 @@ private def peek (conn : LeanLinq.Sqlite.Conn) (now : Nat)
   IO.ofExcept (fromJson? (← WorkQueueStore.apply conn now (request "run" (.peek after count)) 100))
 
 private def priorityTests : IO Unit := do
-  let legacy : WorkItem ← IO.ofExcept (fromJson? (Json.mkObj [("key", toJson "A"), ("value", Json.null)]))
-  assertEq legacy.priority 0 "Unprioritized send changed meaning"
   assertTrue ((fromJson? (α := WorkItem) (Json.mkObj [("key", toJson "A"),
     ("value", Json.null), ("priority", toJson "bad")])).toOption.isNone) "Invalid priority accepted"
   IO.FS.withTempFile fun _ path => do
@@ -63,48 +61,9 @@ private def priorityTests : IO Unit := do
       assertEq ((← peek conn 102).map (·.value)) #[toJson "urgent", toJson "second", toJson "low"]
         "Restart/lease expiry lost priority or FIFO ordering"
     finally conn.close
-  -- A real pre-priority database: migrate pending receipts and retained keys.
-  IO.FS.withTempFile fun _ path => do
-    let conn ← LeanLinq.Sqlite.connect path.toString
-    try
-      conn.execRaw "CREATE TABLE work_messages (queue TEXT NOT NULL, id INTEGER NOT NULL, payload TEXT NOT NULL, receipt TEXT NOT NULL, available INTEGER NOT NULL, PRIMARY KEY(queue,id)); CREATE TABLE work_submissions (queue TEXT NOT NULL, key TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(queue,key)); CREATE TABLE work_counters (queue TEXT NOT NULL PRIMARY KEY, next INTEGER NOT NULL); INSERT INTO work_messages VALUES ('[\"run\",\"build\"]',1,'\"legacy\"','old-receipt',100); INSERT INTO work_submissions VALUES ('[\"run\",\"build\"]','legacy','\"legacy\"'); INSERT INTO work_counters VALUES ('[\"run\",\"build\"]',3);"
-      -- Force failure after the first table rename. The transaction must leave
-      -- the original data/schema intact so the same upgrade can be retried.
-      conn.execRaw "CREATE TABLE work_submissions_legacy (block INTEGER);"
-      rejects (WorkQueueStore.initializeSchema conn)
-      conn.execRaw "DROP TABLE work_submissions_legacy;"
-      WorkQueueStore.initializeSchema conn
-      WorkQueueStore.initializeSchema conn
-      assertTrue (← peek conn 99).isEmpty "Migration dropped a live lease"
-      let rows ← peek conn 100
-      assertEq (rows.map fun row => (row.value.compress, row.position.priority)) #[("\"legacy\"", 0)]
-        "Migration changed legacy payload/priority"
-      discard <| WorkQueueStore.apply conn 100 (request "run" (.send #[⟨"legacy", toJson "legacy", 0⟩]))
-      assertEq (← peek conn 100).size 1 "Migration lost deduplication"
-      let claimed ← receive conn 100
-      assertTrue (claimed[0]!.receipt != "old-receipt") "Migration reused an expired receipt"
-    finally conn.close
 
 def run : IO Unit := do
   priorityTests
-  -- Adopt queues written before durable progress counters were introduced.
-  IO.FS.withTempFile fun _ path => do
-    let conn ← LeanLinq.Sqlite.connect path.toString
-    try
-      WorkQueueStore.initializeSchema conn
-      discard <| WorkQueueStore.apply conn 0 (request "legacy" (.send #[⟨"A", Json.null, 0⟩]))
-      let batch ← receive conn 0 "legacy"
-      discard <| WorkQueueStore.apply conn 1 (request "legacy" (.acknowledge batch[0]!.receipt))
-      conn.execRaw "DROP TABLE work_totals"
-      WorkQueueStore.initializeSchema conn
-      let stats : WorkQueueProgress ← IO.ofExcept (fromJson? (← WorkQueueStore.apply conn 2 (request "legacy" .progress)))
-      assertEq stats ⟨1, 0⟩ "Legacy acknowledgements were forgotten"
-      discard <| WorkQueueStore.apply conn 3 (request "legacy" (.send #[⟨"B", Json.null, 0⟩]))
-      let batch ← receive conn 3 "legacy"
-      discard <| WorkQueueStore.apply conn 4 (request "legacy" (.complete batch[0]!.receipt true))
-      let stats : WorkQueueProgress ← IO.ofExcept (fromJson? (← WorkQueueStore.apply conn 5 (request "legacy" .progress)))
-      assertEq stats ⟨2, 1⟩ "First new completion double-counted legacy progress"
-    finally conn.close
   IO.FS.withTempFile fun _ path => do
     let conn ← LeanLinq.Sqlite.connect path.toString
     let receipt ← try
@@ -145,13 +104,6 @@ def run : IO Unit := do
       discard <| WorkQueueStore.apply conn 202 (request "run" (.complete receipt true))
       let progress : WorkQueueProgress ← IO.ofExcept (fromJson? (← WorkQueueStore.apply conn 202 (request "run" .progress)))
       assertEq progress ⟨2, 1⟩ "Duplicate/expired completion inflated progress"
-      let page : Array WorkCompletion ← IO.ofExcept (fromJson?
-        (← WorkQueueStore.apply conn 202 (request "run" (.completions 0 1))))
-      assertEq (page.map fun item => (item.cursor, item.value, item.failed)) #[(1, toJson "A", false)]
-      let page : Array WorkCompletion ← IO.ofExcept (fromJson?
-        (← WorkQueueStore.apply conn 202 (request "run" (.completions 1 100))))
-      assertEq (page.map fun item => (item.cursor, item.value, item.failed)) #[(2, toJson "B", true)]
-        "Completion feed lost ordering, restart durability, or deduplication"
       assertEq (← WorkQueueStore.apply conn 202 (request "run" .idle)) (toJson true)
       discard <| WorkQueueStore.apply conn 203 (request "run" (.send #[⟨"B", toJson "B", 0⟩]))
       assertEq (← WorkQueueStore.apply conn 203 (request "run" .idle)) (toJson true)
@@ -191,14 +143,8 @@ def run : IO Unit := do
       "Competing HTTP consumers lost or duplicated work"
     assertTrue (← queue.isIdle) "Acknowledged work remained queued"
     assertEq (← queue.progress) ⟨100, 50⟩ "Concurrent HTTP progress is not deduplicated"
-    let page ← queue.completions 0 100
-    assertEq (page.map (·.cursor)) ((Array.range 100).map (· + 1))
-    assertEq ((page.map (·.value.compress)).qsort (· < ·)) ((items.map (·.value.compress)).qsort (· < ·))
-    assertTrue (← queue.completions 100 100).isEmpty "Completion cursor replayed earlier entries"
-    assertEq (← queue.completions 0 100 |>.map (·.map (·.cursor))) (page.map (·.cursor))
-      "Reading the feed consumed another observer's entries"
     HttpMailbox.retireWorkQueues endpoints[0]! "concurrent"
     rejects (queue.send #[⟨"late", Json.null, 0⟩])
-  IO.println "Work queues: priority/FIFO, non-consuming cursors, migration, leases, restart, retirement, concurrent HTTP consumers passed"
+  IO.println "Work queues: priority/FIFO, non-consuming cursors, leases, restart, retirement, concurrent HTTP consumers passed"
 
 end WorkQueueTests

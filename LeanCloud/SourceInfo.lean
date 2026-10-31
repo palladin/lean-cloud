@@ -20,18 +20,7 @@ structure SourceSite where
   endLine : Nat := 0
   endColumn : Nat := 0
   functionInfo : Option CloudFunctionInfo := none
-  deriving Repr, BEq, ToJson, Inhabited
-
-instance : FromJson SourceSite where
-  fromJson? json := do
-    return {
-      id := ← json.getObjValAs? _ "id"
-      line := ← json.getObjValAs? _ "line"
-      column := ← json.getObjValAs? _ "column"
-      endLine := ← json.getObjValAs? _ "endLine"
-      endColumn := ← json.getObjValAs? _ "endColumn"
-      -- Existing deployed source maps have no function metadata.
-      functionInfo := ← fromJson? ((json.getObjVal? "functionInfo").toOption.getD .null) }
+  deriving Repr, BEq, ToJson, FromJson, Inhabited
 
 /-- The exact source used to compile this module, bundled with the application. -/
 structure ProgramSource where

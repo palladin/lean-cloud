@@ -15,15 +15,7 @@ structure ProgressUpdate where
   Its revision orders snapshots independently of worker clocks. -/
   shared : Option String := none
   revision : Nat := 0
-  deriving Repr, BEq, ToJson
-
-instance : FromJson ProgressUpdate where
-  fromJson? json := do
-    return { message := ← json.getObjValAs? String "message"
-             completed := ← json.getObjValAs? Nat "completed"
-             total := ← json.getObjValAs? (Option Nat) "total"
-             shared := (json.getObjValAs? String "shared").toOption
-             revision := (json.getObjValAs? Nat "revision").toOption.getD 0 }
+  deriving Repr, BEq, ToJson, FromJson
 
 /-- Durable, deduplicated settlements. Failed work is included in completed. -/
 structure WorkQueueProgress where
@@ -48,16 +40,7 @@ structure WorkItem where
   key : String
   value : Json
   priority : Nat := 0
-  deriving ToJson
-
-instance : FromJson WorkItem where
-  fromJson? json := do
-    let fields ← json.getObj?
-    return { key := ← json.getObjValAs? String "key"
-             value := ← json.getObjVal? "value"
-             priority := ← match fields["priority"]? with
-               | none => pure 0
-               | some value => fromJson? value }
+  deriving ToJson, FromJson
 
 /-- Stable position in priority-descending, submission-ascending order. -/
 structure WorkPosition where
@@ -70,14 +53,6 @@ structure WorkPreview where
   position : WorkPosition
   value : Json
   deriving ToJson, FromJson
-
-/-- A durable completion announcement. Every observer has its own cursor;
-reading this feed neither dequeues work nor changes another observer's position. -/
-structure WorkCompletion where
-  cursor : Nat
-  value : Json
-  failed : Bool
-  deriving Repr, ToJson, FromJson, Inhabited
 
 /-- Competing consumers with renewable leases. Duplicate deliveries are allowed.
 Receipts fence expired deliveries; settlement never deletes a newer lease.
@@ -98,7 +73,6 @@ structure WorkQueue (m : Type → Type u) where
   /-- Settle with an application outcome, atomically updating queue progress. -/
   complete : String → Bool → m Unit
   progress : m WorkQueueProgress
-  completions : Nat → Nat → m (Array WorkCompletion)
   renew : String → m Unit
   release : String → m Unit
 
@@ -110,7 +84,6 @@ def WorkQueue.map (f : {α : Type} → m α → n α) (queue : WorkQueue m) : Wo
   acknowledge receipt := f (queue.acknowledge receipt)
   complete receipt failed := f (queue.complete receipt failed)
   progress := f queue.progress
-  completions after count := f (queue.completions after count)
   renew receipt := f (queue.renew receipt)
   release receipt := f (queue.release receipt)
 
@@ -131,7 +104,6 @@ def QueueProvider.unsupported [Monad m] [MonadExceptOf CloudError m] : QueueProv
     acknowledge _ := unavailable
     complete _ _ := unavailable
     progress := unavailable
-    completions _ _ := unavailable
     renew _ := unavailable
     release _ := unavailable }⟩
 

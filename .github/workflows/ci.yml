@@ -133,9 +133,9 @@ jobs:
           lake build cloud_app build_local build_tests
           .lake/build/bin/cloud_app programs | jq -e '.[0].entry == "lean-build/v6"'
           jq -c . example.json | .lake/build/bin/cloud_app validate lean-build/v6
-          jq -c '.check = {mode: "kernel"}' example.json > /tmp/lean-build-legacy-request.json
-          if .lake/build/bin/cloud_app validate lean-build/v6 < /tmp/lean-build-legacy-request.json; then
-            echo 'Removed proof checking was silently accepted' >&2; exit 1
+          jq -c '.unknown = true' example.json > /tmp/lean-build-invalid-request.json
+          if .lake/build/bin/cloud_app validate lean-build/v6 < /tmp/lean-build-invalid-request.json; then
+            echo 'Unknown request field was silently accepted' >&2; exit 1
           fi
 
       # Native fixtures build real Lake projects. Give them their own budget so

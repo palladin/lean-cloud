@@ -40,35 +40,14 @@ structure RunCatalog where
   mode : Mode
   scheduler : Scheduler.Catalog
   finalization : Scheduler.Status := .pending
-  deriving ToJson
+  deriving ToJson, FromJson
 
 structure Catalog where
   runs : Array RunCatalog := #[]
   cursor : Nat := 0
   membership : Membership := {}
   removed : Array String := #[]
-  deriving ToJson
-
-instance : FromJson RunCatalog where
-  fromJson? json := do
-    let finalization ← match json.getObjVal? "finalization" with
-      | .ok value => fromJson? value
-      | .error _ => pure Scheduler.Status.pending
-    return {
-      id := ← json.getObjValAs? String "id"
-      mode := ← json.getObjValAs? Mode "mode"
-      scheduler := ← json.getObjValAs? Scheduler.Catalog "scheduler"
-      finalization }
-
-instance : FromJson Catalog where
-  fromJson? json := do
-    let membership ← match json.getObjVal? "membership" with
-      | .ok value => fromJson? value
-      | .error _ => pure {}
-    let removed ← match json.getObjVal? "removed" with
-      | .ok value => fromJson? value
-      | .error _ => pure #[]
-    return { runs := ← json.getObjValAs? _ "runs", cursor := ← json.getObjValAs? Nat "cursor", membership, removed }
+  deriving ToJson, FromJson
 
 def State.catalog (state : State) : Catalog :=
   { cursor := state.cursor, membership := state.membership, removed := state.removed
@@ -274,8 +253,6 @@ structure Diagnostics where
   configuredWorkers : Option Nat
   pending : Nat
   running : Nat
-  /-- Kept for wire compatibility. Worker replies now resume callbacks immediately. -/
-  replies : Nat
   deriving Repr, BEq, ToJson, FromJson
 
 def diagnostics (state : State) (run : Run) : Diagnostics := Id.run do
@@ -295,8 +272,7 @@ def diagnostics (state : State) (run : Run) : Diagnostics := Id.run do
     else if configuredWorkers == some 0 then .noWorkers
     else if running > 0 then .running else .queued
   return {
-    phase, stopping := run.scheduler.stopping, configuredWorkers, pending, running
-    replies := 0 }
+    phase, stopping := run.scheduler.stopping, configuredWorkers, pending, running }
 
 /-- Administrative requests are serialized with assignment and report handling.
 Pausing revokes attempts; resuming never reuses an attempt number. -/

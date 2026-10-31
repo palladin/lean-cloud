@@ -120,8 +120,7 @@ def Request.validate (request : Request) : Except String Unit := do
 def Request.encode (request : Request) : Json := Json.mkObj [
   ("apiVersion", toJson version), ("request", toJson request)]
 
-/-- This new API requires an explicit version. Legacy /app remains a separate
-endpoint; it cannot accidentally decode as a deployment request. -/
+/-- The public API requires its explicit version and validated request shape. -/
 def Request.decode (json : Json) : Except String Request := do
   let actual ← json.getObjValAs? Nat "apiVersion"
   unless actual == version do throw s!"Unsupported deployment API version {actual}; expected {version}"

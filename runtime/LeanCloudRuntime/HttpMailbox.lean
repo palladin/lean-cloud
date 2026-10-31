@@ -21,17 +21,7 @@ structure WorkerEndpoint where
   /-- Local computation concurrency budget, independent of the host's CPU count. -/
   cpus : Nat := 1
   memoryMiB : Option Nat := none
-  deriving ToJson, Inhabited
-
-instance : FromJson WorkerEndpoint where
-  fromJson? json := do
-    return {
-      worker := ← json.getObjValAs? _ "worker"
-      endpoint := ← json.getObjValAs? _ "endpoint"
-      cpus := ← match json.getObjVal? "cpus" with
-        | .error _ => pure 1 | .ok value => fromJson? value
-      memoryMiB := ← match json.getObjVal? "memoryMiB" with
-        | .error _ => pure none | .ok value => fromJson? value }
+  deriving ToJson, FromJson, Inhabited
 
 def WorkerEndpoint.capacity (route : WorkerEndpoint) : WorkerCapacity :=
   { id := route.worker, cpus := route.cpus, memoryMiB := route.memoryMiB }
@@ -86,7 +76,6 @@ def workQueues (config : Config) (run : String) : QueueProvider IO := ⟨fun nam
     acknowledge receipt := do discard (call (.acknowledge receipt))
     complete receipt failed := do discard (call (.complete receipt failed))
     progress := do IO.ofExcept (fromJson? (← call .progress))
-    completions after count := do IO.ofExcept (fromJson? (← call (.completions after count)))
     renew receipt := do discard (call (.renew receipt))
     release receipt := do discard (call (.release receipt)) }⟩
 
@@ -227,7 +216,7 @@ private def respond (handler : ServerHandler) (path : String) (json : Json) : IO
       | none => pure (.error "Node telemetry is not configured")
     | _ => pure (.error "Unknown endpoint")
   catch error => pure (.error error.toString)
-  return LeanCloud.Version.response json (toJson result)
+  return LeanCloud.Version.response (toJson result)
 
 open Std.Http in
 instance : Std.Http.Server.Handler ServerHandler where
@@ -246,7 +235,7 @@ instance : Std.Http.Server.Handler ServerHandler where
       let text : String ← request.body.readAll (maximumSize := some (8 * 1024 * 1024))
       let json ← IO.ofExcept (Json.parse text)
       Std.Async.Async.ofAsyncTask (← IO.asTask (respond handler path json) .dedicated)
-    catch error => pure (toJson (Except.error (α := Json) error.toString))
+    catch error => pure (LeanCloud.Version.response (toJson (Except.error (α := Json) error.toString)))
     Response.ok |>.json response.compress
 
 /-- The HTTP server and actor live in this same process. Durable queue rows

@@ -56,14 +56,10 @@ def run : IO Unit := do
   let json ← unwrap (Json.parse (include_str "../deploy/config.json"))
   assertTrue (fromJson? (α := Config) (json.setObjVal! "formatVersion" (toJson (999 : Nat)))).toOption.isNone
     "Future runtime configuration was accepted"
-  let legacy := Json.mkObj ((← unwrap json.getObj?).toList.filter (·.1 != "worker"))
-  let old : Config ← unwrap (fromJson? legacy)
-  assertEq old.worker ({} : ExecutionConfig) "Legacy config lost defaults"
-  let some route := old.mailboxes.workers[0]? | throw (IO.userError "Missing fixture worker")
-  assertEq route.cpus 1 "Legacy worker lost its conservative CPU budget"
-  assertTrue route.memoryMiB.isNone "Legacy worker fabricated a memory budget"
+  let current : Config ← unwrap (fromJson? json)
+  let some route := current.mailboxes.workers[0]? | throw (IO.userError "Missing fixture worker")
   for invalid in [{ route with cpus := 0 }, { route with memoryMiB := some 0 }] do
-    assertTrue ({ old.mailboxes with workers := #[invalid] }.validate).toOption.isNone
+    assertTrue ({ current.mailboxes with workers := #[invalid] }.validate).toOption.isNone
       "Invalid worker budget was accepted"
   for (field, value) in [("cpus", Json.null), ("cpus", toJson false),
       ("memoryMiB", toJson false), ("memoryMiB", toJson "8192")] do
@@ -97,10 +93,8 @@ def run : IO Unit := do
   assertEq (recovered.program.map toJson) (historical.program.map toJson) "Saved source metadata changed"
   assertTrue (recovered.sameSubmission historical) "Identical submission rejected"
   assertTrue (!(recovered.sameSubmission { historical with image := some "sha256:new" })) "Run reused across releases"
+  assertTrue (!(definition.sameSubmission historical)) "Missing release identity matched another image"
   assertTrue (!(recovered.sameSubmission { historical with input := toJson (6 : Nat) })) "Run reused for different input"
-  let legacyDefinition : RunDefinition ← unwrap (fromJson? (Json.mkObj [
-    ("entry", toJson definition.entry), ("input", definition.input), ("resultSchema", toJson definition.resultSchema)]))
-  assertTrue (legacyDefinition.image.isNone && legacyDefinition.program.isNone) "Legacy source/release invented"
   let trace ← Trace.create "config-test"
   let assignment : Assignment := ⟨0, Location.root⟩
   let limited ← registered.execute { interpreterFuel := 1 } definition "test" ⟨store, pure #[]⟩ trace assignment blobs
@@ -163,13 +157,9 @@ def run : IO Unit := do
   assertTrue (registered.info.sources.all fun file => !file.sites.isEmpty) "Empty source map"
   let _ ← unwrap LeanCloudRuntime.programs.validate
 
-  let saved : LeanCloudRuntime.Pool.Saved ← unwrap (fromJson? (Json.mkObj [
-    ("state", Json.mkObj [("runs", toJson (#[] : Array LeanCloud.Pool.Run)), ("cursor", toJson (0 : Nat))]),
-    ("replies", toJson (#[] : Array (String × Except String Json)))]))
+  let saved : LeanCloudRuntime.Pool.Saved := {}
   assertTrue (fromJson? (α := LeanCloudRuntime.Pool.Saved)
     ((toJson saved).setObjVal! "formatVersion" (toJson (999 : Nat)))).toOption.isNone "Future catalog was accepted"
-  assertTrue saved.routes.isNone "Legacy scheduler state fabricated routes"
-  assertTrue saved.timings.isEmpty "Legacy scheduler state fabricated timestamps"
   let timing : LeanCloud.Timing.Run := { span := some ⟨1000, some 3000⟩, observedMs := 3000 }
   let restored : LeanCloudRuntime.Pool.Saved ← unwrap (fromJson? (toJson { saved with timings := #[ ("one", timing) ] }))
   assertEq restored.timings #[("one", timing)] "Saved scheduler timing did not roundtrip"

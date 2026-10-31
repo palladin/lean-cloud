@@ -180,22 +180,25 @@ private def http : IO Unit := IO.FS.withTempFile fun _ path => do
         let response ← LeanCloudCli.Http.post publicUrl client.token bad.compress
         let response : Except String Json ← unwrap (Json.parse response >>= fromJson?)
         assertTrue (!response.isOk) "Invalid public request was accepted"
-      -- Bypass the version-aware client to exercise old and future senders.
-      let request := toJson (Inbox.Request.mk "compatibility" "" (.send "legacy"))
-      for version in [none, some (999 : Nat)] do
+      -- Bypass the client to check that only the current wire version can mutate mail.
+      let rawPost (body : String) : IO (Except String Json) := do
+        let raw ← IO.Process.output { cmd := "curl", args := #["--silent", "--show-error", "--fail",
+          "--max-time", "5", "-H", "Authorization: Bearer test-token", "-H", "Content-Type: application/json",
+          "--data-binary", body, s!"http://127.0.0.1:{bound.port}/mailbox"] }
+        assertEq raw.exitCode 0 "Raw protocol check failed"
+        IO.ofExcept (Json.parse raw.stdout >>= Version.responsePayload >>= fromJson?)
+      assertTrue (!(← rawPost "{invalid").isOk) "Malformed JSON did not return a versioned error"
+      let request := toJson (Inbox.Request.mk "version-check" "" (.send "current"))
+      for version in [none, some (0 : Nat), some Version.current, some (999 : Nat)] do
         let body := match version with
           | none => request
           | some value => request.setObjVal! "protocolVersion" (toJson value)
-        let raw ← IO.Process.output { cmd := "curl", args := #["--silent", "--show-error", "--fail",
-          "--max-time", "5", "-H", "Authorization: Bearer test-token", "-H", "Content-Type: application/json",
-          "--data-binary", body.compress, s!"http://127.0.0.1:{bound.port}/mailbox"] }
-        assertEq raw.exitCode 0 "Raw protocol check failed"
-        let result : Except String Json ← IO.ofExcept (Json.parse raw.stdout >>= Version.responsePayload >>= fromJson?)
-        assertEq result.isOk version.isNone "Protocol compatibility check returned the wrong result"
-      discard <| Inbox.apply store 0 ⟨"compatibility", "reader", .open⟩
-      let some legacy ← take store 0 "compatibility" "reader" | throw (IO.userError "Legacy send was lost")
-      discard <| Inbox.apply store 0 ⟨"compatibility", "reader", .acknowledge legacy.receipt⟩
-      assertEq (← take store 0 "compatibility" "reader") none "Future protocol mutated the inbox"
+        let result ← rawPost body.compress
+        assertEq result.isOk (version == some Version.current) "Unsupported protocol version was accepted"
+      discard <| Inbox.apply store 0 ⟨"version-check", "reader", .open⟩
+      let some current ← take store 0 "version-check" "reader" | throw (IO.userError "Current-version send was lost")
+      discard <| Inbox.apply store 0 ⟨"version-check", "reader", .acknowledge current.receipt⟩
+      assertEq (← take store 0 "version-check" "reader") none "Unsupported protocol mutated the inbox"
       rejects (HttpMailbox.send { endpoint with token := "wrong" } "run" "actor" (7 : Nat)) "Unauthenticated send accepted"
       HttpMailbox.send endpoint "run" "actor" (7 : Nat)
       let first ← HttpMailbox.openMailbox endpoint "run" "actor"

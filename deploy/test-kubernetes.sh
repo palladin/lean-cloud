@@ -76,10 +76,7 @@ bash deploy/kubernetes.sh down "$work/deployment" > "$work/result" 2>&1
 grep -q 'scale statefulset/worker1 --replicas=0' "$work/calls"
 grep -q 'delete configmap cloud-operation' "$work/calls"
 if grep -q 'delete pvc\|delete namespace' "$work/calls"; then echo 'Down destroyed data'; exit 1; fi
-# Resource/startup changes must not change durable identity, including records
-# saved before these optional settings were excluded from the identity.
-jq '.data.identity |= (fromjson | .startupSeconds=300 | tojson)' "$work/record.json" > "$work/record.next"
-mv "$work/record.next" "$work/record.json"
+# Resource/startup changes must not change durable identity.
 jq '.startupSeconds=900 | .cpuMillis=8000 | .cpuRequestMillis=7000 | .memoryMiB=8192 | .schedulerResources={cpuMillis:250,memoryMiB:512}' \
   "$work/deployment/deployment.json" > "$work/deployment/next.json"
 mv "$work/deployment/next.json" "$work/deployment/deployment.json"
@@ -100,6 +97,7 @@ if bash deploy/kubernetes.sh scale "$work/deployment" invalid > "$work/result" 2
 # Scale starts the requested workers only after the old generation has stopped,
 # and publishes matching mailbox membership. A later scale to zero retires them.
 bash deploy/kubernetes.sh scale "$work/deployment" 2 > "$work/result" 2>&1
+jq -e '.formatVersion==1 and (.worker|type)=="object" and .blobs.provider=="azure"' "$work/deployment/config.json" >/dev/null
 jq -e '.workers==2' "$work/deployment/deployment.json" >/dev/null
 jq -e 'map(.worker)==["worker1","worker2"]' "$work/membership.json" >/dev/null
 jq -e 'all(.cpus==8 and .memoryMiB==8192)' "$work/membership.json" >/dev/null

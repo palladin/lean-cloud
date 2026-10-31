@@ -45,7 +45,7 @@ private def inspectRun (ctx : Context) (id : String) : Cli Unit := do
   let some state := state | return
   if let some diagnostics := state.diagnostics then
     printLine s!"Execution: {phaseLabel diagnostics.phase}"
-    printLine s!"Assignments: {diagnostics.pending} pending, {diagnostics.running} running, {diagnostics.replies} replies collected"
+    printLine s!"Assignments: {diagnostics.pending} pending, {diagnostics.running} running"
     if diagnostics.configuredWorkers == some 0 then printLine "No workers configured. Add capacity using your deployment tooling."
     unless diagnostics.stopping.isEmpty do
       printLine s!"Waiting for stop acknowledgement: {String.intercalate ", " diagnostics.stopping.toList}"

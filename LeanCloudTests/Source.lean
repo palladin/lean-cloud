@@ -289,8 +289,6 @@ def cases : Array TestCase := #[
     let original := skipDelay (skipDelay (skipDelay plainCaller))
     assertTrue ((site original.metadata).bind (·.functionInfo)).isNone "Description leaked into another call"⟩,
   ⟨"source.function-metadata-wire-and-watch", do
-    let legacy : SourceSite ← unwrap (Json.parse "{\"id\":\"old\",\"line\":2,\"column\":0,\"endLine\":2,\"endColumn\":5}" >>= fromJson?)
-    assertTrue legacy.functionInfo.isNone "Old source map requires function metadata"
     let invalid := Json.mkObj [("id", toJson "bad"), ("line", toJson (2 : Nat)),
       ("column", toJson (0 : Nat)), ("endLine", toJson (2 : Nat)), ("endColumn", toJson (5 : Nat)),
       ("functionInfo", toJson false)]

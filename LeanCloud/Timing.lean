@@ -25,8 +25,8 @@ structure Run where
   observedMs : Nat := 0
   deriving BEq, Repr, ToJson, FromJson
 
-/-- Advance only from actual transitions. Loading an older database without
-timings must not invent start times for work that already existed. -/
+/-- Advance only from actual transitions; repeated observations do not invent
+new start times. -/
 def observe (timing : Run) (before : Option Pool.Run) (after : Pool.Run) (now : Nat) : Run := Id.run do
   let now := max timing.observedMs now
   let mut timing := { timing with observedMs := now }
@@ -59,7 +59,7 @@ def observe (timing : Run) (before : Option Pool.Run) (after : Pool.Run) (now : 
     (location, if stopped || groupsDone[location.key]?.getD false then span.finish now else span)
   return { timing with branches, groups, span := timing.span.map fun span => if stopped then span.finish now else span }
 
-/-- The ordinary status JSON with optional timings. Old runtimes remain readable. -/
+/-- Current status with observational timing and scheduling diagnostics. -/
 structure Status extends Scheduler.Snapshot where
   timing : Option Run := none
   diagnostics : Option Pool.Diagnostics := none
@@ -70,12 +70,8 @@ instance : ToJson Status := ⟨fun status =>
 
 instance : FromJson Status where
   fromJson? json := do
-    let timing ← match json.getObjVal? "timing" with
-      | .ok value => fromJson? value
-      | .error _ => pure none
-    let diagnostics ← match json.getObjVal? "diagnostics" with
-      | .ok value => fromJson? value
-      | .error _ => pure none
-    return { toSnapshot := ← fromJson? json, timing, diagnostics }
+    return { toSnapshot := ← fromJson? json
+             timing := ← json.getObjValAs? _ "timing"
+             diagnostics := ← json.getObjValAs? _ "diagnostics" }
 
 end LeanCloud.Timing

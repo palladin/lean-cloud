@@ -2,7 +2,7 @@ variable "LEAN_VERSION" {
   default = "4.35.0"
 }
 
-// Also usable locally; CI adds its legacy GitHub cache imports via --set.
+// Also usable locally; CI adds its GitHub cache imports via --set.
 group "default" {
   targets = ["demo", "chaos"]
 }

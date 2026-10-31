@@ -44,7 +44,7 @@ def commands : Array Command := #[
       ("--id ID", "Choose a unique run ID; otherwise one is generated.")]
     examples := #["run squares/v1", "run squares/v1 --input numbers.json --id example-1"] },
   { name := "ps", summary := "List cloud runs, status, and elapsed time."
-    details := "Shows start and finish timestamps in UTC and elapsed wall time, including waiting, pauses and retries. Completed durations stay fixed. Older runs without timing metadata show —."
+    details := "Shows start and finish timestamps in UTC and elapsed wall time, including waiting, pauses and retries. Completed durations stay fixed. Unavailable timestamps show —."
     examples := #["ps"] },
   { name := "inspect", arguments := "RUN", summary := "Inspect a run's jobs and worker assignments."
     details := "Shows its outcome or control status and, for an active run, scheduler locations and attempts."

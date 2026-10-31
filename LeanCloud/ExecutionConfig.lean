@@ -16,6 +16,9 @@ def ExecutionConfig.validate (config : ExecutionConfig) : Except String Unit := 
 instance : FromJson ExecutionConfig where
   fromJson? json := do
     let object ← json.getObj?
+    unless object.toList.all (fun (name, _) =>
+        ["interpreterFuel", "replayCacheBytes", "replayCacheEntries"].contains name) do
+      throw "Unknown worker execution setting"
     let field (name : String) (fallback : Nat) :=
       match object[name]? with
       | none => pure fallback

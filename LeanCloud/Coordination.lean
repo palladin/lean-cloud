@@ -12,16 +12,7 @@ from immutable records; assignments contain no replay cursor or join flag. -/
 structure Assignment where
   attempt : Nat
   branchStart : Location
-  deriving Repr, BEq, ToJson
-
-/-- Old durable inbox messages may still contain a cursor. Keep their stable
-branch identity and let replay discover progress from storage. -/
-instance : FromJson Assignment where
-  fromJson? json := do
-    let branchStart ← match json.getObjVal? "branchStart" with
-      | .ok value => fromJson? value
-      | .error _ => json.getObjValAs? Location "branch"
-    return { attempt := ← json.getObjValAs? Nat "attempt", branchStart }
+  deriving Repr, BEq, ToJson, FromJson
 
 /-- A worker reports control flow and record keys, never result values. -/
 inductive Progress where

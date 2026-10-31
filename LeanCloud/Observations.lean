@@ -17,21 +17,9 @@ structure Step where
   /-- Optional labels carried by a parallel observation, including its final text. -/
   parallel : Option ParallelDisplay := none
   progress : Option (String × ProgressUpdate) := none
-  deriving ToJson
+  deriving ToJson, FromJson
 
 instance : Inhabited Step := ⟨{ timestamp := "", event := ⟨"", 0, 0, "", none, "", "", "", "", none⟩ }⟩
-
-/-- Old trace caches remain readable. Absent or malformed telemetry never
-fabricates metrics or discards an otherwise valid execution observation. -/
-instance : FromJson Step where
-  fromJson? json := do
-    return { timestamp := ← json.getObjValAs? String "timestamp"
-             event := ← json.getObjValAs? ExecutionEvent "event"
-             resources := (json.getObjValAs? ResourceSample "resources").toOption
-             branch := (json.getObjValAs? Location "branch").toOption
-             job := (json.getObjValAs? BranchObservation "job").toOption
-             parallel := (json.getObjValAs? ParallelDisplay "parallel").toOption
-             progress := (json.getObjValAs? (String × ProgressUpdate) "progress").toOption }
 
 def Step.id (step : Step) : String :=
   (toJson (step.timestamp, step.event.worker, step.event.session, step.event.seq)).compress

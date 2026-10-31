@@ -284,9 +284,10 @@ private def generatedTests : IO Unit := do
     check ((Tools.sourceRelease s!"leanprover/lean4:v{version}").toOption == some version) "Supported release rejected"
   for version in ["3.99.0", "4.34.99", "4.35", "04.35.0", "4.35.0-rc1", "nightly"] do
     check ((Tools.sourceRelease s!"leanprover/lean4:v{version}").toOption.isNone) "Unsupported release accepted"
-  for old in ["check", "theorems", "allowedAxioms", "paranoid", "modules", "modulesPerJob"] do
-    check ((fromJson? (α := LeanBuild.Request) ((toJson request).setObjVal! old Json.null)).toOption.isNone)
-      "Removed request field was silently ignored"
+  check ((fromJson? (α := LeanBuild.Request) ((toJson request).setObjVal! "unknown" Json.null)).toOption.isNone)
+    "Unknown request field was silently ignored"
+  check ((fromJson? (α := LeanBuild.Limits) ((toJson request.limits).setObjVal! "unknown" Json.null)).toOption.isNone)
+    "Unknown limit was silently ignored"
   let store := objects (← Std.Mutex.new {})
   for seed in [:40] do
     let modules := (Array.range (4 + seed % 12)).map fun i => {
@@ -371,9 +372,6 @@ private def generatedTests : IO Unit := do
     for name in ["Needed", "Unrelated"] do
       discard <| Builders.publishResult env { name, status := .built }
     queue.send #[⟨"Busy", toJson "Busy", 2⟩, ⟨"Next", toJson "Next", 1⟩]
-    let observed := { queue with
-      completions := fun _ _ => throw (IO.userError "Prefetch still uses the completion feed") }
-    let env := { env with queues := ⟨fun _ => observed⟩ }
     let prefetched ← IO.mkRef false
     runBuilders env plan (fun _ m _ => do
       let deadline := (← IO.monoMsNow) + 3000
@@ -805,18 +803,15 @@ private def workspaceTests (store : ObjectStore) : IO Unit := IO.FS.withTempDir 
   IO.FS.writeFile (source / "input") "prepared source"
   let files ← (← Bundle.snapshot source 10000).publish store
   let ref ← Files.putJson store files
-  let legacyRef ← Files.putText store (toJson files).pretty
   let cache := root / "workspace"
   let use := Workspace.use store (some cache) "build-a"
   use fun session => do
     let manifest ← session.readManifest ref
-    discard <| session.readManifest legacyRef
     Bundle.synchronize store session.directory manifest 10000
     session.commit
   let offline := { store with read := fun _ => throw (IO.userError "Unnecessary blob read") }
   Workspace.use offline (some cache) "build-a" fun session => do
     let manifest ← session.readManifest ref
-    discard <| session.readManifest legacyRef
     check (← (session.directory / "input").pathExists) "Clean workspace was discarded"
     let before ← (session.directory / "input").metadata
     Bundle.synchronize offline session.directory manifest 10000

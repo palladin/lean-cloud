@@ -6,25 +6,19 @@ import Std.Time
 namespace LeanCloudRuntime.WorkQueueStore
 open Lean LeanLinq LeanCloud
 
-private abbrev LegacyRow : Schema := [("queue", .string), ("id", .int), ("payload", .string),
-  ("receipt", .string), ("available", .int)]
 private abbrev Row : Schema := [("queue", .string), ("id", .int), ("payload", .string),
   ("receipt", .string), ("available", .int), ("priority", .int)]
 private abbrev Counter : Schema := [("queue", .string), ("next", .int)]
-private abbrev LegacySubmission : Schema := [("queue", .string), ("key", .string), ("payload", .string)]
 private abbrev Submission : Schema := [("queue", .string), ("key", .string), ("payload", .string), ("priority", .int)]
 private abbrev Retired : Schema := [("run", .string)]
 private abbrev Totals : Schema := [("queue", .string), ("completed", .int), ("failed", .int)]
-private abbrev Completed : Schema := [("queue", .string), ("cursor", .int), ("payload", .string), ("failed", .bool)]
 private abbrev Context : Ctx := { tables := [("work_messages", Row), ("work_counters", Counter),
-  ("work_submissions", Submission), ("work_retired", Retired), ("work_totals", Totals),
-  ("work_completed", Completed)] }
+  ("work_submissions", Submission), ("work_retired", Retired), ("work_totals", Totals)] }
 private def messages : Table "work_messages" Row := ⟨⟩
 private def counters : Table "work_counters" Counter := ⟨⟩
 private def submissions : Table "work_submissions" Submission := ⟨⟩
 private def retired : Table "work_retired" Retired := ⟨⟩
 private def totals : Table "work_totals" Totals := ⟨⟩
-private def completed : Table "work_completed" Completed := ⟨⟩
 
 inductive Operation where
   | send (values : Array WorkItem)
@@ -34,7 +28,6 @@ inductive Operation where
   | acknowledge (receipt : String)
   | complete (receipt : String) (failed : Bool)
   | progress
-  | completions (after count : Nat)
   | renew (receipt : String)
   | release (receipt : String)
   | retire
@@ -45,82 +38,30 @@ structure Request where
   operation : Operation
   deriving ToJson, FromJson
 
-/-- Rebuild the legacy tables with typed schemas and typed row copies. The
-transaction preserves pending leases, submission order and deduplication on
-upgrade, including when initialization is interrupted. -/
-private def initializePriority (conn : Sqlite.Conn) : IO Unit := do
-  let format : Table "work_queue_format" [("version", .int)] := ⟨⟩
-  let query : Query { tables := [("work_queue_format", [("version", .int)])] } _ :=
-    Query.from' format
-  conn.createTable format (primaryKey := [.column "version"])
-  match ← conn.query query with
-  | [.cons 1 .nil] => return
-  | [] => pure ()
-  | _ => throw (IO.userError "Unsupported work queue schema")
-  conn.createTable (⟨⟩ : Table "work_messages" LegacyRow)
-    (primaryKey := [.column "queue", .column "id"])
-  conn.createTable (⟨⟩ : Table "work_submissions" LegacySubmission)
-    (primaryKey := [.column "queue", .column "key"])
-  conn.execRaw "ALTER TABLE work_messages RENAME TO work_messages_legacy; ALTER TABLE work_submissions RENAME TO work_submissions_legacy;"
+def initializeSchema (conn : Sqlite.Conn) : IO Unit := conn.withTransaction do
   conn.createTable messages (primaryKey := [.column "queue", .column "id"])
   conn.createTable submissions (primaryKey := [.column "queue", .column "key"])
-  let oldMessages : Table "work_messages_legacy" LegacyRow := ⟨⟩
-  let oldSubmissions : Table "work_submissions_legacy" LegacySubmission := ⟨⟩
-  let migration : Ctx := { tables := [("work_messages_legacy", LegacyRow),
-    ("work_submissions_legacy", LegacySubmission), ("work_messages", Row), ("work_submissions", Submission)] }
-  let rows : Query migration Row := Query.from' (ts := migration) oldMessages
-    |>.select (fun r => ![r["queue"].as "queue", r["id"].as "id", r["payload"].as "payload",
-      r["receipt"].as "receipt", r["available"].as "available", (SqlExpr.int 0).as "priority"])
-  discard (conn.execInsertSelect (messages.insertFrom rows))
-  let sent : Query migration Submission := Query.from' (ts := migration) oldSubmissions
-    |>.select (fun r => ![r["queue"].as "queue", r["key"].as "key", r["payload"].as "payload", (SqlExpr.int 0).as "priority"])
-  discard (conn.execInsertSelect (submissions.insertFrom sent))
-  conn.execRaw "DROP TABLE work_messages_legacy; DROP TABLE work_submissions_legacy;"
-  discard <| conn.execInsert (format.insert (ts := { tables := [("work_queue_format", [("version", .int)])] })
-    |>.value "version" (SqlExpr.int 1))
-
-def initializeSchema (conn : Sqlite.Conn) : IO Unit := conn.withTransaction do
-  initializePriority conn
   conn.createTable counters (primaryKey := [.column "queue"])
   conn.createTable retired (primaryKey := [.column "run"])
   conn.createTable totals (primaryKey := [.column "queue"])
-  conn.createTable completed (primaryKey := [.column "queue", .column "cursor"])
   conn.execRaw "CREATE INDEX IF NOT EXISTS work_messages_order ON work_messages (queue, priority DESC, id ASC, available);"
 
 private def progress (conn : Sqlite.Conn) (queue : String) : IO WorkQueueProgress := do
   let query : Query Context Totals := Query.from' (ts := Context) totals
     |>.where' (fun r => r["queue"] ==. SqlExpr.str queue)
   match ← conn.query query with
-  | [] =>
-    -- Older queues have no counter yet. Their retained submission keys and
-    -- outstanding rows recover the completed count without reading blobs.
-    let submitted : Query Context Submission := Query.from' (ts := Context) submissions
-      |>.where' (fun r => r["queue"] ==. SqlExpr.str queue)
-    let pending : Query Context Row := Query.from' (ts := Context) messages
-      |>.where' (fun r => r["queue"] ==. SqlExpr.str queue)
-    let sent := (← conn.queryCell submitted.count).getD 0
-    let remaining := (← conn.queryCell pending.count).getD 0
-    return ⟨(sent - remaining).toNat, 0⟩
+  | [] => return ⟨0, 0⟩
   | [.cons _ (.cons completed (.cons failed .nil))] => return ⟨completed.toNat, failed.toNat⟩
   | _ => throw (IO.userError "Invalid queue progress")
 
 private def settle (conn : Sqlite.Conn) (now : Nat) (queue receipt : String) (failed : Bool) : IO Unit := do
   unless !receipt.isEmpty do throw (IO.userError "Empty receipt")
   let previous ← progress conn queue
-  let query : Query Context Row := Query.from' (ts := Context) messages
-    |>.where' (fun r => (r["queue"] ==. SqlExpr.str queue) &&.
-      (r["receipt"] ==. SqlExpr.str receipt) &&. (r["available"] >. SqlExpr.int now))
-  let [.cons _ (.cons _ (.cons payload (.cons _ (.cons _ (.cons _ .nil)))))] ← conn.query query
-    | return
   let delete : DeleteStmt Context _ _ := messages.delete
     |>.where' (fun r => (r["queue"] ==. SqlExpr.str queue) &&.
       (r["receipt"] ==. SqlExpr.str receipt) &&. (r["available"] >. SqlExpr.int now))
   -- Redelivery, repeated ACKs and expired receipts cannot increment progress.
   if (← conn.execDelete delete) == 0 then return
-  let insert : InsertStmt Context _ _ := completed.insert
-    |>.value "queue" (SqlExpr.str queue) |>.value "cursor" (SqlExpr.int (previous.completed + 1))
-    |>.value "payload" (SqlExpr.str payload) |>.value "failed" (SqlExpr.bool failed)
-  discard (conn.execInsert insert)
   let update : UpdateStmt Context _ _ := totals.update
     |>.set "completed" (SqlExpr.int (previous.completed + 1))
     |>.set "failed" (SqlExpr.int (previous.failed + if failed then 1 else 0))
@@ -146,9 +87,6 @@ private def retire (conn : Sqlite.Conn) (run : String) : IO Unit := do
       |>.where' (fun r => r["queue"] ==. SqlExpr.str name)
     discard (conn.execDelete delete)
     let delete : DeleteStmt Context _ _ := totals.delete
-      |>.where' (fun r => r["queue"] ==. SqlExpr.str name)
-    discard (conn.execDelete delete)
-    let delete : DeleteStmt Context _ _ := completed.delete
       |>.where' (fun r => r["queue"] ==. SqlExpr.str name)
     discard (conn.execDelete delete)
     let delete : DeleteStmt Context _ _ := submissions.delete
@@ -203,15 +141,6 @@ def apply (conn : Sqlite.Conn) (now : Nat) (request : Request)
   match operation with
   | .retire => return Json.null
   | .progress => return toJson (← progress conn queue)
-  | .completions after count =>
-    unless count > 0 && count ≤ 100 do throw (IO.userError "Completion count must be between 1 and 100")
-    let query : Query Context Completed := Query.from' (ts := Context) completed
-      |>.where' (fun r => (r["queue"] ==. SqlExpr.str queue) &&. (r["cursor"] >. SqlExpr.int after))
-      |>.orderBy (fun r => [r["cursor"].asc]) |>.limit count
-    let values ← (← conn.query query).toArray.mapM fun
-      | .cons _ (.cons cursor (.cons payload (.cons failed .nil))) => do
-        return (⟨cursor.toNat, ← IO.ofExcept (Json.parse payload), failed⟩ : WorkCompletion)
-    return toJson values
   | .idle =>
     let query : Query Context Row := Query.from' (ts := Context) messages
       |>.where' (fun r => r["queue"] ==. SqlExpr.str queue) |>.limit 1
@@ -301,7 +230,6 @@ def provider (conn : Sqlite.Conn) (lock : Std.Mutex Unit) (scope : String) : Que
       acknowledge receipt := do discard (call (.acknowledge receipt))
       complete receipt failed := do discard (call (.complete receipt failed))
       progress := do IO.ofExcept (fromJson? (← call .progress))
-      completions after count := do IO.ofExcept (fromJson? (← call (.completions after count)))
       renew receipt := do discard (call (.renew receipt))
       release receipt := do discard (call (.release receipt)) }⟩
 
