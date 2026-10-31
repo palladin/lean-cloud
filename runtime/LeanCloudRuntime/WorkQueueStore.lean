@@ -6,10 +6,13 @@ import Std.Time
 namespace LeanCloudRuntime.WorkQueueStore
 open Lean LeanLinq LeanCloud
 
-private abbrev Row : Schema := [("queue", .string), ("id", .int), ("payload", .string),
+private abbrev LegacyRow : Schema := [("queue", .string), ("id", .int), ("payload", .string),
   ("receipt", .string), ("available", .int)]
+private abbrev Row : Schema := [("queue", .string), ("id", .int), ("payload", .string),
+  ("receipt", .string), ("available", .int), ("priority", .int)]
 private abbrev Counter : Schema := [("queue", .string), ("next", .int)]
-private abbrev Submission : Schema := [("queue", .string), ("key", .string), ("payload", .string)]
+private abbrev LegacySubmission : Schema := [("queue", .string), ("key", .string), ("payload", .string)]
+private abbrev Submission : Schema := [("queue", .string), ("key", .string), ("payload", .string), ("priority", .int)]
 private abbrev Retired : Schema := [("run", .string)]
 private abbrev Totals : Schema := [("queue", .string), ("completed", .int), ("failed", .int)]
 private abbrev Completed : Schema := [("queue", .string), ("cursor", .int), ("payload", .string), ("failed", .bool)]
@@ -26,6 +29,7 @@ private def completed : Table "work_completed" Completed := ⟨⟩
 inductive Operation where
   | send (values : Array WorkItem)
   | receive (count : Nat)
+  | peek (after : Option WorkPosition) (count : Nat)
   | idle
   | acknowledge (receipt : String)
   | complete (receipt : String) (failed : Bool)
@@ -41,13 +45,47 @@ structure Request where
   operation : Operation
   deriving ToJson, FromJson
 
-def initializeSchema (conn : Sqlite.Conn) : IO Unit := do
+/-- Rebuild the legacy tables with typed schemas and typed row copies. The
+transaction preserves pending leases, submission order and deduplication on
+upgrade, including when initialization is interrupted. -/
+private def initializePriority (conn : Sqlite.Conn) : IO Unit := do
+  let format : Table "work_queue_format" [("version", .int)] := ⟨⟩
+  let query : Query { tables := [("work_queue_format", [("version", .int)])] } _ :=
+    Query.from' format
+  conn.createTable format (primaryKey := [.column "version"])
+  match ← conn.query query with
+  | [.cons 1 .nil] => return
+  | [] => pure ()
+  | _ => throw (IO.userError "Unsupported work queue schema")
+  conn.createTable (⟨⟩ : Table "work_messages" LegacyRow)
+    (primaryKey := [.column "queue", .column "id"])
+  conn.createTable (⟨⟩ : Table "work_submissions" LegacySubmission)
+    (primaryKey := [.column "queue", .column "key"])
+  conn.execRaw "ALTER TABLE work_messages RENAME TO work_messages_legacy; ALTER TABLE work_submissions RENAME TO work_submissions_legacy;"
   conn.createTable messages (primaryKey := [.column "queue", .column "id"])
-  conn.createTable counters (primaryKey := [.column "queue"])
   conn.createTable submissions (primaryKey := [.column "queue", .column "key"])
+  let oldMessages : Table "work_messages_legacy" LegacyRow := ⟨⟩
+  let oldSubmissions : Table "work_submissions_legacy" LegacySubmission := ⟨⟩
+  let migration : Ctx := { tables := [("work_messages_legacy", LegacyRow),
+    ("work_submissions_legacy", LegacySubmission), ("work_messages", Row), ("work_submissions", Submission)] }
+  let rows : Query migration Row := Query.from' (ts := migration) oldMessages
+    |>.select (fun r => ![r["queue"].as "queue", r["id"].as "id", r["payload"].as "payload",
+      r["receipt"].as "receipt", r["available"].as "available", (SqlExpr.int 0).as "priority"])
+  discard (conn.execInsertSelect (messages.insertFrom rows))
+  let sent : Query migration Submission := Query.from' (ts := migration) oldSubmissions
+    |>.select (fun r => ![r["queue"].as "queue", r["key"].as "key", r["payload"].as "payload", (SqlExpr.int 0).as "priority"])
+  discard (conn.execInsertSelect (submissions.insertFrom sent))
+  conn.execRaw "DROP TABLE work_messages_legacy; DROP TABLE work_submissions_legacy;"
+  discard <| conn.execInsert (format.insert (ts := { tables := [("work_queue_format", [("version", .int)])] })
+    |>.value "version" (SqlExpr.int 1))
+
+def initializeSchema (conn : Sqlite.Conn) : IO Unit := conn.withTransaction do
+  initializePriority conn
+  conn.createTable counters (primaryKey := [.column "queue"])
   conn.createTable retired (primaryKey := [.column "run"])
   conn.createTable totals (primaryKey := [.column "queue"])
   conn.createTable completed (primaryKey := [.column "queue", .column "cursor"])
+  conn.execRaw "CREATE INDEX IF NOT EXISTS work_messages_order ON work_messages (queue, priority DESC, id ASC, available);"
 
 private def progress (conn : Sqlite.Conn) (queue : String) : IO WorkQueueProgress := do
   let query : Query Context Totals := Query.from' (ts := Context) totals
@@ -72,7 +110,7 @@ private def settle (conn : Sqlite.Conn) (now : Nat) (queue receipt : String) (fa
   let query : Query Context Row := Query.from' (ts := Context) messages
     |>.where' (fun r => (r["queue"] ==. SqlExpr.str queue) &&.
       (r["receipt"] ==. SqlExpr.str receipt) &&. (r["available"] >. SqlExpr.int now))
-  let [.cons _ (.cons _ (.cons payload (.cons _ (.cons _ .nil))))] ← conn.query query
+  let [.cons _ (.cons _ (.cons payload (.cons _ (.cons _ (.cons _ .nil)))))] ← conn.query query
     | return
   let delete : DeleteStmt Context _ _ := messages.delete
     |>.where' (fun r => (r["queue"] ==. SqlExpr.str queue) &&.
@@ -139,6 +177,18 @@ private def allocate (conn : Sqlite.Conn) (queue : String) (count : Nat) : IO Na
   discard (conn.execUpdate update)
   return next.toNat
 
+/-- Receive and peek share both eligibility and ordering. Keyset pagination
+does not skip rows when earlier work is leased or removed between requests. -/
+private def available (queue : String) (now : Nat) (after : Option WorkPosition)
+    (count : Nat) : Query Context Row :=
+  let query := Query.from' (ts := Context) messages
+    |>.where' (fun r => (r["queue"] ==. SqlExpr.str queue) &&. (r["available"] <=. SqlExpr.int now))
+  let query := match after with
+    | none => query
+    | some cursor => query.where' (fun r => (r["priority"] <. SqlExpr.int cursor.priority) ||.
+        ((r["priority"] ==. SqlExpr.int cursor.priority) &&. (r["id"] >. SqlExpr.int cursor.sequence)))
+  query.orderBy (fun r => [r["priority"].desc, r["id"].asc]) |>.limit count
+
 /-- The caller holds the inbox connection mutex. Wall time and leases survive
 service restart. Every receive allocates new durable receipts, fencing old ACKs. -/
 def apply (conn : Sqlite.Conn) (now : Nat) (request : Request)
@@ -168,7 +218,7 @@ def apply (conn : Sqlite.Conn) (now : Nat) (request : Request)
     return toJson (← conn.query query).isEmpty
   | .send values =>
     unless values.size ≤ 100 && values.all (fun v => !v.key.isEmpty && v.key.utf8ByteSize ≤ 512 &&
-        v.value.compress.utf8ByteSize ≤ 65536) do
+        v.value.compress.utf8ByteSize ≤ 65536 && v.priority ≤ 9223372036854775807) do
       throw (IO.userError "Work queue batch exceeds limits")
     if values.isEmpty then return Json.null
     let first ← allocate conn queue values.size
@@ -178,30 +228,30 @@ def apply (conn : Sqlite.Conn) (now : Nat) (request : Request)
         |>.where' (fun r => (r["queue"] ==. SqlExpr.str queue) &&. (r["key"] ==. SqlExpr.str value.key))
       match ← conn.query query with
       | [] => pure ()
-      | [.cons _ (.cons _ (.cons previous .nil))] =>
-        unless previous == payload do throw (IO.userError "Work item key has different contents")
+      | [.cons _ (.cons _ (.cons previous (.cons priority .nil)))] =>
+        unless previous == payload && priority == value.priority do
+          throw (IO.userError "Work item key has different contents or priority")
         continue
       | _ => throw (IO.userError "Invalid work submission")
       let insert : InsertStmt Context _ _ := submissions.insert
         |>.value "queue" (SqlExpr.str queue) |>.value "key" (SqlExpr.str value.key)
         |>.value "payload" (SqlExpr.str payload)
+        |>.value "priority" (SqlExpr.int value.priority)
       discard (conn.execInsert insert)
       let insert : InsertStmt Context _ _ := messages.insert
         |>.value "queue" (SqlExpr.str queue) |>.value "id" (SqlExpr.int (first + i))
         |>.value "payload" (SqlExpr.str payload)
         |>.value "receipt" (SqlExpr.str "") |>.value "available" (SqlExpr.int 0)
+        |>.value "priority" (SqlExpr.int value.priority)
       discard (conn.execInsert insert)
     return Json.null
   | .receive count =>
     unless 0 < count && count ≤ 100 do throw (IO.userError "Receive count must be between 1 and 100")
-    let query : Query Context Row := Query.from' (ts := Context) messages
-      |>.where' (fun r => (r["queue"] ==. SqlExpr.str queue) &&. (r["available"] <=. SqlExpr.int now))
-      |>.orderBy (fun r => [r["id"].asc]) |>.limit count
-    let rows ← conn.query query
+    let rows ← conn.query (available queue now none count)
     if rows.isEmpty then return toJson (#[] : Array WorkDelivery)
     let first ← allocate conn queue rows.length
     let mut deliveries : Array WorkDelivery := #[]
-    for (.cons _ (.cons id (.cons payload (.cons _ (.cons _ .nil)))), i) in rows.zipIdx do
+    for (.cons _ (.cons id (.cons payload (.cons _ (.cons _ (.cons _ .nil))))), i) in rows.zipIdx do
       let receipt := s!"{id}:{first + i}"
       let update : UpdateStmt Context _ _ := messages.update
         |>.set "receipt" (SqlExpr.str receipt) |>.set "available" (SqlExpr.int (now + leaseMs))
@@ -209,6 +259,13 @@ def apply (conn : Sqlite.Conn) (now : Nat) (request : Request)
       discard (conn.execUpdate update)
       deliveries := deliveries.push ⟨receipt, ← IO.ofExcept (Json.parse payload)⟩
     return toJson deliveries
+  | .peek after count =>
+    unless 0 < count && count ≤ 100 do throw (IO.userError "Peek count must be between 1 and 100")
+    let rows ← conn.query (available queue now after count)
+    let values ← rows.toArray.mapM fun
+      | .cons _ (.cons id (.cons payload (.cons _ (.cons _ (.cons priority .nil))))) => do
+        return (⟨⟨priority.toNat, id.toNat⟩, ← IO.ofExcept (Json.parse payload)⟩ : WorkPreview)
+    return toJson values
   | .acknowledge receipt =>
     settle conn now queue receipt false
     return Json.null
@@ -239,6 +296,7 @@ def provider (conn : Sqlite.Conn) (lock : Std.Mutex Unit) (scope : String) : Que
       apply conn now ⟨(toJson (scope, name)).compress, operation⟩
     { send values := do discard (call (.send values))
       receive count := do IO.ofExcept (fromJson? (← call (.receive count)))
+      peek after count := do IO.ofExcept (fromJson? (← call (.peek after count)))
       isIdle := do IO.ofExcept (fromJson? (← call .idle))
       acknowledge receipt := do discard (call (.acknowledge receipt))
       complete receipt failed := do discard (call (.complete receipt failed))

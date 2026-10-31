@@ -43,10 +43,18 @@ A busy worker leaves additional modules available to other workers. Receives do
 not define execution batches. Shared prerequisite files are transferred once,
 and concurrent preparations await the same transfer.
 
-Every worker also follows a durable completion feed with its own cursor and
-prefetches new artifacts while Lake is busy. Dequeuing a module waits only for
-prerequisites still in flight. The feed announces module names; artifact bytes
-travel directly from blob storage. Read and upload pools each allow up to
+Ready modules are ordered by the longest remaining dependency chain, computed
+once from the DAG. Higher priorities run first; equal priorities keep submission
+order. Both initial modules and newly ready dependents use the same lookup.
+
+Every worker continuously looks ahead through this ordered queue while Lake is
+busy, prefetching the upcoming modules' prerequisites. The scan does not claim
+work, and continues beyond the first page. It revisits the front every 200 ms so
+new high-priority modules overtake unstarted downloads. Free download slots refill
+without waiting for a whole page. It does not download unrelated completed
+modules. Dequeuing a module waits only for prerequisites still missing or in
+flight; preparation and prefetch share transfers and the local cache.
+Artifact bytes travel directly from blob storage. Read and upload pools each allow up to
 `min 32 (max 4 (4 × CPUs))` concurrent transfers, shared across nested operations.
 Compilation still uses `max 1 (CPUs − 1)` slots.
 

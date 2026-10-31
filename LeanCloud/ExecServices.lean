@@ -42,9 +42,32 @@ structure WorkDelivery where
   deriving ToJson, FromJson, Inhabited
 
 /-- A stable application key makes publication safe to repeat, even after ACK.
-Keys are unique within one run-scoped queue. Reusing a key requires equal data. -/
+Keys are unique within one run-scoped queue. Reusing a key requires equal data
+and priority. Higher priorities are received first. -/
 structure WorkItem where
   key : String
+  value : Json
+  priority : Nat := 0
+  deriving ToJson
+
+instance : FromJson WorkItem where
+  fromJson? json := do
+    let fields ← json.getObj?
+    return { key := ← json.getObjValAs? String "key"
+             value := ← json.getObjVal? "value"
+             priority := ← match fields["priority"]? with
+               | none => pure 0
+               | some value => fromJson? value }
+
+/-- Stable position in priority-descending, submission-ascending order. -/
+structure WorkPosition where
+  priority : Nat
+  sequence : Nat
+  deriving Repr, BEq, ToJson, FromJson
+
+/-- An observation of available work, without a lease or ownership. -/
+structure WorkPreview where
+  position : WorkPosition
   value : Json
   deriving ToJson, FromJson
 
@@ -62,7 +85,12 @@ Broker waiting is bounded; an empty batch is not completion.
 Transport errors are errors, never empty batches. -/
 structure WorkQueue (m : Type → Type u) where
   send : Array WorkItem → m Unit
+  /-- Highest priority first, FIFO for ties. Only available work is leased. -/
   receive : Nat → m (Array WorkDelivery)
+  /-- Read available work in receive order without leasing it. A cursor continues
+  strictly after that position, even if its item was removed. Pages are live,
+  not a snapshot: restart at `none` to see new work ahead of the cursor. -/
+  peek : Option WorkPosition → Nat → m (Array WorkPreview)
   /-- No messages remain, including leased messages. This is not a completion
   guarantee unless the application has finished producing work. -/
   isIdle : m Bool
@@ -77,6 +105,7 @@ structure WorkQueue (m : Type → Type u) where
 def WorkQueue.map (f : {α : Type} → m α → n α) (queue : WorkQueue m) : WorkQueue n where
   send values := f (queue.send values)
   receive count := f (queue.receive count)
+  peek after count := f (queue.peek after count)
   isIdle := f queue.isIdle
   acknowledge receipt := f (queue.acknowledge receipt)
   complete receipt failed := f (queue.complete receipt failed)
@@ -97,6 +126,7 @@ def QueueProvider.unsupported [Monad m] [MonadExceptOf CloudError m] : QueueProv
   ⟨fun _ => {
     send _ := unavailable
     receive _ := unavailable
+    peek _ _ := unavailable
     isIdle := unavailable
     acknowledge _ := unavailable
     complete _ _ := unavailable

@@ -170,6 +170,115 @@ private def admissionTest : IO Unit := do
     check ((← (env.queues.open Builders.queueName).progress) == ⟨4, 0⟩) "Admission lost queue completions"
   IO.println "PASS busy compilers leave unstarted work available to idle workers"
 
+private def priorityTests : IO Unit := do
+  let modules : Array LeanBuild.Module := #[⟨"A", #[]⟩, ⟨"B", #[]⟩,
+    ⟨"C", #[]⟩, ⟨"D", #["C"]⟩, ⟨"E", #["D"]⟩, ⟨"F", #["E"]⟩]
+  let scores := Builders.priorities modules
+  check (modules.map (fun m => scores[m.name]?.getD 0) == #[1, 1, 4, 3, 2, 1])
+    "Priority counted prerequisites instead of the remaining chain"
+  let diamond := Builders.priorities #[⟨"Root", #[]⟩, ⟨"Left", #["Root"]⟩,
+    ⟨"Right", #["Root"]⟩, ⟨"Join", #["Left", "Right"]⟩]
+  check (diamond["Root"]? == some 3) "Priority summed branches instead of taking the longest chain"
+  let store := objects (← Std.Mutex.new {})
+  withEnvironment store (pool #[1]) fun env => do
+    let plan := { fixturePlan with modules }
+    let seen ← IO.mkRef (#[] : Array String)
+    let sent ← IO.mkRef (0 : Nat)
+    let queue := env.queues.open Builders.queueName
+    let checked := { queue with send := fun values => do
+      for value in values do
+        check (scores[value.key]? == some value.priority) "Successor lost its DAG priority"
+      sent.modify (· + values.size)
+      queue.send values }
+    let env := { env with queues := ⟨fun _ => checked⟩ }
+    Builders.seed env plan
+    runBuilders env plan fun _ m _ => do
+      seen.modify (·.push m.name)
+      return { name := m.name, status := .built }
+    -- Publication overlaps admission: a free compiler may take another root
+    -- before its previous module has made a higher-priority successor ready.
+    check ((← seen.get)[0]? == some "C" && (← seen.get).size == 6 && (← sent.get) == 6)
+      "Highest-priority root was not selected, or a successor was lost"
+  IO.println "PASS longest-chain priorities and priority-ordered successor admission"
+
+private def prefetchTests : IO Unit := do
+  let store := objects (← Std.Mutex.new {})
+  -- Scan more than a page while every item stays in the queue. Revisiting the
+  -- first page must neither repeat downloads nor starve the remainder.
+  withEnvironment store (pool #[2]) fun env => do
+    let queue := env.queues.open "prefetch-pages"
+    let items := (Array.range 205).map fun n => ⟨toString n, toJson n, n⟩
+    for start in [0, 100, 200] do queue.send (items.extract start (start + 100))
+    let seen ← IO.mkRef (#[] : Array Nat)
+    let deadline := (← IO.monoMsNow) + 5000
+    let stop : CancellationToken IO := ⟨do
+      check ((← IO.monoMsNow) < deadline) "Prefetch did not cover the ordered queue"
+      return (← seen.get).size == 205⟩
+    Prefetch.run queue stop 1 fun _ value => do
+      seen.modify (·.push (← IO.ofExcept (fromJson? value)))
+    check ((← seen.get) == (Array.range 205).reverse) "Prefetch ignored priority, repeated work or skipped a page"
+    check ((← queue.receive 1).map (·.value.compress) == #[(toJson (204 : Nat)).compress])
+      "Prefetch claimed work that another worker should be able to receive"
+    check ((← queue.progress) == ⟨0, 0⟩) "Prefetch altered build progress"
+  -- Keep one slow transfer active. Another slot must refill, and a new urgent
+  -- item must overtake lower-priority lookahead after the head refresh.
+  withEnvironment store (pool #[3]) fun env => do
+    let queue := env.queues.open "prefetch-refill"
+    queue.send #[⟨"slow", toJson "slow", 3⟩, ⟨"fast", toJson "fast", 2⟩, ⟨"last", toJson "last", 1⟩]
+    let seen ← Std.Mutex.new (#[] : Array String)
+    let urgentSeen ← IO.mkRef false
+    let finished ← IO.mkRef false
+    let slowStopped ← IO.mkRef false
+    let deadline := (← IO.monoMsNow) + 5000
+    let stop : CancellationToken IO := ⟨do
+      check ((← IO.monoMsNow) < deadline) "Prefetch page barrier or head starvation"
+      return (← finished.get) && (← slowStopped.get)⟩
+    let observed := { queue with peek := fun after count => do
+      let page ← queue.peek after count
+      if after.isNone && page.any (·.value.compress == (toJson "urgent").compress) then urgentSeen.set true
+      return page }
+    Prefetch.run observed stop 2 fun _ value => do
+      let name : String ← IO.ofExcept (fromJson? value)
+      seen.atomically (modify (·.push name))
+      if name == "slow" then
+        while !(← finished.get) do
+          check ((← IO.monoMsNow) < deadline) "Prefetch waited for a whole page"
+          IO.sleep 10
+        slowStopped.set true
+      if name == "fast" then
+        queue.send #[⟨"urgent", toJson "urgent", 10⟩]
+        while !(← urgentSeen.get) do
+          check ((← IO.monoMsNow) < deadline) "Busy prefetch slots stopped observing the head"
+          IO.sleep 10
+      if name == "last" then finished.set true
+    let seen ← seen.atomically get
+    check (seen.size == 4 && seen.extract 2 4 == #["urgent", "last"])
+      "New high-priority work did not overtake unstarted prefetches"
+    check ((← queue.receive 4).size == 4) "Prefetch removed or leased queued work"
+  -- A failing download cancels and joins its sibling before propagating.
+  withEnvironment store (pool #[3]) fun env => do
+    let queue := env.queues.open "prefetch-failure"
+    queue.send #[⟨"wait", toJson false, 0⟩, ⟨"fail", toJson true, 0⟩]
+    let started ← IO.mkRef false
+    let joined ← IO.mkRef false
+    let deadline := (← IO.monoMsNow) + 5000
+    let failed ← try
+      Prefetch.run queue .never 2 fun stop value => do
+        if ← IO.ofExcept (fromJson? (α := Bool) value) then
+          while !(← started.get) do
+            check ((← IO.monoMsNow) < deadline) "Sibling prefetch did not start"
+            IO.sleep 10
+          throw (IO.userError "Prefetch failed")
+        started.set true
+        while !(← stop.isRequested) do
+          check ((← IO.monoMsNow) < deadline) "Failed prefetch did not cancel its sibling"
+          IO.sleep 10
+        joined.set true
+      pure false
+    catch error => pure (error.toString == "Prefetch failed")
+    check (failed && (← joined.get)) "Prefetch failure was lost or returned before joining"
+  IO.println "PASS ordered prefetch beyond one page, urgent arrivals, rolling refill, no leases, cancellation and joins"
+
 private def generatedTests : IO Unit := do
   for version in ["4.35.0", "4.35.1", "4.36.0", "5.0.0"] do
     check ((Tools.sourceRelease s!"leanprover/lean4:v{version}").toOption == some version) "Supported release rejected"
@@ -253,25 +362,29 @@ private def generatedTests : IO Unit := do
     runBuilders env plan fun _ m _ => pure { name := m.name, status := .built }
     check (!(← probes.get).contains (Builders.resultName "Far"))
       "Publication fetched prerequisites after a known missing dependency"
-  -- Slots are replenished without claiming an unbounded ready frontier.
-  -- A worker with a busy compiler must observe/download another worker's
-  -- artifact before dequeuing its next job. Cursor catch-up must work too.
+  -- A busy compiler must warm the next queued module's prerequisites, without
+  -- downloading unrelated completed artifacts or reserving the next module.
   withEnvironment store (pool #[2]) fun env => do
-    let plan := { fixturePlan with modules := #[⟨"Published", #[]⟩, ⟨"Busy", #[]⟩] }
-    Builders.seed env plan
+    let plan := { fixturePlan with modules := #[⟨"Unrelated", #[]⟩, ⟨"Needed", #[]⟩,
+      ⟨"Busy", #[]⟩, ⟨"Next", #["Needed"]⟩] }
     let queue := env.queues.open Builders.queueName
-    let claimed ← queue.receive 1
-    discard <| Builders.publishResult env { name := "Published", status := .built }
-    queue.complete claimed[0]!.receipt false
+    for name in ["Needed", "Unrelated"] do
+      discard <| Builders.publishResult env { name, status := .built }
+    queue.send #[⟨"Busy", toJson "Busy", 2⟩, ⟨"Next", toJson "Next", 1⟩]
+    let observed := { queue with
+      completions := fun _ _ => throw (IO.userError "Prefetch still uses the completion feed") }
+    let env := { env with queues := ⟨fun _ => observed⟩ }
     let prefetched ← IO.mkRef false
     runBuilders env plan (fun _ m _ => do
       let deadline := (← IO.monoMsNow) + 3000
       while !(← prefetched.get) do
-        check ((← IO.monoMsNow) < deadline) "Busy worker did not prefetch the completion feed"
+        check ((← IO.monoMsNow) < deadline) "Busy worker did not prefetch upcoming prerequisites"
         IO.sleep 10
       return { name := m.name, status := .built })
-      (fun _ results => if results.any (·.name == "Published") then prefetched.set true else pure ())
-    check (← prefetched.get) "Completion catch-up skipped a committed artifact"
+      (fun _ results => do
+        check (!results.any (·.name == "Unrelated")) "Prefetched an unrelated completed artifact"
+        if results.any (·.name == "Needed") then prefetched.set true)
+    check (← prefetched.get) "Queued prerequisites were not prefetched"
   withEnvironment store (pool #[3]) fun env => do
     let modules := (Array.range 33).map fun i => ⟨s!"M{i}", #[]⟩
     let plan := { fixturePlan with modules }
@@ -1179,6 +1292,8 @@ def main (args : List String) : IO Unit := do
   if args == ["--native-only"] then nativeTests; return
   builderSourceTest
   admissionTest
+  priorityTests
+  prefetchTests
   generatedTests
   if args.contains "--io" then parallelIOTests (objects (← Std.Mutex.new {}))
   if args.contains "--native" then nativeTests

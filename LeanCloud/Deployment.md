@@ -80,16 +80,24 @@ assignment ownership signals cancellation. Stop and join local tasks before
 returning; the runtime refuses to journal an outcome after revocation.
 
 `env.queues.open "name"` opens a run-scoped work queue. It provides batched
-`send`/`receive`, `acknowledge`, `renew`, `release`, and `isIdle`. Deliveries have
+`send`/`receive`, read-only `peek`, `acknowledge`, `renew`, `release`, and `isIdle`. Deliveries have
 renewable leases and may repeat. An empty receive can mean other consumers still
 hold leases; even `isIdle` only means there are currently no pending or leased
 messages, not that future producers are finished. Applications own their
 completion protocol and must make repeated work safe.
 
-Each sent item has a stable `key` and JSON `value`. Sending the same key and
-value again is a no-op, including after acknowledgement; changing its value is
-an error. This lets multiple parents safely announce the same ready task. Keys
+Each sent item has a stable `key`, JSON `value`, and optional `priority` (default
+zero). Receive selects the highest priority first, using FIFO for ties. Sending
+the same key, value and priority again is a no-op, including after acknowledgement;
+changing its value or priority is an error. This lets multiple parents safely
+announce the same ready task. Keys
 and their deduplication records live until the run is removed.
+
+`peek none count` observes available work in receive order without taking leases.
+Continue with the last item's `position` to read beyond a page, even if earlier
+items were removed. Pages are live observations rather than a snapshot: start
+again at `none` to see new work ahead of a previous position. Peeking never
+prevents another worker from receiving the observed work.
 
 The runtime hosts these queues in the scheduler's existing HTTP/SQLite service.
 Queue transactions run independently of the Cloud actor loop. Local, Azure and

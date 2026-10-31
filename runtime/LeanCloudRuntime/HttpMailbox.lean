@@ -81,6 +81,7 @@ def workQueues (config : Config) (run : String) : QueueProvider IO := ⟨fun nam
   {
     send values := do discard (call (.send values))
     receive count := do IO.ofExcept (fromJson? (← call (.receive count)))
+    peek after count := do IO.ofExcept (fromJson? (← call (.peek after count)))
     isIdle := do IO.ofExcept (fromJson? (← call .idle))
     acknowledge receipt := do discard (call (.acknowledge receipt))
     complete receipt failed := do discard (call (.complete receipt failed))

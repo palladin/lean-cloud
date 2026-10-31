@@ -1,4 +1,5 @@
 import LeanBuild.Model
+import LeanBuild.Prefetch
 import LeanCloudRuntime.Parallel
 import Std.Sync.Channel
 
@@ -10,6 +11,17 @@ def resultName (module : String) := "lean-build/v7/results/" ++ module
 
 /-- Network latency can be overlapped without consuming a compiler CPU slot. -/
 def ioConcurrency (cpus : Nat) : Nat := max 4 (min 32 (4 * cpus))
+
+/-- Longest chain from each module to an output, including the module itself.
+The plan is topological: propagate each score to its imports in one reverse pass. -/
+def priorities (modules : Array Module) : Std.HashMap String Nat :=
+  modules.foldr (fun m scores =>
+    let score := max 1 (scores[m.name]?.getD 0)
+    m.imports.foldl (fun scores name => scores.insert name (max (score + 1) (scores[name]?.getD 0)))
+      (scores.insert m.name score)) {}
+
+private def item (scores : Std.HashMap String Nat) (m : Module) : WorkItem :=
+  { key := m.name, value := toJson m.name, priority := scores[m.name]?.getD 1 }
 
 def readResult (env : Environment IO) (name : String) : IO (Option BuildResult) := do
   let some ref ← env.blobs.readNamed (resultName name) | return none
@@ -28,9 +40,10 @@ def publishResult (env : Environment IO) (result : BuildResult) : IO BuildResult
 def seed (env : Environment IO) (plan : Plan) : IO Unit := do
   IO.ofExcept (validateModules plan.modules)
   let roots := plan.modules.filter (·.imports.isEmpty)
+  let scores := priorities plan.modules
   let queue := env.queues.open queueName
   for offset in [:((roots.size + 99) / 100)] do
-    queue.send ((roots.extract (offset * 100) ((offset + 1) * 100)).map fun m => ⟨m.name, toJson m.name⟩)
+    queue.send ((roots.extract (offset * 100) ((offset + 1) * 100)).map (item scores))
 
 def results (env : Environment IO) (plan : Plan) : IO (Array BuildResult) :=
   Parallel.map (ioConcurrency env.currentWorker.cpus) plan.modules fun m => do
@@ -139,6 +152,11 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
   let capacity := 3 * slots + ioSlots
   let activity ← Std.Mutex.new "Starting Lake"
   let byName := plan.modules.foldl (fun map m => map.insert m.name m) ({} : Std.HashMap String Module)
+  let scores := priorities plan.modules
+  let inputs (m : Module) : IO (Array BuildResult) :=
+    Parallel.map (ioConcurrency env.currentWorker.cpus) (dependencies plan.modules #[m]) fun dep => do
+      let some result ← read dep.name | throw (IO.userError "Missing transitive prerequisite")
+      return result
   let dependents := plan.modules.foldl (fun map m => m.imports.foldl (fun map dep =>
     map.insert dep ((map[dep]?.getD #[]).push m)) map) ({} : Std.HashMap String (Array Module))
   let settle (work : Work) (result : BuildResult) : IO Unit := do
@@ -149,7 +167,7 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
     -- reading every parent of every dependent adds IO on the publication path.
     let ready ← Parallel.map (ioConcurrency env.currentWorker.cpus) candidates fun m => do
       if ← m.imports.allM (fun name => return (← read name).isSome) then
-        return some (⟨m.name, toJson m.name⟩ : WorkItem)
+        return some (item scores m)
       return none
     let ready := ready.filterMap id
     for offset in [:((ready.size + 99) / 100)] do
@@ -173,11 +191,7 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
       settle work (← publishResult env {
         name := work.mod.name, status := .blocked, message := "A prerequisite failed" })
     else
-      let inputs ← Parallel.map (ioConcurrency env.currentWorker.cpus)
-          (dependencies plan.modules #[work.mod]) fun dep => do
-        let some result ← read dep.name | throw (IO.userError "Missing transitive prerequisite")
-        return result
-      engine.prepare stop work.mod inputs
+      engine.prepare stop work.mod (← inputs work.mod)
       unless ← stop.isRequested do events.sync.send (.prepared work.mod.name)
   -- Renewal is independent of telemetry and compiler activity.
   let renewer ← IO.asTask (do
@@ -199,21 +213,20 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
         report env queue plan.modules.size (← activity.atomically get)
         next := (← IO.monoMsNow) + 1000
       IO.sleep 50) .dedicated
-  -- Every worker follows the same append-only completion feed with its own
-  -- cursor. Artifact IO overlaps compilation and never consumes a work lease.
+  -- Follow upcoming work, not past completions. Peek never claims a module;
+  -- foreground preparation shares the same cached, in-flight artifact transfers.
   let prefetcher ← IO.asTask (do
     try
-      let mut cursor := 0
-      while !(← stop.isRequested) do
-        let completed ← queue.completions cursor 100
-        if completed.isEmpty then IO.sleep 200
-        else
-          let results ← Parallel.map (ioConcurrency env.currentWorker.cpus) completed fun item => do
-            let name ← IO.ofExcept (fromJson? (α := String) item.value)
-            let some result ← read name | throw (IO.userError "Completion has no published module result")
-            return result
-          engine.prefetch stop (results.filter (·.status == .built))
-          cursor := completed.back!.cursor
+      Prefetch.run queue stop ioSlots fun stop value => do
+        if ← stop.isRequested then return
+        let name ← IO.ofExcept (fromJson? (α := String) value)
+        let some m := byName[name]? | throw (IO.userError "Unknown queued module")
+        if (← read name).isSome then return
+        let parents ← Parallel.map (ioConcurrency env.currentWorker.cpus) m.imports read
+        -- Failed/early deliveries are handled by the owning builder; there are
+        -- no valid artifacts to warm until every prerequisite has succeeded.
+        unless parents.all (fun result => result.any (·.status == .built)) do return
+        engine.prefetch stop (← inputs m)
     catch error =>
       control.atomically (modify fun s => { s with stopped := true, error := s.error.orElse (fun _ => some error) })) .dedicated
   try
