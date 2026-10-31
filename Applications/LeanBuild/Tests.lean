@@ -86,7 +86,9 @@ private def withEnvironment (store : ObjectStore) (base : ExecContext IO)
 /-- The same rolling coordinator, with task-backed compiler jobs for model tests. -/
 private def runBuilders (env : Environment IO) (plan : Plan)
     (build : CancellationToken IO → LeanBuild.Module → Array BuildResult → IO BuildResult)
-    (prefetch : CancellationToken IO → Array BuildResult → IO Unit := fun _ _ => pure ()) : IO Unit := do
+    (prefetch : CancellationToken IO → Array BuildResult → IO Unit := fun _ _ => pure ())
+    (onSubmit : IO Unit := pure ()) : IO Unit := do
+  let compilers ← Parallel.Limit.new (Builders.compilerSlots env.currentWorker.cpus)
   let prepared ← Std.Mutex.new ({} : Std.HashMap String (CancellationToken IO × Array BuildResult))
   let running ← IO.mkRef (#[] : Array (String × Task (Except IO.Error BuildResult)))
   let engine : Builders.Engine BuildResult := {
@@ -95,8 +97,11 @@ private def runBuilders (env : Environment IO) (plan : Plan)
     submit := fun m => do
       let some (stop, inputs) ← prepared.atomically do return (← get)[m.name]?
         | throw (IO.userError "Submitted before preparation")
-      let task ← IO.asTask (build stop m inputs) .dedicated
+      let task ← IO.asTask (compilers.run do
+        if ← stop.isRequested then throw (IO.userError "Cancelled queued compilation")
+        build stop m inputs) .dedicated
       running.modify (·.push (m.name, task))
+      onSubmit
     poll := do
       let mut waiting := #[]
       let mut done := #[]
@@ -139,24 +144,27 @@ private def builderSourceTest : IO Unit := do
   check ((← calls.get) == 2) "Did not inspect both builder branches"
   IO.println "PASS builder exec source locations through replay"
 
-/-- Busy compilers must leave unstarted work available to another worker.
-The slow worker cannot finish until the second worker compiles both fast jobs. -/
+/-- Fill the engine's bounded lookahead while every compiler is busy, without
+claiming the whole shared queue. A second worker must still make progress. -/
 private def admissionTest : IO Unit := do
   let store := objects (← Std.Mutex.new {})
   withEnvironment store (pool #[3, 2]) fun env => do
-    let modules : Array LeanBuild.Module := (Array.range 4).map fun i => ⟨s!"Module{i}", #[]⟩
+    let modules : Array LeanBuild.Module := (Array.range 12).map fun i => ⟨s!"Module{i}", #[]⟩
     let plan := { fixturePlan with modules }
     let started ← Std.Mutex.new (0 : Nat)
+    let submitted ← Std.Mutex.new (0 : Nat)
     let finished ← Std.Mutex.new (0 : Nat)
     Builders.seed env plan
     discard <| Parallel.map 2 #[0, 1] fun worker => do
       let deadline := (← IO.monoMsNow) + 5000
       if worker == 1 then
-        while (← started.atomically get) < 2 do
-          check ((← IO.monoMsNow) < deadline) "First worker did not fill its compiler slots"
+        while (← submitted.atomically get) < 4 || (← started.atomically get) < 2 do
+          check ((← IO.monoMsNow) < deadline) "Busy worker did not submit queued replacements"
           IO.sleep 10
+        check ((← submitted.atomically get) == 4 && (← started.atomically get) == 2)
+          "Queued work exceeded the lookahead window or compiler budget"
       let capacity := env.workers[worker]!
-      runBuilders { env with currentWorker := capacity } plan fun _ m _ => do
+      runBuilders { env with currentWorker := capacity } plan (fun _ m _ => do
         if worker == 0 then
           started.atomically (modify (· + 1))
           while (← finished.atomically get) < 2 do
@@ -165,10 +173,11 @@ private def admissionTest : IO Unit := do
             IO.sleep 10
         else
           finished.atomically (modify (· + 1))
-        return { name := m.name, status := .built }
+        return { name := m.name, status := .built })
+        (onSubmit := if worker == 0 then submitted.atomically (modify (· + 1)) else pure ())
     check ((← Builders.results env plan).all (·.status == .built)) "Admission lost module results"
-    check ((← (env.queues.open Builders.queueName).progress) == ⟨4, 0⟩) "Admission lost queue completions"
-  IO.println "PASS busy compilers leave unstarted work available to idle workers"
+    check ((← (env.queues.open Builders.queueName).progress) == ⟨12, 0⟩) "Admission lost queue completions"
+  IO.println "PASS queued replacements, bounded compilation and work sharing between workers"
 
 private def priorityTests : IO Unit := do
   let modules : Array LeanBuild.Module := #[⟨"A", #[]⟩, ⟨"B", #[]⟩,
@@ -183,21 +192,28 @@ private def priorityTests : IO Unit := do
   withEnvironment store (pool #[1]) fun env => do
     let plan := { fixturePlan with modules }
     let seen ← IO.mkRef (#[] : Array String)
+    let received ← IO.mkRef (#[] : Array String)
     let sent ← IO.mkRef (0 : Nat)
     let queue := env.queues.open Builders.queueName
-    let checked := { queue with send := fun values => do
-      for value in values do
-        check (scores[value.key]? == some value.priority) "Successor lost its DAG priority"
-      sent.modify (· + values.size)
-      queue.send values }
+    let checked := { queue with
+      send := fun values => do
+        for value in values do
+          check (scores[value.key]? == some value.priority) "Successor lost its DAG priority"
+        sent.modify (· + values.size)
+        queue.send values
+      receive := fun count => do
+        let deliveries ← queue.receive count
+        let names ← deliveries.mapM fun d => IO.ofExcept (fromJson? (α := String) d.value)
+        received.modify (· ++ names)
+        return deliveries }
     let env := { env with queues := ⟨fun _ => checked⟩ }
     Builders.seed env plan
     runBuilders env plan fun _ m _ => do
       seen.modify (·.push m.name)
       return { name := m.name, status := .built }
-    -- Publication overlaps admission: a free compiler may take another root
-    -- before its previous module has made a higher-priority successor ready.
-    check ((← seen.get)[0]? == some "C" && (← seen.get).size == 6 && (← sent.get) == 6)
+    -- Queue admission follows priority. Parallel preparation and publication
+    -- can change when admitted modules actually reach a compiler.
+    check ((← received.get)[0]? == some "C" && (← seen.get).size == 6 && (← sent.get) == 6)
       "Highest-priority root was not selected, or a successor was lost"
   IO.println "PASS longest-chain priorities and priority-ordered successor admission"
 
@@ -367,11 +383,12 @@ private def generatedTests : IO Unit := do
   -- downloading unrelated completed artifacts or reserving the next module.
   withEnvironment store (pool #[2]) fun env => do
     let plan := { fixturePlan with modules := #[⟨"Unrelated", #[]⟩, ⟨"Needed", #[]⟩,
-      ⟨"Busy", #[]⟩, ⟨"Next", #["Needed"]⟩] }
+      ⟨"Busy", #[]⟩, ⟨"Buffered", #[]⟩, ⟨"Next", #["Needed"]⟩] }
     let queue := env.queues.open Builders.queueName
     for name in ["Needed", "Unrelated"] do
       discard <| Builders.publishResult env { name, status := .built }
-    queue.send #[⟨"Busy", toJson "Busy", 2⟩, ⟨"Next", toJson "Next", 1⟩]
+    queue.send #[⟨"Busy", toJson "Busy", 3⟩, ⟨"Buffered", toJson "Buffered", 2⟩,
+      ⟨"Next", toJson "Next", 1⟩]
     let prefetched ← IO.mkRef false
     runBuilders env plan (fun _ m _ => do
       let deadline := (← IO.monoMsNow) + 3000
@@ -549,13 +566,86 @@ private def helperFailureTests (tools : Tools) (fixture : System.FilePath) : IO 
       cmd := (tools.toolchain / "bin/lake").toString, cwd := directory
       env := #[("LEAN_NUM_THREADS", some "2")]
       args := #["--no-cache", "env", "lean", "--load-dynlib", library.toString, "--run",
-        tools.helper.toString, "serve", policy.toString, input.toString, output.toString, directory.toString] }
+        tools.helper.toString, "serve", "1", policy.toString, input.toString, output.toString, directory.toString] }
     IO.FS.writeFile output "[]"
     check ((← run "Missing.Module").exitCode != 0) "A stale result file hid a Lake fetch failure"
     IO.FS.removeFile output
     IO.FS.createDir output
     IO.FS.createDir (output / "0.json")
     check ((← run "Fixture.Base").exitCode != 0) "The helper swallowed a result-publication IO exception"
+
+/-- All requests reach Lake while its compiler slots are occupied. Releasing
+one compiler starts an already queued replacement, without another submission.
+Filesystem permits detect oversubscription in the actual compiler processes. -/
+private def lakeQueueTests (tools : Tools) (fixture : System.FilePath) : IO Unit := do
+  for cpus in [1, 3] do
+    IO.FS.withTempDir fun root => do
+      let slots := Builders.compilerSlots cpus
+      let count := Builders.submissionWindow cpus
+      let directory := root / "project"
+      let input := root / "requests"
+      let output := root / "results"
+      let started := root / "started"
+      let released := root / "released"
+      let permits := root / "permits"
+      for path in [directory, input, started, released, permits] do IO.FS.createDir path
+      copyFixture fixture directory
+      let policy := root / "policy.json"
+      IO.FS.writeFile policy (toJson request).pretty
+      for index in [:count] do
+        let name := s!"Fixture.Queued{index}"
+        IO.FS.writeFile (input / s!"{index}.json") (toJson name).compress
+        IO.FS.writeFile (directory / "Fixture" / s!"Queued{index}.lean") (String.intercalate "\n" [
+          "import Lean", "run_cmd Lean.Elab.Command.liftIO do",
+          "  let mut permit : Option System.FilePath := none",
+          s!"  for i in [:{slots}] do",
+          "    if permit.isNone then",
+          s!"      let path := System.FilePath.mk {reprStr permits.toString} / toString i",
+          "      try IO.FS.createDir path; permit := some path catch _ => pure ()",
+          "  let some held := permit | throw (IO.userError \"Too many concurrent compilers\")",
+          "  try",
+          s!"    IO.FS.writeFile {reprStr (started / toString index).toString} \"started\"",
+          "    let deadline := (← IO.monoMsNow) + 20000",
+          s!"    while !(← System.FilePath.pathExists {reprStr (released / toString index).toString}) do",
+          "      if (← IO.monoMsNow) > deadline then throw (IO.userError \"Queued compiler timed out\")",
+          "      IO.sleep 10",
+          "  finally IO.FS.removeDir held", ""])
+      IO.FS.writeFile (input / "finish") ""
+      let library := tools.toolchain / "lib/lean" /
+        (if System.Platform.isOSX then "libLake_shared.dylib" else "libLake_shared.so")
+      let helper ← IO.asTask (IO.Process.output {
+        cmd := (tools.toolchain / "bin/lake").toString, cwd := directory
+        env := #[("LEAN_NUM_THREADS", some (toString (max 2 cpus)))]
+        args := #["--no-cache", "env", "lean", s!"-j{max 2 cpus}", "--load-dynlib", library.toString,
+          "--run", tools.helper.toString, "serve", toString slots, policy.toString, input.toString,
+          output.toString, directory.toString] }) .dedicated
+      let waitFor (condition : IO Bool) (message : String) : IO Unit := do
+        let deadline := (← IO.monoMsNow) + 15000
+        while !(← condition) do
+          if ← IO.hasFinished helper then
+            let result ← IO.ofExcept (← IO.wait helper)
+            throw (IO.userError s!"Lake exited early: {result.stderr}")
+          check ((← IO.monoMsNow) < deadline) message
+          IO.sleep 10
+      try
+        waitFor (do
+          let accepted ← (Array.range count).allM fun i => return !(← (input / s!"{i}.json").pathExists)
+          return accepted && (← started.readDir).size == slots)
+          "Lake did not queue all replacements while compilers were busy"
+        let some first := (← started.readDir)[0]? | throw (IO.userError "No compiler started")
+        IO.FS.writeFile (released / first.fileName) "release"
+        waitFor (return (← started.readDir).size > slots)
+          "Lake waited for another submission instead of running a queued replacement"
+      finally
+        for i in [:count] do IO.FS.writeFile (released / toString i) "release"
+        discard <| IO.wait helper
+      let result ← IO.ofExcept (← IO.wait helper)
+      check (result.exitCode == 0) s!"Queued Lake build failed: {result.stderr}"
+      for i in [:count] do
+        let value ← IO.ofExcept (Json.parse (← IO.FS.readFile (output / s!"{i}.json")))
+        check ((value.getObjValAs? Bool "success").toOption == some true)
+          "Queued module failed or exceeded the compiler budget"
+  IO.println "PASS real Lake queues replacements, refills without another request and limits concurrent compilers"
 
 private def failedJobTests (tools : Tools) (store : ObjectStore) (fixture : System.FilePath) : IO Unit :=
   IO.FS.withTempDir fun root => do
@@ -1100,6 +1190,7 @@ private def nativeTests : IO Unit := IO.FS.withTempDir fun cacheRoot => do
   let fixture ← IO.FS.realPath "fixtures/Diamond"
   let full ← IO.FS.realPath "fixtures/FullBuild"
   helperFailureTests tools fixture
+  lakeQueueTests tools fixture
   let store := objects (← Std.Mutex.new {})
   failedJobTests tools store fixture
   streamingPublicationTest tools store fixture

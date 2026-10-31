@@ -291,13 +291,14 @@ def Tools.builder (tools : Tools) (store : ObjectStore) (env : Environment IO)
     IO.FS.createDirAll input
     IO.FS.createDirAll output
     let abort ← Std.Mutex.new false
-    -- One helper thread can be occupied by the admission loop even on a
-    -- single-CPU worker. The coordinator separately bounds compiler slots.
+    -- Give Lake the worker's thread budget; the helper separately limits module
+    -- jobs. Even a single-CPU worker needs a job thread plus the admission loop.
     let localTools := { tools with
       threads := max 2 env.currentWorker.cpus
       cancelled := do return (← abort.atomically get) || (← env.cancellation.isRequested) }
     let task ← IO.asTask (runHelper localTools directory request "modules"
-      #["serve", policy.toString, input.toString, output.toString, directory.toString]) .dedicated
+      #["serve", toString (Builders.compilerSlots env.currentWorker.cpus),
+        policy.toString, input.toString, output.toString, directory.toString]) .dedicated
     let pending ← IO.mkRef (#[] : Array (Nat × Module × Nat))
     let next ← IO.mkRef (0 : Nat)
     let failed ← IO.mkRef false

@@ -37,15 +37,21 @@ The Cloud workflow has five stages:
 
 Each builder restores the prepared sources once and loads Lake once. A bounded
 pipeline receives ready work, restores missing prerequisites, compiles modules
-and publishes their artifacts concurrently. Queue receives claim only enough
-modules to fill free compiler slots, counting preparation against that budget.
-A busy worker leaves additional modules available to other workers. Receives do
-not define execution batches. Shared prerequisite files are transferred once,
+and publishes their artifacts concurrently. Each worker admits up to twice its
+compiler-slot count, including preparation and jobs already submitted to Lake.
+The persistent Lake session queues prepared modules: seven compiler slots can
+have seven replacements waiting. The session starts the next module locally
+when a Lake job finishes, without waiting for the outer coordinator to poll it
+and submit more work. An explicit job limit enforces the compilation budget;
+Lean's task-pool size alone is not a hard process limit. The bounded window leaves
+further work available to other workers. Receives do not define execution
+batches. Shared prerequisite files are transferred once,
 and concurrent preparations await the same transfer.
 
 Ready modules are ordered by the longest remaining dependency chain, computed
-once from the DAG. Higher priorities run first; equal priorities keep submission
-order. Both initial modules and newly ready dependents use the same lookup.
+once from the DAG. The shared queue offers higher priorities first; equal
+priorities keep submission order. Parallel preparation can change when they
+reach Lake. Both initial modules and newly ready dependents use the same lookup.
 
 Every worker continuously looks ahead through this ordered queue while Lake is
 busy, prefetching the upcoming modules' prerequisites. The scan does not claim
@@ -96,8 +102,10 @@ Ordinary IO exceptions remain application failures; they are not crash retries.
 HTTP clients retry transient connection failures and temporary service responses
 with bounded backoff and jitter before reporting an exhausted operation as an error.
 
-`watch` shows one shared module completion counter and each worker's compiling,
-restoring, ready and publishing counts. Failed/blocked modules are included in
+`watch` shows one shared module completion counter and each worker's submitted
+Lake jobs (running plus queued), compiler-slot budget, restoring, ready and
+publishing counts. Queued jobs do not imply extra active compilers.
+Failed/blocked modules are included in
 completed work and displayed separately. The service updates the durable counter
 atomically with settlement; repeated acknowledgements cannot inflate it. Workers
 report snapshots approximately once per second independently of compilation.
@@ -254,13 +262,16 @@ lake build cloud_app build_local build_tests
 ```
 
 Tests compare direct/replay execution on 40 generated DAGs. They cover concurrent
-builder sessions, admission that leaves work available to idle workers, progress
+builder sessions, bounded lookahead that leaves work available to idle workers, progress
 without round barriers, interruption between result
 publication and notification, cancellation, blocked dependencies, durable errors,
 cache reuse and integrity. A native rendezvous verifies concurrent publications
 while another compiler in the same session is still running. A single-worker
 rendezvous checks that newly ready dependencies advance before an unrelated slow
-compiler completes. Native fixtures compare output with ordinary Lake and
+compiler completes. Native compiler processes also verify that Lake queues
+replacements while all slots are occupied, starts them without another request,
+and keeps the compiler limit, including on a single-CPU worker.
+Native fixtures compare output with ordinary Lake and
 cover libraries, executables, C FFI, generated/custom targets and restored artifacts.
 Runtime tests separately exercise the same HTTP/SQLite queue's leases, reopening,
 stale receipts, concurrent consumers and run removal.

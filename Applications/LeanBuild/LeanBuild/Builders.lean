@@ -74,8 +74,13 @@ private def dependencies (modules targets : Array Module) : Array Module := Id.r
 not CPU affinity. A single-CPU worker still has one compilation slot. -/
 def compilerSlots (cpus : Nat) := max 1 (cpus - 1)
 
-/-- One persistent compiler session. Only the coordinator calls submit/poll.
-Preparation and publication run in separate bounded pools. -/
+/-- One window compiling and one preparing/queued ahead. Bound reservations so
+other workers can still receive work from the shared priority queue. -/
+def submissionWindow (cpus : Nat) := 2 * compilerSlots cpus
+
+/-- One persistent compiler session. Submit queues work; the engine limits
+compilation concurrency. Only the coordinator calls submit/poll. Preparation
+and publication run in separate bounded pools. -/
 structure Engine (α : Type) where
   prefetch : CancellationToken IO → Array BuildResult → IO Unit := fun _ _ => pure ()
   prepare : CancellationToken IO → Module → Array BuildResult → IO Unit
@@ -148,6 +153,7 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
         control.atomically (modify fun s => { s with stopped := true, error := s.error.orElse (fun _ => some error) })) .dedicated
     tasks.modify (·.push task)
   let slots := compilerSlots env.currentWorker.cpus
+  let window := submissionWindow env.currentWorker.cpus
   let ioSlots := max 2 (min 8 env.currentWorker.cpus)
   let capacity := 3 * slots + ioSlots
   let activity ← Std.Mutex.new "Starting Lake"
@@ -234,7 +240,7 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
     let mut waiting : Array String := #[]
     let mut restoring : Std.HashSet String := {}
     let mut ready : Array String := #[]
-    let mut compiling : Std.HashSet String := {}
+    let mut submitted : Std.HashSet String := {}
     let mut completed : Array (String × α) := #[]
     let mut publishing : Std.HashSet String := {}
     let mut receiving := false
@@ -280,15 +286,15 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
           restoring := restoring.erase name
           publishing := publishing.erase name
       for (name, result) in ← engine.poll do
-        unless compiling.contains name do throw (IO.userError "Unknown or duplicate Lake completion")
-        compiling := compiling.erase name
+        unless submitted.contains name do throw (IO.userError "Unknown or duplicate Lake completion")
+        submitted := submitted.erase name
         completed := completed.push (name, result)
-      while compiling.size < slots && !ready.isEmpty do
+      while !ready.isEmpty do
         let name := ready[0]!
         ready := ready.extract 1 ready.size
         let some w := work[name]? | throw (IO.userError "Missing prepared work")
         engine.submit w.mod
-        compiling := compiling.insert name
+        submitted := submitted.insert name
       while publishing.size < ioSlots && !completed.isEmpty do
         let some (name, value) := completed[0]? | break
         completed := completed.extract 1 completed.size
@@ -305,10 +311,10 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
         restoring := restoring.insert name
         spawn (prepare w)
       if idle && work.isEmpty && !receiving then break
-      -- Preparation reserves a compiler slot; do not lease an extra local
-      -- backlog while other workers could run it. Artifact prefetching is
-      -- independent, and publication does not occupy a compiler slot.
-      let admission := slots - (waiting.size + restoring.size + ready.size + compiling.size)
+      -- Feed prepared work ahead into the Lake session. The window includes
+      -- preparation, so slow restores cannot accumulate an unbounded backlog.
+      -- Publication and unclaimed artifact prefetching remain independent.
+      let admission := window - (waiting.size + restoring.size + ready.size + submitted.size)
       if !receiving && admission > 0 && work.size < capacity && (← IO.monoMsNow) ≥ nextReceive then
         receiving := true
         let count := min 100 (min admission (capacity - work.size))
@@ -318,7 +324,7 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
           control.atomically (modify fun s => { s with claims := s.claims ++ claims })
           let idle ← if claims.isEmpty then queue.isIdle else pure false
           events.sync.send (.received claims idle)
-      activity.atomically (set s!"compiling {compiling.size}/{slots} · restoring {restoring.size} · ready {ready.size} · publishing {publishing.size + completed.size}")
+      activity.atomically (set s!"Lake jobs {submitted.size} running/queued · slots {slots} · restoring {restoring.size} · ready {ready.size} · publishing {publishing.size + completed.size}")
       IO.sleep 10
     if let some error ← control.atomically do return (← get).error then throw error
     unless ← env.cancellation.isRequested do

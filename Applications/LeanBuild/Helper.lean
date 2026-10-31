@@ -179,13 +179,17 @@ private def modulePaths (m : Lake.Module) (root : String) : IO (Array String) :=
 /-- One workspace and one BuildStore for the worker's lifetime. Requests and
 completions are atomically renamed local files, so the helper can use the source
 project's exact Lean version without sharing Lean values across processes.
-Only this loop owns FetchM; jobs execute concurrently in Lake's task pool. -/
-private def serveModules (policy : Json) (input output root : String) : IO Unit := do
+Only this loop owns FetchM. It accepts prepared modules ahead and refills Lake
+jobs locally, without waiting for the worker's completion/publication loop.
+The explicit job limit is separate from Lean's task-pool size. -/
+private def serveModules (slots : Nat) (policy : Json) (input output root : String) : IO Unit := do
+  if slots == 0 then throw (IO.userError "Expected at least one compiler slot")
   let ws ← workspace policy
   IO.FS.createDirAll output
   ws.runFetchM do
     let mut next := 0
     let mut seen : Std.HashSet String := {}
+    let mut queued : Array (Nat × Lake.Module) := #[]
     let mut pending : Array (Nat × IO (Option Json)) := #[]
     repeat
       let mut waiting := #[]
@@ -204,6 +208,12 @@ private def serveModules (policy : Json) (input output root : String) : IO Unit 
         unless !seen.contains name do error s!"Repeated module submission: {name}"
         let some m := ws.findTargetModule? name.toName | error s!"Unknown module: {name}"
         seen := seen.insert name
+        queued := queued.push (next, m)
+        IO.FS.removeFile path
+        next := next + 1
+      while pending.size < slots && !queued.isEmpty do
+        let some (id, m) := queued[0]? | break
+        queued := queued.extract 1 queued.size
         let job ← m.leanArts.fetch
         let inspect : IO (Option Json) := do
           unless ← IO.hasFinished job.task do return none
@@ -212,13 +222,11 @@ private def serveModules (policy : Json) (input output root : String) : IO Unit 
             | .error _ state => pure (false, state.log.toString)
           let paths ← if success then modulePaths m root else pure #[]
           return some (Json.mkObj [
-            ("name", toJson name), ("success", toJson success),
+            ("name", toJson m.name.toString), ("success", toJson success),
             ("paths", toJson paths), ("diagnostics", toJson diagnostics)])
-        pending := pending.push (next, inspect)
-        IO.FS.removeFile path
-        next := next + 1
-      else
-        if pending.isEmpty && (← (FilePath.mk input / "finish").pathExists) then break
+        pending := pending.push (id, inspect)
+      if !(← (FilePath.mk input / s!"{next}.json").pathExists) then
+        if pending.isEmpty && queued.isEmpty && (← (FilePath.mk input / "finish").pathExists) then break
         IO.sleep 10
 
 def main (args : List String) : IO UInt32 := do
@@ -226,7 +234,9 @@ def main (args : List String) : IO UInt32 := do
     match args with
     | ["plan", policy, output, root] => plan (← readJson policy) output root
     | ["build", policy, output] => buildTargets (← readJson policy) output
-    | ["serve", policy, input, output, root] => serveModules (← readJson policy) input output root
-    | _ => throw (IO.userError "Expected plan POLICY OUTPUT ROOT | build POLICY OUTPUT | serve POLICY INPUT OUTPUT ROOT")
+    | ["serve", slots, policy, input, output, root] =>
+      let some slots := slots.toNat? | throw (IO.userError "Invalid compiler slot count")
+      serveModules slots (← readJson policy) input output root
+    | _ => throw (IO.userError "Expected plan POLICY OUTPUT ROOT | build POLICY OUTPUT | serve SLOTS POLICY INPUT OUTPUT ROOT")
     return 0
   catch error => IO.eprintln s!"{error}"; return 1
