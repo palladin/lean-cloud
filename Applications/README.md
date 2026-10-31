@@ -5,7 +5,7 @@ Applications built on the existing cloud effects and interpreters:
 | Application | Distributed work | Status |
 | --- | --- | --- |
 | [Cube-and-conquer SAT](CubeAndConquer/README.md) | Recursively split with `march_cu`, solve leaves with Kissat | Implemented; blob inputs, checked models, verified proof bundles |
-| [LeanBuild](LeanBuild/README.md) | Build a GitHub Lean project with optional independent proof checking | Build artifacts, executables, diagnostics and optional proof reports |
+| [LeanBuild](LeanBuild/README.md) | Build a GitHub Lean project using distributed workers and local Lake parallelism | Build artifacts, executables and diagnostics; [Mathlib on AWS walkthrough](LeanBuild/MathlibAWS.md) |
 | [Wiki](Wiki/README.md) | Prepare Wikipedia shards, count a vocabulary and search article text | Immutable datasets, exact counts and sharded search results |
 
 See each application's README for its input format, deployment and tests.

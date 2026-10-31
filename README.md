@@ -33,6 +33,36 @@ Each branch reads one file and counts its errors. The workflow combines the
 counts and saves a report. Its type, `Cloud IO BlobRef`, tells us that the result
 is a reference to that report in blob storage.
 
+## Cloud console
+
+Connect the console to a deployed scheduler to run programs and follow their
+progress. `watch` shows the branch tree, executing code, and worker resource use.
+Local Docker, Azure, and AWS use the same console commands.
+
+```text
+cloud> programs
+cloud> run lean-build --input Applications/LeanBuild/mathlib.json --id mathlib
+cloud> watch mathlib
+```
+
+Building Mathlib on four AWS workers:
+
+![Cloud console showing Mathlib build progress, workflow code, and four workers' CPU, memory, and IO](docs/images/mathlib-watch.png)
+
+Follow the [AWS Mathlib walkthrough](Applications/LeanBuild/MathlibAWS.md) to
+set this up, or see the [console guide](LeanCloud/Console.md) for all commands.
+
+## Applications
+
+- [LeanBuild](Applications/LeanBuild/README.md): build Lean projects from GitHub
+  across workers, using Lake's local parallelism.
+- [Cube-and-conquer SAT](Applications/CubeAndConquer/README.md): split a CNF
+  problem, solve it in parallel, and check the resulting models or proofs.
+- [Wiki](Applications/Wiki/README.md): count words and search Wikipedia dumps
+  using composable cloud reducers.
+
+## Get started
+
 - [Run locally with Docker](deploy/README.md#local-docker)
 - [Deploy and run the example on Azure](deploy/Azure.md)
 - [Deploy and run the example on AWS](deploy/AWS.md)

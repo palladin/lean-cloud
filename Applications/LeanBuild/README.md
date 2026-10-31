@@ -6,6 +6,9 @@ artifacts through blob storage. The final report links to the completed workspac
 executables, and diagnostics. Lean's normal elaboration and kernel checking run
 as part of compilation.
 
+For a full example, follow [Build Mathlib on AWS](MathlibAWS.md): create four
+workers, build a pinned Mathlib revision, watch its progress, and clean up.
+
 ```json
 {
   "repository": "https://github.com/leanprover-community/batteries",
@@ -150,6 +153,8 @@ works with the [Azure](../../deploy/Azure.md), [AWS](../../deploy/AWS.md), and
 [existing Kubernetes](../../deploy/README.md) deployment helpers; the console
 uses the same HTTP connection in each environment.
 
+## Build results
+
 The report contains:
 
 - `commit`, `toolchain`, `platform`, and `source`: exact input provenance.
@@ -293,9 +298,10 @@ deployment on exit:
 bash Applications/LeanBuild/test-deployment.sh lean-cloud-build:dev
 ```
 
-The continuous builder has not yet been benchmarked on the full Mathlib DAG in a
-cloud deployment. Shared queue throughput, artifact IO, module memory use and the
-final target build can still limit utilization. Finalization merges manifests in
-one pass, verifies files concurrently, retains existing entries from that scan,
-and uploads the final manifest in parallel chunks. Unchanged artifacts keep their
-original blob references.
+The [AWS Mathlib walkthrough](MathlibAWS.md) uses a full-build configuration tested
+on 31 October 2026: 9,031 modules completed on four workers in 25m27s. Shared queue
+throughput, artifact IO, module memory use and the final target build can still
+limit utilization. Finalization merges manifests in one pass, verifies files
+concurrently, retains existing entries from that scan, and uploads the final
+manifest in parallel chunks. Unchanged artifacts keep their original blob
+references.

@@ -9,6 +9,10 @@ needs no provisioning helper.
 
 The flow is **check tools → login → create cluster → build → publish → configure → up → connect → run**.
 
+To build a complete Lean project instead of the bundled demo, follow
+[Build Mathlib on AWS](../Applications/LeanBuild/MathlibAWS.md). It includes the
+LeanBuild image, four-worker resource settings, the pinned request, and `watch`.
+
 ## 1. Check tools and sign in
 
 Run from the repository directory. Install the [local prerequisites](README.md#local-docker),
