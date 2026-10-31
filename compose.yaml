@@ -1,4 +1,4 @@
-name: lean-cloud
+name: lean-cloud-checks
 
 x-worker: &worker
   build: .

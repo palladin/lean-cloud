@@ -1361,6 +1361,33 @@ private def threadProbe : String := String.intercalate "\n" [
   "  let (_, peak) ← counts.atomically get",
   "  unless peak == expected do throw (IO.userError s!\"Expected {expected} threads, observed {peak}\")", ""]
 
+/-- `limits.seconds` bounds each wait for a module, not the whole session: a
+chain of slow modules may outlast it, while a hung compiler is still stopped. -/
+private def sessionLimitTests (tools : Tools) (store : ObjectStore) (fixture : System.FilePath) : IO Unit := do
+  let delay (ms : Nat) (names : List String) (directory : System.FilePath) : IO Unit := do
+    for name in names do
+      let path := directory / "Fixture" / s!"{name}.lean"
+      IO.FS.writeFile path ("import Lean\n" ++ (← IO.FS.readFile path) ++
+        s!"\nrun_cmd Lean.Elab.Command.liftIO (IO.sleep {ms})\n")
+  -- Three dependency levels of 2.5 s each keep the session busy for over 6 s.
+  let start ← IO.monoMsNow
+  let slow ← nativeTest tools store fixture (delay 2500 ["Base", "Left", "Right", "Final"])
+    { request with limits.seconds := 6 }
+  requireSuccess store slow
+  check ((← IO.monoMsNow) - start > 6000) "Slow fixture did not outlast the time limit"
+  let start ← IO.monoMsNow
+  let hung ← try
+      pure (Sum.inr (← nativeTest tools store fixture (delay 600000 ["Left"])
+        { request with limits.seconds := 5 }))
+    catch error => pure (Sum.inl error.toString)
+  match hung with
+  | .inr report => throw (IO.userError s!"A hung compiler did not fail the build: {repr report}")
+  | .inl message =>
+    check ((message.splitOn "No module finished within limits.seconds").length > 1)
+      s!"Unexpected time-limit failure: {message}"
+  check ((← IO.monoMsNow) - start < 60000) "The hung compiler was not stopped promptly"
+  IO.println "PASS time limit bounds inactivity: slow chains finish, hung compilers stop"
+
 private def nativeTests : IO Unit := IO.FS.withTempDir fun cacheRoot => do
   toolchainTests
   let tools ← Tools.fromEnvironment
@@ -1378,6 +1405,7 @@ private def nativeTests : IO Unit := IO.FS.withTempDir fun cacheRoot => do
   parallelIOTests store
   backendCacheTests tools store fixture
   sharedInstallationTest tools store fixture
+  sessionLimitTests tools store fixture
   let built ← nativeTest tools store fixture (environment := pool #[2, 2])
   requireSuccess store built
   check (built.modules.size == 4 && built.build.status == .built) "Build report is incorrect"

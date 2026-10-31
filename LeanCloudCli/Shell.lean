@@ -115,7 +115,7 @@ def frame (project : String) (catalog : Completion.Catalog) (state : State)
   if footer.size < height then
     let hint := if !state.notice.isEmpty then state.notice
       else if transcript.hasSelection then "Ctrl-C copy selection · Esc clear · wheel scroll"
-      else if busy then "Wheel scroll · drag copies · Ctrl-A all · Ctrl-C interrupt"
+      else if busy then "Wheel scroll · drag copies · Ctrl-A all"
       else "Wheel scroll · drag copies · Ctrl-A all · Tab complete · ↑↓ history"
     footer := footer.push (Styled.text ("  " ++ hint) .muted)
   lines := lines ++ footer
@@ -254,6 +254,13 @@ private def submit (ctx : Context) (catalog : Completion.Catalog) (state : State
   let (ctx, keepGoing) := result.toOption.getD (ctx, true)
   return (ctx, keepGoing, state)
 
+def exitNotice := "Press Ctrl-C again, Ctrl-D or type quit to leave"
+
+/-- Keys typed during a command are read after it finishes, so a single Ctrl-C
+on the empty prompt only warns; `none` leaves the console. -/
+def interruptEmpty (state : State) : Option State :=
+  if state.notice == exitNotice then none else some { state with notice := exitNotice }
+
 private partial def loop (ctx : Context) (catalog : Completion.Catalog) (state : State)
     (lastSize : Nat × Nat := (0, 0)) (redraw := true) : Cli Unit := do
   let catalog ← if redraw then Completion.refreshFiles ctx catalog state.line state.cursor else pure catalog
@@ -264,7 +271,8 @@ private partial def loop (ctx : Context) (catalog : Completion.Catalog) (state :
   | .interrupt =>
     if state.transcript.hasSelection then
       loop ctx catalog (← handleKey catalog state key size) size
-    else if state.line.isEmpty then return
+    else if state.line.isEmpty then
+      if let some state := interruptEmpty state then loop ctx catalog state size
     else loop ctx catalog (edit catalog state key) size
   | .eof =>
     if state.line.isEmpty then return

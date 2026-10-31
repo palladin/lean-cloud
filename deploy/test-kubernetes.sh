@@ -94,10 +94,17 @@ cmp "$work/deployment/deployment.json" "$work/shown.json"
 : > "$work/calls"
 if bash deploy/kubernetes.sh scale "$work/deployment" invalid > "$work/result" 2>&1; then echo 'Accepted invalid worker count'; exit 1; fi
 [[ ! -s "$work/calls" ]]
+for settings in '{"unknown":1}' '{"replayCacheBytes":-1}' '{"replayCacheEntries":1.5}' '{"interpreterFuel":0}' '[]'; do
+  jq --argjson settings "$settings" '.worker=$settings' "$work/original.json" > "$work/deployment/deployment.json"
+  if bash deploy/kubernetes.sh scale "$work/deployment" 2 > "$work/result" 2>&1; then echo "Accepted invalid worker settings: $settings"; exit 1; fi
+  [[ ! -s "$work/calls" ]] || { echo 'Invalid worker settings reached Kubernetes'; exit 1; }
+done
+# Execution settings are not deployment identity: they change through scale/up.
+jq '.worker={replayCacheBytes:0,replayCacheEntries:16}' "$work/original.json" > "$work/deployment/deployment.json"
 # Scale starts the requested workers only after the old generation has stopped,
 # and publishes matching mailbox membership. A later scale to zero retires them.
 bash deploy/kubernetes.sh scale "$work/deployment" 2 > "$work/result" 2>&1
-jq -e '.formatVersion==1 and (.worker|type)=="object" and .blobs.provider=="azure"' "$work/deployment/config.json" >/dev/null
+jq -e '.formatVersion==1 and .worker=={replayCacheBytes:0,replayCacheEntries:16} and .blobs.provider=="azure"' "$work/deployment/config.json" >/dev/null
 jq -e '.workers==2' "$work/deployment/deployment.json" >/dev/null
 jq -e 'map(.worker)==["worker1","worker2"]' "$work/membership.json" >/dev/null
 jq -e 'all(.cpus==8 and .memoryMiB==8192)' "$work/membership.json" >/dev/null

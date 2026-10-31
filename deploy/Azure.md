@@ -15,7 +15,7 @@ Already have a cluster? Use the [existing Kubernetes instructions](README.md#exi
 
 Run from the repository directory. Install the [local prerequisites](README.md#local-docker),
 [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli),
-[OpenTofu](https://opentofu.org/docs/intro/install/) (>= 1.10, < 2), `kubectl`, and
+[OpenTofu](https://opentofu.org/docs/intro/install/) (>= 1.10, < 2), `kubectl` 1.31 or newer, and
 [Azure kubelogin](https://azure.github.io/kubelogin/install.html).
 
 ```sh
@@ -27,7 +27,15 @@ Run from the repository directory. Install the [local prerequisites](README.md#l
 Authentication stays with Azure CLI; the helpers do not collect credentials.
 Other commands use that existing login and never initiate sign-in themselves.
 Your account needs permission to create AKS, registry, storage, managed identities,
-and role assignments. Regional VM quota and provider registration must allow them.
+and role assignments. Regional VM quota must allow them. The infrastructure does
+not register resource providers; on a new subscription, register them once:
+
+```sh
+for provider in Microsoft.ContainerService Microsoft.ContainerRegistry Microsoft.Storage \
+    Microsoft.ManagedIdentity Microsoft.Compute Microsoft.Network; do
+  az provider register --namespace "$provider" --wait
+done
+```
 
 ## 2. Configure and create the cluster
 
@@ -89,7 +97,7 @@ that local image. See [application setup](README.md#your-application).
 ```sh
 ./deploy/azure.sh configure .azure-infra .azure-deployment demo 3
 ./deploy/kubernetes.sh show .azure-deployment
-# Review .azure-deployment/deployment.json, storage.json, and resources.json.
+# show prints deployment.json; also review .azure-deployment/storage.json and resources.json.
 ./deploy/kubernetes.sh up .azure-deployment
 ./deploy/kubernetes.sh status .azure-deployment
 ```

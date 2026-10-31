@@ -7,7 +7,8 @@ cd runtime && lake exe cloud_inbox_tests
 ```
 
 The three semantic theorems are checked by `lake build`.
-`ProofExamples.lean` applies all three to a nested parallel workflow.
+`ProofExamples.lean` applies all three to a nested parallel workflow; it is
+checked by `lake test`.
 Generated programs compare DirectInterpreter with sequential, parallel and
 restarting replay. The runtime model adds scheduling, worker isolation, crashes,
 restarts, membership changes and durable completion. Seeded programs cover

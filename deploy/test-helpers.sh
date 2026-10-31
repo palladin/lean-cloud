@@ -3,7 +3,7 @@
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd -P)
 cd "$root"
-need() { command -v "$1" >/dev/null; }
+need() { command -v "$1" >/dev/null || { echo "Install $1 to run these tests" >&2; exit 1; }; }
 need jq
 need rg
 for script in deploy/*.sh; do bash -n "$script"; done
@@ -113,10 +113,11 @@ HELPER_TEST_START=1 bash deploy/local.sh down "$work/local-6"
 bash deploy/local.sh clean "$work/local-6" --yes
 
 # Resource edits take effect through the same stop/render/start barrier as scaling.
-jq '.cpuMillis=2500 | .memoryMiB=2048' "$work/local-1/deployment.json" > "$work/next.json"
+jq '.cpuMillis=2500 | .memoryMiB=2048 | .worker={replayCacheEntries:16}' "$work/local-1/deployment.json" > "$work/next.json"
 mv "$work/next.json" "$work/local-1/deployment.json"
 HELPER_TEST_START=1 HELPER_TEST_MEMBERSHIP="$work/local-membership.json" bash deploy/local.sh scale "$work/local-1" 1
 jq -e '.services.worker1|.cpus==2.5 and .mem_limit=="2048m"' "$work/local-1/compose.json" >/dev/null
+jq -e '.worker=={interpreterFuel:100000,replayCacheEntries:16}' "$work/local-1/config.json" >/dev/null
 jq -e 'length==1 and all(.cpus==2 and .memoryMiB==2048)' "$work/local-membership.json" >/dev/null
 
 mkdir "$work/kube"

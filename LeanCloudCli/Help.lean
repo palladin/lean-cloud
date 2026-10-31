@@ -42,7 +42,7 @@ def commands : Array Command := #[
     details := "Submits to the deployed nodes without creating containers. Use 'programs' to list entry points. Without --input, uses the program's sample input if available."
     options := #[("--input FILE", "Read and validate input from a JSON file."),
       ("--id ID", "Choose a unique run ID; otherwise one is generated.")]
-    examples := #["run squares/v1", "run squares/v1 --input numbers.json --id example-1"] },
+    examples := #["run sum-squares/v1", "run sum-squares/v1 --input numbers.json --id example-1"] },
   { name := "ps", summary := "List cloud runs, status, and elapsed time."
     details := "Shows start and finish timestamps in UTC and elapsed wall time, including waiting, pauses and retries. Completed durations stay fixed. Unavailable timestamps show —."
     examples := #["ps"] },
@@ -96,7 +96,12 @@ def requested : List String → Bool
 private def overview : Cli Unit := do
   printHeading "Commands:"
   for command in commands do
-    printStyled (Styled.text ("  " ++ pad 44 command.usage ++ "  ") .cyan ++ Styled.text command.summary)
+    -- A long usage gets its own line rather than being clipped.
+    if command.usage.length > 44 then
+      printStyled (Styled.text ("  " ++ command.usage) .cyan)
+      printStyled (Styled.text ("  " ++ pad 44 "" ++ "  ") ++ Styled.text command.summary)
+    else
+      printStyled (Styled.text ("  " ++ pad 44 command.usage ++ "  ") .cyan ++ Styled.text command.summary)
   printLine "Use 'help COMMAND' or 'COMMAND --help' for usage, options, and examples."
 
 private def detail (name : String) : Cli Unit := do

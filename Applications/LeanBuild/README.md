@@ -214,8 +214,13 @@ Artifact hashing, restoration and blob transfers also use bounded local pools.
 
 `limits` defaults to `seconds: 600` per subprocess, `helperMemoryMiB: 4096` per
 Lake helper, `bytes: 2147483648` per workspace, and `modules: 10000`.
-The time limit covers the persistent Lake session, not each module individually; the final
-Lake invocation has its own limit. Diagnostics are capped at 16 MiB per stream. Workspace size is checked at
+Preparation and the final Lake invocation must each finish within `seconds`. A
+persistent Lake session lasts as long as its worker's share of the build, so there
+`seconds` bounds inactivity instead: while modules wait in Lake, the next one must
+finish within `seconds` of the previous completion (or of submission when Lake was
+idle), and the session must exit within `seconds` after its last module. Fewer
+workers therefore take longer rather than failing, while a hung compiler still
+stops the build. Diagnostics are capped at 16 MiB per stream. Workspace size is checked at
 preparation, restoration/publication boundaries and after all local compilers
 stop. Container memory and disk limits bound peak usage between these checks.
 
@@ -288,6 +293,8 @@ Incremental prerequisite lookup is compared with full DAG traversal, and shared
 installation tests cover concurrent reads, failures and retry from a cold workspace.
 Native fixtures compare output with ordinary Lake and
 cover libraries, executables, C FFI, generated/custom targets and restored artifacts.
+A native time-limit test checks that a chain of slow modules may outlast `seconds`
+while a hung compiler still stops the build.
 Runtime tests separately exercise the same HTTP/SQLite queue's leases, reopening,
 stale receipts, concurrent consumers and run removal.
 

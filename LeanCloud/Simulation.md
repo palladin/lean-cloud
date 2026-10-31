@@ -1,6 +1,7 @@
 # Simulating the scheduler and workers
 
-`SimM` is lean-eff's freer computation over atomic environment operations.
+[`SimM`](Simulation.lean) is a lean-eff freer computation over atomic
+environment operations.
 `Cloud (SimM World)` uses the ordinary Cloud effects. The replay interpreter runs
 unchanged: storage and mailbox operations suspend its `SimM` continuation.
 

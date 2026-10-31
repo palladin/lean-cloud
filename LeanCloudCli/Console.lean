@@ -107,6 +107,12 @@ private def runOptions (args : List String) : Except String (Option String × Op
     | _ => throw "Usage: run PROGRAM [--input FILE.json] [--id ID]"
   return (file, id)
 
+/-- Sanitize each line separately so multi-line results keep their line breaks. -/
+private def printLines (text : String) : Cli Unit := do
+  let lines := text.splitOn "\n"
+  for line in if lines.length > 1 && lines.getLast? == some "" then lines.dropLast else lines do
+    printLine (safe line)
+
 def command (ctx : Context) (args : List String) : Cli Bool := do
   if Help.requested args then
     Help.display args
@@ -119,8 +125,9 @@ def command (ctx : Context) (args : List String) : Cli Bool := do
   | ["status"] => ctx.status
   | ["doctor"] => ctx.doctor
   | ["programs"] =>
+    let deployment ← ctx.deployment
     printHeading "PROGRAM                  DESCRIPTION"
-    for program in (← ctx.deployment).programs do
+    for program in deployment.programs do
       printStyled (Styled.text (pad 25 program.entry) .cyan ++ Styled.text program.description)
   | "run" :: name :: args =>
     let (file, id) ← liftExcept (runOptions args)
@@ -140,8 +147,8 @@ def command (ctx : Context) (args : List String) : Cli Bool := do
     match outcome with
     | .success value =>
       if run.program.resultSchema == (inferInstance : Codec BlobRef).schema then
-        printLine (safe (← ctx.result run))
-      else printLine (safe value.pretty)
+        printLines (← ctx.result run)
+      else printLines value.pretty
     | .failure error => printLine s!"failed: {safe error.message}"
     | .cancelled reason => printLine s!"cancelled: {safe reason}"
   | ["logs", id] | ["logs", id, _] =>
@@ -151,7 +158,9 @@ def command (ctx : Context) (args : List String) : Cli Bool := do
       if args[2]?.all (· == step.event.worker) then
         printLine (safe s!"{step.timestamp} {step.event.worker} {step.event.location} {step.event.activity} {step.event.operation}")
     unless snapshot.warning.isEmpty do printLine (safe snapshot.warning)
-  | _ => throw "Unknown command. Use 'help'."
+  | name :: _ =>
+    let some known := Help.find? name | throw "Unknown command. Use 'help'."
+    throw s!"Usage: {known.usage}. Use 'help {known.name}' for details."
   return true
 
 /-- Connection selection changes only the console's local profile. -/

@@ -115,10 +115,14 @@ against that snapshot's published checksums before importing. Do not mix dates
 or use a history dump. Keep the source URL, date and license information with
 any dataset you redistribute.
 
+Expand only the index first. A large index can exceed the native helper's 1 GiB
+decompression limit; the helper reads an expanded `index.txt` line by line:
+
 ```sh
+bzip2 -dc /path/to/wiki-pages-articles-multistream-index.txt.bz2 > /tmp/wiki-index.txt
 ./Applications/Wiki/local-files.sh .wiki-deployment import \
   /path/to/wiki-pages-articles-multistream.xml.bz2 \
-  /path/to/wiki-pages-articles-multistream-index.txt.bz2 \
+  /tmp/wiki-index.txt \
   /tmp/wiki-prepare.json
 ```
 
@@ -146,16 +150,35 @@ Use `linux/amd64` for an x86 cluster. This helper includes Wiki's XML and bzip2
 libraries. Continue with the guide's `up`, `connect`, and workflow submission steps.
 Deployment and provisioning remain outside Wiki workflows.
 
+### Files on Kubernetes
+
+`local-files.sh` works only with the local Compose deployment. On Kubernetes,
+including Azure and AWS, import data with `wiki_files` or the
+[cluster import job](FullWikipedia.md), and run downloads inside the scheduler
+pod. This fetches the search results saved by `result search`:
+
+```sh
+spec=.wiki-deployment/deployment.json
+kube=(kubectl --context "$(jq -r .context "$spec")" --namespace "$(jq -r .namespace "$spec")")
+[[ -z "$(jq -r '.kubeconfig // empty' "$spec")" ]] || kube+=(--kubeconfig "$(jq -r .kubeconfig "$spec")")
+fetch() { "${kube[@]}" exec -i scheduler-0 -- cloud-app files download /etc/lean-cloud/config.json /dev/stdin -; }
+
+jq .results /tmp/wiki-search.json | fetch > /tmp/wiki-matches.json
+jq -c '.parts[].file' /tmp/wiki-matches.json |
+  while read -r part; do printf '%s\n' "$part" | fetch; done > /tmp/wiki-hits.jsonl
+```
+
 ## Requests and exact semantics
 
 Every request uses immutable `FileRef` objects, as produced by the helpers.
 Optional fields have defaults:
 
-- Prepare: `source`, `shardBytes` (32 MiB), `namespaceId` (0),
-  `includeRedirects` (false).
+- Prepare: `source`, `shardBytes` (32 MiB; 1–64 MiB), `namespaceId` (0;
+  at most 100000), `includeRedirects` (false).
 - Count: `dataset`, `vocabulary`, `ignoreCase` (true).
-- Grep: `dataset`, `pattern`, `regex` (false), `ignoreCase` (false),
-  `maxOutputBytes` (64 MiB **per input shard**).
+- Grep: `dataset`, `pattern` (1–4096 UTF-8 bytes, no NUL), `regex` (false),
+  `ignoreCase` (false), `maxOutputBytes` (64 MiB **per input shard**; at most
+  128 MiB).
 
 Text is **wikitext**, with XML entities decoded. Templates, links and references
 remain in it; counts are not counts of rendered prose. Title/revision metadata

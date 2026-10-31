@@ -40,6 +40,7 @@ progress. `watch` shows the branch tree, executing code, and worker resource use
 Local Docker, Azure, and AWS use the same console commands.
 
 ```text
+cloud> connect mathlib-demo http://127.0.0.1:8081 --token-file .mathlib-deployment/client.token
 cloud> programs
 cloud> run lean-build --input Applications/LeanBuild/mathlib.json --id mathlib
 cloud> watch mathlib
@@ -67,3 +68,24 @@ set this up, or see the [console guide](LeanCloud/Console.md) for all commands.
 - [Deploy and run the example on Azure](deploy/Azure.md)
 - [Deploy and run the example on AWS](deploy/AWS.md)
 - [Run your first log-processing workflow](deploy/README.md#run-the-log-processing-example)
+
+## How it works
+
+- [Proofs](LeanCloud/Proofs/README.md): for pure cloud programs, sequential,
+  parallel and crash-restarting replay return the same result as direct execution.
+- [Worker recovery](LeanCloud/ReplayRecovery.md) and
+  [scheduler simulation](LeanCloud/Simulation.md).
+- [Deployment model](LeanCloud/Deployment.md): durability, scaling and credentials.
+- [Tests](LeanCloudTests/README.md): run `lake build` for the library and proofs,
+  then `lake test`.
+
+## Repository layout
+
+| Directory | Contents |
+| --- | --- |
+| `LeanCloud/` | The `Cloud` monad, interpreters, scheduler model and proofs |
+| `LeanCloudCli/` | The `lean_cloud` console |
+| `runtime/` | Deployed scheduler and worker processes: HTTP mailboxes, SQLite, S3/Azure blob storage, and the demo registry that ships as `cloud-app` |
+| `reducers/` | [Cloud reducers](reducers/README.md) for tree-shaped aggregation |
+| `Applications/` | [Example applications](Applications/README.md) |
+| `deploy/` | [Deployment helpers](deploy/README.md) for Docker, Kubernetes, Azure and AWS |

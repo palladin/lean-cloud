@@ -17,7 +17,7 @@ LeanBuild image, four-worker resource settings, the pinned request, and `watch`.
 
 Run from the repository directory. Install the [local prerequisites](README.md#local-docker),
 [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html),
-[OpenTofu](https://opentofu.org/docs/intro/install/) (>= 1.10, < 2), and `kubectl`.
+[OpenTofu](https://opentofu.org/docs/intro/install/) (>= 1.10, < 2), and `kubectl` 1.31 or newer.
 The helper checks for CLI 2.32 or newer, as required for
 [AWS browser login](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sign-in.html).
 
@@ -62,8 +62,10 @@ support. You can edit the file before `plan`. `create` applies the saved plan;
 configuration edits require a new plan. Retain the directory for cleanup.
 
 The first plan binds this directory to the cluster name, account, region,
-namespace and worker zone. Use a fresh directory to change these. VM count,
-size and administrator access settings remain editable through a new plan.
+namespace and worker zone. Use a fresh directory to change these. VM count and
+administrator access settings remain editable through a new plan. To change
+`machine_size`, keep the CPU architecture `init` detected (or also edit
+`architecture`), and choose a size the saved `worker_zone` offers.
 
 Defaults: **one ARM64 `m7g.large` VM**, 32 GiB OS disk, and no automatic scaling.
 The application will have one scheduler and three workers. `--machines`,
@@ -95,7 +97,11 @@ but these final steps failed, retry them without applying the provision plan aga
 ./deploy/aws.sh publish .aws-infra lean-cloud-demo:dev demo-v1
 ```
 
-Use `linux/amd64` for an x86 machine. The image contains `log-summary` and
+The platform must match the cluster's machines, not your computer: use
+`linux/amd64` only if you chose an x86 `--machine-size`. Building ARM64 images on
+an x86 computer needs Docker's
+[QEMU emulation](https://docs.docker.com/build/building/multi-platform/#qemu),
+which Docker Desktop includes. The image contains `log-summary` and
 `sum-squares`. For your own registered workflows, replace the build's application
 path; see [application setup](README.md#your-application).
 
@@ -109,7 +115,7 @@ for changed code. An interrupted upload can be retried. If the tag already exist
 ```sh
 ./deploy/aws.sh configure .aws-infra .aws-deployment demo-v1 3
 ./deploy/kubernetes.sh show .aws-deployment
-# Review deployment.json, storage.json and resources.json.
+# show prints deployment.json; also review storage.json and resources.json.
 ./deploy/kubernetes.sh up .aws-deployment
 ./deploy/kubernetes.sh status .aws-deployment
 ```
@@ -190,8 +196,8 @@ when finished; stopping pods alone does not remove those charges.
 ## Existing EKS clusters
 
 Follow the [existing Kubernetes instructions](README.md#existing-kubernetes-cluster).
-Provide an existing EBS CSI StorageClass with `WaitForFirstConsumer`, an immutable
-image, and a private storage.json:
+Set `storageClass` in deployment.json to an existing EBS CSI StorageClass with
+`WaitForFirstConsumer`, and provide an immutable image and a private storage.json:
 
 ```json
 {"provider":"s3","endpoint":"https://s3.eu-north-1.amazonaws.com","region":"eu-north-1","bucket":"YOUR_BUCKET","provisioned":true,"authentication":{"kind":"podIdentity"}}

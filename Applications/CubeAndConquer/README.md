@@ -56,11 +56,12 @@ Delete the test deployment and its blobs: `bash deploy/local.sh clean .sat-deplo
 ## Input and result contract
 
 `input.json` contains **a CNF file reference**, not CNF text, paths, credentials,
-or executable names. Edit its parameters before submission:
+or executable names. Every parameter below is required in the request;
+`prepare` writes the values in the second column. Edit them before submission:
 
-| Parameter | Default | Meaning |
+| Parameter | Written by `prepare` | Meaning |
 | --- | --- | --- |
-| `depth` | 10 | Total decision-depth budget; 0 goes directly to Kissat |
+| `depth` | 10 | Total decision-depth budget, at most 16 because `2^depth` must fit in `maxCubes`; 0 goes directly to Kissat |
 | `maxCubes` | 4096 | Leaf safeguard, 1–100000; must accommodate `2^depth` |
 | `splitDepth` | 5 | Decision levels per `march` invocation, 1–8 |
 | `cubesPerJob` | 32 | Maximum sibling leaves per cloud solver/checker batch, 1–256 |

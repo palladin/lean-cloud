@@ -162,7 +162,13 @@ def shellCases : Array TestCase := #[
         (keyBytes "\x1b[<64;0;2M", .idle), (keyBytes "\x1b[1;5F", .scrollBottom)] do
       let (result, world) := ConsoleModel.run Input.read { keys := bytes ++ keyBytes "x" }
       assertEq (← unwrap result) expected
-      assertEq world.keys (keyBytes "x") "Mouse payload leaked into the command line"⟩
+      assertEq world.keys (keyBytes "x") "Mouse payload leaked into the command line"⟩,
+  ⟨"console.shell.buffered-interrupt-does-not-exit", do
+    let some warned := Shell.interruptEmpty {} | throw (IO.userError "First Ctrl-C left the console")
+    assertEq warned.notice Shell.exitNotice
+    assertTrue (Shell.interruptEmpty warned).isNone "Second Ctrl-C did not leave the console"
+    let typed ← unwrap (ConsoleModel.run (Shell.handleKey {} warned (.text "p") (80, 24))).1
+    assertTrue (Shell.interruptEmpty { typed with line := "" }).isSome "Exit warning outlived other keys"⟩
 ]
 
 end LeanCloudTests

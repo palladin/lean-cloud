@@ -56,7 +56,8 @@ not model thread scheduling or prove operating-system progress.
 
 ## Worker-local recovery
 
-[RestartingParallelReplay](../ReplayRecovery.md) adds local worker crashes to the
+[RestartingParallelReplay](../RestartingParallelReplay.lean) (see
+[ReplayRecovery.md](../ReplayRecovery.md)) adds local worker crashes to the
 same interpreter. Workers retry inside their spawned functions and return their
 recorded outcomes. Scheduling only handles replies; it has no journal operations
 or crash mechanism.
@@ -99,7 +100,8 @@ availability, arbitrary IO equivalence, or OS task scheduling progress.
 
 [ProofExamples.lean](../../LeanCloudTests/ProofExamples.lean) applies all three public
 theorems to a workflow with captured values, delays, and nested parallel groups.
-Build the proofs with `lake build`.
+`lake build` checks the proofs; the examples are part of the test library, so
+`lake test` (or `lake build LeanCloudTests`) checks them.
 
 ## Runtime validation
 

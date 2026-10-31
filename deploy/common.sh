@@ -7,6 +7,13 @@ need() { command -v "$1" >/dev/null || fail "Missing tool: $1. Install it before
 identifier() { [[ "$1" =~ ^[a-z][a-z0-9-]{0,62}$ ]] || fail 'Use a lowercase name beginning with a letter (max 63 characters).'; }
 number() { [[ "$1" =~ ^(0|[1-9][0-9]{0,4})$ ]] || fail 'Expected a nonnegative integer (at most 5 digits, no leading zeroes).'; }
 absolute_dir() { (cd "$1" && pwd -P); }
+# Optional deployment.json "worker" settings override every node's runtime config.
+worker_settings() {
+  jq -e '(.worker // {}) | type=="object" and
+    (keys|all(.=="interpreterFuel" or .=="replayCacheBytes" or .=="replayCacheEntries")) and
+    (values|all(type=="number" and .>=0 and floor==.)) and (.interpreterFuel // 1) > 0' "$1" >/dev/null ||
+    fail 'worker accepts nonnegative integer interpreterFuel (positive), replayCacheBytes and replayCacheEntries'
+}
 secret() { openssl rand -hex "${1:-32}"; }
 # State directories may have any name. Protect them even outside this checkout.
 private_dir() {

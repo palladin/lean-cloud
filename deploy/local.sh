@@ -72,6 +72,7 @@ fi
 name=$(jq -er .name "$spec"); identifier "$name"
 if [[ "$command" == configure || "$command" == up || "$command" == scale ]]; then
   jq -e '[.cpuMillis,.memoryMiB]|all(.==null or (type=="number" and .>0 and floor==.))' "$spec" >/dev/null || fail 'Invalid worker CPU or memory budget'
+  worker_settings "$spec"
 fi
 [[ $(jq -r .directory "$spec") == "$directory" ]] || fail 'Deployment directory has moved; review its bind paths before use.'
 compose() { docker compose -p "$name" -f "$directory/compose.json" "$@"; }
@@ -83,6 +84,7 @@ mounted_config_permissions() {
 render() {
   jq --slurpfile spec "$spec" --rawfile client "$directory/client.token" --rawfile internal "$directory/internal.token" '
     $spec[0] as $s | .client={deployment:$s.name,image:$s.image,token:($client|rtrimstr("\n"))} |
+    .worker=((.worker // {}) + ($s.worker // {})) |
     .scheduler.database="/data/scheduler.sqlite" |
     .mailboxes.scheduler={host:"scheduler-mailbox",port:8080,token:($internal|rtrimstr("\n"))} |
     .mailboxes.workers=[range(1;$s.workers+1) | {worker:"worker\(.)",cpus:([1,(($s.cpuMillis // 1000)/1000|floor)]|max),memoryMiB:($s.memoryMiB // null),endpoint:{host:"worker\(.)-mailbox",port:8080,token:($internal|rtrimstr("\n"))}}]

@@ -13,9 +13,11 @@ restart locally:
 ```
 
 A crash discards the worker's continuation and retries the same assignment with
-its surviving records. The interpreter budget resets on each attempt; the retry
-budget limits the number of attempts. Application errors and interpreter budget
-errors are not crashes and do not trigger retries.
+its surviving records. The interpreter budget resets on each attempt.
+`RestartingParallelReplay` uses its remaining fuel as both the interpreter budget
+and the retry limit, so nested branches, which receive less fuel, also allow
+fewer attempts; there is no separate retry setting. Application errors and
+interpreter budget errors are not crashes and do not trigger retries.
 
 The scheduler handles replies: it schedules children for `fork`, then schedules
 the parent again. The root worker's `done(outcome)` supplies the final result;
@@ -52,15 +54,16 @@ def workflow (n : Nat) : Cloud WorkerM Nat := cloud {
 }
 
 def faults : Plan := {
-  workers := [(Location.root.next.child 0,
-    [⟨.create (ReplayStore.valueKey (Location.root.next.child 0)), .after⟩])] }
+  workers := [(Location.root.child 0,
+    [⟨.create (ReplayStore.valueKey (Location.root.child 0)), .after⟩])] }
 
 #eval ((interpret 1000 workflow 7).run (Saved.initial faults)).1
 -- Except.ok 113
 ```
 
-A scripted fault fires once at its next matching operation. Unreachable faults
-do not fire. Scripts and counters survive retries. After fuel exhaustion, pass
+A worker's faults fire in list order: each fires once, at the first operation
+matching it after the previous fault has fired. An unreachable fault never fires
+and also holds back every fault after it. Scripts and counters survive retries. After fuel exhaustion, pass
 the returned `Saved` to another call with more fuel to retain progress.
 
 ## Verification

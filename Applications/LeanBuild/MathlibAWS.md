@@ -189,8 +189,9 @@ failure, so check `success`. The report includes module diagnostics and a
 
 To repeat the experiment, use a new run ID. A repeat on these same workers may
 reuse local toolchains and caches, so it is not the same as a fresh-machine test.
-The request's one-hour limit applies to each persistent Lake session and to the
-final Lake invocation; it is not an automatic AWS cleanup timer.
+The request's one-hour limit applies to preparation, to the final Lake
+invocation, and to each wait for the next module to finish; fewer workers take
+longer rather than failing. It is not an automatic AWS cleanup timer.
 
 ## 7. Clean up
 

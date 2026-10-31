@@ -72,8 +72,9 @@ uses these existing nodes. Only the scheduler port is published, on loopback.
 Client and internal tokens are separate; the deployment directory is private.
 Its runtime config is readable inside the container by the unprivileged worker.
 The helper generates separate random client, mailbox, and blob credentials for
-each deployment. The fixed values in `deploy/config.json` and `deploy/s3.json`
-are used only by the repository's isolated Compose test fixture.
+each deployment. `deploy/config.json` and `deploy/s3.json` are templates for new
+local deployments: `configure` replaces their credentials and tokens but keeps
+their other settings. The repository's Compose test fixture uses them unchanged.
 
 ## Run the log-processing example
 
@@ -156,6 +157,11 @@ The same settings reach the workflow through `env.currentWorker` and
 This is a concurrency budget, not CPU pinning or a count of idle cores. See the
 [environment example](../LeanCloud/Deployment.md#planning-work-and-using-local-resources).
 
+An optional `worker` object sets runtime execution settings on every node:
+`replayCacheBytes` and `replayCacheEntries` (the
+[replay cache](../LeanCloud/Deployment.md) budgets; zero disables it) and
+`interpreterFuel`. They do not change replay semantics.
+
 After editing these fields, apply them through `scale` with the desired worker
 count, even if that count is unchanged:
 
@@ -195,7 +201,8 @@ resulting digest (`IMAGE@sha256:...`) in Kubernetes.
 
 ## Existing Kubernetes cluster
 
-Requires `kubectl`, `jq`, `openssl`, and `shasum`. Authentication and cluster
+Requires `kubectl` 1.31 or newer (for `kubectl wait --for=create`), `jq`,
+`openssl`, and `shasum`. Authentication and cluster
 context setup belong to your environment. The helper manages a dedicated
 namespace, one StatefulSet and durable PVC per node, and private ClusterIP
 services. The source template is `deploy/kubernetes/resources.jq`.
@@ -204,6 +211,8 @@ services. The source template is `deploy/kubernetes/resources.jq`.
 mkdir -m 700 .kube-deployment
 cp deploy/kubernetes/deployment.example.json .kube-deployment/deployment.json
 # Edit context, namespace, immutable image, worker count and resource settings.
+# Set storageClass to a StorageClass in your cluster; the example's managed-csi
+# exists only on AKS (on EKS, use an EBS CSI class). Choose diskGiB per node.
 # Supply .kube-deployment/storage.json for your shared blob service (examples below).
 ./deploy/kubernetes.sh render .kube-deployment
 # Review .kube-deployment/resources.json; render does not contact Kubernetes.
@@ -231,8 +240,8 @@ Applications that install tools at startup can set `startupSeconds` in
 `deployment.json` (default 300, range 5–3600). This controls the startup probe
 and the helper's readiness wait. For LeanBuild's first toolchain download, use 900.
 Your own authenticated HTTPS gateway may
-expose `/deployment` instead; never expose internal `/app`, `/mailbox` or
-`/telemetry` routes publicly. The CLI accepts HTTPS, or HTTP on loopback only.
+expose `/deployment` instead; never expose internal `/app`, `/mailbox`, `/work`
+or `/telemetry` routes publicly. The CLI accepts HTTPS, or HTTP on loopback only.
 
 For Azure workload identity, use:
 
@@ -246,8 +255,9 @@ Set `serviceAccountAnnotations` to
 An S3-compatible service can instead use
 `"authentication":{"kind":"keys","accessKey":"...","secretKey":"..."}` in
 the private storage.json file, with `"provider":"s3"`.
-The bucket/container must already exist when marked
-provisioned. With Azure workload identity, nodes obtain credentials themselves;
+An Azure container must already exist. An S3 bucket must exist when
+`"provisioned":true`; otherwise nodes create it. S3 settings also need
+`endpoint` and `bucket`; `region` defaults to `us-east-1`. With Azure workload identity, nodes obtain credentials themselves;
 no storage key is needed in the configuration.
 
 To change worker count, use the same command as locally:

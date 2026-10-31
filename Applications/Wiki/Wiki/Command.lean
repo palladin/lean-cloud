@@ -19,7 +19,7 @@ private def run [FromJson ι] [ToJson α] (store : ObjectStore)
   | .error e => throw (IO.userError e.message)
   | .ok value => write output value
 
-def main (args : List String) : IO UInt32 := do
+def main (args : List String) (program := "cloud-app files") : IO UInt32 := do
   try
     match args with
     | ["import", config, dump, index, output] =>
@@ -44,7 +44,7 @@ def main (args : List String) : IO UInt32 := do
       | "wiki-grep" => run cfg.objects (grep b) input output
       | _ => throw (IO.userError "Unknown Wiki program")
     | _ =>
-      IO.eprintln "Usage: files import CONFIG DUMP.bz2 INDEX.txt[.bz2] REQUEST.json | files import-xml CONFIG DUMP.xml[.bz2] REQUEST.json | files download CONFIG FILE_REF OUTPUT | files run CONFIG PROGRAM INPUT OUTPUT"
+      IO.eprintln s!"Usage: {program} import CONFIG DUMP.bz2 INDEX.txt[.bz2] REQUEST.json | {program} import-xml CONFIG DUMP.xml[.bz2] REQUEST.json | {program} download CONFIG FILE_REF OUTPUT | {program} run CONFIG PROGRAM INPUT OUTPUT"
       return 2
     return 0
   catch error => IO.eprintln s!"{error}"; return 1

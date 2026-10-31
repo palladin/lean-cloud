@@ -47,6 +47,7 @@ jq -e '[.diskGiB,.cpuMillis,.memoryMiB]|all(type=="number" and .>0 and floor==.)
 jq -e 'if has("cpuRequestMillis") then .cpuMillis as $budget | .cpuRequestMillis |
   type=="number" and .>0 and floor==. and .<=$budget else true end' "$spec" >/dev/null || fail 'cpuRequestMillis must be a positive integer no greater than cpuMillis'
 jq -e '(.schedulerResources // {}) | type=="object" and (keys|all(.=="cpuMillis" or .=="memoryMiB")) and (values|all(type=="number" and .>0 and floor==.))' "$spec" >/dev/null || fail 'Invalid scheduler resources'
+worker_settings "$spec"
 kube() { kubectl "${kube_options[@]}" --request-timeout=30s "$@"; }
 roles() { printf 'scheduler\n'; for ((i=1;i<=workers;i++)); do printf 'worker%s\n' "$i"; done; }
 if [[ "$command" == render ]]; then
@@ -104,7 +105,7 @@ fi
 kube create configmap cloud-operation --from-literal="operation=$command" >/dev/null || fail 'Deployment operation is locked; verify the previous operator has stopped before removing cloud-operation.'
 trap 'kube delete configmap cloud-operation --ignore-not-found --wait=true >/dev/null' EXIT
 storage_hash=$(jq -Sc . "$directory/storage.json" | shasum -a 256 | cut -d " " -f 1)
-identity_filter='del(.workers,.cpuMillis,.cpuRequestMillis,.memoryMiB,.schedulerResources,.startupSeconds,.kubeconfig)'
+identity_filter='del(.workers,.cpuMillis,.cpuRequestMillis,.memoryMiB,.schedulerResources,.startupSeconds,.worker,.kubeconfig)'
 identity=$(jq -Sc "$identity_filter" "$spec")
 record=$(kube get configmap cloud-deployment --ignore-not-found -o json)
 if [[ -n "$record" ]]; then
@@ -148,7 +149,7 @@ for token in client internal; do
 done
 jq -n --slurpfile spec "$spec" --slurpfile storage "$directory/storage.json" \
   --rawfile client "$directory/client.token" --rawfile internal "$directory/internal.token" '
-  $spec[0] as $c | {formatVersion:1,worker:{},client:{deployment:$c.name,image:$c.image,token:($client|rtrimstr("\n"))},
+  $spec[0] as $c | {formatVersion:1,worker:($c.worker // {}),client:{deployment:$c.name,image:$c.image,token:($client|rtrimstr("\n"))},
   scheduler:{database:"/data/scheduler.sqlite",assignmentMs:30000},blobs:$storage[0],
   mailboxes:{scheduler:{host:"scheduler",port:8080,token:($internal|rtrimstr("\n"))},workers:[range(1;$c.workers+1)|{worker:"worker\(.)",cpus:([1,($c.cpuMillis/1000|floor)]|max),memoryMiB:$c.memoryMiB,endpoint:{host:"worker\(.)",port:8080,token:($internal|rtrimstr("\n"))}}]}}
   ' > "$directory/config.json"

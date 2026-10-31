@@ -7,6 +7,8 @@ open Lean LeanCloud LeanCloudCli
 structure World where
   files : Array (String × String) := #[]
   directories : Array String := #["/work"]
+  /-- Symbolic link prefixes and the paths they resolve to. -/
+  links : Array (String × String) := #[]
   env : Option String := none
   envs : Array (String × String) := #[]
   lines : List String := []
@@ -101,7 +103,9 @@ private def operation : HostOp α → ExceptT String (StateM World) α
       else result) #[]
   | .createDir path => modify fun w => { w with directories := w.directories.push path.toString }
   | .isDir path => return (← get).directories.contains path.toString
-  | .realPath path => return path
+  | .realPath path => do
+    let some (link, target) := (← get).links.find? (path.toString.startsWith ·.1) | return path
+    return target ++ (path.toString.drop link.length).toString
   | .currentDir => return "/work"
   | .getEnv name => do
     if let some value := (← get).envs.find? (·.1 == name) then return some value.2

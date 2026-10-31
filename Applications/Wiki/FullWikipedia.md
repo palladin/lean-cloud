@@ -157,7 +157,9 @@ lake exe lean_cloud result enwiki-grep > .lean-cloud/wiki-full/grep-result.json
 
 Run `result` after each workflow completes. Use different run IDs for subsequent
 queries. Count results are small summaries; grep returns a blob manifest of result
-parts, not all matching text over HTTP. The same dataset can serve both workflows
+parts, not all matching text over HTTP. To download the matching articles, use
+[files on Kubernetes](README.md#files-on-kubernetes) with `grep-result.json` in
+place of `/tmp/wiki-search.json`. The same dataset can serve both workflows
 without repeating preparation. Byte-range reducers read only relevant immutable
 chunks and split work across worker CPUs.
 

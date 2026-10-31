@@ -16,6 +16,11 @@ structure Tools where
   cache : Option Bundle.Cache := none
   threads : Nat := 1
   cancelled : IO Bool := pure false
+  /-- When false, the caller enforces `limits.seconds` through `cancelled`. -/
+  deadline : Bool := true
+
+/-- A persistent session's watchdog replaces its wall-clock deadline. -/
+private def unbounded : Nat := 1 <<< 62
 
 private def withWorkspace (action : System.FilePath → IO α) : IO α :=
   IO.FS.withTempDir fun root => do
@@ -39,7 +44,7 @@ private def run (tools : Tools) (directory : System.FilePath) (limits : Limits)
       s!"HOME={home}", s!"LEAN_NUM_THREADS={max 1 tools.threads}",
       "LANG=C.UTF-8", "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1"] ++
       cacheEnv ++ #[command] ++ args
-  } (limits.seconds * 1000) (directory / ".." / s!"{label}.stdout")
+  } (if tools.deadline then limits.seconds * 1000 else unbounded) (directory / ".." / s!"{label}.stdout")
     (directory / ".." / s!"{label}.stderr") (16 * 1024 * 1024) (cancelled := tools.cancelled)
   if out.stopped then return .error s!"{label}: time or output limit exceeded"
   if out.exitCode != 0 then
@@ -317,15 +322,32 @@ def Tools.builder (tools : Tools) (store : ObjectStore) (env : Environment IO)
     IO.FS.createDirAll input
     IO.FS.createDirAll output
     let abort ← Std.Mutex.new false
+    let pending ← IO.mkRef (#[] : Array (Nat × Module × Nat))
+    let progress ← IO.mkRef (← IO.monoMsNow)
+    let finishing ← IO.mkRef false
+    let timedOut ← IO.mkRef false
+    -- The session lasts as long as this worker's share of the build, so
+    -- `limits.seconds` bounds inactivity instead: while modules wait in Lake or
+    -- the session is finishing, the next completion must arrive in time.
+    let stalled : IO Bool := do
+      let waiting ← pending.get
+      if waiting.isEmpty && !(← finishing.get) then return false
+      if (← IO.monoMsNow) < (← progress.get) + request.limits.seconds * 1000 then return false
+      -- Completions wait for the next poll, but they still count as progress.
+      if ← waiting.anyM fun (id, _, _) => (output / s!"{id}.json").pathExists then
+        progress.set (← IO.monoMsNow)
+        return false
+      timedOut.set true
+      return true
     -- Give Lake the worker's thread budget; the helper separately limits module
     -- jobs. Even a single-CPU worker needs a job thread plus the admission loop.
     let localTools := { tools with
       threads := max 2 env.currentWorker.cpus
-      cancelled := do return (← abort.atomically get) || (← env.cancellation.isRequested) }
+      deadline := false
+      cancelled := do return (← abort.atomically get) || (← env.cancellation.isRequested) || (← stalled) }
     let task ← IO.asTask (runHelper localTools directory request "modules"
       #["serve", toString (Builders.compilerSlots env.currentWorker.cpus),
         policy.toString, input.toString, output.toString, directory.toString]) .dedicated
-    let pending ← IO.mkRef (#[] : Array (Nat × Module × Nat))
     let next ← IO.mkRef (0 : Nat)
     let failed ← IO.mkRef false
     let cancel : IO Unit := do
@@ -341,6 +363,7 @@ def Tools.builder (tools : Tools) (store : ObjectStore) (env : Environment IO)
         IO.FS.writeFile temporary (toJson mod.name).compress
         IO.FS.rename temporary path
         let start ← IO.monoMsNow
+        if (← pending.get).isEmpty then progress.set start
         pending.modify (·.push (id, mod, start))
         next.set (id + 1)
       poll := do
@@ -355,9 +378,13 @@ def Tools.builder (tools : Tools) (store : ObjectStore) (env : Environment IO)
           unless value.name == mod.name do throw (IO.userError "Module completion name mismatch")
           if !value.success then failed.set true
           results := results.push (mod.name, (value, (← IO.monoMsNow) - start))
+          -- Record progress before the watchdog can no longer see this file.
+          progress.set (← IO.monoMsNow)
           IO.FS.removeFile path
         pending.set waiting
         if exited then
+          if ← timedOut.get then
+            throw (IO.userError s!"No module finished within limits.seconds ({request.limits.seconds} s)")
           match ← IO.ofExcept (← IO.wait task) with
           | .error message => throw (IO.userError message)
           | .ok () => throw (IO.userError "Lake session exited before finish")
@@ -365,8 +392,12 @@ def Tools.builder (tools : Tools) (store : ObjectStore) (env : Environment IO)
       publish := fun _ mod (value, elapsed) => publishModule tools store directory request session installed mod value elapsed
       finish := do
         unless (← pending.get).isEmpty do throw (IO.userError "Lake session has unfinished modules")
+        progress.set (← IO.monoMsNow)
+        finishing.set true
         IO.FS.writeFile (input / "finish") ""
         let result ← IO.ofExcept (← IO.wait task)
+        if ← timedOut.get then
+          throw (IO.userError s!"Lake session did not finish within limits.seconds ({request.limits.seconds} s)")
         if let .error message := result then
           unless ← failed.get do throw (IO.userError message)
       cancel }

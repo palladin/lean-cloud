@@ -23,8 +23,10 @@ volumes. No scheduler tree is persisted: recovery reconstructs it through replay
 
 Workers cache confirmed immutable replay records across assignments. Each node
 defaults to at most 64 MiB of encoded records and keys, and 4,096 entries; map
-overhead is additional. Set `worker.replayCacheBytes` and
-`worker.replayCacheEntries` in the runtime configuration to change these budgets.
+overhead is additional. To change these budgets, add a `worker` object to the
+deployment helpers' `deployment.json`, for example
+`"worker": {"replayCacheBytes": 134217728, "replayCacheEntries": 8192}`, and apply
+it with `up` or `scale` (see [worker resource budgets](../deploy/README.md#worker-resource-budgets)).
 Either value can be zero to disable caching. The cache is disposable memory:
 restarts read the global journal again. Every cache hit still checks assignment
 ownership, and creates always publish to durable storage before caching a value.
@@ -133,4 +135,4 @@ startup. Shared application blobs are retained.
 Public client credentials are separate from internal node credentials. Provider
 login stays outside Lean Cloud; deployed cloud nodes use workload identities.
 Only expose `/deployment` through a public authenticated HTTPS endpoint. Internal
-mailbox, administration and telemetry routes remain private.
+mailbox, work-queue, administration and telemetry routes remain private.

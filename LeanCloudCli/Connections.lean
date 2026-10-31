@@ -10,9 +10,10 @@ def connect (name url : String) (tokenEnv := "LEAN_CLOUD_TOKEN")
   unless name == name.toLower do throw "Connection name must be lowercase"
   let connection ← Client.connect url tokenEnv tokenFile
   let directory ← Profiles.home
-  let root := directory / "connections"
+  request (.createDir (directory / "connections"))
+  -- The catalog records resolved paths; the session must use the same spelling.
+  let root ← request (.realPath (directory / "connections"))
   let ctx : Context := ⟨root, name⟩
-  request (.createDir root)
   Profiles.checkOwnership ctx
   if let some existing ← ctx.connection then
     unless existing.deployment == connection.deployment do

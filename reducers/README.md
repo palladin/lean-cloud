@@ -74,11 +74,6 @@ Tree depth grows logarithmically with the number of batches. This distributes
 combining work but adds forks and recorded effects compared with a flat fan-out;
 keep leaves coarse enough to justify cloud scheduling.
 
-The execution topology changed with tree reduction. Version workflows that used
-the previous flat reducer before deploying this implementation over existing runs.
-`foldWith` replaces `foldPartitions`: supply a pairwise combiner for the finalized
-leaf results instead of gathering them all for one final merge.
-
 The [Wiki workflows](../Applications/Wiki/Wiki/Workflow.lean) demonstrate
 preparation, vocabulary counting, and grep with results stored in blobs.
 

@@ -322,6 +322,34 @@ def cases : Array TestCase := #[
       assertTrue (world.requests.all (·.1 == url ++ "/deployment")) "Client changed transport path"
     let action := Client.connect "http://127.0.0.1:8080" "CLOUD_TOKEN" (some "/missing.token")
     let (result, world) := (Cli.runWith clientHost action).run {}
-    assertTrue (!result.isOk && world.requests.isEmpty) "Missing file fell back to ambient token"⟩]
+    assertTrue (!result.isOk && world.requests.isEmpty) "Missing file fell back to ambient token"⟩,
+  ⟨"deployment-api.result-keeps-lines-and-failed-catalog-prints-nothing", do
+    let value := Json.mkObj [("message", toJson (String.ofList (List.replicate 100 'x'))), ("count", toJson (2 : Nat))]
+    assertTrue ((value.pretty.splitOn "\n").length > 1) "Fixture result is a single line"
+    let http url token json := do
+      match ← LeanCloud.DeploymentApi.Request.decode json with
+      | .outcome _ => return toJson (.ok (toJson (some (.success value) : Option Exit)) : Except String Json)
+      | _ => monitoringHost true url token json
+    let (result, world) := ConsoleModel.run (command remoteContext ["result", "one"])
+      (withConnection { remoteWorld with http := some http })
+    discard <| unwrap result
+    assertEq world.stdout (value.pretty ++ "\n") "Result lost its line breaks"
+    let (result, world) := ConsoleModel.run (command remoteContext ["programs"])
+      (withConnection { remoteWorld with http := some (fun _ _ _ => .error "Connection lost") })
+    assertTrue (!result.isOk) "Catalog failure was swallowed"
+    assertEq world.stdout "" "Catalog heading printed after a failed request"
+    let (result, world) := ConsoleModel.run (command remoteContext ["run"]) (withConnection remoteWorld)
+    assertTrue (!result.isOk) "Incomplete command was accepted"
+    assertTrue ((world.stderr.splitOn "Usage: run PROGRAM").length > 1 ||
+      (match result with | .error e => (e.splitOn "Usage: run PROGRAM").length > 1 | _ => false))
+      "Known command with wrong arguments did not show its usage"⟩,
+  ⟨"deployment-api.selected-connection-through-linked-state-directory", do
+    let action := do
+      let (ctx, _) ← dispatch ⟨"/work", "local"⟩ ["connect", "production", "https://cloud.example.test"]
+      listConnections ctx
+    let (result, world) := ConsoleModel.run action
+      { remoteWorld with envs := remoteWorld.envs.push ("LEAN_CLOUD_HOME", "/link/state"), links := #[("/link", "/real")] }
+    discard <| unwrap result
+    assertTrue ((world.stdout.splitOn "* production").length > 1) s!"Selected connection not marked: {world.stdout}"⟩]
 
 end LeanCloudTests.DeploymentApi
