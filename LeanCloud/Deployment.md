@@ -26,7 +26,9 @@ defaults to at most 64 MiB of encoded records and keys, and 4,096 entries; map
 overhead is additional. To change these budgets, add a `worker` object to the
 deployment helpers' `deployment.json`, for example
 `"worker": {"replayCacheBytes": 134217728, "replayCacheEntries": 8192}`, and apply
-it with `up` or `scale` (see [worker resource budgets](../deploy/README.md#worker-resource-budgets)).
+it with `scale`, keeping the same worker count if desired (see
+[worker resource budgets](../deploy/README.md#worker-resource-budgets)). Local
+`up` starts the existing configuration; Kubernetes also applies edits through `up`.
 Either value can be zero to disable caching. The cache is disposable memory:
 restarts read the global journal again. Every cache hit still checks assignment
 ownership, and creates always publish to durable storage before caching a value.

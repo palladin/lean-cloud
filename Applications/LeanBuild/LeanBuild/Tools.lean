@@ -3,6 +3,7 @@ import LeanBuild.Bundle
 import LeanBuild.Workspace
 import LeanBuild.Toolchain
 import LeanBuild.Builders
+import LeanBuild.Watchdog
 import LeanCloudRuntime.Process
 
 namespace LeanBuild
@@ -323,22 +324,14 @@ def Tools.builder (tools : Tools) (store : ObjectStore) (env : Environment IO)
     IO.FS.createDirAll output
     let abort ← Std.Mutex.new false
     let pending ← IO.mkRef (#[] : Array (Nat × Module × Nat))
-    let progress ← IO.mkRef (← IO.monoMsNow)
+    let watchdog ← Watchdog.create (request.limits.seconds * 1000)
     let finishing ← IO.mkRef false
-    let timedOut ← IO.mkRef false
     -- The session lasts as long as this worker's share of the build, so
     -- `limits.seconds` bounds inactivity instead: while modules wait in Lake or
     -- the session is finishing, the next completion must arrive in time.
-    let stalled : IO Bool := do
-      let waiting ← pending.get
-      if waiting.isEmpty && !(← finishing.get) then return false
-      if (← IO.monoMsNow) < (← progress.get) + request.limits.seconds * 1000 then return false
-      -- Completions wait for the next poll, but they still count as progress.
-      if ← waiting.anyM fun (id, _, _) => (output / s!"{id}.json").pathExists then
-        progress.set (← IO.monoMsNow)
-        return false
-      timedOut.set true
-      return true
+    let stalled := watchdog.check
+      (do return !(← pending.get).isEmpty || (← finishing.get))
+      (do (← pending.get).anyM fun (id, _, _) => (output / s!"{id}.json").pathExists)
     -- Give Lake the worker's thread budget; the helper separately limits module
     -- jobs. Even a single-CPU worker needs a job thread plus the admission loop.
     let localTools := { tools with
@@ -363,7 +356,7 @@ def Tools.builder (tools : Tools) (store : ObjectStore) (env : Environment IO)
         IO.FS.writeFile temporary (toJson mod.name).compress
         IO.FS.rename temporary path
         let start ← IO.monoMsNow
-        if (← pending.get).isEmpty then progress.set start
+        if (← pending.get).isEmpty then watchdog.progress
         pending.modify (·.push (id, mod, start))
         next.set (id + 1)
       poll := do
@@ -378,12 +371,12 @@ def Tools.builder (tools : Tools) (store : ObjectStore) (env : Environment IO)
           unless value.name == mod.name do throw (IO.userError "Module completion name mismatch")
           if !value.success then failed.set true
           results := results.push (mod.name, (value, (← IO.monoMsNow) - start))
-          -- Record progress before the watchdog can no longer see this file.
-          progress.set (← IO.monoMsNow)
+          -- Invalidate any watchdog probe before removing its evidence of progress.
+          watchdog.progress
           IO.FS.removeFile path
         pending.set waiting
         if exited then
-          if ← timedOut.get then
+          if ← watchdog.timedOut then
             throw (IO.userError s!"No module finished within limits.seconds ({request.limits.seconds} s)")
           match ← IO.ofExcept (← IO.wait task) with
           | .error message => throw (IO.userError message)
@@ -392,11 +385,11 @@ def Tools.builder (tools : Tools) (store : ObjectStore) (env : Environment IO)
       publish := fun _ mod (value, elapsed) => publishModule tools store directory request session installed mod value elapsed
       finish := do
         unless (← pending.get).isEmpty do throw (IO.userError "Lake session has unfinished modules")
-        progress.set (← IO.monoMsNow)
+        watchdog.progress
         finishing.set true
         IO.FS.writeFile (input / "finish") ""
         let result ← IO.ofExcept (← IO.wait task)
-        if ← timedOut.get then
+        if ← watchdog.timedOut then
           throw (IO.userError s!"Lake session did not finish within limits.seconds ({request.limits.seconds} s)")
         if let .error message := result then
           unless ← failed.get do throw (IO.userError message)

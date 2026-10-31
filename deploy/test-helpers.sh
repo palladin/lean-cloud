@@ -9,6 +9,7 @@ need rg
 for script in deploy/*.sh; do bash -n "$script"; done
 if command -v shellcheck >/dev/null; then shellcheck -S warning deploy/*.sh; fi
 work=$(mktemp -d)
+work=$(cd "$work" && pwd -P)
 trap 'rm -rf "$work"' EXIT
 mkdir "$work/bin"
 export HELPER_TEST_LOG="$work/calls"
@@ -19,7 +20,9 @@ case "$*" in
   'image inspect '* ) printf 'sha256:%064d\n' 1 ;;
   'info --format {{.Name}}') printf 'test-machine\n' ;;
   info|'compose version'|'buildx version') ;;
-  *'volume inspect'*) exit 1 ;;
+  *'volume inspect'*)
+    [[ -n ${HELPER_TEST_VOLUME_OWNER:-} ]] || exit 1
+    printf '%s\n' "$HELPER_TEST_VOLUME_OWNER" ;;
   *'compose '*down*) ;;
   *'compose '*port*) printf '127.0.0.1:8080\n' ;;
   *'compose '*ps) ;;
@@ -119,6 +122,28 @@ HELPER_TEST_START=1 HELPER_TEST_MEMBERSHIP="$work/local-membership.json" bash de
 jq -e '.services.worker1|.cpus==2.5 and .mem_limit=="2048m"' "$work/local-1/compose.json" >/dev/null
 jq -e '.worker=={interpreterFuel:100000,replayCacheEntries:16}' "$work/local-1/config.json" >/dev/null
 jq -e 'length==1 and all(.cpus==2 and .memoryMiB==2048)' "$work/local-membership.json" >/dev/null
+
+# Local up starts the saved configuration; scale applies edits and resets removed
+# overrides from defaults rather than inheriting the previous generated settings.
+jq '.worker={interpreterFuel:300000,replayCacheBytes:0,replayCacheEntries:32}' \
+  "$work/local-1/deployment.json" > "$work/next.json"
+mv "$work/next.json" "$work/local-1/deployment.json"
+HELPER_TEST_START=1 HELPER_TEST_VOLUME_OWNER="$work/local-1" HELPER_TEST_MEMBERSHIP="$work/local-membership.json" \
+  bash deploy/local.sh up "$work/local-1"
+jq -e '.worker=={interpreterFuel:100000,replayCacheEntries:16}' "$work/local-1/config.json" >/dev/null
+HELPER_TEST_START=1 HELPER_TEST_VOLUME_OWNER="$work/local-1" HELPER_TEST_MEMBERSHIP="$work/local-membership.json" \
+  bash deploy/local.sh scale "$work/local-1" 1
+jq -e '.worker=={interpreterFuel:300000,replayCacheBytes:0,replayCacheEntries:32}' "$work/local-1/config.json" >/dev/null
+jq 'del(.worker.replayCacheEntries)' "$work/local-1/deployment.json" > "$work/next.json"
+mv "$work/next.json" "$work/local-1/deployment.json"
+HELPER_TEST_START=1 HELPER_TEST_VOLUME_OWNER="$work/local-1" HELPER_TEST_MEMBERSHIP="$work/local-membership.json" \
+  bash deploy/local.sh scale "$work/local-1" 1
+jq -e '.worker=={interpreterFuel:300000,replayCacheBytes:0}' "$work/local-1/config.json" >/dev/null
+jq 'del(.worker)' "$work/local-1/deployment.json" > "$work/next.json"
+mv "$work/next.json" "$work/local-1/deployment.json"
+HELPER_TEST_START=1 HELPER_TEST_VOLUME_OWNER="$work/local-1" HELPER_TEST_MEMBERSHIP="$work/local-membership.json" \
+  bash deploy/local.sh scale "$work/local-1" 1
+jq -e --slurpfile defaults deploy/config.json '.worker==$defaults[0].worker' "$work/local-1/config.json" >/dev/null
 
 mkdir "$work/kube"
 jq '.image="registry/app@sha256:0000000000000000000000000000000000000000000000000000000000000001"' \

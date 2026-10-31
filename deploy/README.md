@@ -160,7 +160,8 @@ This is a concurrency budget, not CPU pinning or a count of idle cores. See the
 An optional `worker` object sets runtime execution settings on every node:
 `replayCacheBytes` and `replayCacheEntries` (the
 [replay cache](../LeanCloud/Deployment.md) budgets; zero disables it) and
-`interpreterFuel`. They do not change replay semantics.
+`interpreterFuel`. They do not change replay semantics. Removing an override
+restores its default on the next configuration update.
 
 After editing these fields, apply them through `scale` with the desired worker
 count, even if that count is unchanged:
@@ -172,7 +173,8 @@ count, even if that count is unchanged:
 ```
 
 This stops old nodes before updating the runtime configuration and starting
-replacements. Kubernetes also supports separate `schedulerResources`, described below.
+replacements. Local `up` starts the existing generated configuration; use `scale`
+to apply edits. Kubernetes also supports separate `schedulerResources`, described below.
 
 ## Your application
 

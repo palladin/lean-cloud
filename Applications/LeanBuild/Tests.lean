@@ -1349,6 +1349,51 @@ private def toolchainTests : IO Unit :=
       check bad.validate.toOption.isNone "Invalid release accepted"
     IO.println "PASS pinned toolchain download, checksum rejection, helper check, interrupted installation and reuse"
 
+private def watchdogTests : IO Unit := do
+  let clock ← IO.mkRef (0 : Nat)
+  let watchdog ← Watchdog.create 1000 clock.get
+  clock.set 10000
+  check (!(← watchdog.check (pure false) (throw (IO.userError "Idle watchdog probed completions"))))
+    "Idle sessions must not time out"
+  watchdog.progress
+  clock.set 10999
+  check (!(← watchdog.check (pure true) (pure false))) "Submission did not reset the deadline"
+  clock.set 11000
+  check (!(← watchdog.check (pure true) (pure true))) "Unconsumed completion did not count as progress"
+  clock.set 11999
+  check (!(← watchdog.check (pure true) (pure false))) "Completion did not reset the deadline"
+  clock.set 12000
+  check (← watchdog.check (pure true) (pure false)) "Stalled session did not time out"
+  watchdog.progress
+  check (← watchdog.timedOut) "Progress revived an already stopped session"
+
+  IO.FS.withTempDir fun directory => do
+    let path := directory / "0.json"
+    IO.FS.writeFile path "{}"
+    clock.set 0
+    let watchdog ← Watchdog.create 1000 clock.get
+    let probing ← IO.Promise.new
+    let resume ← IO.Promise.new
+    clock.set 1000
+    -- Pause the real watchdog after it observes the old deadline. Poll consumes
+    -- the completion before the filesystem probe returns, while other jobs remain.
+    let task ← IO.asTask (watchdog.check (pure true) do
+      probing.resolve ()
+      discard <| IO.wait resume.result!
+      path.pathExists) .dedicated
+    discard <| IO.wait probing.result!
+    try
+      watchdog.progress
+      IO.FS.removeFile path
+    finally resume.resolve ()
+    check (!(← IO.ofExcept (← IO.wait task)) && !(← watchdog.timedOut))
+      "Consumed completion raced with the timeout decision"
+    clock.set 1999
+    check (!(← watchdog.check (pure true) (pure false))) "Racing completion lost its new deadline"
+    clock.set 2000
+    check (← watchdog.check (pure true) (pure false)) "Race recovery disabled later timeouts"
+  IO.println "PASS inactivity deadlines, idle sessions, pending completions and concurrent completion consumption"
+
 /-- Measure executing tasks, not merely the inherited environment variable. -/
 private def threadProbe : String := String.intercalate "\n" [
   "private def checkThreadPool (expected : Nat) : IO Unit := do",
@@ -1582,6 +1627,7 @@ private def nativeTests : IO Unit := IO.FS.withTempDir fun cacheRoot => do
   IO.println "PASS native Lake builds, executable/FFI/generated/custom targets, restored artifacts and build failures"
 
 def main (args : List String) : IO Unit := do
+  watchdogTests
   if args == ["--native-only"] then nativeTests; return
   builderSourceTest
   admissionTest

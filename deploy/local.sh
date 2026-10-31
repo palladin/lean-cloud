@@ -82,9 +82,10 @@ mounted_config_permissions() {
   chmod 644 "$directory/config.json" "$directory/s3.json" "$directory/filer.toml"
 }
 render() {
-  jq --slurpfile spec "$spec" --rawfile client "$directory/client.token" --rawfile internal "$directory/internal.token" '
+  jq --slurpfile spec "$spec" --slurpfile defaults "$assets/config.json" \
+    --rawfile client "$directory/client.token" --rawfile internal "$directory/internal.token" '
     $spec[0] as $s | .client={deployment:$s.name,image:$s.image,token:($client|rtrimstr("\n"))} |
-    .worker=((.worker // {}) + ($s.worker // {})) |
+    .worker=(($defaults[0].worker // {}) + ($s.worker // {})) |
     .scheduler.database="/data/scheduler.sqlite" |
     .mailboxes.scheduler={host:"scheduler-mailbox",port:8080,token:($internal|rtrimstr("\n"))} |
     .mailboxes.workers=[range(1;$s.workers+1) | {worker:"worker\(.)",cpus:([1,(($s.cpuMillis // 1000)/1000|floor)]|max),memoryMiB:($s.memoryMiB // null),endpoint:{host:"worker\(.)-mailbox",port:8080,token:($internal|rtrimstr("\n"))}}]
