@@ -1,4 +1,5 @@
 import LeanBuild.Workflow
+import LeanBuild.Project
 import LeanBuild.Bundle
 import LeanBuild.Workspace
 import LeanBuild.Toolchain
@@ -106,34 +107,10 @@ private def policyFile (directory : System.FilePath) (request : Request) : IO Sy
   IO.FS.writeFile path (toJson request).pretty
   return path
 
-/-- Resolve dependencies and generated inputs once, then freeze their bytes. -/
-def Tools.prepareDirectory (tools : Tools) (store : ObjectStore) (request : Request)
-    (directory : System.FilePath) (commit : String) : IO Preparation := do
-  let prepared : Except String (String × String × Array Module × Bundle.Snapshot) ← try
-    let root ← IO.FS.realPath directory
-    let cwd ← IO.FS.realPath (project directory request)
-    unless cwd == root || cwd.toString.startsWith (root.toString ++ "/") do
-      throw (IO.userError "Project directory is outside the repository")
-    let toolchain ← verifyToolchain tools cwd
-    let policy ← policyFile directory request
-    let output := directory / ".." / "build-plan.json"
-    IO.ofExcept (← runHelper tools directory request "plan"
-      #["plan", policy.toString, output.toString, directory.toString])
-    let modules : Array Module ← readJson output
-    IO.ofExcept (validateModules modules)
-    let source ← Bundle.snapshot directory request.limits.bytes
-    pure (.ok (toolchain, ← platform, modules, source))
-  catch error => pure (.error (toString error))
-  match prepared with
-  | .error reason => return { error := reason, diagnostics := ← logs store directory }
-  | .ok (toolchain, platform, modules, snapshot) =>
-    -- Publication exceptions propagate to Cloud.exec and are durable failures.
-    let source ← snapshot.publish store tools.cache (Builders.ioConcurrency tools.threads)
-    let reference ← Files.putJson store source (Builders.ioConcurrency tools.threads)
-    return { plan := some { commit, toolchain, platform, modules, source := reference } }
-
-def Tools.prepare (tools : Tools) (store : ObjectStore) (request : Request) : IO Preparation :=
-  withWorkspace fun directory => do
+/-- Only the handler accesses files, invokes Git/Lake, or publishes bytes. -/
+private def prepareHandle (tools : Tools) (store : ObjectStore) (request : Request)
+    (directory : System.FilePath) : Project.PrepareOp α → IO α
+  | .fetch => do
     let steps := #[
       ("git-init", #["init", "--quiet"]),
       ("git-remote", #["remote", "add", "origin", request.repository]),
@@ -141,14 +118,39 @@ def Tools.prepare (tools : Tools) (store : ObjectStore) (request : Request) : IO
       ("git-checkout", #["checkout", "--detach", "--quiet", "FETCH_HEAD"]),
       ("git-revision", #["rev-parse", "HEAD"])]
     for (label, args) in steps do
-      let args := #["-c", s!"pack.threads={max 1 tools.threads}",
-        "-c", s!"index.threads={max 1 tools.threads}"] ++ args
-      if let .error reason ← run tools directory request.limits label "git" args then
-        return { error := reason, diagnostics := ← logs store directory }
-    let commit := (← IO.FS.readFile (directory / ".." / "git-revision.stdout")).trimAscii.toString
-    if ← (directory / ".gitmodules").pathExists then
-      return { error := "Git submodules are not supported; use Lake dependencies" }
-    tools.prepareDirectory store request directory commit
+      IO.ofExcept (← run tools directory request.limits label "git"
+        (#["-c", s!"pack.threads={max 1 tools.threads}", "-c", s!"index.threads={max 1 tools.threads}"] ++ args))
+    return (← IO.FS.readFile (directory / ".." / "git-revision.stdout")).trimAscii.toString
+  | .hasSubmodules => (directory / ".gitmodules").pathExists
+  | .checkProject => do
+    let root ← IO.FS.realPath directory
+    let cwd ← IO.FS.realPath (project directory request)
+    unless cwd == root || cwd.toString.startsWith (root.toString ++ "/") do
+      throw (IO.userError "Project directory is outside the repository")
+    verifyToolchain tools cwd
+  | .discover => do
+    let policy ← policyFile directory request
+    let output := directory / ".." / "build-plan.json"
+    IO.ofExcept (← runHelper tools directory request "plan"
+      #["plan", policy.toString, output.toString, directory.toString])
+    readJson output
+  | .snapshot => Bundle.snapshot directory request.limits.bytes
+  | .platform => platform
+  | .publish snapshot => do
+    let source ← snapshot.publish store tools.cache (Builders.ioConcurrency tools.threads)
+    Files.putJson store source (Builders.ioConcurrency tools.threads)
+  | .diagnostics => logs store directory
+
+private def runProject (handle : {α : Type} → op α → IO α) (program : Project.Program op α) : IO α := do
+  IO.ofExcept (← Project.runWith (fun operation => do
+    try return .ok (← handle operation) catch error => return .error error.toString) program)
+
+def Tools.prepareDirectory (tools : Tools) (store : ObjectStore) (request : Request)
+    (directory : System.FilePath) (commit : String) : IO Preparation :=
+  runProject (prepareHandle tools store request directory) (Project.prepareDirectory commit)
+
+def Tools.prepare (tools : Tools) (store : ObjectStore) (request : Request) : IO Preparation :=
+  withWorkspace fun directory => runProject (prepareHandle tools store request directory) Project.prepare
 
 private def restore (tools : Tools) (store : ObjectStore) (directory : System.FilePath)
     (request : Request) (plan : Plan) (artifacts : Bundle.Manifest)
@@ -165,44 +167,34 @@ private def workspaceKey (tools : Tools) (request : Request) (plan : Plan) : IO 
   return (toJson ("lean-build/workspace/v1", request, plan,
     tools.toolchain.toString, ← Files.digest tools.helper)).compress
 
-/-- Final Lake targets can include native compilation, linking and custom outputs. -/
+private def finishHandle (tools : Tools) (store : ObjectStore) (request : Request)
+    (plan : Plan) (session : Workspace.Session) (progress : ProgressReporter IO) : Project.FinishOp α → IO α
+  | .now => IO.monoMsNow
+  | .progress text => progress.report "finalize" { message := text }
+  | .manifests refs => Parallel.map (Builders.ioConcurrency tools.threads) refs session.readManifest
+  | .restore imports => restore tools store session.directory request plan imports session
+  | .targets => do
+    let directory := session.directory
+    let policy ← policyFile directory request
+    let output := directory / ".." / "built-modules.json"
+    IO.ofExcept (← runHelper tools directory request "build" #["build", policy.toString, output.toString])
+    readJson output
+  | .difference baseline => Bundle.delta session.directory request.limits.bytes baseline #[] tools.threads
+  | .diagnostics => logs store session.directory
+  | .publish difference => do
+    let changes ← difference.changed.publish store tools.cache (Builders.ioConcurrency tools.threads)
+    let artifacts := difference.retained ++ changes
+    let reference ← Bundle.publishManifest store artifacts (Builders.ioConcurrency tools.threads)
+    session.rememberManifest reference artifacts
+    return reference
+  | .commit => session.commit
+
 private def finishTargets (tools : Tools) (store : ObjectStore) (request : Request)
     (plan : Plan) (completed : Array BuildResult) (progress : ProgressReporter IO) : IO BuildResult := do
   let key ← workspaceKey tools request plan
   let cache := tools.cache.map fun cache => cache.directory.addExtension "workspace"
-  Workspace.use store cache key (concurrency := Builders.ioConcurrency tools.threads) fun session => do
-    let directory := session.directory
-    let start ← IO.monoMsNow
-    progress.report "finalize" { message := "Collecting artifact manifests" }
-    let references ← completed.mapM fun result => do
-      let some ref := result.artifacts | throw (IO.userError "Missing prerequisite artifacts")
-      return ref
-    let downloaded ← Parallel.map (Builders.ioConcurrency tools.threads) references session.readManifest
-    let imports ← IO.ofExcept (Bundle.mergeMany downloaded)
-    progress.report "finalize" { message := "Restoring and verifying cached artifacts" }
-    let baseline ← restore tools store directory request plan imports session
-    let result : Except String (Array String × Bundle.Difference) ← try
-      progress.report "finalize" { message := "Completing Lake targets" }
-      let policy ← policyFile directory request
-      let output := directory / ".." / "built-modules.json"
-      IO.ofExcept (← runHelper tools directory request "build" #["build", policy.toString, output.toString])
-      let names ← readJson output
-      progress.report "finalize" { message := "Verifying final workspace" }
-      pure (.ok (names, ← Bundle.delta directory request.limits.bytes baseline #[] tools.threads))
-    catch error => pure (.error (toString error))
-    let diagnostics ← logs store directory
-    let milliseconds := (← IO.monoMsNow) - start
-    match result with
-    | .error message => return { name := "targets", status := .failed, diagnostics, milliseconds, message }
-    | .ok (builtModules, difference) =>
-      progress.report "finalize" { message := "Publishing final workspace" }
-      let changes ← difference.changed.publish store tools.cache (Builders.ioConcurrency tools.threads)
-      let artifacts := difference.retained ++ changes
-      let reference ← Bundle.publishManifest store artifacts (Builders.ioConcurrency tools.threads)
-      session.rememberManifest reference artifacts
-      session.commit
-      progress.report "finalize" { message := "Finished" }
-      return { name := "targets", status := .built, diagnostics, milliseconds := (← IO.monoMsNow) - start, artifacts := some reference, builtModules }
+  Workspace.use store cache key (concurrency := Builders.ioConcurrency tools.threads) fun session =>
+    runProject (finishHandle tools store request plan session progress) (Project.finish completed)
 
 private structure Installed where
   modules : Std.HashMap String FileRef := {}
@@ -338,15 +330,22 @@ def Tools.builder (tools : Tools) (store : ObjectStore) (env : Environment IO)
       threads := max 2 env.currentWorker.cpus
       deadline := false
       cancelled := do return (← abort.atomically get) || (← env.cancellation.isRequested) || (← stalled) }
-    let task ← IO.asTask (runHelper localTools directory request "modules"
-      #["serve", toString (Builders.compilerSlots env.currentWorker.cpus),
-        policy.toString, input.toString, output.toString, directory.toString]) .dedicated
+    let task ← IO.mkRef (none : Option (Task (Except IO.Error (Except String Unit))))
+    let running := do
+      let some task ← task.get | throw (IO.userError "Lake session has not started")
+      pure task
     let next ← IO.mkRef (0 : Nat)
     let failed ← IO.mkRef false
     let cancel : IO Unit := do
       abort.atomically (set true)
-      discard <| IO.wait task
+      if let some task ← task.get then discard <| IO.wait task
     let engine : Builders.Engine (ModuleCompletion × Nat) := {
+      start := fun cpus => do
+        if (← task.get).isSome then throw (IO.userError "Lake session already started")
+        let started ← IO.asTask (runHelper { localTools with threads := max 2 cpus } directory request "modules"
+          #["serve", toString (Builders.compilerSlots cpus),
+            policy.toString, input.toString, output.toString, directory.toString]) .dedicated
+        task.set (some started)
       prefetch := fun stop inputs => install tools store directory request session installed installing stop inputs
       prepare := fun stop _ inputs => install tools store directory request session installed installing stop inputs
       submit := fun mod => do
@@ -360,6 +359,7 @@ def Tools.builder (tools : Tools) (store : ObjectStore) (env : Environment IO)
         pending.modify (·.push (id, mod, start))
         next.set (id + 1)
       poll := do
+        let task ← running
         -- Unexpected helper termination is an exec error, not a node crash.
         let exited ← IO.hasFinished task
         let mut waiting := #[]
@@ -384,6 +384,7 @@ def Tools.builder (tools : Tools) (store : ObjectStore) (env : Environment IO)
         return results
       publish := fun _ mod (value, elapsed) => publishModule tools store directory request session installed mod value elapsed
       finish := do
+        let task ← running
         unless (← pending.get).isEmpty do throw (IO.userError "Lake session has unfinished modules")
         watchdog.progress
         finishing.set true

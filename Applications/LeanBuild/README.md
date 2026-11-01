@@ -38,6 +38,18 @@ The Cloud workflow has five stages:
    targets, including native compilation, linking, custom targets and dynamic
    dependencies. Publish the complete workspace manifest.
 
+Inside these `exec` boundaries, LeanBuild uses **Eff programs**. The
+[builder model](LeanBuild/Builders/Model.lean) makes pure scheduling decisions;
+the [program](LeanBuild/Builders/Program.lean) describes preparation, publication,
+successor notification and queue settlement. The
+[Lake session](LeanBuild/LakeSession.lean) has explicit start, submit, poll,
+finish and cancel operations. [IO handlers](LeanBuild/Builders/IO.lean) own tasks,
+leases and bounded transfer pools, and join outstanding work on exit.
+[Project preparation and finalization](LeanBuild/Project.lean) and
+[prefetch ordering](LeanBuild/Prefetch/Program.lean) are also Eff programs.
+These are local effects; they do not add Cloud replay records or scheduler
+round trips for individual modules.
+
 Each builder restores the prepared sources once and loads Lake once. A bounded
 pipeline receives ready work, restores missing prerequisites, compiles modules
 and publishes their artifacts concurrently. Each worker admits up to twice its
@@ -279,7 +291,13 @@ lake build cloud_app build_local build_tests
 .lake/build/bin/build_tests --native
 ```
 
-Tests compare direct/replay execution on 40 generated DAGs. They cover concurrent
+Pure handlers test the same Eff builder over 360 seeded DAG schedules on 2–4
+builders. Each turn advances one effect, with separate Lake sessions, bounded
+parallel jobs and local artifact caches. Schedules inject lease expiry/redelivery
+and cancellation between installation, submission, publication, commit, successor
+notification and acknowledgement. They check results, stale receipt fencing and
+cleanup, and assert that the intended fault interleavings actually occurred.
+Tests also compare direct/replay execution on 40 generated DAGs. They cover concurrent
 builder sessions, bounded lookahead that leaves work available to idle workers, progress
 without round barriers, interruption between result
 publication and notification, cancellation, blocked dependencies, durable errors,

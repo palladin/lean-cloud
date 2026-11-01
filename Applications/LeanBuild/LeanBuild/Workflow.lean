@@ -12,7 +12,7 @@ structure Backend (m : Type → Type) where
   finish : Environment m → Request → Plan → Array BuildResult → m BuildResult
 
 /-- Prepare once, keep builders alive until the DAG is finished, then assemble
-Lake's requested targets. Dependency scheduling is ordinary IO inside builders. -/
+Lake's requested targets. Builders interpret local Eff programs inside `exec`. -/
 def workflow [Monad m] [MonadCloudExec m] (backend : Backend m) (request : Request) : Cloud m Report := cloud {
   match request.validate with
   | .error reason => Cloud.fail reason

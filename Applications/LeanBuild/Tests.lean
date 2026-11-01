@@ -1,4 +1,5 @@
 import LeanBuild
+import LeanBuild.Tests.Effects
 import LeanCloudRuntime.WorkQueueStore
 import LeanCloud.DirectInterpreter
 import LeanCloud.SequentialReplay
@@ -82,6 +83,55 @@ private def withEnvironment (store : ObjectStore) (base : ExecContext IO)
       blobs := context.blobs.map MonadCloudExec.restore
       queues := WorkQueueStore.provider conn (← Std.Mutex.new ()) scope }
   finally conn.close
+
+/-- Session acquisition and cleanup belong to the handler, including partial
+startup and failures in the compiler's own cancellation operation. -/
+private def sessionScopeTests : IO Unit := do
+  let store := objects (← Std.Mutex.new {})
+  withEnvironment store (pool #[8]) fun env => do
+    let calls ← IO.mkRef (#[] : Array String)
+    let engine : Builders.Engine Unit := {
+      start := fun cpus => do
+        check (cpus == 8) "Lake did not receive the worker CPU budget"
+        calls.modify (·.push "start")
+      prepare := fun _ _ _ => throw (IO.userError "Unexpected preparation")
+      submit := fun _ => throw (IO.userError "Unexpected submission")
+      poll := pure #[]
+      publish := fun _ _ _ => throw (IO.userError "Unexpected publication")
+      finish := calls.modify (·.push "finish")
+      cancel := calls.modify (·.push "cancel") }
+    Builders.run env { fixturePlan with modules := #[] } engine
+    check ((← calls.get) == #["start", "finish", "cancel"]) "Incorrect normal Lake session lifecycle"
+    calls.set #[]
+    let failed ← try
+      Builders.run env { fixturePlan with modules := #[] } { engine with
+        start := fun _ => do calls.modify (·.push "start"); throw (IO.userError "startup failed") }
+      pure false
+    catch error => pure (error.toString == "startup failed")
+    check (failed && (← calls.get) == #["start", "cancel"]) "Failed startup did not close the session"
+  withEnvironment store (pool #[2]) fun env => do
+    let plan := { fixturePlan with modules := #[⟨"Root", #[]⟩] }
+    Builders.seed env plan
+    let preparing ← IO.mkRef false
+    let joined ← IO.mkRef false
+    let engine : Builders.Engine Unit := {
+      prepare := fun stop _ _ => do
+        preparing.set true
+        while !(← stop.isRequested) do IO.sleep 1
+        joined.set true
+      submit := fun _ => throw (IO.userError "Unexpected submission")
+      poll := do
+        if ← preparing.get then throw (IO.userError "poll failed")
+        return #[]
+      publish := fun _ _ _ => throw (IO.userError "Unexpected publication")
+      finish := pure ()
+      cancel := throw (IO.userError "cancel failed") }
+    let failed ← try Builders.run env plan engine; pure false
+      catch error => pure (error.toString == "cancel failed")
+    check (failed && (← joined.get)) "Cancellation failure skipped joining preparation"
+    let available ← (env.queues.open Builders.queueName).receive 1
+    check (available.size == 1) "Cancellation failure did not release outstanding leases"
+  IO.println "PASS Lake session startup, finish, cancellation failure, task joins and lease cleanup"
 
 /-- The same rolling coordinator, with task-backed compiler jobs for model tests. -/
 private def runBuilders (env : Environment IO) (plan : Plan)
@@ -1628,6 +1678,8 @@ private def nativeTests : IO Unit := IO.FS.withTempDir fun cacheRoot => do
 
 def main (args : List String) : IO Unit := do
   watchdogTests
+  LeanBuild.Tests.effectTests
+  sessionScopeTests
   if args == ["--native-only"] then nativeTests; return
   builderSourceTest
   admissionTest
