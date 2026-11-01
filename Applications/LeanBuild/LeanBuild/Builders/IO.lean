@@ -1,4 +1,5 @@
 import LeanBuild.Builders.Program
+import LeanBuild.BuildIO
 import LeanBuild.Prefetch
 import LeanCloudRuntime.Parallel
 import Std.Sync.Channel
@@ -6,31 +7,39 @@ import Std.Sync.Channel
 namespace LeanBuild.Builders
 open Lean LeanCloud LeanCloudRuntime LeanEff
 
-def readResult (env : Environment IO) (name : String) : IO (Option BuildResult) := do
-  let some ref ← env.blobs.readNamed (resultName name) | return none
-  let result : BuildResult ← IO.ofExcept (Json.parse (← env.blobs.readText ref) >>= fromJson?)
-  unless result.name == name do throw (IO.userError "Module result name mismatch")
+private def readResultTyped (env : Environment IO) (name : String) : BuildIO (Option BuildResult) := do
+  let some ref ← BuildIO.capture .network (env.blobs.readNamed (resultName name)) | return none
+  let text ← BuildIO.capture .network (env.blobs.readText ref)
+  let result : BuildResult ← liftExcept ((Json.parse text >>= fromJson?).mapError BuildError.protocol)
+  unless result.name == name do throw (.protocol "Module result name mismatch")
   return some result
 
-def publishResult (env : Environment IO) (result : BuildResult) : IO BuildResult := do
-  let ref ← env.blobs.putText (toJson result).compress
-  let selected ← env.blobs.publishNamed (resultName result.name) ref
+def readResult (env : Environment IO) (name : String) : IO (Option BuildResult) :=
+  (readResultTyped env name).toIO
+
+private def publishResultTyped (env : Environment IO) (result : BuildResult) : BuildIO BuildResult := do
+  let ref ← BuildIO.capture .network (env.blobs.putText (toJson result).compress)
+  let selected ← BuildIO.capture .network (env.blobs.publishNamed (resultName result.name) ref)
   if selected == ref then return result
-  let value : BuildResult ← IO.ofExcept (Json.parse (← env.blobs.readText selected) >>= fromJson?)
-  unless value.name == result.name do throw (IO.userError "Module result name mismatch")
+  let text ← BuildIO.capture .network (env.blobs.readText selected)
+  let value : BuildResult ← liftExcept ((Json.parse text >>= fromJson?).mapError BuildError.protocol)
+  unless value.name == result.name do throw (.protocol "Module result name mismatch")
   return value
+
+def publishResult (env : Environment IO) (result : BuildResult) : IO BuildResult :=
+  (publishResultTyped env result).toIO
 
 private structure Cache where
   results : Std.HashMap String BuildResult := {}
-  reading : Std.HashMap String (IO.Promise (Except IO.Error (Option BuildResult))) := {}
+  reading : Std.HashMap String (IO.Promise (Except BuildError (Option BuildResult))) := {}
   /-- Artifacts and their full ancestry have finished preparation on this worker. -/
   prepared : Std.HashSet String := {}
 
 /-- Only committed successes/failures are cached. Missing results may become
 available at any time, so a negative lookup is never retained. -/
 private def read (env : Environment IO) (state : Std.Mutex Cache)
-    (limit : Parallel.Limit) (name : String) : IO (Option BuildResult) := do
-  let entry : BuildResult ⊕ (IO.Promise (Except IO.Error (Option BuildResult)) × Bool) ← state.atomically do
+    (limit : Parallel.Limit) (name : String) : BuildIO (Option BuildResult) := do
+  let entry : BuildResult ⊕ (IO.Promise (Except BuildError (Option BuildResult)) × Bool) ← state.atomically do
     let s ← get
     if let some result := s.results[name]? then return .inl result
     if let some pending := s.reading[name]? then return .inr (pending, false)
@@ -43,7 +52,7 @@ private def read (env : Environment IO) (state : Std.Mutex Cache)
     if owner then
       -- Only the owner consumes IO capacity. Concurrent lookups share its
       -- result, including absence/errors; later lookups retry those outcomes.
-      let outcome ← (limit.run (readResult env name)).toBaseIO
+      let outcome ← BuildIO.inspect (ExceptT.mk (limit.run (BuildIO.outcome (readResultTyped env name))))
       state.atomically do
         modify fun s => { s with
           reading := s.reading.erase name
@@ -51,7 +60,7 @@ private def read (env : Environment IO) (state : Std.Mutex Cache)
             | .ok (some result) => s.results.insert name result
             | _ => s.results }
       pending.resolve outcome
-    IO.ofExcept (← IO.wait pending.result!)
+    liftExcept (← IO.wait pending.result!)
 
 /-- One persistent compiler session. Submit queues work; the engine limits
 compilation concurrency. Only the coordinator calls submit/poll. Preparation
@@ -98,54 +107,50 @@ private def report (env : Environment IO) (queue : WorkQueue IO) (total : Nat)
     env.progress.report "worker" { message := activity }
   catch _ => pure ()
 
-/-- Interpret domain requests, scoped asynchronous jobs, and bounded maps. -/
+/-- Interpret domain requests, scoped asynchronous jobs, and bounded maps.
+Errors stay typed across child tasks, pool shutdown, and Eff continuations. -/
 partial def runProgram
-    (handle : {β : Type} → Operation α β → IO β)
-    (launch : IO (Event α) → IO Unit) (program : Program α β) : IO β := do
+    (handle : {β : Type} → Operation α β → BuildIO β)
+    (launch : BuildIO (Event α) → BuildIO Unit) (program : Program α β) : BuildIO β := do
   match program.run with
-  | .pure _ result => IO.ofExcept result
+  | .pure _ result => liftExcept result
   | .impure _ (.request operation) next =>
-    let result ← try pure (.ok (← handle operation)) catch e => pure (.error e.toString)
-    runProgram handle launch (ExceptT.mk (next.apply result))
+    runProgram handle launch (ExceptT.mk (next.apply (← BuildIO.inspect (handle operation))))
   | .impure _ (.launch job) next =>
     launch (runProgram handle launch (ExceptT.mk job))
     runProgram handle launch (ExceptT.mk (next.apply ()))
   | .impure _ (.parallel limit count jobs) next =>
-    let result ← try
-      pure (.ok (← Parallel.map limit (Array.finRange count) fun i =>
-        runProgram handle launch (ExceptT.mk (jobs i))))
-    catch e => pure (.error e.toString)
+    let result ← BuildIO.inspect (BuildIO.parallel limit (Array.finRange count) fun i =>
+      runProgram handle launch (ExceptT.mk (jobs i)))
     runProgram handle launch (ExceptT.mk (next.apply result))
   | .impure _ (.all limit count jobs) next =>
-    let result ← try
-      pure (.ok (← Parallel.all limit (Array.finRange count) fun i =>
-        runProgram handle launch (ExceptT.mk (jobs i))))
-    catch e => pure (.error e.toString)
+    let result ← BuildIO.inspect (BuildIO.all limit (Array.finRange count) fun i =>
+      runProgram handle launch (ExceptT.mk (jobs i)))
     runProgram handle launch (ExceptT.mk (next.apply result))
 
-private def dataHandle (env : Environment IO) : Operation α β → IO β
-  | .readResult name => readResult env name
-  | .commitResult result => publishResult env result
-  | .send items => (env.queues.open queueName).send items
-  | _ => throw (IO.userError "This operation requires an active builder session")
+private def dataHandle (env : Environment IO) : Operation α β → BuildIO β
+  | .readResult name => readResultTyped env name
+  | .commitResult result => publishResultTyped env result
+  | .send items => BuildIO.capture .network ((env.queues.open queueName).send items)
+  | _ => throw (.protocol "This operation requires an active builder session")
 
-private def noLaunch (_ : IO (Event α)) : IO Unit :=
-  throw (IO.userError "This program cannot launch builder jobs")
+private def noLaunch (_ : BuildIO (Event α)) : BuildIO Unit :=
+  throw (.protocol "This program cannot launch builder jobs")
 
 def seed (env : Environment IO) (plan : Plan) : IO Unit :=
-  runProgram (dataHandle env) noLaunch (seedProgram (α := Unit) plan)
+  (runProgram (dataHandle env) noLaunch (seedProgram (α := Unit) plan)).toIO
 
 def results (env : Environment IO) (plan : Plan) : IO (Array BuildResult) :=
-  runProgram (dataHandle env) noLaunch (resultsProgram (α := Unit) plan env.currentWorker.cpus)
+  (runProgram (dataHandle env) noLaunch (resultsProgram (α := Unit) plan env.currentWorker.cpus)).toIO
 
 private structure Control where
   stopped : Bool := false
-  error : Option IO.Error := none
+  error : Option BuildError := none
   claims : Std.HashMap String Claim := {}
 
-/-- One scope owns all tasks, leases and transfer caches. Scheduling decisions
-live in `program`; this handler only executes requests and delivers replies. -/
-def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := do
+/-- One scope owns all tasks, leases and transfer caches. Preserve the first
+failure while collecting cleanup failures; every cleanup action is attempted. -/
+def runTyped (env : Environment IO) (plan : Plan) (engine : Engine α) : BuildIO Unit := ExceptT.mk do
   let queue := env.queues.open queueName
   let cache ← Std.Mutex.new ({} : Cache)
   let reads ← Parallel.Limit.new (ioConcurrency env.currentWorker.cpus)
@@ -154,49 +159,51 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
     return (← env.cancellation.isRequested) || (← control.atomically do return (← get).stopped)⟩
   let events ← Std.Channel.new (α := Event α)
   let tasks ← IO.mkRef (#[] : Array (Task (Except IO.Error Unit)))
-  let fail (error : IO.Error) : IO Unit := do
-    unless ← env.cancellation.isRequested do
-      control.atomically (modify fun s => { s with stopped := true, error := s.error.orElse (fun _ => some error) })
-  let launch (job : IO (Event α)) : IO Unit := do
+  let fail (error : BuildError) : IO Unit := do
+    if error.isCancelled && (← stop.isRequested) then return
+    control.atomically (modify fun s => { s with stopped := true, error := s.error.orElse (fun _ => some error) })
+  let launch (job : BuildIO (Event α)) : BuildIO Unit := BuildIO.capture .tool do
     unless ← stop.isRequested do
       let task ← IO.asTask (do
-        try
-          let event ← job
-          unless ← stop.isRequested do events.sync.send event
-        catch error => fail error) .dedicated
+        match ← BuildIO.outcome job with
+        | .ok event => unless ← stop.isRequested do events.sync.send event
+        | .error error => fail error) .dedicated
       tasks.modify (·.push task)
   let ioSlots := max 2 (min 8 env.currentWorker.cpus)
   let settings := Settings.ofPlan plan env.currentWorker.cpus
   let activity ← Std.Mutex.new "Starting Lake"
   let session ← IO.mkRef ({} : LakeSession.State)
-  let lakeHandle : {β : Type} → LakeSession.Operation α β → IO β := fun op =>
+  -- All Lake operations originate from the coordinator thread. Launched jobs
+  -- only prepare/publish/settle; they never access this session reference.
+  -- Final engine cancellation also runs on the coordinator, before joining jobs.
+  let lakeHandle : {β : Type} → LakeSession.Operation α β → BuildIO β := fun op =>
     match op with
     | .start cpus => do
-      let next ← IO.ofExcept (← session.get).start
-      engine.start cpus
+      let next ← liftExcept ((← session.get).start.mapError BuildError.protocol)
+      BuildIO.capture .tool (engine.start cpus)
       session.set next
     | .submit m => do
-      let next ← IO.ofExcept ((← session.get).submit m.name)
-      engine.submit m
+      let next ← liftExcept (((← session.get).submit m.name).mapError BuildError.protocol)
+      BuildIO.capture .tool (engine.submit m)
       session.set next
     | .poll => do
-      let results ← engine.poll
-      let next ← IO.ofExcept ((← session.get).complete (results.map (·.1)))
+      let results ← BuildIO.capture .tool engine.poll
+      let next ← liftExcept (((← session.get).complete (results.map (·.1))).mapError BuildError.protocol)
       session.set next
       return results
     | .finish => do
-      let next ← IO.ofExcept (← session.get).finish
-      engine.finish
+      let next ← liftExcept ((← session.get).finish.mapError BuildError.protocol)
+      BuildIO.capture .tool engine.finish
       session.set next
     | .cancel => do
-      engine.cancel
+      BuildIO.capture .tool engine.cancel
       session.modify (·.cancel)
-  let handle : {β : Type} → Operation α β → IO β := fun {β} operation =>
+  let handle : {β : Type} → Operation α β → BuildIO β := fun operation =>
     match operation with
     | .readResult name => read env cache reads name
     | .commitResult result => do
-      if ← stop.isRequested then throw (IO.userError "Build cancelled")
-      let result ← publishResult env result
+      if ← stop.isRequested then throw .cancelled
+      let result ← publishResultTyped env result
       cache.atomically (modify fun s => { s with results := s.results.insert result.name result })
       return result
     | .prepared => cache.atomically do return (← get).prepared
@@ -204,28 +211,28 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
       modify fun s => { s with prepared := inputs.foldl (fun names r => names.insert r.name) s.prepared }
     | .install m inputs prefetch => do
       unless ← stop.isRequested do
-        if prefetch then engine.prefetch stop inputs else engine.prepare stop m inputs
+        BuildIO.capture .tool (if prefetch then engine.prefetch stop inputs else engine.prepare stop m inputs)
     | .lake op => lakeHandle op
-    | .publish m value => engine.publish stop m value
+    | .publish m value => BuildIO.capture .network (engine.publish stop m value)
     | .receive count => do
-      let deliveries ← queue.receive count
+      let deliveries ← BuildIO.capture .network (queue.receive count)
       for delivery in deliveries do
         let claim := { delivery, settled := ← Std.Mutex.new false : Claim }
         control.atomically do
           modify fun s => { s with claims := s.claims.insertIfNew delivery.receipt claim }
-      let idle ← if deliveries.isEmpty then queue.isIdle else pure false
+      let idle ← if deliveries.isEmpty then BuildIO.capture .network queue.isIdle else pure false
       return (deliveries, idle)
-    | .send items => do unless ← stop.isRequested do queue.send items
+    | .send items => do unless ← stop.isRequested do BuildIO.capture .network (queue.send items)
     | .complete receipts failed => do
       for receipt in receipts do
         let some claim ← control.atomically do return (← get).claims[receipt]?
-          | throw (IO.userError "Unknown queue receipt")
-        unless ← stop.isRequested do claim.settle queue failed
+          | throw (.protocol "Unknown queue receipt")
+        unless ← stop.isRequested do BuildIO.capture .network (claim.settle queue failed)
     | .release receipts => do
       for receipt in receipts do
         let some claim ← control.atomically do return (← get).claims[receipt]?
-          | throw (IO.userError "Unknown queue receipt")
-        claim.release queue
+          | throw (.protocol "Unknown queue receipt")
+        BuildIO.capture .network (claim.release queue)
     | .cancelled => stop.isRequested
     | .activity text => activity.atomically (set text)
     | .events => do
@@ -241,58 +248,61 @@ def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit := d
       while let some event ← events.tryRecv do replies := replies.push event
       return (← IO.monoMsNow, replies)
   let background ← IO.mkRef (#[] : Array (Task (Except IO.Error Unit)))
-  let startBackground (action : IO Unit) : IO Unit := do
-    let task ← IO.asTask action .dedicated
+  let startBackground (action : BuildIO Unit) : IO Unit := do
+    let task ← IO.asTask (do
+      if let .error error ← BuildIO.outcome action then fail error) .dedicated
     background.modify (·.push task)
-  try
-    discard <| startBackground (do
-      try
-        let mut next := (← IO.monoMsNow) + 10000
-        while !(← stop.isRequested) do
-          if (← IO.monoMsNow) ≥ next then
-            let claims ← control.atomically do return (← get).claims.toArray.map (·.2)
-            discard <| Parallel.map ioSlots claims fun claim => claim.settled.atomically do
-              unless ← get do queue.renew claim.delivery.receipt
-            next := (← IO.monoMsNow) + 10000
-          IO.sleep 50
-      catch error => fail error)
-    discard <| startBackground (do
+  let body ← BuildIO.outcome do
+    startBackground <| BuildIO.capture .network do
+      let mut next := (← IO.monoMsNow) + 10000
+      while !(← stop.isRequested) do
+        if (← IO.monoMsNow) ≥ next then
+          let claims ← control.atomically do return (← get).claims.toArray.map (·.2)
+          discard <| Parallel.map ioSlots claims fun claim => claim.settled.atomically do
+            unless ← get do queue.renew claim.delivery.receipt
+          next := (← IO.monoMsNow) + 10000
+        IO.sleep 50
+    startBackground <| BuildIO.capture .tool do
       let mut next := 0
       while !(← stop.isRequested) do
         if (← IO.monoMsNow) ≥ next then
           report env queue plan.modules.size (← activity.atomically get)
           next := (← IO.monoMsNow) + 1000
-        IO.sleep 50)
-    discard <| startBackground (do
-      try
-        Prefetch.run queue stop ioSlots fun childStop value => do
-          let execute : {β : Type} → Operation α β → IO β := fun op =>
-            match op with
-            | .cancelled => childStop.isRequested
-            | .install m inputs warm => do
-              if ← childStop.isRequested then throw (IO.userError "Prefetch cancelled")
-              if warm then engine.prefetch childStop inputs else engine.prepare childStop m inputs
-              if ← childStop.isRequested then throw (IO.userError "Prefetch cancelled")
-            | op => handle op
-          let outcome ← (runProgram execute noLaunch (prefetch settings value)).toBaseIO
-          if let .error error := outcome then
-            unless ← childStop.isRequested do throw error
-      catch error => fail error)
+        IO.sleep 50
+    startBackground <| Prefetch.runTyped queue stop ioSlots fun childStop value => do
+      let execute : {β : Type} → Operation α β → BuildIO β := fun op =>
+        match op with
+        | .cancelled => childStop.isRequested
+        | .install m inputs warm => do
+          if ← childStop.isRequested then throw .cancelled
+          BuildIO.capture .tool (if warm then engine.prefetch childStop inputs else engine.prepare childStop m inputs)
+          if ← childStop.isRequested then throw .cancelled
+        | op => handle op
+      try runProgram execute noLaunch (prefetch settings value)
+      catch error => unless error.isCancelled && (← childStop.isRequested) do throw error
     runProgram handle launch (program plan env.currentWorker.cpus)
-    if let some error ← control.atomically do return (← get).error then throw error
-    unless ← env.cancellation.isRequested do
-      control.atomically (modify fun s => { s with stopped := true })
-      for task in ← background.get do discard <| IO.wait task
-      if let some error ← control.atomically do return (← get).error then throw error
-      report env queue plan.modules.size "Finished"
-  finally
-    control.atomically (modify fun s => { s with stopped := true })
-    try engine.cancel
-    finally
-      for task in ← tasks.get do discard <| IO.wait task
-      for task in ← background.get do discard <| IO.wait task
-      let claims ← control.atomically do return (← get).claims.toArray.map (·.2)
-      discard <| Parallel.map ioSlots claims fun claim => do
-        try claim.release queue catch _ => pure ()
+  if let .error error := body then fail error
+  control.atomically (modify fun s => { s with stopped := true })
+  -- No throwing finally: cancellation, joins and releases all run, and their
+  -- failures are attached to the first build error instead of replacing it.
+  let cancelled ← BuildIO.outcome (BuildIO.capture .tool engine.cancel)
+  let mut joined : Except BuildError Unit := .ok ()
+  for task in (← tasks.get) ++ (← background.get) do
+    let result ← IO.wait task
+    joined := BuildError.after joined (result.mapError (BuildError.tool ∘ toString))
+  let first ← control.atomically do return (← get).error
+  let mut result := BuildError.after (first.map Except.error |>.getD body) cancelled
+  result := BuildError.after result joined
+  let claims ← control.atomically do return (← get).claims.toArray.map (·.2)
+  let released ← BuildIO.outcome <| BuildIO.capture .tool <|
+    Parallel.map ioSlots claims fun claim => (BuildIO.capture .network (claim.release queue)).run
+  match released with
+  | .error error => result := BuildError.after result (.error error)
+  | .ok outcomes => for outcome in outcomes do result := BuildError.after result outcome
+  if result.isOk && !(← env.cancellation.isRequested) then report env queue plan.modules.size "Finished"
+  return result
+
+def run (env : Environment IO) (plan : Plan) (engine : Engine α) : IO Unit :=
+  (runTyped env plan engine).toIO
 
 end LeanBuild.Builders

@@ -1,3 +1,4 @@
+import LeanBuild.BuildError
 import LeanCloud.ExecServices
 import LeanEff.Core
 import Std.Data.HashSet
@@ -12,9 +13,9 @@ inductive Operation : Type → Type where
   | start (item : WorkPreview) : Operation Unit
 
 inductive Host : Effect where
-  | request (operation : Operation α) : Host (Except String α)
+  | request (operation : Operation α) : Host (Except BuildError α)
 
-abbrev Program := ExceptT String (EffF Host Empty)
+abbrev Program := ExceptT BuildError (EffF Host Empty)
 
 def perform (operation : Operation α) : Program α := ExceptT.mk (EffF.send (.request operation))
 
@@ -53,8 +54,8 @@ partial def program (concurrency : Nat) (state : State := {}) : Program Unit := 
     s := { s with pending := s.pending.extract 1 s.pending.size, active := s.active.insert item.position.sequence }
   program concurrency s
 
-partial def runWith [Monad m] (handle : {α : Type} → Operation α → m (Except String α))
-    (program : Program α) : m (Except String α) := do
+partial def runWith [Monad m] (handle : {α : Type} → Operation α → m (Except BuildError α))
+    (program : Program α) : m (Except BuildError α) := do
   match program.run with
   | .pure _ result => return result
   | .impure _ (.request op) next =>

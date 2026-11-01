@@ -1,4 +1,5 @@
 import LeanBuild.Builders.Model
+import LeanBuild.BuildError
 import LeanBuild.LakeSession
 import LeanEff.Core
 
@@ -23,16 +24,16 @@ inductive Operation (α : Type) : Type → Type 1 where
   | activity (text : String) : Operation α Unit
 
 inductive BuildEffect (α : Type) : Effect where
-  | request (operation : Operation α β) : BuildEffect α (Except String β)
+  | request (operation : Operation α β) : BuildEffect α (Except BuildError β)
   /-- Start a scoped job; its eventual reply joins the coordinator's event stream. -/
-  | launch (job : EffF (BuildEffect α) Empty (Except String (Event α))) : BuildEffect α Unit
+  | launch (job : EffF (BuildEffect α) Empty (Except BuildError (Event α))) : BuildEffect α Unit
   /-- Bounded overlap, preserving result order and joining on failure. -/
-  | parallel (limit count : Nat) (jobs : Fin count → EffF (BuildEffect α) Empty (Except String β)) :
-      BuildEffect α (Except String (Array β))
-  | all (limit count : Nat) (jobs : Fin count → EffF (BuildEffect α) Empty (Except String Bool)) :
-      BuildEffect α (Except String Bool)
+  | parallel (limit count : Nat) (jobs : Fin count → EffF (BuildEffect α) Empty (Except BuildError β)) :
+      BuildEffect α (Except BuildError (Array β))
+  | all (limit count : Nat) (jobs : Fin count → EffF (BuildEffect α) Empty (Except BuildError Bool)) :
+      BuildEffect α (Except BuildError Bool)
 
-abbrev Program (α : Type) := ExceptT String (EffF (BuildEffect α) Empty)
+abbrev Program (α : Type) := ExceptT BuildError (EffF (BuildEffect α) Empty)
 
 def perform (operation : Operation α β) : Program α β := ExceptT.mk (EffF.send (.request operation))
 
@@ -43,9 +44,9 @@ def all (limit : Nat) (items : Array β) (body : β → Program α Bool) : Progr
   ExceptT.mk (EffF.send (.all limit items.size (fun i => (body items[i]).run)))
 
 private def inputs (cfg : Settings) (m : Module) : Program α (Array BuildResult) := do
-  let missing ← liftExcept (Dependencies.missing cfg.modules (← perform .prepared) m.imports)
+  let missing ← liftExcept ((Dependencies.missing cfg.modules (← perform .prepared) m.imports).mapError BuildError.protocol)
   parallel (ioConcurrency cfg.cpus) missing fun dep => do
-    let some result ← perform (.readResult dep.name) | throw "Missing transitive prerequisite"
+    let some result ← perform (.readResult dep.name) | throw (.protocol "Missing transitive prerequisite")
     return result
 
 /-- Preparation policy is shared by the real handler and deterministic models. -/
@@ -76,8 +77,8 @@ def settle (cfg : Settings) (m : Module) (result : BuildResult) (receipts : Arra
   return .settled m.name receipts
 
 def prefetch (cfg : Settings) (value : Json) : Program α Unit := do
-  let name : String ← liftExcept (fromJson? value)
-  let some m := cfg.modules[name]? | throw "Unknown queued module"
+  let name : String ← liftExcept ((fromJson? value).mapError BuildError.protocol)
+  let some m := cfg.modules[name]? | throw (.protocol "Unknown queued module")
   if (← perform (.readResult name)).isSome then return
   let parents ← parallel (ioConcurrency cfg.cpus) m.imports fun name => perform (.readResult name)
   unless parents.all (fun result => result.any (·.status == .built)) do return
@@ -87,7 +88,7 @@ def prefetch (cfg : Settings) (value : Json) : Program α Unit := do
     perform (.remember missing)
 
 def seedProgram (plan : Plan) : Program α Unit := do
-  liftExcept (validateModules plan.modules)
+  liftExcept ((validateModules plan.modules).mapError BuildError.protocol)
   let roots := plan.modules.filter (·.imports.isEmpty)
   let scores := priorities plan.modules
   for offset in [:((roots.size + 99) / 100)] do
@@ -95,7 +96,7 @@ def seedProgram (plan : Plan) : Program α Unit := do
 
 def resultsProgram (plan : Plan) (cpus : Nat) : Program α (Array BuildResult) :=
   parallel (ioConcurrency cpus) plan.modules fun m => do
-    let some result ← perform (.readResult m.name) | throw s!"Missing module result: {m.name}"
+    let some result ← perform (.readResult m.name) | throw (.protocol s!"Missing module result: {m.name}")
     return result
 
 private def launch (job : Program α (Event α)) : Program α Unit := ExceptT.mk do
@@ -112,7 +113,7 @@ def dispatch (cfg : Settings) : Action α → Program α Unit
   | .prepare m => launch (prepare cfg m)
   | .publish m value => launch do
     let result ← perform (.publish m value)
-    unless result.name == m.name do throw "Builder returned an unrequested module"
+    unless result.name == m.name do throw (.protocol "Builder returned an unrequested module")
     return .published (← perform (.commitResult result))
   | .settle m result receipts => launch (settle cfg m result receipts)
   | .release name receipts => launch do
@@ -124,14 +125,14 @@ partial def loop (cfg : Settings) (state : State α := {}) : Program α Bool := 
   if events.any (fun | .cancelled => true | _ => false) then return false
   let compiled ← perform (.lake .poll)
   let events := events ++ compiled.map fun (name, value) => Event.compiled name value
-  let (state, actions) ← liftExcept (advance cfg now state events)
+  let (state, actions) ← liftExcept ((advance cfg now state events).mapError BuildError.protocol)
   for action in actions do dispatch cfg action
   perform (.activity (state.activity cfg.cpus))
   if state.finished then return true
   loop cfg state
 
 def program (plan : Plan) (cpus : Nat) : Program α Unit := do
-  liftExcept (validateModules plan.modules)
+  liftExcept ((validateModules plan.modules).mapError BuildError.protocol)
   perform (.lake (.start cpus))
   if ← loop (.ofPlan plan cpus) then perform (.lake .finish)
   else perform (.lake .cancel)

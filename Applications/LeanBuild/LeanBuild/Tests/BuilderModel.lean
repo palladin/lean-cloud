@@ -18,18 +18,18 @@ private structure Pool (α : Type) (count : Nat) : Type 1 where
   next : Nat := 0
   active : Array (Fin count) := #[]
   results : Array (Option α) := Array.replicate count none
-  error : Option String := none
+  error : Option BuildError := none
   halted : Bool := false
 
 private inductive Fiber : Type → Type 1 where
   | run {α : Type} (program : Program BuildResult α) : Fiber α
   | pool {α β : Type} (limit count : Nat) (children : Fin count → Fiber β)
       (state : Pool β count) (stop : β → Bool)
-      (next : Except String (Array β) → Program BuildResult α) : Fiber α
+      (next : Except BuildError (Array β) → Program BuildResult α) : Fiber α
 
-private instance : Inhabited (Fiber α) := ⟨.run (throw "Invalid model fiber")⟩
+private instance : Inhabited (Fiber α) := ⟨.run (throw (.protocol "Invalid model fiber"))⟩
 
-private def Fiber.outcome : Fiber α → Option (Except String α)
+private def Fiber.outcome : Fiber α → Option (Except BuildError α)
   | .run program => match program.run with | .pure _ result => some result | _ => none
   | .pool .. => none
 
@@ -52,11 +52,34 @@ private structure Worker where
   peak : Nat := 0
   cancelled : Bool := false
   closed : Bool := false
+  cleanupStarted : Bool := false
+  failure : Option BuildError := none
+  cleanup : Option BuildError := none
   submitted : Nat := 0
   deriving Inhabited
 
+private def Worker.stopping (w : Worker) : Bool := w.cancelled || w.failure.isSome
+
+/-- Inject one failed capability call, after a seed-dependent number of uses.
+It is an operation failure, not a worker crash or an automatic retry. -/
+inductive FaultSite where
+  | readResult | send | receive | publish
+  deriving Repr, BEq, Inhabited
+
+def FaultSite.error (site : FaultSite) : BuildError :=
+  .network s!"Injected transient {reprStr site} failure"
+
+private def faultSite : Operation BuildResult α → Option FaultSite
+  | .readResult _ => some .readResult
+  | .send _ => some .send
+  | .receive _ => some .receive
+  | .publish .. => some .publish
+  | _ => none
+
 structure Coverage where
   requests : Nat := 0
+  operationFailures : Nat := 0
+  cleanupFailures : Nat := 0
   switches : Nat := 0
   redeliveries : Nat := 0
   expiries : Nat := 0
@@ -74,6 +97,9 @@ structure Coverage where
   deriving Repr
 
 structure Faults where
+  operation : Option FaultSite := none
+  skip : Nat := 0
+  failCleanup : Bool := false
   expire : Nat := 0
   cancelAfter : Option String := none
 
@@ -121,26 +147,26 @@ private def release (s : World) (worker : Nat) (receipt : String) : World :=
   | none => { s with coverage.staleReleases := s.coverage.staleReleases + 1 }
   | some lease => { s with
       leases := s.leases.erase receipt, queue := s.queue.push lease.item
-      coverage.releasedOnCancel := s.coverage.releasedOnCancel + if s.workers[worker]!.cancelled then 1 else 0 }
+      coverage.releasedOnCancel := s.coverage.releasedOnCancel + if s.workers[worker]!.stopping then 1 else 0 }
 
 /-- The outer Except reports a violated model invariant. The inner Except is
 an operation error delivered back to the real Eff continuation. -/
-private def operate (worker : Nat) : Operation BuildResult α → World → Except String (Except String α × World)
+private def operate (worker : Nat) : Operation BuildResult α → World → Except String (Except BuildError α × World)
   | .readResult name, s => return (.ok s.records[name]?, s)
   | .commitResult result, s => do
-    if s.workers[worker]!.cancelled then return (.error "Build cancelled", s)
+    if s.workers[worker]!.stopping then return (.error .cancelled, s)
     if let some old := s.records[result.name]? then
       require (old.status == result.status) "Conflicting immutable results"
       return (.ok old, { s with coverage.repeatedCommits := s.coverage.repeatedCommits + 1 })
     return (.ok result, { s with records := s.records.insert result.name result })
   | .prepared, s => return (.ok s.workers[worker]!.prepared, s)
   | .remember inputs, s => do
-    require (inputs.all (fun r => s.workers[worker]!.installed.contains r.name) || s.workers[worker]!.cancelled)
+    require (inputs.all (fun r => s.workers[worker]!.installed.contains r.name) || s.workers[worker]!.stopping)
       "Remembered artifacts before installation"
     return (.ok (), s.update worker fun w => { w with prepared := inputs.foldl (fun names r => names.insert r.name) w.prepared })
   | .install _ inputs _, s => do
     require (inputs.all (·.status == .built)) "Installed failed prerequisite"
-    if s.workers[worker]!.cancelled then return (.ok (), s)
+    if s.workers[worker]!.stopping then return (.ok (), s)
     return (.ok (), s.update worker fun w => { w with installed := inputs.foldl (fun names r => names.insert r.name) w.installed })
   | .lake (.start cpus), s => do
     let .ok session := s.workers[worker]!.session.start | throw "Invalid Lake start"
@@ -149,7 +175,7 @@ private def operate (worker : Nat) : Operation BuildResult α → World → Exce
     let w := s.workers[worker]!
     let .ok session := w.session.submit m.name | throw "Invalid Lake submission"
     require (m.imports.all (fun n => s.records[n]?.any (·.status == .built))) "Compiled before prerequisites were durable"
-    require (m.imports.all w.installed.contains || w.cancelled) "Compiled without local prerequisites"
+    require (m.imports.all w.installed.contains || w.stopping) "Compiled without local prerequisites"
     return (.ok (), s.update worker fun w => { w with session, queued := w.queued.push m, submitted := w.submitted + 1 }.fill)
   | .lake .poll, s => do
     let w := s.workers[worker]!
@@ -177,12 +203,12 @@ private def operate (worker : Nat) : Operation BuildResult α → World → Exce
     let s := s.update worker fun w => { w with receipts := deliveries.foldl (fun names (d : WorkDelivery) => names.insert d.receipt) w.receipts }
     return (.ok (deliveries, remaining.isEmpty && leases.isEmpty), s)
   | .send items, s => do
-    if s.workers[worker]!.cancelled then return (.ok (), s)
+    if s.workers[worker]!.stopping then return (.ok (), s)
     let s := items.foldl (fun s item => if s.sent.contains item.key then s else
       { s with sent := s.sent.insert item.key, queue := s.queue.push item }) s
     return (.ok (), s)
   | .complete receipts _, s => do
-    if s.workers[worker]!.cancelled then return (.ok (), s)
+    if s.workers[worker]!.stopping then return (.ok (), s)
     let mut s := s
     for receipt in receipts do
       s := s.update worker fun w => { w with receipts := w.receipts.erase receipt }
@@ -193,12 +219,28 @@ private def operate (worker : Nat) : Operation BuildResult α → World → Exce
       else s := { s with coverage.staleAcks := s.coverage.staleAcks + 1 }
     return (.ok (), s)
   | .release receipts, s => return (.ok (), receipts.foldl (release · worker ·) s)
-  | .cancelled, s => return (.ok s.workers[worker]!.cancelled, s)
+  | .cancelled, s => return (.ok s.workers[worker]!.stopping, s)
   | .activity _, s => return (.ok (), s)
-  | .events, s =>
+  | .events, s => do
     let w := s.workers[worker]!
+    if let some error := w.failure then return (.error error, s)
     let replies := if w.cancelled then #[.cancelled] else w.replies
     return (.ok (s.clock, replies), s.update worker fun w => { w with replies := #[] })
+
+private def request (worker : Nat) (op : Operation BuildResult α) (s : World) :
+    Except String (Except BuildError α × World) := do
+  if let some site := faultSite op then
+    if s.faults.operation == some site && !s.workers[worker]!.stopping then
+      if s.faults.skip > 0 then
+        return ← operate worker op { s with faults.skip := s.faults.skip - 1 }
+      return (.error site.error, { s with
+        faults.operation := none
+        coverage.operationFailures := s.coverage.operationFailures + 1 })
+  operate worker op s
+
+private def failed (s : World) (worker : Nat) (error : BuildError) : World :=
+  if error.isCancelled && s.workers[worker]!.stopping then s else
+    s.update worker fun w => { w with failure := w.failure.orElse (fun _ => some error) }
 
 /-- One effect, or one pool bookkeeping step. Never evaluates a whole job. -/
 private partial def step (worker : Nat) (fiber : Fiber α) (s : World) : Except String (Fiber α × World) := do
@@ -207,14 +249,14 @@ private partial def step (worker : Nat) (fiber : Fiber α) (s : World) : Except 
     match program.run with
     | .pure .. => return (fiber, s)
     | .impure _ (.request op) next =>
-      let (value, s) ← operate worker op s
+      let (value, s) ← request worker op s
       let s := { s with
         boundary := some (worker, label op), lastWorker := some worker
         coverage.requests := s.coverage.requests + 1
         coverage.switches := s.coverage.switches + if s.lastWorker.any (· != worker) then 1 else 0 }
       return (.run (ExceptT.mk (next.apply value)), s)
     | .impure _ (.launch job) next =>
-      let s := if s.workers[worker]!.cancelled then s else
+      let s := if s.workers[worker]!.stopping then s else
         s.update worker fun w => { w with jobs := w.jobs.push (.run (ExceptT.mk job)) }
       return (.run (ExceptT.mk (next.apply ())), s)
     | .impure _ (.parallel limit count jobs) next =>
@@ -242,7 +284,7 @@ private partial def step (worker : Nat) (fiber : Fiber α) (s : World) : Except 
     if let some result := child.outcome then
       state := { state with active := state.active.eraseIdxIfInBounds slot }
       match result with
-      | .error error => state := { state with error := some error }
+      | .error error => state := { state with error := state.error.orElse (fun _ => some error) }
       | .ok value => state := { state with results := state.results.set! i.val (some value), halted := state.halted || stop value }
     return (.pool limit count children state stop next, s)
 
@@ -250,6 +292,7 @@ private inductive Turn where
   | root (worker : Nat)
   | job (worker index : Nat)
   | compiler (worker : Nat)
+  | stop (worker : Nat)
   | close (worker : Nat)
   deriving Inhabited
 
@@ -261,24 +304,30 @@ private def runnable (s : World) : Array Turn := Id.run do
     if w.root.outcome.isNone then turns := turns.push (.root i)
     for j in [:w.jobs.size] do turns := turns.push (.job i j)
     if !w.running.isEmpty then turns := turns.push (.compiler i)
-    if w.root.outcome.isSome && w.jobs.isEmpty then turns := turns.push (.close i)
+    if w.root.outcome.isSome then
+      if !w.cleanupStarted then turns := turns.push (.stop i)
+      else if w.jobs.isEmpty then turns := turns.push (.close i)
   return turns
 
 private def takeTurn (turn : Turn) (s : World) : Except String World := do
   match turn with
   | .root worker =>
     let (root, s) ← step worker s.workers[worker]!.root s
-    return s.update worker fun w => { w with root }
+    let s := s.update worker fun w => { w with root }
+    return match root.outcome with
+      | some (.error error) => failed s worker error
+      | _ => s
   | .job worker index =>
     let (job, s) ← step worker s.workers[worker]!.jobs[index]! s
     match job.outcome with
     | none => return s.update worker fun w => { w with jobs := w.jobs.set! index job }
     | some outcome =>
       let s := s.update worker fun w => { w with jobs := w.jobs.eraseIdxIfInBounds index }
-      if s.workers[worker]!.cancelled then return s
       match outcome with
-      | .error error => throw error
-      | .ok event => return s.update worker fun w => { w with replies := w.replies.push event }
+      | .error error => return failed s worker error
+      | .ok event =>
+        return if s.workers[worker]!.stopping then s else
+          (s.update worker fun w => { w with replies := w.replies.push event })
   | .compiler worker =>
     let w := s.workers[worker]!
     let i := s.random % w.running.size
@@ -287,14 +336,21 @@ private def takeTurn (turn : Turn) (s : World) : Except String World := do
     return s.update worker fun w => { w with
       running := w.running.eraseIdxIfInBounds i
       completions := w.completions.push (m.name, result) }.fill
+  | .stop worker =>
+    let w := s.workers[worker]!
+    require (w.stopping || w.session.phase == .closed) "Builder returned with open Lake session"
+    -- Model cancellation failure after the engine stopped its jobs. Cleanup
+    -- still joins application jobs and releases receipts, just like runTyped.
+    let fails := s.faults.failCleanup && w.failure.isSome
+    let s := s.update worker fun w => { w with
+      cleanupStarted := true, session := w.session.cancel
+      queued := #[], running := #[], completions := #[]
+      cleanup := if fails then some (.tool "cancel failed") else none }
+    return if fails then { s with faults.failCleanup := false, coverage.cleanupFailures := s.coverage.cleanupFailures + 1 } else s
   | .close worker =>
     let w := s.workers[worker]!
-    if let some (.error error) := w.root.outcome then unless w.cancelled do throw error
-    require (w.cancelled || w.session.phase == .closed) "Builder returned with open Lake session"
     let s := w.receipts.toArray.foldl (release · worker ·) s
-    return s.update worker fun w => { w with
-      closed := true, replies := #[], session := w.session.cancel
-      queued := #[], running := #[], completions := #[] }
+    return s.update worker fun w => { w with closed := true, replies := #[] }
 
 private def inject (s : World) : World := Id.run do
   let mut s := s
@@ -321,6 +377,7 @@ structure Result : Type 1 where
   records : Std.HashMap String BuildResult
   coverage : Coverage
   participating : Nat
+  outcomes : Array (Except BuildError Unit)
 
 /-- Finite seeded schedules; failure reports include the seed at the call site.
 No wall-clock timing, threads, native processes or real service calls. -/
@@ -328,7 +385,7 @@ def run (plan : Plan) (cpus : Array Nat) (seed : Nat) (failure : Option String :
     (faults : Faults := {}) : Except String Result := do
   require (cpus.size ≥ 2) "Model needs multiple builders"
   let workers := cpus.map fun cpus => { root := .run (program plan cpus) : Worker }
-  let mut s : World := { workers, random := seed, failure, faults }
+  let mut s : World := { workers, random := seed, failure }
   -- Workflow seeds once before launching builders. Interpret the actual seeding
   -- program too, without injecting builder failures into this earlier stage.
   let mut seeding : Fiber Unit := .run (seedProgram plan)
@@ -336,7 +393,8 @@ def run (plan : Plan) (cpus : Array Nat) (seed : Nat) (failure : Option String :
     let (next, world) ← step 0 seeding s
     seeding := next
     s := world
-  if let some (.error error) := seeding.outcome then throw error
+  if let some (.error error) := seeding.outcome then throw (toString error)
+  s := { s with faults }
   for _ in [:200000] do
     if s.workers.all (·.closed) then
       require (s.queue.isEmpty && s.leases.isEmpty && s.finished.size == plan.modules.size) "Scopes closed with unfinished queue work"
@@ -344,7 +402,10 @@ def run (plan : Plan) (cpus : Array Nat) (seed : Nat) (failure : Option String :
         w.running.isEmpty && w.queued.isEmpty && w.peak ≤ w.slots) "Scope leaked jobs, leases or compiler slots"
       return {
         records := s.records, coverage := s.coverage
-        participating := (s.workers.filter (·.submitted > 0)).size }
+        participating := (s.workers.filter (·.submitted > 0)).size
+        outcomes := s.workers.map fun w => BuildError.after
+          (w.failure.map Except.error |>.getD (.ok ()))
+          (w.cleanup.map Except.error |>.getD (.ok ())) }
     s := { s with clock := s.clock + 1, random := (s.random * 1664525 + 1013904223) % 4294967296, boundary := none }
     let turns := runnable s
     require (!turns.isEmpty) "Model deadlocked"

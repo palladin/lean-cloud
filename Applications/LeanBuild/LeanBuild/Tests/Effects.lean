@@ -38,6 +38,7 @@ private def schedules : Except String Unit := do
         match BuilderModel.run p cpus seed failure faults with
         | .error error => throw s!"seed={seed}, failure={failure}, mode={mode}: {error}"
         | .ok final =>
+          ensure (final.outcomes.all Except.isOk) "Unexpected builder error in cancellation/redelivery schedule"
           let c := final.coverage
           ensure (c.requests > modules.size && c.switches > 0 && c.poolOverlap)
             s!"seed={seed}: generated schedule did not interleave effects/pool children"
@@ -67,6 +68,28 @@ private def schedules : Except String Unit := do
   ensure (crossWorkerRedeliveries > 0 && releasedOnCancel > 0 && cancelledJobs > 0)
     "Schedules missed redelivery to another builder or cancellation lease cleanup"
 
+/-- One-off operation failures reach the real Eff continuation, then stop that
+builder scope. Other builders recover its released work; no crash retry is used.
+Half of the schedules also fail engine cancellation after it stops compiler jobs. -/
+private def operationFailures : Except String Unit := do
+  let sites : Array BuilderModel.FaultSite := #[.readResult, .send, .receive, .publish]
+  for seed in [:40] do
+    let modules := (Array.range 24).map fun i =>
+      { name := s!"F{i}", imports := if i < 8 then #[] else #[s!"F{i-8}"] : Module }
+    for site in sites do
+      for cleanup in [false, true] do
+        let faults : BuilderModel.Faults := { operation := some site, skip := seed % 4, failCleanup := cleanup }
+        match BuilderModel.run (plan modules) #[2, 3, 4] seed none faults with
+        | .error error => throw s!"fault seed={seed}, site={reprStr site}, cleanup={cleanup}: {error}"
+        | .ok final =>
+          ensure (final.coverage.operationFailures == 1) "Operation failure was never injected"
+          let errors := final.outcomes.filterMap fun | .error error => some error | _ => none
+          let expected := if cleanup then BuildError.cleanup site.error (.tool "cancel failed") else site.error
+          ensure (errors == #[expected]) s!"Wrong fault propagation: {reprStr errors}"
+          ensure (final.coverage.cleanupFailures == if cleanup then 1 else 0) "Missing cleanup failure coverage"
+          ensure (final.records.size == modules.size && final.records.toArray.all (fun (_, r) => r.status == .built))
+            "Surviving builders did not finish released work"
+
 /-- Exercise the critical interleavings directly, including late duplicate
 receipts and cancellation during an upload. -/
 private def transitions : Except String Unit := do
@@ -93,22 +116,22 @@ private def transitions : Except String Unit := do
 
 private def preparation : Except String Unit := do
   let snapshot : Bundle.Snapshot := ⟨"unused", 1, #[]⟩
-  let handle (failAt : String) : {α : Type} → Project.PrepareOp α → StateM (Array String) (Except String α)
+  let handle (failAt : String) : {α : Type} → Project.PrepareOp α → StateM (Array String) (Except BuildError α)
     | _, .fetch => pure (.ok "commit")
     | _, .hasSubmodules => pure (.ok false)
     | _, .checkProject => pure (.ok "toolchain")
-    | _, .discover => pure (if failAt == "discover" then .error "discovery failed" else .ok #[])
+    | _, .discover => pure (if failAt == "discover" then .error (.tool "discovery failed") else .ok #[])
     | _, .snapshot => pure (.ok snapshot)
     | _, .platform => pure (.ok "platform")
     | _, .publish _ => do
       modify (·.push "publish")
-      return if failAt == "publish" then .error "publication failed" else .ok default
+      return if failAt == "publish" then .error (.network "publication failed") else .ok default
     | _, .diagnostics => do modify (·.push "diagnostics"); return .ok default
   let (failed, log) := (Project.runWith (handle "discover") Project.prepare).run #[]
   ensure (failed.toOption.any (fun p => p.plan.isNone && p.error == "discovery failed") && log == #["diagnostics"])
     "Discovery failure was not a report"
   let (failed, log) := (Project.runWith (handle "publish") Project.prepare).run #[]
-  ensure ((match failed with | .error "publication failed" => true | _ => false) && log == #["publish"])
+  ensure ((match failed with | .error (.network "publication failed") => true | _ => false) && log == #["publish"])
     "Publication failure was swallowed"
 
 private def lakeLifecycle : Except String Unit := do
@@ -128,19 +151,19 @@ private def lakeLifecycle : Except String Unit := do
 
 private def finalization : Except String Unit := do
   let difference : Bundle.Difference := ⟨⟨"unused", 1, #[]⟩, #[]⟩
-  let handle (failAt : String) : {α : Type} → Project.FinishOp α → StateM (Array String) (Except String α)
+  let handle (failAt : String) : {α : Type} → Project.FinishOp α → StateM (Array String) (Except BuildError α)
     | _, .now => pure (.ok 10)
     | _, .progress _ => pure (.ok ())
     | _, .manifests _ => pure (.ok #[])
     | _, .restore _ => do modify (·.push "restore"); return .ok #[]
     | _, .targets => do
       modify (·.push "targets")
-      return if failAt == "targets" then .error "compile failed" else .ok #["A"]
+      return if failAt == "targets" then .error (.tool "compile failed") else .ok #["A"]
     | _, .difference _ => do modify (·.push "verify"); return .ok difference
     | _, .diagnostics => pure (.ok default)
     | _, .publish _ => do
       modify (·.push "publish")
-      return if failAt == "publish" then .error "upload failed" else .ok default
+      return if failAt == "publish" then .error (.network "upload failed") else .ok default
     | _, .commit => do modify (·.push "commit"); return .ok ()
   let (success, log) := (Project.runWith (handle "") (Project.finish #[])).run #[]
   ensure (success.toOption.any (·.status == .built) && log == #["restore", "targets", "verify", "publish", "commit"])
@@ -159,11 +182,11 @@ private structure PreviewModel where
 private def prefetchPolicy : Except String Unit := do
   let items := (Array.range 205).map fun i =>
     { position := ⟨205 - i, i⟩, value := toJson i : WorkPreview }
-  let handle : {α : Type} → Prefetch.Operation α → StateM PreviewModel (Except String α)
+  let handle : {α : Type} → Prefetch.Operation α → StateM PreviewModel (Except BuildError α)
     | _, .observe => do
       let s ← get
       set { s with started := #[], clock := s.clock + 10 }
-      if s.clock > 10000 then return .error "Prefetch did not finish"
+      if s.clock > 10000 then return .error (.protocol "Prefetch did not finish")
       return .ok (s.clock, s.started, s.seen.size == 205)
     | _, .peek after =>
       pure (.ok ((items.filter (fun item => after.all (·.sequence < item.position.sequence))).extract 0 100))
@@ -176,11 +199,12 @@ private def prefetchPolicy : Except String Unit := do
 /-- Tests are pure; IO is only used to report a failed assertion to the runner. -/
 def effectTests : IO Unit := do
   IO.ofExcept schedules
+  IO.ofExcept operationFailures
   IO.ofExcept transitions
   IO.ofExcept preparation
   IO.ofExcept lakeLifecycle
   IO.ofExcept finalization
   IO.ofExcept prefetchPolicy
-  IO.println "PASS pure Eff models: 360 effect-interleaved DAG schedules, 2–4 builders, redelivery, cancellation, Lake lifecycle, prefetch ordering and project boundaries"
+  IO.println "PASS pure Eff models: 680 effect-interleaved DAG schedules with operation/cleanup faults, 2–4 builders, redelivery, cancellation, Lake lifecycle, prefetch ordering and project boundaries"
 
 end LeanBuild.Tests

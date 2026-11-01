@@ -50,6 +50,12 @@ leases and bounded transfer pools, and join outstanding work on exit.
 These are local effects; they do not add Cloud replay records or scheduler
 round trips for individual modules.
 
+Eff programs use [BuildError](LeanBuild/BuildError.lean) to distinguish
+cancellation, network, tool and protocol failures. Errors stay typed across
+parallel jobs. Cleanup preserves the original cause and attaches later failures;
+it still joins tasks and attempts to release every lease. An operation error is
+an exec failure, not a worker crash or an automatic retry.
+
 Each builder restores the prepared sources once and loads Lake once. A bounded
 pipeline receives ready work, restores missing prerequisites, compiles modules
 and publishes their artifacts concurrently. Each worker admits up to twice its
@@ -291,12 +297,16 @@ lake build cloud_app build_local build_tests
 .lake/build/bin/build_tests --native
 ```
 
-Pure handlers test the same Eff builder over 360 seeded DAG schedules on 2–4
+Pure handlers test the same Eff builder over 680 seeded DAG schedules on 2–4
 builders. Each turn advances one effect, with separate Lake sessions, bounded
 parallel jobs and local artifact caches. Schedules inject lease expiry/redelivery
 and cancellation between installation, submission, publication, commit, successor
 notification and acknowledgement. They check results, stale receipt fencing and
 cleanup, and assert that the intended fault interleavings actually occurred.
+320 schedules inject one-off failures in result reads, queue sends/receives and
+artifact publication; half also fail compiler cleanup. They verify typed error
+propagation, preservation of the original cause and recovery of released work by
+the remaining builders.
 Tests also compare direct/replay execution on 40 generated DAGs. They cover concurrent
 builder sessions, bounded lookahead that leaves work available to idle workers, progress
 without round barriers, interruption between result

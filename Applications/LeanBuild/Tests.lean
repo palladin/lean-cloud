@@ -84,6 +84,9 @@ private def withEnvironment (store : ObjectStore) (base : ExecContext IO)
       queues := WorkQueueStore.provider conn (← Std.Mutex.new ()) scope }
   finally conn.close
 
+private def errorIs (result : Except BuildError α) (expected : BuildError) : Bool :=
+  match result with | .error actual => actual == expected | .ok _ => false
+
 /-- Session acquisition and cleanup belong to the handler, including partial
 startup and failures in the compiler's own cancellation operation. -/
 private def sessionScopeTests : IO Unit := do
@@ -103,35 +106,88 @@ private def sessionScopeTests : IO Unit := do
     Builders.run env { fixturePlan with modules := #[] } engine
     check ((← calls.get) == #["start", "finish", "cancel"]) "Incorrect normal Lake session lifecycle"
     calls.set #[]
-    let failed ← try
-      Builders.run env { fixturePlan with modules := #[] } { engine with
-        start := fun _ => do calls.modify (·.push "start"); throw (IO.userError "startup failed") }
-      pure false
-    catch error => pure (error.toString == "startup failed")
-    check (failed && (← calls.get) == #["start", "cancel"]) "Failed startup did not close the session"
-  withEnvironment store (pool #[2]) fun env => do
-    let plan := { fixturePlan with modules := #[⟨"Root", #[]⟩] }
-    Builders.seed env plan
-    let preparing ← IO.mkRef false
-    let joined ← IO.mkRef false
-    let engine : Builders.Engine Unit := {
-      prepare := fun stop _ _ => do
-        preparing.set true
-        while !(← stop.isRequested) do IO.sleep 1
-        joined.set true
-      submit := fun _ => throw (IO.userError "Unexpected submission")
-      poll := do
-        if ← preparing.get then throw (IO.userError "poll failed")
-        return #[]
-      publish := fun _ _ _ => throw (IO.userError "Unexpected publication")
-      finish := pure ()
-      cancel := throw (IO.userError "cancel failed") }
-    let failed ← try Builders.run env plan engine; pure false
-      catch error => pure (error.toString == "cancel failed")
-    check (failed && (← joined.get)) "Cancellation failure skipped joining preparation"
-    let available ← (env.queues.open Builders.queueName).receive 1
-    check (available.size == 1) "Cancellation failure did not release outstanding leases"
-  IO.println "PASS Lake session startup, finish, cancellation failure, task joins and lease cleanup"
+    let failed ← (Builders.runTyped env { fixturePlan with modules := #[] } { engine with
+      start := fun _ => do calls.modify (·.push "start"); throw (IO.userError "startup failed") }).run
+    check (errorIs failed (.tool "startup failed") && (← calls.get) == #["start", "cancel"])
+      "Failed startup did not preserve the error and close the session"
+    let cleanupOnly ← (Builders.runTyped env { fixturePlan with modules := #[] } { engine with
+      cancel := throw (IO.userError "cancel failed") }).run
+    check (errorIs cleanupOnly (.tool "cancel failed")) "Successful build swallowed cleanup failure"
+    let both ← (Builders.runTyped env { fixturePlan with modules := #[] } { engine with
+      start := fun _ => throw (IO.userError "startup failed")
+      cancel := throw (IO.userError "cancel failed") }).run
+    check (errorIs both (.cleanup (.tool "startup failed") (.tool "cancel failed")))
+      "Cleanup replaced a startup failure"
+  for releaseFails in [false, true] do
+    withEnvironment store (pool #[2]) fun base => do
+      let env := { base with queues := ⟨fun name =>
+        let queue := base.queues.open name
+        { queue with release := fun receipt => do
+          queue.release receipt
+          if releaseFails then throw (IO.userError "release failed") }⟩ }
+      let plan := { fixturePlan with modules := #[⟨"RootA", #[]⟩, ⟨"RootB", #[]⟩] }
+      Builders.seed env plan
+      let preparing ← Std.Mutex.new (0 : Nat)
+      let joined ← Std.Mutex.new (0 : Nat)
+      let engine : Builders.Engine Unit := {
+        prepare := fun stop _ _ => do
+          preparing.atomically (modify (· + 1))
+          while !(← stop.isRequested) do IO.sleep 1
+          joined.atomically (modify (· + 1))
+        submit := fun _ => throw (IO.userError "Unexpected submission")
+        poll := do
+          if (← preparing.atomically get) == 2 then throw (IO.userError "poll failed")
+          return #[]
+        publish := fun _ _ _ => throw (IO.userError "Unexpected publication")
+        finish := pure ()
+        cancel := throw (IO.userError "cancel failed") }
+      let failed ← (Builders.runTyped env plan engine).run
+      let expected := BuildError.cleanup (.tool "poll failed") (.tool "cancel failed")
+      let expected := if releaseFails then .cleanup (.cleanup expected (.network "release failed")) (.network "release failed") else expected
+      check (errorIs failed expected && expected.primary == .tool "poll failed" && (← joined.atomically get) == 2)
+        "Cleanup hid the original error or skipped joining preparation"
+      check ((toString expected).startsWith "poll failed\nCleanup failed: cancel failed")
+        "Diagnostic lost the original error"
+      let available ← (base.queues.open Builders.queueName).receive 1
+      let more ← (base.queues.open Builders.queueName).receive 1
+      check (available.size == 1 && more.size == 1) "Cancellation failure did not release every outstanding lease"
+  IO.println "PASS typed Lake session errors, primary/cleanup diagnostics, task joins and lease cleanup"
+
+private def typedErrorTests : IO Unit := do
+  let errors : Array BuildError := #[.cancelled, .network "offline", .tool "compiler failed", .protocol "invalid",
+    .cleanup .cancelled (.network "cleanup offline")]
+  for expected in errors do
+    let handle : {α : Type} → Builders.Operation Unit α → BuildIO α := fun _ => throw expected
+    let launch : BuildIO (Builders.Event Unit) → BuildIO Unit := fun _ => throw (.protocol "Unexpected launch")
+    for mode in [:3] do
+      let program : Builders.Program Unit BuildError := do
+        try
+          if mode == 0 then discard <| Builders.perform (.readResult "x")
+          else if mode == 1 then
+            discard <| Builders.parallel 2 #["x", "y"] fun name => Builders.perform (.readResult name)
+          else
+            discard <| Builders.all 2 #["x", "y"] fun name => return (← Builders.perform (.readResult name)).isSome
+          pure (BuildError.protocol "Missing error")
+        catch error => pure error
+      let actual ← (Builders.runProgram handle launch program).toIO
+      check (actual == expected) "Eff catch lost typed error through request/parallel/all"
+  let started ← IO.Promise.new
+  let queue : WorkQueue IO := {
+    send := fun _ => pure (), receive := fun _ => pure #[], acknowledge := fun _ => pure ()
+    complete := fun _ _ => pure (), progress := pure {}, isIdle := pure false
+    renew := fun _ => pure (), release := fun _ => pure ()
+    peek := fun _ _ => pure #[⟨⟨1, 0⟩, toJson (0 : Nat)⟩, ⟨⟨1, 1⟩, toJson (1 : Nat)⟩] }
+  let outcome ← (Prefetch.runTyped queue ⟨pure false⟩ 2 fun stop value => do
+    if (fromJson? value : Except String Nat).toOption == some 0 then
+      discard <| IO.wait started.result!
+      throw .cancelled
+    else
+      started.resolve ()
+      while !(← stop.isRequested) do IO.sleep 1
+      throw (.network "cleanup offline")).run
+  check (errorIs outcome (.cleanup .cancelled (.network "cleanup offline")))
+    "Prefetch cleanup hid a failure behind cancellation"
+  IO.println "PASS typed cancellation, network, tool and protocol errors through Eff catches and bounded pools"
 
 /-- The same rolling coordinator, with task-backed compiler jobs for model tests. -/
 private def runBuilders (env : Environment IO) (plan : Plan)
@@ -1680,6 +1736,7 @@ def main (args : List String) : IO Unit := do
   watchdogTests
   LeanBuild.Tests.effectTests
   sessionScopeTests
+  typedErrorTests
   if args == ["--native-only"] then nativeTests; return
   builderSourceTest
   admissionTest

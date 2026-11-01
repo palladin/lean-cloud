@@ -141,16 +141,24 @@ private def prepareHandle (tools : Tools) (store : ObjectStore) (request : Reque
     Files.putJson store source (Builders.ioConcurrency tools.threads)
   | .diagnostics => logs store directory
 
-private def runProject (handle : {α : Type} → op α → IO α) (program : Project.Program op α) : IO α := do
+private def runProject (handle : {α : Type} → op α → IO α) (classify : {α : Type} → op α → String → BuildError) (program : Project.Program op α) : IO α := do
   IO.ofExcept (← Project.runWith (fun operation => do
-    try return .ok (← handle operation) catch error => return .error error.toString) program)
+    try return .ok (← handle operation) catch error => return .error (classify operation error.toString)) program)
+
+private def prepareError : Project.PrepareOp α → String → BuildError
+  | .publish _ | .diagnostics => .network
+  | _ => .tool
+
+private def finishError : Project.FinishOp α → String → BuildError
+  | .manifests _ | .restore _ | .publish _ | .diagnostics => .network
+  | _ => .tool
 
 def Tools.prepareDirectory (tools : Tools) (store : ObjectStore) (request : Request)
     (directory : System.FilePath) (commit : String) : IO Preparation :=
-  runProject (prepareHandle tools store request directory) (Project.prepareDirectory commit)
+  runProject (prepareHandle tools store request directory) prepareError (Project.prepareDirectory commit)
 
 def Tools.prepare (tools : Tools) (store : ObjectStore) (request : Request) : IO Preparation :=
-  withWorkspace fun directory => runProject (prepareHandle tools store request directory) Project.prepare
+  withWorkspace fun directory => runProject (prepareHandle tools store request directory) prepareError Project.prepare
 
 private def restore (tools : Tools) (store : ObjectStore) (directory : System.FilePath)
     (request : Request) (plan : Plan) (artifacts : Bundle.Manifest)
@@ -194,7 +202,7 @@ private def finishTargets (tools : Tools) (store : ObjectStore) (request : Reque
   let key ← workspaceKey tools request plan
   let cache := tools.cache.map fun cache => cache.directory.addExtension "workspace"
   Workspace.use store cache key (concurrency := Builders.ioConcurrency tools.threads) fun session =>
-    runProject (finishHandle tools store request plan session progress) (Project.finish completed)
+    runProject (finishHandle tools store request plan session progress) finishError (Project.finish completed)
 
 private structure Installed where
   modules : Std.HashMap String FileRef := {}
@@ -395,14 +403,14 @@ def Tools.builder (tools : Tools) (store : ObjectStore) (env : Environment IO)
         if let .error message := result then
           unless ← failed.get do throw (IO.userError message)
       cancel }
-    try
-      Builders.run env plan engine
-      unless ← env.cancellation.isRequested do
-        let inputs ← installed.atomically do return (← get).files.toArray.map (·.2)
-        Bundle.validateInputs directory inputs tools.threads
-        discard (Bundle.snapshot directory request.limits.bytes)
-        session.commit
-    finally cancel
+    -- Builders.run owns the Lake session, including shutdown and failure
+    -- aggregation. A second finally here could hide its original diagnostic.
+    Builders.run env plan engine
+    unless ← env.cancellation.isRequested do
+      let inputs ← installed.atomically do return (← get).files.toArray.map (·.2)
+      Bundle.validateInputs directory inputs tools.threads
+      discard (Bundle.snapshot directory request.limits.bytes)
+      session.commit
 
 /-- Lake completes exactly the requested targets: native compilation, linking,
 custom targets and any dynamic dependencies remain Lake's responsibility. -/
